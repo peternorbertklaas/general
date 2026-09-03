@@ -54,7 +54,7 @@ jobs:
         if: matrix.node == 22
         run: pnpm --filter @deriva/web run test:e2e
       - name: Upload coverage (all packages)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-node${{ matrix.node }}
@@ -64,7 +64,7 @@ jobs:
             apps/web/coverage
           if-no-files-found: warn
       - name: Upload web build (without source maps) and E2E screenshots
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always() && matrix.node == 22
         with:
           name: web-dist
