@@ -1,42 +1,65 @@
-import { type FixedLeg, type FloatLeg, type SwapLeg, type Trade, parseISO, toISO } from "@deriva/pricing-core";
+import { useMemo, useState } from "react";
+import {
+  type BusinessDayConvention,
+  type CrossCurrencySwap,
+  type FixedLeg,
+  type FloatLeg,
+  type InterestRateSwap,
+  type StubType,
+  type SwapLeg,
+  type Trade,
+  buildSchedule,
+  getIndex,
+  linearAmortisation,
+} from "@deriva/pricing-core";
+import { parseDateInput } from "../lib/date-parse.js";
+import { fmtDate, fmtMoney } from "../lib/format.js";
+import { BARRIER_DE, CAPFLOOR_DE, CASH_CONVENTION_DE, MODEL_DE, OPTION_TYPE_DE, PAYER_RECEIVER_DE, SETTLEMENT_DE, optionsFrom } from "../lib/i18n.js";
+import { parseNumberInput } from "../lib/num-parse.js";
+import { annuityAmortisation, frequencyMonths, parseSchedulePaste } from "../lib/trade-ops.js";
+import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
+import { LS_KEYS, STATUS_LABELS, TRADE_STATUSES, readLocal, useStore, writeLocal } from "../state/store.js";
+import { DateInput } from "./DateInput.js";
+import { NumInput, OptNumInput } from "./NumInput.js";
+
+export { NumInput, OptNumInput };
 
 interface Props {
   trade: Trade;
   onChange: (t: Trade) => void;
 }
 
-function Field({ label, children, span2 }: { label: string; children: React.ReactNode; span2?: boolean }) {
+/** Form field with label; `issue` renders aria-invalid styling + message under the field. */
+function Field({ label, children, span2, issue, hint }: { label: string; children: React.ReactNode; span2?: boolean; issue?: TradeIssue; hint?: string }) {
   return (
-    <div className={`field ${span2 ? "span-2" : ""}`}>
+    <div className={`field ${span2 ? "span-2" : ""} ${issue ? (issue.level === "error" ? "invalid" : "warn") : ""}`}>
       <label>{label}</label>
       {children}
+      {issue && (
+        <span className={`field-msg ${issue.level}`} role={issue.level === "error" ? "alert" : undefined}>
+          {issue.msg}
+        </span>
+      )}
+      {!issue && hint && <span className="field-msg muted">{hint}</span>}
     </div>
   );
 }
 
-function NumInput({ value, onChange, step, pct, digits }: { value: number; onChange: (v: number) => void; step?: number; pct?: boolean; digits?: number }) {
-  const shown = pct ? Number((value * 100).toFixed(digits ?? 4)) : value;
+function Select<T extends string>({
+  value,
+  options,
+  onChange,
+  invalid,
+  ariaLabel,
+}: {
+  value: T;
+  options: readonly T[] | readonly { v: T; l: string }[];
+  onChange: (v: T) => void;
+  invalid?: boolean;
+  ariaLabel?: string;
+}) {
   return (
-    <input
-      type="number"
-      step={step ?? (pct ? 0.01 : 1)}
-      value={Number.isFinite(shown) ? shown : ""}
-      onChange={(e) => {
-        const v = Number(e.target.value);
-        if (!Number.isFinite(v)) return;
-        onChange(pct ? v / 100 : v);
-      }}
-    />
-  );
-}
-
-function DateInput({ value, onChange }: { value: number; onChange: (v: number) => void }) {
-  return <input type="date" value={toISO(value)} onChange={(e) => e.target.value && onChange(parseISO(e.target.value))} />;
-}
-
-function Select<T extends string>({ value, options, onChange }: { value: T; options: readonly T[] | readonly { v: T; l: string }[]; onChange: (v: T) => void }) {
-  return (
-    <select value={value} onChange={(e) => onChange(e.target.value as T)}>
+    <select value={value} onChange={(e) => onChange(e.target.value as T)} aria-invalid={invalid || undefined} aria-label={ariaLabel}>
       {options.map((o) => {
         const v = typeof o === "string" ? o : o.v;
         const l = typeof o === "string" ? o : o.l;
@@ -50,30 +73,438 @@ function Select<T extends string>({ value, options, onChange }: { value: T; opti
   );
 }
 
+function Checkbox({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
+  return (
+    <label className="check">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} /> {label}
+    </label>
+  );
+}
+
+/** Collapsible section; the open state is shared for all legs and remembered in localStorage. */
+function Collapsible({ title, open, onToggle, children }: { title: string; open: boolean; onToggle: () => void; children: React.ReactNode }) {
+  return (
+    <div className="collapsible">
+      <button type="button" onClick={onToggle} aria-expanded={open}>
+        <span>{open ? "▾" : "▸"}</span> {title}
+      </button>
+      {open && <div className="body form">{children}</div>}
+    </div>
+  );
+}
+
+function useConventionsOpen(): [boolean, () => void] {
+  const [open, setOpen] = useState(() => readLocal(LS_KEYS.conventionsOpen) === "1");
+  return [
+    open,
+    () => {
+      const next = !open;
+      setOpen(next);
+      writeLocal(LS_KEYS.conventionsOpen, next ? "1" : "0");
+    },
+  ];
+}
+
+const CCY_PRIORITY = ["EUR", "GBP", "AUD", "NZD", "USD", "CAD", "CHF", "JPY"];
+/** Market quotation: the currency with higher priority is the base (e.g. EUR/USD, USD/JPY). */
+function marketRate(
+  buyCcy: string,
+  buyAmt: number,
+  sellCcy: string,
+  sellAmt: number,
+): { label: string; rate: number; setFromRate: (r: number) => { buyAmount?: number; sellAmount?: number } } {
+  const buyIsBase = CCY_PRIORITY.indexOf(buyCcy) <= CCY_PRIORITY.indexOf(sellCcy) && CCY_PRIORITY.indexOf(buyCcy) !== -1;
+  if (buyIsBase) {
+    return { label: `Kurs ${buyCcy}/${sellCcy}`, rate: buyAmt ? sellAmt / buyAmt : 0, setFromRate: (r) => ({ sellAmount: buyAmt * r }) };
+  }
+  return { label: `Kurs ${sellCcy}/${buyCcy}`, rate: sellAmt ? buyAmt / sellAmt : 0, setFromRate: (r) => ({ buyAmount: sellAmt * r }) };
+}
+
 const DAYCOUNTS = ["ACT/360", "ACT/365F", "30E/360", "30/360", "ACT/ACT ISDA"] as const;
 const FREQS = ["1M", "3M", "6M", "1Y", "ZC"] as const;
 const INDICES = ["EURIBOR-3M", "EURIBOR-6M", "ESTR", "SOFR", "SONIA", "SARON"] as const;
 const CCYS = ["EUR", "USD", "GBP", "CHF"] as const;
 const PAIRS = ["EURUSD", "EURGBP", "EURCHF", "EURJPY", "USDJPY"] as const;
+const STUBS: { v: StubType; l: string }[] = [
+  { v: "ShortFront", l: "Short Front" },
+  { v: "LongFront", l: "Long Front" },
+  { v: "ShortBack", l: "Short Back" },
+  { v: "LongBack", l: "Long Back" },
+];
+const BDCS: { v: BusinessDayConvention; l: string }[] = [
+  { v: "Following", l: "Following" },
+  { v: "ModifiedFollowing", l: "Modified Following" },
+  { v: "Preceding", l: "Preceding" },
+  { v: "ModifiedPreceding", l: "Modified Preceding" },
+];
+type Payout = "Vanilla" | "DigitalCash" | "DigitalAsset";
+const PAYOUTS: { v: Payout; l: string }[] = [
+  { v: "Vanilla", l: "Vanilla" },
+  { v: "DigitalCash", l: "Digital (Cash – Quote-Ccy)" },
+  { v: "DigitalAsset", l: "Digital (Asset – Basis-Ccy)" },
+];
+
+/** Whether an index is an overnight (RFR) index – enables lookback / observation shift. */
+export function isOisIndex(index: string): boolean {
+  try {
+    return getIndex(index).type === "OIS";
+  } catch {
+    return false;
+  }
+}
+
+type LegPatch = Partial<Omit<FloatLeg, "type">> & Partial<Pick<FixedLeg, "rate">>;
+
+/** Schedule conventions of a swap leg (stub, BDC, EOM, lags, RFR conventions, embedded cap/floor). */
+function LegConventions({ leg, onChange, open, onToggle }: { leg: SwapLeg; onChange: (patch: LegPatch) => void; open: boolean; onToggle: () => void }) {
+  const fl = leg.type === "Float" ? leg : undefined;
+  const ois = fl ? isOisIndex(fl.index) : false;
+  let defaultFixingLag = "";
+  if (fl) {
+    try {
+      defaultFixingLag = String(getIndex(fl.index).fixingLag);
+    } catch {
+      defaultFixingLag = "";
+    }
+  }
+  return (
+    <Collapsible title="Konventionen" open={open} onToggle={onToggle}>
+      <Field label="Stub">
+        <Select value={leg.stub ?? "ShortFront"} options={STUBS} onChange={(v) => onChange({ stub: v })} />
+      </Field>
+      <Field label="Business-Day-Convention">
+        <Select value={leg.businessDayConvention ?? "ModifiedFollowing"} options={BDCS} onChange={(v) => onChange({ businessDayConvention: v })} />
+      </Field>
+      <Field label="End-of-Month">
+        <Checkbox checked={leg.endOfMonth ?? false} onChange={(v) => onChange({ endOfMonth: v })} label="Monatsultimo-Regel" />
+      </Field>
+      <Field label="Payment-Lag">
+        <NumInput value={leg.paymentLag ?? 0} step={1} min={0} unit="Tage" onChange={(v) => onChange({ paymentLag: Math.max(0, Math.round(v)) })} />
+      </Field>
+      {fl && (
+        <>
+          <Field label="Fixing-Lag">
+            <OptNumInput
+              value={fl.fixingLag}
+              step={1}
+              unit="Tage"
+              placeholder={defaultFixingLag}
+              onChange={(v) => onChange({ fixingLag: v === undefined ? undefined : Math.max(0, Math.round(v)) })}
+            />
+          </Field>
+          {ois && (
+            <>
+              <Field label="Lookback">
+                <NumInput value={fl.lookbackDays ?? 0} step={1} min={0} unit="Tage" onChange={(v) => onChange({ lookbackDays: Math.max(0, Math.round(v)) })} />
+              </Field>
+              <Field label="Observation-Shift">
+                <Checkbox checked={fl.observationShift ?? false} onChange={(v) => onChange({ observationShift: v })} label="Gewichte aus Beobachtungsperiode" />
+              </Field>
+            </>
+          )}
+          <Field label="Cap (eingebettet)">
+            <OptNumInput value={fl.capRate} scale={100} step={0.05} unit="%" placeholder="–" onChange={(v) => onChange({ capRate: v })} />
+          </Field>
+          <Field label="Floor (eingebettet)">
+            <OptNumInput value={fl.floorRate} scale={100} step={0.05} unit="%" placeholder="–" onChange={(v) => onChange({ floorRate: v })} />
+          </Field>
+        </>
+      )}
+    </Collapsible>
+  );
+}
+
+type AmortKind = "linear" | "annuity" | "custom";
+
+/**
+ * Amortisation editor (Markt N17): notional per period start (dates from the
+ * leg schedule). Profiles: "Linear" to a target residual, "Annuität" (constant
+ * instalment from the loan rate), "Custom" (edit / paste a Datum;Nominal table).
+ */
+function AmortisationEditor({ trade, onChange }: { trade: InterestRateSwap | CrossCurrencySwap; onChange: (t: Trade) => void }) {
+  const valuationDate = useStore((s) => s.valuationDate);
+  const showToast = useStore((s) => s.showToast);
+  const [applyAll, setApplyAll] = useState(trade.type === "InterestRateSwap");
+  const [legIdx, setLegIdx] = useState(0);
+  const [kind, setKind] = useState<AmortKind>("linear");
+  const [residual, setResidual] = useState(0);
+  const [loanRate, setLoanRate] = useState(0.04);
+  const sameDates = trade.legs.every((l) => l.effectiveDate === trade.legs[0]!.effectiveDate && l.terminationDate === trade.legs[0]!.terminationDate);
+  const all = applyAll && sameDates;
+  const ref = trade.legs[all ? 0 : Math.min(legIdx, trade.legs.length - 1)]!;
+  const on = (ref.notionalSchedule?.length ?? 0) > 0;
+
+  const periodStarts = useMemo(() => {
+    try {
+      return buildSchedule({
+        effectiveDate: ref.effectiveDate,
+        terminationDate: ref.terminationDate,
+        frequency: ref.frequency,
+        calendar: ref.calendar,
+        businessDayConvention: ref.businessDayConvention,
+        stub: ref.stub,
+        endOfMonth: ref.endOfMonth,
+        paymentLag: ref.paymentLag,
+      }).periods.map((p) => p.accrualStart);
+    } catch {
+      return [] as number[];
+    }
+  }, [ref.effectiveDate, ref.terminationDate, ref.frequency, ref.calendar, ref.businessDayConvention, ref.stub, ref.endOfMonth, ref.paymentLag]);
+
+  /** Notional in force at a period start = last schedule entry dated on/before it (same rule as the pricer). */
+  const notionalAt = (date: number): number => {
+    let n = ref.notionalSchedule?.[0]?.notional ?? ref.notional;
+    for (const e of ref.notionalSchedule ?? []) if (e.date <= date) n = e.notional;
+    return n;
+  };
+
+  const setSchedule = (schedule: { date: number; notional: number }[] | undefined) => {
+    const targets = all ? trade.legs.map((_, i) => i) : [trade.legs.indexOf(ref)];
+    onChange({ ...trade, legs: trade.legs.map((l, i) => (targets.includes(i) ? { ...l, notionalSchedule: schedule } : l)) } as Trade);
+  };
+  const toggle = (enabled: boolean) => setSchedule(enabled ? periodStarts.map((d) => ({ date: d, notional: ref.notional })) : undefined);
+  const setRow = (i: number, notional: number) => {
+    setKind("custom");
+    setSchedule(periodStarts.map((d, j) => ({ date: d, notional: j === i ? notional : notionalAt(d) })));
+  };
+  const startNotional = ref.notionalSchedule?.[0]?.notional ?? ref.notional;
+  const applyLinear = () => {
+    setKind("linear");
+    setSchedule(linearAmortisation(ref, startNotional, residual));
+  };
+  const applyAnnuity = () => {
+    setKind("annuity");
+    setSchedule(annuityAmortisation(periodStarts, startNotional, residual, loanRate, frequencyMonths(ref.frequency)));
+  };
+  const onPaste = (e: React.ClipboardEvent) => {
+    const text = e.clipboardData.getData("text/plain");
+    if (!text || !/[\n;\t]/.test(text)) return;
+    const parsed = parseSchedulePaste(
+      text,
+      (s) => parseDateInput(s, { base: valuationDate }),
+      (s) => parseNumberInput(s)?.value,
+    );
+    if (parsed.length === 0) return;
+    e.preventDefault();
+    setKind("custom");
+    setSchedule(parsed);
+    showToast(`Tilgungsplan übernommen (${parsed.length} Zeilen)`);
+  };
+
+  return (
+    <div className="card" style={{ padding: 10 }} data-testid="amortisation-editor">
+      <h3>
+        Amortisation
+        <span className="right row" style={{ gap: 12 }}>
+          {trade.legs.length > 1 && (
+            <Checkbox checked={all} onChange={setApplyAll} label={sameDates ? "auf alle Legs anwenden" : "auf alle Legs anwenden (Laufzeiten abweichend)"} />
+          )}
+          {!all && trade.legs.length > 1 && (
+            <select className="inline" value={legIdx} onChange={(e) => setLegIdx(Number(e.target.value))} aria-label="Leg für Amortisation">
+              {trade.legs.map((l, i) => (
+                <option key={i} value={i}>
+                  Leg {i + 1} ({l.type === "Fixed" ? "Fest" : l.index})
+                </option>
+              ))}
+            </select>
+          )}
+          <Checkbox checked={on} onChange={toggle} label="Amortisierend" />
+        </span>
+      </h3>
+      {on && (
+        <>
+          <div className="row wrap" style={{ marginBottom: 8, gap: 10 }}>
+            <div className="seg" role="group" aria-label="Tilgungsprofil">
+              <button
+                type="button"
+                className={kind === "linear" ? "active" : ""}
+                aria-pressed={kind === "linear"}
+                onClick={applyLinear}
+                title="Linear auf die Restschuld abschmelzend"
+              >
+                Linear
+              </button>
+              <button
+                type="button"
+                className={kind === "annuity" ? "active" : ""}
+                aria-pressed={kind === "annuity"}
+                onClick={applyAnnuity}
+                title="Annuität: konstante Rate aus Kreditzins, Tilgung steigt über die Laufzeit"
+              >
+                Annuität
+              </button>
+              <button
+                type="button"
+                className={kind === "custom" ? "active" : ""}
+                aria-pressed={kind === "custom"}
+                onClick={() => setKind("custom")}
+                title="Nominal je Periode frei eingeben oder Tabelle (Datum;Nominal) einfügen"
+              >
+                Custom
+              </button>
+            </div>
+            <label className="row" style={{ gap: 6 }}>
+              <span className="muted small">Restschuld</span>
+              <span style={{ display: "inline-block", width: 170 }}>
+                <NumInput
+                  inline
+                  value={residual}
+                  step={100000}
+                  min={0}
+                  unit={ref.currency}
+                  ariaLabel="Restschuld"
+                  onChange={setResidual}
+                  onCommit={() => (kind === "annuity" ? applyAnnuity() : applyLinear())}
+                />
+              </span>
+            </label>
+            {kind === "annuity" && (
+              <label className="row" style={{ gap: 6 }}>
+                <span className="muted small">Kreditzins</span>
+                <span style={{ display: "inline-block", width: 110 }}>
+                  <NumInput inline value={loanRate} scale={100} step={0.05} unit="%" ariaLabel="Kreditzins" onChange={setLoanRate} onCommit={applyAnnuity} />
+                </span>
+              </label>
+            )}
+            <button type="button" className="btn ghost" onClick={() => toggle(false)} title="Nominalplan entfernen – konstantes Nominal">
+              Konstant
+            </button>
+            <span className="muted xs">
+              {periodStarts.length} Perioden · Start {fmtMoney(notionalAt(periodStarts[0] ?? ref.effectiveDate), ref.currency)} · Ende{" "}
+              {fmtMoney(notionalAt(periodStarts[periodStarts.length - 1] ?? ref.effectiveDate), ref.currency)}
+            </span>
+          </div>
+          <div className="table-scroll" style={{ maxHeight: 240 }} onPaste={onPaste} data-testid="amortisation-table">
+            <table className="grid-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Periodenstart</th>
+                  <th className="num">Nominal</th>
+                </tr>
+              </thead>
+              <tbody>
+                {periodStarts.map((d, i) => (
+                  <tr key={d} style={{ cursor: "default" }} tabIndex={0}>
+                    <td className="muted">{i + 1}</td>
+                    <td className="mono">{fmtDate(d)}</td>
+                    <td className="num">
+                      <span style={{ display: "inline-block", width: 190 }}>
+                        <NumInput
+                          inline
+                          value={notionalAt(d)}
+                          step={100000}
+                          min={0}
+                          unit={ref.currency}
+                          ariaLabel={`Nominal Periode ${i + 1}`}
+                          onChange={(v) => setRow(i, v)}
+                        />
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="muted xs" style={{ marginTop: 4 }}>
+            Zweispaltige Tabelle (Datum;Nominal, z. B. aus Excel) mit <kbd>Ctrl</kbd>+<kbd>V</kbd> in die Tabelle einfügen – Datum als tt.mm.jjjj oder ISO.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 export function TradeEditor({ trade, onChange }: Props) {
+  const customerMode = useStore((s) => s.customerMode);
+  const valuationDate = useStore((s) => s.valuationDate);
+  const [convOpen, toggleConv] = useConventionsOpen();
+  const issues = useMemo(() => validateTrade(trade), [trade]);
+  const iss = (field: string) => issueFor(issues, field);
   const upd = (patch: Partial<Trade>) => onChange({ ...trade, ...patch } as Trade);
+  const baseCcy =
+    trade.type === "FxOption"
+      ? trade.pair.slice(0, 3)
+      : trade.type === "FxForward"
+        ? trade.buyCurrency
+        : trade.type === "FxSwap"
+          ? trade.nearLeg.buyCurrency
+          : "currency" in trade
+            ? trade.currency
+            : trade.type === "Swaption"
+              ? trade.underlying.legs[0]!.currency
+              : trade.legs[0]!.currency;
+  const upfrontOn = trade.upfront !== undefined;
   const common = (
     <>
       <Field label="Bezeichnung" span2>
-        <input value={trade.name ?? ""} onChange={(e) => upd({ name: e.target.value })} />
+        <input value={trade.name ?? ""} onChange={(e) => upd({ name: e.target.value })} aria-label="Bezeichnung" />
       </Field>
-      <Field label="Kontrahent">
-        <input value={trade.counterparty ?? ""} onChange={(e) => upd({ counterparty: e.target.value })} />
+      {!customerMode && (
+        <Field label="Kontrahent" issue={iss("counterparty")}>
+          <input value={trade.counterparty ?? ""} placeholder="(offen)" onChange={(e) => upd({ counterparty: e.target.value })} aria-label="Kontrahent" />
+        </Field>
+      )}
+      {!customerMode && (
+        <Field label="Buch">
+          <input
+            value={trade.book ?? ""}
+            placeholder="z. B. Treasury"
+            onChange={(e) => upd({ book: e.target.value || undefined })}
+            aria-label="Buch"
+            list="book-suggestions"
+          />
+        </Field>
+      )}
+      <Field label="Status">
+        <Select value={trade.status ?? "Indication"} options={TRADE_STATUSES.map((v) => ({ v, l: STATUS_LABELS[v] }))} onChange={(v) => upd({ status: v })} />
       </Field>
+      <Field label="Collateral (CSA)" hint="Diskontkurve nach Besicherung">
+        <Select
+          value={(trade.collateralCurrency ?? "") as string}
+          options={[{ v: "", l: "unbesichert" }, ...CCYS.map((c) => ({ v: c, l: `${c}-CSA` }))]}
+          ariaLabel="Collateral-Währung"
+          onChange={(v) => upd({ collateralCurrency: v || undefined })}
+        />
+      </Field>
+      <Field label="Upfront / Prämie" hint="+ = wir zahlen">
+        <OptNumInput
+          value={trade.upfront?.amount}
+          step={1000}
+          unit={trade.upfront?.currency ?? baseCcy}
+          placeholder="keine"
+          ariaLabel="Upfront-Betrag"
+          onChange={(v) =>
+            upd({
+              upfront: v === undefined ? undefined : { amount: v, currency: trade.upfront?.currency ?? baseCcy, date: trade.upfront?.date ?? valuationDate },
+            })
+          }
+        />
+      </Field>
+      {upfrontOn && (
+        <>
+          <Field label="Upfront-Währung">
+            <Select
+              value={trade.upfront!.currency}
+              options={[...new Set([...CCYS, trade.upfront!.currency])]}
+              ariaLabel="Upfront-Währung"
+              onChange={(v) => upd({ upfront: { ...trade.upfront!, currency: v } })}
+            />
+          </Field>
+          <Field label="Upfront-Datum">
+            <DateInput value={trade.upfront!.date} ariaLabel="Upfront-Datum" onChange={(v) => upd({ upfront: { ...trade.upfront!, date: v } })} />
+          </Field>
+        </>
+      )}
     </>
   );
 
   switch (trade.type) {
     case "InterestRateSwap":
     case "CrossCurrencySwap": {
-      const setLeg = (i: number, patch: Partial<SwapLeg>) => onChange({ ...trade, legs: trade.legs.map((l, j) => (j === i ? ({ ...l, ...patch } as SwapLeg) : l)) } as Trade);
-      const setBoth = (patch: Partial<SwapLeg>) => onChange({ ...trade, legs: trade.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } as Trade);
+      const setLeg = (i: number, patch: LegPatch) =>
+        onChange({ ...trade, legs: trade.legs.map((l, j) => (j === i ? ({ ...l, ...patch } as SwapLeg) : l)) } as Trade);
+      const setBoth = (patch: LegPatch) => onChange({ ...trade, legs: trade.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } as Trade);
       const leg0 = trade.legs[0]!;
       return (
         <div className="stack">
@@ -85,28 +516,76 @@ export function TradeEditor({ trade, onChange }: Props) {
                   <Select value={leg0.currency} options={CCYS} onChange={(v) => setBoth({ currency: v })} />
                 </Field>
                 <Field label="Nominal">
-                  <NumInput value={leg0.notional} step={100000} onChange={(v) => setBoth({ notional: v })} />
+                  <NumInput
+                    value={leg0.notional}
+                    step={100000}
+                    unit={leg0.currency}
+                    error={iss("notional:0")?.msg}
+                    level={iss("notional:0")?.level}
+                    ariaLabel="Nominal"
+                    onChange={(v) => setBoth({ notional: v })}
+                  />
                 </Field>
               </>
             )}
             <Field label="Startdatum">
-              <DateInput value={leg0.effectiveDate} onChange={(v) => setBoth({ effectiveDate: v })} />
+              <DateInput value={leg0.effectiveDate} ariaLabel="Startdatum" onChange={(v) => setBoth({ effectiveDate: v })} />
             </Field>
-            <Field label="Enddatum">
-              <DateInput value={leg0.terminationDate} onChange={(v) => setBoth({ terminationDate: v })} />
+            <Field label="Enddatum" issue={iss("terminationDate:0")}>
+              <DateInput
+                value={leg0.terminationDate}
+                ariaLabel="Enddatum"
+                invalid={!!iss("terminationDate:0")}
+                base={leg0.effectiveDate}
+                onChange={(v) => setBoth({ terminationDate: v })}
+              />
             </Field>
-            <Field label="Collateral (CSA)">
-              <Select value={(trade.collateralCurrency ?? "") as string} options={["", ...CCYS]} onChange={(v) => upd({ collateralCurrency: v || undefined })} />
-            </Field>
+            {trade.type === "CrossCurrencySwap" && (
+              <>
+                <Field label="Nominalaustausch">
+                  <span className="row wrap" style={{ gap: 10 }}>
+                    <Checkbox
+                      checked={leg0.notionalExchange?.initial ?? false}
+                      onChange={(v) =>
+                        setBoth({ notionalExchange: { initial: v, final: leg0.notionalExchange?.final ?? false, interim: leg0.notionalExchange?.interim } })
+                      }
+                      label="Start"
+                    />
+                    <Checkbox
+                      checked={leg0.notionalExchange?.final ?? false}
+                      onChange={(v) =>
+                        setBoth({ notionalExchange: { initial: leg0.notionalExchange?.initial ?? false, final: v, interim: leg0.notionalExchange?.interim } })
+                      }
+                      label="Ende"
+                    />
+                  </span>
+                </Field>
+                <Field label="MtM-Reset">
+                  <Select
+                    value={trade.mtmReset ? String(trade.mtmReset.resettingLegIndex) : ""}
+                    options={[{ v: "", l: "kein Reset" }, ...trade.legs.map((_, i) => ({ v: String(i), l: `Leg ${i + 1}` }))]}
+                    ariaLabel="MtM-Reset"
+                    onChange={(v) => upd({ mtmReset: v === "" ? undefined : { resettingLegIndex: Number(v) } } as Partial<CrossCurrencySwap>)}
+                  />
+                </Field>
+              </>
+            )}
           </div>
+          <AmortisationEditor trade={trade} onChange={onChange} />
           {trade.legs.map((leg, i) => (
             <div key={i} className="card" style={{ padding: 10 }}>
               <h3>
                 Leg {i + 1} · {leg.type === "Fixed" ? "Festzins" : `Variabel ${(leg as FloatLeg).index}`}
                 <span className="right">
-                  <div className="seg">
+                  <div className="seg" role="group" aria-label={`Richtung Leg ${i + 1}`}>
                     {(["Pay", "Receive"] as const).map((p) => (
-                      <button key={p} className={leg.payReceive === p ? "active" : ""} onClick={() => setLeg(i, { payReceive: p })}>
+                      <button
+                        key={p}
+                        type="button"
+                        className={leg.payReceive === p ? "active" : ""}
+                        aria-pressed={leg.payReceive === p}
+                        onClick={() => setLeg(i, { payReceive: p })}
+                      >
                         {p === "Pay" ? "Zahlen" : "Erhalten"}
                       </button>
                     ))}
@@ -120,21 +599,47 @@ export function TradeEditor({ trade, onChange }: Props) {
                       <Select value={leg.currency} options={CCYS} onChange={(v) => setLeg(i, { currency: v })} />
                     </Field>
                     <Field label="Nominal">
-                      <NumInput value={leg.notional} step={100000} onChange={(v) => setLeg(i, { notional: v })} />
+                      <NumInput
+                        value={leg.notional}
+                        step={100000}
+                        unit={leg.currency}
+                        error={iss(`notional:${i}`)?.msg}
+                        level={iss(`notional:${i}`)?.level}
+                        ariaLabel={`Nominal Leg ${i + 1}`}
+                        onChange={(v) => setLeg(i, { notional: v })}
+                      />
                     </Field>
                   </>
                 )}
                 {leg.type === "Fixed" ? (
-                  <Field label="Festsatz %">
-                    <NumInput value={(leg as FixedLeg).rate} pct step={0.005} onChange={(v) => setLeg(i, { rate: v } as Partial<FixedLeg>)} />
+                  <Field label="Festsatz">
+                    <NumInput
+                      value={(leg as FixedLeg).rate}
+                      scale={100}
+                      step={0.005}
+                      unit="%"
+                      error={iss(`rate:${i}`)?.msg}
+                      level={iss(`rate:${i}`)?.level}
+                      ariaLabel={`Festsatz Leg ${i + 1}`}
+                      onChange={(v) => setLeg(i, { rate: v })}
+                    />
                   </Field>
                 ) : (
                   <>
                     <Field label="Index">
-                      <Select value={(leg as FloatLeg).index} options={INDICES} onChange={(v) => setLeg(i, { index: v } as Partial<FloatLeg>)} />
+                      <Select value={(leg as FloatLeg).index} options={INDICES} onChange={(v) => setLeg(i, { index: v })} />
                     </Field>
-                    <Field label="Spread bp">
-                      <NumInput value={((leg as FloatLeg).spread ?? 0) * 1e4} step={1} onChange={(v) => setLeg(i, { spread: v / 1e4 } as Partial<FloatLeg>)} />
+                    <Field label="Spread">
+                      <NumInput
+                        value={(leg as FloatLeg).spread ?? 0}
+                        scale={1e4}
+                        step={1}
+                        unit="bp"
+                        error={iss(`spread:${i}`)?.msg}
+                        level={iss(`spread:${i}`)?.level}
+                        ariaLabel={`Spread Leg ${i + 1}`}
+                        onChange={(v) => setLeg(i, { spread: v })}
+                      />
                     </Field>
                   </>
                 )}
@@ -145,6 +650,7 @@ export function TradeEditor({ trade, onChange }: Props) {
                   <Select value={leg.dayCount} options={DAYCOUNTS} onChange={(v) => setLeg(i, { dayCount: v })} />
                 </Field>
               </div>
+              <LegConventions leg={leg} onChange={(patch) => setLeg(i, patch)} open={convOpen} onToggle={toggleConv} />
             </div>
           ))}
         </div>
@@ -152,83 +658,216 @@ export function TradeEditor({ trade, onChange }: Props) {
     }
     case "CapFloor":
       return (
-        <div className="form">
-          {common}
-          <Field label="Art">
-            <Select value={trade.capFloor} options={["Cap", "Floor", "Collar"] as const} onChange={(v) => upd({ capFloor: v })} />
-          </Field>
-          <Field label="Position">
-            <Select value={trade.payReceive} options={[{ v: "Receive" as const, l: "Long (Käufer)" }, { v: "Pay" as const, l: "Short (Verkäufer)" }]} onChange={(v) => upd({ payReceive: v })} />
-          </Field>
-          <Field label="Währung">
-            <Select value={trade.currency} options={CCYS} onChange={(v) => upd({ currency: v })} />
-          </Field>
-          <Field label="Index">
-            <Select value={trade.index} options={INDICES} onChange={(v) => upd({ index: v })} />
-          </Field>
-          <Field label="Nominal">
-            <NumInput value={trade.notional} step={100000} onChange={(v) => upd({ notional: v })} />
-          </Field>
-          <Field label={trade.capFloor === "Floor" ? "Floor-Strike %" : "Cap-Strike %"}>
-            <NumInput value={trade.strike} pct step={0.05} onChange={(v) => upd({ strike: v })} />
-          </Field>
-          {trade.capFloor === "Collar" && (
-            <Field label="Floor-Strike %">
-              <NumInput value={trade.floorStrike ?? 0} pct step={0.05} onChange={(v) => upd({ floorStrike: v })} />
+        <div className="stack">
+          <div className="form">
+            {common}
+            <Field label="Art">
+              <Select value={trade.capFloor} options={optionsFrom(["Cap", "Floor", "Collar"] as const, CAPFLOOR_DE)} onChange={(v) => upd({ capFloor: v })} />
             </Field>
-          )}
-          <Field label="Start">
-            <DateInput value={trade.effectiveDate} onChange={(v) => upd({ effectiveDate: v })} />
-          </Field>
-          <Field label="Ende">
-            <DateInput value={trade.terminationDate} onChange={(v) => upd({ terminationDate: v })} />
-          </Field>
-          <Field label="Frequenz">
-            <Select value={trade.frequency} options={FREQS} onChange={(v) => upd({ frequency: v })} />
-          </Field>
-          <Field label="Modell">
-            <Select value={trade.model ?? "Bachelier"} options={["Bachelier", "Black", "ShiftedBlack"] as const} onChange={(v) => upd({ model: v })} />
-          </Field>
-          <Field label="Vol-Override (bp, leer=Fläche)">
-            <input type="number" value={trade.volOverride !== undefined ? trade.volOverride * 1e4 : ""} onChange={(e) => upd({ volOverride: e.target.value === "" ? undefined : Number(e.target.value) / 1e4 })} />
-          </Field>
+            <Field label="Position">
+              <Select
+                value={trade.payReceive}
+                options={[
+                  { v: "Receive" as const, l: "Long (Käufer)" },
+                  { v: "Pay" as const, l: "Short (Verkäufer)" },
+                ]}
+                onChange={(v) => upd({ payReceive: v })}
+              />
+            </Field>
+            <Field label="Währung">
+              <Select value={trade.currency} options={CCYS} onChange={(v) => upd({ currency: v })} />
+            </Field>
+            <Field label="Index">
+              <Select value={trade.index} options={INDICES} onChange={(v) => upd({ index: v })} />
+            </Field>
+            <Field label="Nominal">
+              <NumInput
+                value={trade.notional}
+                step={100000}
+                unit={trade.currency}
+                error={iss("notional")?.msg}
+                level={iss("notional")?.level}
+                ariaLabel="Nominal"
+                onChange={(v) => upd({ notional: v })}
+              />
+            </Field>
+            <Field label={trade.capFloor === "Floor" ? "Floor-Strike" : "Cap-Strike"}>
+              <NumInput
+                value={trade.strike}
+                scale={100}
+                step={0.05}
+                unit="%"
+                error={iss("strike")?.msg}
+                level={iss("strike")?.level}
+                ariaLabel="Strike"
+                onChange={(v) => upd({ strike: v })}
+              />
+            </Field>
+            {trade.capFloor === "Collar" && (
+              <Field label="Floor-Strike">
+                <NumInput
+                  value={trade.floorStrike ?? 0}
+                  scale={100}
+                  step={0.05}
+                  unit="%"
+                  error={iss("floorStrike")?.msg}
+                  level={iss("floorStrike")?.level}
+                  ariaLabel="Floor-Strike"
+                  onChange={(v) => upd({ floorStrike: v })}
+                />
+              </Field>
+            )}
+            <Field label="Start">
+              <DateInput value={trade.effectiveDate} ariaLabel="Start" onChange={(v) => upd({ effectiveDate: v })} />
+            </Field>
+            <Field label="Ende" issue={iss("terminationDate")}>
+              <DateInput
+                value={trade.terminationDate}
+                ariaLabel="Ende"
+                invalid={!!iss("terminationDate")}
+                base={trade.effectiveDate}
+                onChange={(v) => upd({ terminationDate: v })}
+              />
+            </Field>
+            <Field label="Frequenz">
+              <Select value={trade.frequency} options={FREQS} onChange={(v) => upd({ frequency: v })} />
+            </Field>
+            <Field label="Modell">
+              <Select
+                value={trade.model ?? "Bachelier"}
+                options={optionsFrom(["Bachelier", "Black", "ShiftedBlack"] as const, MODEL_DE)}
+                onChange={(v) => upd({ model: v })}
+              />
+            </Field>
+            <Field label="Vol-Override (leer = Fläche)">
+              <OptNumInput
+                value={trade.volOverride}
+                scale={1e4}
+                step={1}
+                unit="bp"
+                placeholder="Fläche"
+                error={iss("volOverride")?.msg}
+                level={iss("volOverride")?.level}
+                ariaLabel="Vol-Override"
+                onChange={(v) => upd({ volOverride: v })}
+              />
+            </Field>
+          </div>
+          <Collapsible title="Konventionen" open={convOpen} onToggle={toggleConv}>
+            <Field label="Stub">
+              <Select value={trade.stub ?? "ShortFront"} options={STUBS} onChange={(v) => upd({ stub: v })} />
+            </Field>
+            <Field label="Business-Day-Convention">
+              <Select value={trade.businessDayConvention ?? "ModifiedFollowing"} options={BDCS} onChange={(v) => upd({ businessDayConvention: v })} />
+            </Field>
+          </Collapsible>
         </div>
       );
     case "Swaption": {
       const fixed = trade.underlying.legs.find((l): l is FixedLeg => l.type === "Fixed")!;
-      const setUnderlying = (patch: Partial<SwapLeg>) => onChange({ ...trade, underlying: { ...trade.underlying, legs: trade.underlying.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } });
+      const setUnderlying = (patch: LegPatch) =>
+        onChange({ ...trade, underlying: { ...trade.underlying, legs: trade.underlying.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } });
       return (
         <div className="form">
           {common}
           <Field label="Typ">
-            <Select value={trade.payerReceiver} options={["Payer", "Receiver"] as const} onChange={(v) => onChange({ ...trade, payerReceiver: v, underlying: { ...trade.underlying, legs: trade.underlying.legs.map((l) => ({ ...l, payReceive: l.type === "Fixed" ? (v === "Payer" ? "Pay" : "Receive") : v === "Payer" ? "Receive" : "Pay" }) as SwapLeg) } })} />
+            <Select
+              value={trade.payerReceiver}
+              options={optionsFrom(["Payer", "Receiver"] as const, PAYER_RECEIVER_DE)}
+              onChange={(v) =>
+                onChange({
+                  ...trade,
+                  payerReceiver: v,
+                  underlying: {
+                    ...trade.underlying,
+                    legs: trade.underlying.legs.map(
+                      (l) => ({ ...l, payReceive: l.type === "Fixed" ? (v === "Payer" ? "Pay" : "Receive") : v === "Payer" ? "Receive" : "Pay" }) as SwapLeg,
+                    ),
+                  },
+                })
+              }
+            />
           </Field>
           <Field label="Position">
-            <Select value={trade.payReceive} options={[{ v: "Receive" as const, l: "Long" }, { v: "Pay" as const, l: "Short" }]} onChange={(v) => upd({ payReceive: v })} />
+            <Select
+              value={trade.payReceive}
+              options={[
+                { v: "Receive" as const, l: "Long" },
+                { v: "Pay" as const, l: "Short" },
+              ]}
+              onChange={(v) => upd({ payReceive: v })}
+            />
           </Field>
-          <Field label="Verfall">
-            <DateInput value={trade.expiryDate} onChange={(v) => upd({ expiryDate: v })} />
+          <Field label="Verfall" issue={iss("expiryDate")}>
+            <DateInput value={trade.expiryDate} ariaLabel="Verfall" invalid={iss("expiryDate")?.level === "error"} onChange={(v) => upd({ expiryDate: v })} />
           </Field>
           <Field label="Settlement">
-            <Select value={trade.settlement} options={["Physical", "Cash"] as const} onChange={(v) => upd({ settlement: v })} />
+            <Select value={trade.settlement} options={optionsFrom(["Physical", "Cash"] as const, SETTLEMENT_DE)} onChange={(v) => upd({ settlement: v })} />
           </Field>
-          <Field label="Strike %">
-            <NumInput value={fixed.rate} pct step={0.005} onChange={(v) => setUnderlying({ rate: v } as Partial<FixedLeg>)} />
+          {trade.settlement === "Cash" && (
+            <Field label="Cash-Konvention" hint="EUR-Standard seit 2018: Collateralised Cash Price">
+              <Select
+                value={trade.cashSettlementConvention ?? "CollateralisedCashPrice"}
+                options={optionsFrom(["CollateralisedCashPrice", "IRR"] as const, CASH_CONVENTION_DE)}
+                ariaLabel="Cash-Settlement-Konvention"
+                onChange={(v) => upd({ cashSettlementConvention: v })}
+              />
+            </Field>
+          )}
+          <Field label="Strike">
+            <NumInput
+              value={fixed.rate}
+              scale={100}
+              step={0.005}
+              unit="%"
+              error={iss("strike")?.msg}
+              level={iss("strike")?.level}
+              ariaLabel="Strike"
+              onChange={(v) => setUnderlying({ rate: v })}
+            />
           </Field>
           <Field label="Nominal">
-            <NumInput value={fixed.notional} step={100000} onChange={(v) => setUnderlying({ notional: v })} />
+            <NumInput
+              value={fixed.notional}
+              step={100000}
+              unit={fixed.currency}
+              error={iss("notional")?.msg}
+              level={iss("notional")?.level}
+              ariaLabel="Nominal"
+              onChange={(v) => setUnderlying({ notional: v })}
+            />
           </Field>
           <Field label="Swap-Start">
-            <DateInput value={fixed.effectiveDate} onChange={(v) => setUnderlying({ effectiveDate: v })} />
+            <DateInput value={fixed.effectiveDate} ariaLabel="Swap-Start" onChange={(v) => setUnderlying({ effectiveDate: v })} />
           </Field>
-          <Field label="Swap-Ende">
-            <DateInput value={fixed.terminationDate} onChange={(v) => setUnderlying({ terminationDate: v })} />
+          <Field label="Swap-Ende" issue={iss("swapEnd")}>
+            <DateInput
+              value={fixed.terminationDate}
+              ariaLabel="Swap-Ende"
+              invalid={!!iss("swapEnd")}
+              base={fixed.effectiveDate}
+              onChange={(v) => setUnderlying({ terminationDate: v })}
+            />
           </Field>
           <Field label="Modell">
-            <Select value={trade.model ?? "Bachelier"} options={["Bachelier", "Black", "ShiftedBlack"] as const} onChange={(v) => upd({ model: v })} />
+            <Select
+              value={trade.model ?? "Bachelier"}
+              options={optionsFrom(["Bachelier", "Black", "ShiftedBlack"] as const, MODEL_DE)}
+              onChange={(v) => upd({ model: v })}
+            />
           </Field>
-          <Field label="Vol-Override (bp)">
-            <input type="number" value={trade.volOverride !== undefined ? trade.volOverride * 1e4 : ""} onChange={(e) => upd({ volOverride: e.target.value === "" ? undefined : Number(e.target.value) / 1e4 })} />
+          <Field label="Vol-Override">
+            <OptNumInput
+              value={trade.volOverride}
+              scale={1e4}
+              step={1}
+              unit="bp"
+              placeholder="Fläche"
+              error={iss("volOverride")?.msg}
+              level={iss("volOverride")?.level}
+              ariaLabel="Vol-Override"
+              onChange={(v) => upd({ volOverride: v })}
+            />
           </Field>
         </div>
       );
@@ -238,26 +877,90 @@ export function TradeEditor({ trade, onChange }: Props) {
         <div className="form">
           {common}
           <Field label="Kaufen">
-            <Select value={trade.buyCurrency} options={CCYS} onChange={(v) => upd({ buyCurrency: v })} />
+            <Select value={trade.buyCurrency} options={CCYS} ariaLabel="Kaufwährung" onChange={(v) => upd({ buyCurrency: v })} />
           </Field>
           <Field label="Betrag kaufen">
-            <NumInput value={trade.buyAmount} step={10000} onChange={(v) => upd({ buyAmount: v })} />
+            <NumInput
+              value={trade.buyAmount}
+              step={10000}
+              unit={trade.buyCurrency}
+              error={iss("buyAmount")?.msg}
+              level={iss("buyAmount")?.level}
+              ariaLabel="Betrag kaufen"
+              onChange={(v) => upd({ buyAmount: v })}
+            />
           </Field>
-          <Field label="Verkaufen">
-            <Select value={trade.sellCurrency} options={CCYS} onChange={(v) => upd({ sellCurrency: v })} />
+          <Field label="Verkaufen" issue={iss("sellCurrency")}>
+            <Select
+              value={trade.sellCurrency}
+              options={CCYS}
+              invalid={!!iss("sellCurrency")}
+              ariaLabel="Verkaufswährung"
+              onChange={(v) => upd({ sellCurrency: v })}
+            />
           </Field>
           <Field label="Betrag verkaufen">
-            <NumInput value={trade.sellAmount} step={10000} onChange={(v) => upd({ sellAmount: v })} />
+            <NumInput
+              value={trade.sellAmount}
+              step={10000}
+              unit={trade.sellCurrency}
+              error={iss("sellAmount")?.msg}
+              level={iss("sellAmount")?.level}
+              ariaLabel="Betrag verkaufen"
+              onChange={(v) => upd({ sellAmount: v })}
+            />
           </Field>
-          <Field label="Kontraktkurs (verk./kauf)">
-            <NumInput value={trade.sellAmount / trade.buyAmount} step={0.0001} onChange={(v) => upd({ sellAmount: trade.buyAmount * v })} />
-          </Field>
+          {(() => {
+            const mr = marketRate(trade.buyCurrency, trade.buyAmount, trade.sellCurrency, trade.sellAmount);
+            return (
+              <Field label={mr.label}>
+                <NumInput value={Math.round(mr.rate * 1e6) / 1e6} step={0.0001} digits={4} ariaLabel={mr.label} onChange={(v) => upd(mr.setFromRate(v))} />
+              </Field>
+            );
+          })()}
           <Field label="Lieferung">
-            <DateInput value={trade.deliveryDate} onChange={(v) => upd({ deliveryDate: v })} />
+            <DateInput
+              value={trade.deliveryDate}
+              ariaLabel="Lieferung"
+              onChange={(v) => upd({ deliveryDate: v, ...(trade.ndf ? { ndf: { ...trade.ndf, fixingDate: Math.min(trade.ndf.fixingDate, v) } } : {}) })}
+            />
           </Field>
+          <Field label="NDF" hint="Barausgleich in der Settlement-Währung am Fixing">
+            <Checkbox
+              checked={!!trade.ndf}
+              onChange={(v) =>
+                upd({
+                  ndf: v
+                    ? {
+                        fixingDate: trade.deliveryDate - 2,
+                        settlementCurrency:
+                          CCY_PRIORITY.indexOf(trade.buyCurrency) <= CCY_PRIORITY.indexOf(trade.sellCurrency) ? trade.sellCurrency : trade.buyCurrency,
+                      }
+                    : undefined,
+                })
+              }
+              label="Non-Deliverable Forward"
+            />
+          </Field>
+          {trade.ndf && (
+            <>
+              <Field label="NDF-Fixing">
+                <DateInput value={trade.ndf.fixingDate} ariaLabel="NDF-Fixing" onChange={(v) => upd({ ndf: { ...trade.ndf!, fixingDate: v } })} />
+              </Field>
+              <Field label="Settlement-Währung">
+                <Select
+                  value={trade.ndf.settlementCurrency}
+                  options={[...new Set([trade.buyCurrency, trade.sellCurrency, ...CCYS])]}
+                  ariaLabel="NDF-Settlement-Währung"
+                  onChange={(v) => upd({ ndf: { ...trade.ndf!, settlementCurrency: v } })}
+                />
+              </Field>
+            </>
+          )}
         </div>
       );
-    case "FxOption":
+    case "FxOption": {
+      const payout: Payout = trade.digital ? (trade.digital.payoutCurrency === trade.pair.slice(0, 3) ? "DigitalAsset" : "DigitalCash") : "Vanilla";
       return (
         <div className="form">
           {common}
@@ -265,62 +968,262 @@ export function TradeEditor({ trade, onChange }: Props) {
             <Select value={trade.pair} options={PAIRS} onChange={(v) => upd({ pair: v })} />
           </Field>
           <Field label="Typ (auf Basis-Ccy)">
-            <Select value={trade.optionType} options={["Call", "Put"] as const} onChange={(v) => upd({ optionType: v })} />
+            <Select value={trade.optionType} options={optionsFrom(["Call", "Put"] as const, OPTION_TYPE_DE)} onChange={(v) => upd({ optionType: v })} />
           </Field>
           <Field label="Position">
-            <Select value={trade.payReceive} options={[{ v: "Receive" as const, l: "Long" }, { v: "Pay" as const, l: "Short" }]} onChange={(v) => upd({ payReceive: v })} />
+            <Select
+              value={trade.payReceive}
+              options={[
+                { v: "Receive" as const, l: "Long" },
+                { v: "Pay" as const, l: "Short" },
+              ]}
+              onChange={(v) => upd({ payReceive: v })}
+            />
           </Field>
           <Field label="Nominal (Basis)">
-            <NumInput value={trade.notional} step={10000} onChange={(v) => upd({ notional: v })} />
+            <NumInput
+              value={trade.notional}
+              step={10000}
+              unit={trade.pair.slice(0, 3)}
+              error={iss("notional")?.msg}
+              level={iss("notional")?.level}
+              ariaLabel="Nominal"
+              onChange={(v) => upd({ notional: v })}
+            />
           </Field>
           <Field label="Strike">
-            <NumInput value={trade.strike} step={0.0025} onChange={(v) => upd({ strike: v })} />
+            <NumInput
+              value={trade.strike}
+              step={0.0025}
+              digits={4}
+              error={iss("strike")?.msg}
+              level={iss("strike")?.level}
+              ariaLabel="Strike"
+              onChange={(v) => upd({ strike: v })}
+            />
           </Field>
           <Field label="Verfall">
-            <DateInput value={trade.expiryDate} onChange={(v) => upd({ expiryDate: v, deliveryDate: Math.max(trade.deliveryDate, v + 2) })} />
+            <DateInput
+              value={trade.expiryDate}
+              ariaLabel="Verfall"
+              onChange={(v) => upd({ expiryDate: v, deliveryDate: Math.max(trade.deliveryDate, v + 2) })}
+            />
           </Field>
-          <Field label="Lieferung">
-            <DateInput value={trade.deliveryDate} onChange={(v) => upd({ deliveryDate: v })} />
+          <Field label="Lieferung" issue={iss("deliveryDate")}>
+            <DateInput
+              value={trade.deliveryDate}
+              ariaLabel="Lieferung"
+              invalid={!!iss("deliveryDate")}
+              base={trade.expiryDate}
+              onChange={(v) => upd({ deliveryDate: v })}
+            />
           </Field>
+          <Field label="Auszahlung">
+            <Select
+              value={payout}
+              options={PAYOUTS}
+              ariaLabel="Auszahlungsprofil"
+              onChange={(v) =>
+                upd({
+                  digital:
+                    v === "Vanilla"
+                      ? undefined
+                      : {
+                          payoutCurrency: v === "DigitalAsset" ? trade.pair.slice(0, 3) : trade.pair.slice(3),
+                          payout: trade.digital?.payout ?? (v === "DigitalAsset" ? trade.notional : Math.round(trade.notional * trade.strike)),
+                        },
+                })
+              }
+            />
+          </Field>
+          {trade.digital && (
+            <Field label={`Auszahlungsbetrag (${trade.digital.payoutCurrency})`}>
+              <NumInput
+                value={trade.digital.payout}
+                step={10000}
+                min={0}
+                unit={trade.digital.payoutCurrency}
+                ariaLabel="Digital-Auszahlung"
+                onChange={(v) => upd({ digital: { ...trade.digital!, payout: v } })}
+              />
+            </Field>
+          )}
           <Field label="Barriere">
             <Select
               value={trade.barrier?.type ?? "None"}
-              options={["None", "UpOut", "UpIn", "DownOut", "DownIn"] as const}
-              onChange={(v) => upd({ barrier: v === "None" ? undefined : { type: v, level: trade.barrier?.level ?? Math.round(trade.strike * (v.startsWith("Up") ? 1.06 : 0.94) * 10000) / 10000 } })}
+              options={optionsFrom(["None", "UpOut", "UpIn", "DownOut", "DownIn"] as const, BARRIER_DE)}
+              onChange={(v) =>
+                upd({
+                  barrier:
+                    v === "None"
+                      ? undefined
+                      : {
+                          type: v,
+                          level: trade.barrier?.level ?? Math.round(trade.strike * (v.startsWith("Up") ? 1.06 : 0.94) * 10000) / 10000,
+                          rebate: trade.barrier?.rebate,
+                        },
+                })
+              }
             />
           </Field>
           {trade.barrier && (
-            <Field label="Barriere-Level">
-              <NumInput value={trade.barrier.level} step={0.0025} onChange={(v) => upd({ barrier: { ...trade.barrier!, level: v } })} />
-            </Field>
+            <>
+              <Field label="Barriere-Level">
+                <NumInput
+                  value={trade.barrier.level}
+                  step={0.0025}
+                  digits={4}
+                  error={iss("barrierLevel")?.msg}
+                  ariaLabel="Barriere-Level"
+                  onChange={(v) => upd({ barrier: { ...trade.barrier!, level: v } })}
+                />
+              </Field>
+              <Field label={`Rebate (${trade.pair.slice(3)})`} hint="Zahlung bei Knock-out / ohne Knock-in">
+                <OptNumInput
+                  value={trade.barrier.rebate}
+                  step={1000}
+                  unit={trade.pair.slice(3)}
+                  placeholder="kein"
+                  ariaLabel="Barriere-Rebate"
+                  onChange={(v) => upd({ barrier: { ...trade.barrier!, rebate: v } })}
+                />
+              </Field>
+            </>
           )}
-          <Field label="Vol-Override % (leer=Smile)">
-            <input type="number" step={0.1} value={trade.volOverride !== undefined ? trade.volOverride * 100 : ""} onChange={(e) => upd({ volOverride: e.target.value === "" ? undefined : Number(e.target.value) / 100 })} />
+          <Field label="Vol-Override (leer = Smile)">
+            <OptNumInput
+              value={trade.volOverride}
+              scale={100}
+              step={0.1}
+              unit="%"
+              placeholder="Smile"
+              error={iss("volOverride")?.msg}
+              level={iss("volOverride")?.level}
+              ariaLabel="Vol-Override"
+              onChange={(v) => upd({ volOverride: v })}
+            />
           </Field>
         </div>
       );
+    }
     case "FRA":
       return (
         <div className="form">
           {common}
           <Field label="Richtung">
-            <Select value={trade.payReceive} options={[{ v: "Pay" as const, l: "Fest zahlen" }, { v: "Receive" as const, l: "Fest erhalten" }]} onChange={(v) => upd({ payReceive: v })} />
+            <Select
+              value={trade.payReceive}
+              options={[
+                { v: "Pay" as const, l: "Fest zahlen" },
+                { v: "Receive" as const, l: "Fest erhalten" },
+              ]}
+              onChange={(v) => upd({ payReceive: v })}
+            />
           </Field>
           <Field label="Nominal">
-            <NumInput value={trade.notional} step={100000} onChange={(v) => upd({ notional: v })} />
+            <NumInput
+              value={trade.notional}
+              step={100000}
+              unit={trade.currency}
+              error={iss("notional")?.msg}
+              level={iss("notional")?.level}
+              ariaLabel="Nominal"
+              onChange={(v) => upd({ notional: v })}
+            />
           </Field>
-          <Field label="Festsatz %">
-            <NumInput value={trade.fixedRate} pct step={0.005} onChange={(v) => upd({ fixedRate: v })} />
+          <Field label="Festsatz">
+            <NumInput
+              value={trade.fixedRate}
+              scale={100}
+              step={0.005}
+              unit="%"
+              error={iss("fixedRate")?.msg}
+              level={iss("fixedRate")?.level}
+              ariaLabel="Festsatz"
+              onChange={(v) => upd({ fixedRate: v })}
+            />
           </Field>
           <Field label="Start">
-            <DateInput value={trade.startDate} onChange={(v) => upd({ startDate: v })} />
+            <DateInput value={trade.startDate} ariaLabel="Start" onChange={(v) => upd({ startDate: v })} />
           </Field>
-          <Field label="Ende">
-            <DateInput value={trade.endDate} onChange={(v) => upd({ endDate: v })} />
+          <Field label="Ende" issue={iss("endDate")}>
+            <DateInput value={trade.endDate} ariaLabel="Ende" invalid={!!iss("endDate")} base={trade.startDate} onChange={(v) => upd({ endDate: v })} />
           </Field>
         </div>
       );
-    case "FxSwap":
-      return <div className="muted small">FX-Swap-Editor: bitte Near-/Far-Leg als einzelne Forwards bearbeiten (v1).</div>;
+    case "FxSwap": {
+      const legEditor = (which: "nearLeg" | "farLeg", title: string) => {
+        const leg = trade[which];
+        const setLeg = (patch: Partial<typeof leg>) => onChange({ ...trade, [which]: { ...leg, ...patch } });
+        return (
+          <div className="card" style={{ padding: 10 }}>
+            <h3>{title}</h3>
+            <div className="form">
+              <Field label="Kaufen">
+                <Select value={leg.buyCurrency} options={CCYS} ariaLabel={`${title} Kaufwährung`} onChange={(v) => setLeg({ buyCurrency: v })} />
+              </Field>
+              <Field label="Betrag kaufen">
+                <NumInput
+                  value={leg.buyAmount}
+                  step={10000}
+                  unit={leg.buyCurrency}
+                  error={iss(`${which}.buyAmount`)?.msg}
+                  ariaLabel={`${title} Betrag kaufen`}
+                  onChange={(v) => setLeg({ buyAmount: v })}
+                />
+              </Field>
+              <Field label="Verkaufen" issue={iss(`${which}.sellCurrency`)}>
+                <Select
+                  value={leg.sellCurrency}
+                  options={CCYS}
+                  invalid={!!iss(`${which}.sellCurrency`)}
+                  ariaLabel={`${title} Verkaufswährung`}
+                  onChange={(v) => setLeg({ sellCurrency: v })}
+                />
+              </Field>
+              <Field label="Betrag verkaufen">
+                <NumInput
+                  value={leg.sellAmount}
+                  step={10000}
+                  unit={leg.sellCurrency}
+                  error={iss(`${which}.sellAmount`)?.msg}
+                  ariaLabel={`${title} Betrag verkaufen`}
+                  onChange={(v) => setLeg({ sellAmount: v })}
+                />
+              </Field>
+              {(() => {
+                const mr = marketRate(leg.buyCurrency, leg.buyAmount, leg.sellCurrency, leg.sellAmount);
+                return (
+                  <Field label={mr.label}>
+                    <NumInput
+                      value={Math.round(mr.rate * 1e6) / 1e6}
+                      step={0.0001}
+                      digits={4}
+                      ariaLabel={`${title} ${mr.label}`}
+                      onChange={(v) => setLeg(mr.setFromRate(v))}
+                    />
+                  </Field>
+                );
+              })()}
+              <Field label="Valuta" issue={which === "farLeg" ? iss("farLeg.deliveryDate") : undefined}>
+                <DateInput
+                  value={leg.deliveryDate}
+                  ariaLabel={`${title} Valuta`}
+                  invalid={which === "farLeg" && !!iss("farLeg.deliveryDate")}
+                  onChange={(v) => setLeg({ deliveryDate: v })}
+                />
+              </Field>
+            </div>
+          </div>
+        );
+      };
+      return (
+        <div className="stack">
+          <div className="form">{common}</div>
+          {legEditor("nearLeg", "Near Leg (Kassa)")}
+          {legEditor("farLeg", "Far Leg (Termin)")}
+        </div>
+      );
+    }
   }
 }

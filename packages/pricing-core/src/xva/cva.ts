@@ -1,11 +1,18 @@
+import { type Curve } from "../curves/curve.js";
+import { type SerialDate, addTenor } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
-import { type FixedLeg, type FxForward, type InterestRateSwap, type Trade } from "../instruments/types.js";
-import { type MarketContext, getDiscountCurve, getFxSpot } from "../market/market-context.js";
+import { brent } from "../math/rootfind.js";
+import { type FixedLeg, type FloatLeg, type FxForward, type InterestRateSwap, type Trade } from "../instruments/types.js";
+import { tradeMaturityDate } from "../instruments/trade-dates.js";
+import { type MarketContext, getDiscountCurve } from "../market/market-context.js";
 import { bachelier, black76 } from "../models/black.js";
+import { normCdf, normPdf } from "../math/normal.js";
+import { computeRisk, rollMarket } from "../risk/sensitivities.js";
+import { priceTrade, tradeCurrencies } from "../pricing/price.js";
 import { fxAtmVol } from "../models/fx-vol-surface.js";
-import { swaptionAtmVol } from "../models/vol-surfaces.js";
-import { fxForwardRate, splitPair } from "../pricing/fx-pricer.js";
-import { scheduleDates } from "../pricing/leg-pricer.js";
+import { swaptionAtmVol, swaptionVol } from "../models/vol-surfaces.js";
+import { fxForwardRate } from "../pricing/fx-pricer.js";
+import { fxToReporting, scheduleDates } from "../pricing/leg-pricer.js";
 import { priceInterestRateSwap } from "../pricing/swap-pricer.js";
 
 export interface ExposurePoint {
@@ -38,29 +45,172 @@ export interface CreditInputs {
   cptyRecovery: number;
   ownHazard?: number;
   ownRecovery?: number;
+  /** Counterparty hazard term structure (from `bootstrapHazardCurve`); overrides `cptyHazard` when present. */
+  cptyHazardCurve?: HazardCurve;
+  /** Own hazard term structure; overrides `ownHazard` when present. */
+  ownHazardCurve?: HazardCurve;
+  /**
+   * Normal volatility of the tenor-basis spread (decimal, e.g. 0.0010 = 10bp)
+   * used for basis-swap exposure. Default: `BASIS_SPREAD_VOL_FRACTION` × ATM
+   * swaption normal vol – a deliberately conservative proxy.
+   */
+  basisSpreadVol?: number;
+}
+
+/**
+ * Default basis-spread vol as a fraction of the outright ATM normal swaption
+ * vol. Tenor-basis spreads historically move at roughly 10–20% of outright
+ * rate vol; 20% is used so the resulting CVA errs on the conservative side.
+ */
+export const BASIS_SPREAD_VOL_FRACTION = 0.2;
+
+// ---------------------------------------------------------------------------
+// Hazard term structure (CDS bootstrap)
+// ---------------------------------------------------------------------------
+
+/**
+ * Piecewise-constant hazard rate term structure: `hazards[i]` applies on
+ * (times[i-1], times[i]] (times[-1] = 0) and the last hazard is extended flat
+ * beyond the final pillar.
+ */
+export interface HazardCurve {
+  /** Pillar times in years (ACT/365F from the valuation date), strictly increasing. */
+  times: number[];
+  /** Hazard rate (continuous, per year) of each interval ending at `times[i]`. */
+  hazards: number[];
+  recovery: number;
+}
+
+/** Survival probability Q(t) = exp(−∫₀ᵗ λ) of a piecewise-constant hazard curve (flat extension beyond the last pillar). */
+export function survivalProbability(curve: HazardCurve, t: number): number {
+  if (t <= 0 || curve.times.length === 0) return 1;
+  let integral = 0;
+  let prev = 0;
+  for (let i = 0; i < curve.times.length; i++) {
+    const end = curve.times[i]!;
+    if (t <= end) {
+      integral += curve.hazards[i]! * (t - prev);
+      return Math.exp(-integral);
+    }
+    integral += curve.hazards[i]! * (end - prev);
+    prev = end;
+  }
+  integral += curve.hazards[curve.hazards.length - 1]! * (t - prev);
+  return Math.exp(-integral);
+}
+
+/** Marginal default probability Q(t0) − Q(t1) in (t0, t1] from a hazard curve. */
+export function marginalPd(curve: HazardCurve, t0: number, t1: number): number {
+  return survivalProbability(curve, t0) - survivalProbability(curve, t1);
+}
+
+/** Flat hazard curve (single pillar), for callers that only know a flat rate. */
+export function flatHazardCurve(hazard: number, recovery: number): HazardCurve {
+  return { times: [100], hazards: [hazard], recovery };
+}
+
+/**
+ * Bootstrap a piecewise-constant hazard curve from par CDS spreads (standard
+ * premium-leg approximation): for each pillar T_i the hazard λ_i on
+ * (T_{i-1}, T_i] solves
+ *
+ *   s · Σ_j Δ_j DF(t_j) [Q(t_j) + ½ (Q(t_{j-1}) − Q(t_j))]  =  (1 − R) · Σ_j DF(t_j) (Q(t_{j-1}) − Q(t_j))
+ *
+ * with quarterly premium dates t_j up to T_i (accrual on default at mid
+ * period, protection paid at the period end). Earlier pillars are kept fixed
+ * (sequential bootstrap). `discount` defaults to DF ≡ 1 – a flat term
+ * structure then reproduces λ = s / (1 − R) up to the quarterly discretisation
+ * (relative error ≈ (λΔ)²/12). Quotes: `tenor` like "1Y", "5Y"; `spread` in
+ * decimal (0.01 = 100bp).
+ */
+export function bootstrapHazardCurve(quotes: { tenor: string; spread: number }[], recovery: number, valuationDate: SerialDate, discount?: Curve): HazardCurve {
+  if (quotes.length === 0) throw new Error("bootstrapHazardCurve: at least one CDS quote is required");
+  if (!(recovery >= 0 && recovery < 1)) throw new Error(`bootstrapHazardCurve: recovery ${recovery} must be in [0, 1)`);
+  const pillars = quotes
+    .map((q) => ({ t: yearFraction(valuationDate, addTenor(valuationDate, q.tenor), "ACT/365F"), s: q.spread }))
+    .filter((p) => p.t > 0)
+    .sort((a, b) => a.t - b.t);
+  const df = (t: number) => (discount ? discount.df(valuationDate + Math.round(t * 365)) : 1);
+  const times: number[] = [];
+  const hazards: number[] = [];
+  const lgd = 1 - recovery;
+  const dt = 0.25;
+  for (const p of pillars) {
+    const partial: HazardCurve = { times: [...times, p.t], hazards: [...hazards, 0], recovery };
+    // Premium and protection legs as functions of the last hazard.
+    const legs = (h: number): number => {
+      partial.hazards[partial.hazards.length - 1] = h;
+      let premium = 0;
+      let protection = 0;
+      let prev = 0;
+      let qPrev = 1;
+      for (let t = dt; t < p.t + 1e-9; t += dt) {
+        const tj = Math.min(t, p.t);
+        const q = survivalProbability(partial, tj);
+        const d = df(tj);
+        premium += (tj - prev) * d * (q + 0.5 * (qPrev - q));
+        protection += d * (qPrev - q);
+        prev = tj;
+        qPrev = q;
+      }
+      if (prev < p.t - 1e-9) {
+        // stub to the pillar
+        const q = survivalProbability(partial, p.t);
+        const d = df(p.t);
+        premium += (p.t - prev) * d * (q + 0.5 * (qPrev - q));
+        protection += d * (qPrev - q);
+      }
+      return p.s * premium - lgd * protection;
+    };
+    const guess = p.s / lgd;
+    let h: number;
+    try {
+      h = brent(legs, Math.min(1e-8, guess * 0.01), Math.max(guess * 5, 0.05), { tolerance: 1e-14, maxIterations: 200 });
+    } catch {
+      h = brent(legs, -0.5, 5, { tolerance: 1e-12, maxIterations: 300 });
+    }
+    times.push(p.t);
+    hazards.push(h);
+  }
+  return { times, hazards, recovery };
 }
 
 /** Marginal default probability under a flat hazard rate. */
-function marginalPd(h: number, t0: number, t1: number): number {
+function marginalPdFlat(h: number, t0: number, t1: number): number {
   return Math.exp(-h * t0) - Math.exp(-h * t1);
+}
+
+/** Counterparty marginal PD from the term structure when given, else the flat hazard. */
+function cptyPd(credit: CreditInputs, t0: number, t1: number): number {
+  return credit.cptyHazardCurve ? marginalPd(credit.cptyHazardCurve, t0, t1) : marginalPdFlat(credit.cptyHazard, t0, t1);
+}
+
+/** Own marginal PD from the term structure when given, else the flat hazard (0 when none). */
+function ownPd(credit: CreditInputs, t0: number, t1: number): number {
+  return credit.ownHazardCurve ? marginalPd(credit.ownHazardCurve, t0, t1) : marginalPdFlat(credit.ownHazard ?? 0, t0, t1);
+}
+
+/** Method suffix documenting the hazard assumption. */
+function hazardLabel(credit: CreditInputs): string {
+  return credit.cptyHazardCurve ? "hazard term structure (CDS bootstrap)" : "flat hazard";
 }
 
 /**
  * Semi-analytic CVA for interest rate swaps: the expected positive exposure
  * at each coupon date equals the price of a European swaption on the
- * remaining swap (Sorensen–Bollier). Uses the ATM normal vol from the
- * swaption surface (or 70bp fallback).
+ * remaining swap (Sorensen–Bollier), valued with the smile vol at the swap's
+ * fixed rate (or 70bp normal vol fallback). The profile ends at maturity with
+ * zero exposure so the last coupon period carries its default probability.
  */
 export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
   const fixed = swap.legs.find((l): l is FixedLeg => l.type === "Fixed");
   if (!fixed) throw new Error("CVA (swaption approach) needs a fixed/float swap");
   const ccy = fixed.currency;
-  const fx = ccy === reporting ? 1 : getFxSpot(ctx, ccy, reporting);
+  const fx = fxToReporting(ctx, ccy, reporting, swap.collateralCurrency);
   const dates = scheduleDates(fixed).filter((d) => d > ctx.valuationDate);
   const surface = ctx.swaptionVols?.[ccy];
   if (!surface) warnings.push("No swaption vol surface – 70bp normal vol assumed for exposure");
-  const disc = getDiscountCurve(ctx, ccy, swap.collateralCurrency);
   const profile: ExposurePoint[] = [];
   const weReceiveFixed = fixed.payReceive === "Receive";
   let prevT = 0;
@@ -85,30 +235,101 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
     }
     if (!Number.isFinite(fwd) || annuity <= 0) continue;
     const tenorLeft = yearFraction(t, fixed.terminationDate, "ACT/365F");
-    const vol = surface ? swaptionAtmVol(surface, T, tenorLeft) : 0.007;
+    const vol = surface ? swaptionVol(surface, T, tenorLeft, fwd, fixed.rate) : 0.007;
     const isNormal = !surface || surface.volType === "Normal";
+    const shift = surface?.shift ?? 0;
+    const opt = (type: "Call" | "Put") => (isNormal ? bachelier(type, fwd, fixed.rate, vol, T) : black76(type, fwd + shift, fixed.rate + shift, vol, T));
     // Our exposure is positive when swap value to us > 0. If we receive fixed, value rises when rates fall → "receiver" optionality = put on rate.
-    const epeUndisc = isNormal
-      ? bachelier(weReceiveFixed ? "Put" : "Call", fwd, fixed.rate, vol, T)
-      : black76(weReceiveFixed ? "Put" : "Call", fwd, fixed.rate, vol, T);
-    const eneUndisc = isNormal
-      ? bachelier(weReceiveFixed ? "Call" : "Put", fwd, fixed.rate, vol, T)
-      : black76(weReceiveFixed ? "Call" : "Put", fwd, fixed.rate, vol, T);
+    const epeUndisc = opt(weReceiveFixed ? "Put" : "Call");
+    const eneUndisc = opt(weReceiveFixed ? "Call" : "Put");
     // annuity already includes discounting to today.
-    const epe = annuity * epeUndisc * fx;
-    const ene = annuity * eneUndisc * fx;
     profile.push({
       date: t,
       years: T,
-      epe,
-      ene,
-      pdCpty: marginalPd(credit.cptyHazard, prevT, T),
-      pdOwn: marginalPd(credit.ownHazard ?? 0, prevT, T),
+      epe: annuity * epeUndisc * fx,
+      ene: annuity * eneUndisc * fx,
+      pdCpty: cptyPd(credit, prevT, T),
+      pdOwn: ownPd(credit, prevT, T),
     });
     prevT = T;
   }
-  void disc;
-  return aggregate(swap.id, reporting, profile, credit, "Swaption-replication (Sorensen–Bollier), flat hazard", warnings);
+  appendMaturityPoint(profile, ctx, fixed.terminationDate, prevT, credit);
+  return aggregate(swap.id, reporting, profile, credit, `Swaption-replication (Sorensen–Bollier), smile vol at strike, ${hazardLabel(credit)}`, warnings);
+}
+
+/** Final profile point at maturity with zero exposure so the last period contributes its PD. */
+function appendMaturityPoint(profile: ExposurePoint[], ctx: MarketContext, maturity: number, prevT: number, credit: CreditInputs): void {
+  const T = yearFraction(ctx.valuationDate, maturity, "ACT/365F");
+  if (T <= prevT) return;
+  profile.push({ date: maturity, years: T, epe: 0, ene: 0, pdCpty: cptyPd(credit, prevT, T), pdOwn: ownPd(credit, prevT, T) });
+}
+
+/**
+ * CVA for a tenor basis swap (two floating legs, one currency) with the
+ * Sorensen–Bollier structure applied to the basis spread: at each coupon date
+ * the exposure is a "basis swaption" – annuity(t) × Bachelier option on the
+ * fair basis spread of the remaining swap struck at the contractual spread.
+ *
+ * Conservative bias (documented): no market for basis-spread vols is
+ * assumed; unless `credit.basisSpreadVol` is given the spread vol is set to
+ * `BASIS_SPREAD_VOL_FRACTION` (20%) of the ATM swaption normal vol, which is
+ * at the upper end of realised tenor-basis volatility, and the spread is
+ * modelled without mean reversion. The resulting CVA is therefore an upper
+ * estimate.
+ */
+export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit: CreditInputs, reporting: string): XvaResult {
+  const warnings: string[] = [];
+  const floats = swap.legs.filter((l): l is FloatLeg => l.type === "Float");
+  if (floats.length !== 2 || swap.legs.length !== 2) throw new Error("cvaBasisSwap needs exactly two floating legs");
+  const leg0 = swap.legs[0] as FloatLeg;
+  const ccy = leg0.currency;
+  const fx = fxToReporting(ctx, ccy, reporting, swap.collateralCurrency);
+  const dates = scheduleDates(leg0).filter((d) => d > ctx.valuationDate);
+  const maturity = Math.max(...swap.legs.map((l) => l.terminationDate));
+  const surface = ctx.swaptionVols?.[ccy];
+  if (credit.basisSpreadVol === undefined) {
+    warnings.push(
+      `BASIS_SPREAD_VOL_ASSUMED: no basis-spread vol supplied – ${Math.round(BASIS_SPREAD_VOL_FRACTION * 100)}% of the ATM swaption normal vol used (conservative upper estimate)`,
+    );
+  }
+  const sLeg0 = leg0.payReceive === "Receive" ? 1 : -1;
+  const contractSpread = leg0.spread ?? 0;
+  const profile: ExposurePoint[] = [];
+  const pv0 = priceInterestRateSwap(ctx, swap, ccy).pv;
+  profile.push({ date: ctx.valuationDate, years: 0, epe: Math.max(pv0, 0) * fx, ene: Math.max(-pv0, 0) * fx, pdCpty: 0, pdOwn: 0 });
+  let prevT = 0;
+  for (let i = 0; i < dates.length - 1; i++) {
+    const t = dates[i]!;
+    const T = yearFraction(ctx.valuationDate, t, "ACT/365F");
+    const remaining: InterestRateSwap = { ...swap, legs: swap.legs.map((l) => ({ ...l, effectiveDate: t })) };
+    let fairSpread: number;
+    let annuity: number;
+    try {
+      const res = priceInterestRateSwap(ctx, remaining, ccy);
+      fairSpread = res.analytics.fairSpread as number;
+      annuity = res.legs[0]!.annuity ?? 0;
+    } catch {
+      continue;
+    }
+    if (!Number.isFinite(fairSpread) || annuity <= 0) continue;
+    const tenorLeft = yearFraction(t, maturity, "ACT/365F");
+    const spreadVol = credit.basisSpreadVol ?? BASIS_SPREAD_VOL_FRACTION * (surface ? swaptionAtmVol(surface, T, Math.max(tenorLeft, 1 / 12)) : 0.007);
+    // Value of the remaining swap to us = sLeg0 · annuity · (K − fair spread):
+    // receiving leg 0 → positive exposure when the fair spread falls below K (put on the spread), and vice versa.
+    const epeUndisc = bachelier(sLeg0 > 0 ? "Put" : "Call", fairSpread, contractSpread, spreadVol, T);
+    const eneUndisc = bachelier(sLeg0 > 0 ? "Call" : "Put", fairSpread, contractSpread, spreadVol, T);
+    profile.push({
+      date: t,
+      years: T,
+      epe: annuity * epeUndisc * fx,
+      ene: annuity * eneUndisc * fx,
+      pdCpty: cptyPd(credit, prevT, T),
+      pdOwn: ownPd(credit, prevT, T),
+    });
+    prevT = T;
+  }
+  appendMaturityPoint(profile, ctx, maturity, prevT, credit);
+  return aggregate(swap.id, reporting, profile, credit, `Basis-swaption replication (Bachelier on the tenor-basis spread), ${hazardLabel(credit)}`, warnings);
 }
 
 /** CVA for an FX forward using Garman–Kohlhagen on the forward at each grid date. */
@@ -118,15 +339,22 @@ export function cvaFxForward(ctx: MarketContext, fwdTrade: FxForward, credit: Cr
   const quote = fwdTrade.sellCurrency;
   const K = fwdTrade.sellAmount / fwdTrade.buyAmount;
   const T = yearFraction(ctx.valuationDate, fwdTrade.deliveryDate, "ACT/365F");
-  const surface = ctx.fxVols?.[`${base}${quote}`];
+  const surface = ctx.fxVols?.[`${base}${quote}`] ?? ctx.fxVols?.[`${quote}${base}`];
   if (!surface) warnings.push("No FX vol surface – 8% vol assumed");
-  const fxQ = quote === reporting ? 1 : getFxSpot(ctx, quote, reporting);
+  const fxQ = fxToReporting(ctx, quote, reporting, fwdTrade.collateralCurrency);
   const steps = Math.max(2, Math.min(24, Math.ceil(T * 12)));
   const profile: ExposurePoint[] = [];
   let prevT = 0;
   const F = fxForwardRate(ctx, base, quote, fwdTrade.deliveryDate, fwdTrade.collateralCurrency);
   const dfQ = getDiscountCurve(ctx, quote, fwdTrade.collateralCurrency).df(fwdTrade.deliveryDate);
-  profile.push({ date: ctx.valuationDate, years: 0, epe: Math.max((F - K) * dfQ * fwdTrade.buyAmount * fxQ, 0), ene: Math.max(-(F - K) * dfQ * fwdTrade.buyAmount * fxQ, 0), pdCpty: 0, pdOwn: 0 });
+  profile.push({
+    date: ctx.valuationDate,
+    years: 0,
+    epe: Math.max((F - K) * dfQ * fwdTrade.buyAmount * fxQ, 0),
+    ene: Math.max(-(F - K) * dfQ * fwdTrade.buyAmount * fxQ, 0),
+    pdCpty: 0,
+    pdOwn: 0,
+  });
   for (let i = 1; i <= steps; i++) {
     const t = (T * i) / steps;
     const vol = surface ? fxAtmVol(surface, t) : 0.08;
@@ -137,23 +365,15 @@ export function cvaFxForward(ctx: MarketContext, fwdTrade: FxForward, credit: Cr
       years: t,
       epe,
       ene,
-      pdCpty: marginalPd(credit.cptyHazard, prevT, t),
-      pdOwn: marginalPd(credit.ownHazard ?? 0, prevT, t),
+      pdCpty: cptyPd(credit, prevT, t),
+      pdOwn: ownPd(credit, prevT, t),
     });
     prevT = t;
   }
-  void splitPair;
-  return aggregate(fwdTrade.id, reporting, profile, credit, "GK forward-exposure, flat hazard", warnings);
+  return aggregate(fwdTrade.id, reporting, profile, credit, `GK forward-exposure, ${hazardLabel(credit)}`, warnings);
 }
 
-function aggregate(
-  tradeId: string,
-  currency: string,
-  profile: ExposurePoint[],
-  credit: CreditInputs,
-  method: string,
-  warnings: string[],
-): XvaResult {
+function aggregate(tradeId: string, currency: string, profile: ExposurePoint[], credit: CreditInputs, method: string, warnings: string[]): XvaResult {
   const lgdC = 1 - credit.cptyRecovery;
   const lgdO = 1 - (credit.ownRecovery ?? 0.4);
   let cva = 0;
@@ -168,23 +388,139 @@ function aggregate(
   return { tradeId, currency, cva, dva, bcva: -cva + dva, profile, method, warnings };
 }
 
+/** Exposure grid: the trade's payment dates plus maturity (quarterly points when there are few cashflows), at most 60 points. */
+function exposureGrid(ctx: MarketContext, base: ReturnType<typeof priceTrade>, maturity: number): number[] {
+  const val = ctx.valuationDate;
+  const set = new Set<number>();
+  for (const leg of base.legs) for (const c of leg.cashflows) if (c.paymentDate > val && c.paymentDate <= maturity) set.add(c.paymentDate);
+  set.add(maturity);
+  if (set.size < 4) {
+    const T = maturity - val;
+    const steps = Math.max(2, Math.min(40, Math.ceil((T / 365.25) * 4)));
+    for (let i = 1; i <= steps; i++) set.add(val + Math.round((T * i) / steps));
+  }
+  let grid = [...set].sort((a, b) => a - b);
+  if (grid.length > 60) {
+    const stride = grid.length / 60;
+    const thinned = new Set<number>();
+    for (let i = 0; i < 60; i++) thinned.add(grid[Math.floor(i * stride)]!);
+    thinned.add(maturity);
+    grid = [...thinned].sort((a, b) => a - b);
+  }
+  return grid;
+}
+
+/**
+ * Generic delta-normal exposure for any instrument (options, CCS, FX swaps):
+ * at each grid date t the expected value μ(t) is the PV today of the cashflows
+ * paid after t (forward-consistent, discounted) and the dispersion σ(t) is
+ * derived from the rate / FX sensitivities of the trade rolled to t
+ * (`computeRisk` on the rolled market, so the risk amortises with the
+ * remaining cashflows) times the ATM vols at (t, remaining tenor):
+ * σ = DF(t)·√((DV01_t·10⁴·σ_N)² + Σ(Δ_FX,t·100·σ_FX)²)·√t. With V ~ N(μ, σ²):
+ * EPE = σφ(μ/σ) + μΦ(μ/σ), ENE = EPE − μ. For a vanilla swap this reproduces
+ * the swaption-replication method closely (same annuity and vol); for options
+ * the normal approximation of the option value is a (conservative) proxy –
+ * long options have no negative, short options no positive exposure.
+ */
+export function cvaGeneric(ctx: MarketContext, trade: Trade, credit: CreditInputs, reporting: string): XvaResult {
+  const warnings: string[] = [];
+  const base = priceTrade(ctx, trade, reporting);
+  const maturity = tradeMaturityDate(trade);
+  const T = Math.max(0, yearFraction(ctx.valuationDate, maturity, "ACT/365F"));
+  if (T <= 0) return aggregate(trade.id, reporting, [], credit, "Delta-normal (expired)", warnings);
+  const ccys = tradeCurrencies(trade);
+  const surface = ctx.swaptionVols?.[ccys[0] ?? "EUR"];
+  const disc = discountCurveFor(ctx, reporting, ccys[0] ?? reporting, trade.collateralCurrency);
+  const cashflows = base.legs.flatMap((l) =>
+    l.cashflows.map((c) => ({ date: c.paymentDate, pv: c.presentValue * fxToReporting(ctx, c.currency, reporting, trade.collateralCurrency) })),
+  );
+  const baseRisk = computeRisk(ctx, trade, reporting, { bucketed: false, vega: false, theta: false });
+  const optionTenor = trade.type === "Swaption" ? yearFraction(trade.underlying.legs[0]!.effectiveDate, maturity, "ACT/365F") : undefined;
+  const profile: ExposurePoint[] = [{ date: ctx.valuationDate, years: 0, epe: Math.max(base.pv, 0), ene: Math.max(-base.pv, 0), pdCpty: 0, pdOwn: 0 }];
+  let prevT = 0;
+  for (const date of exposureGrid(ctx, base, maturity)) {
+    const t = yearFraction(ctx.valuationDate, date, "ACT/365F");
+    if (t <= prevT) continue;
+    const days = date - ctx.valuationDate;
+    // Expected value: PV today of the cashflows still outstanding after t.
+    const mu = cashflows.filter((c) => c.date > date).reduce((s, c) => s + c.pv, 0);
+    // Sensitivities of the remaining trade (rolled to t), discounted back to today.
+    let risk = baseRisk;
+    try {
+      risk = computeRisk(rollMarket(ctx, days), trade, reporting, { bucketed: false, vega: false, theta: false });
+    } catch {
+      // keep today's sensitivities
+    }
+    const dfT = disc.df(date);
+    const tenorLeft = optionTenor ?? Math.max(yearFraction(date, maturity, "ACT/365F"), 1 / 12);
+    const rateVol = surface ? swaptionAtmVol(surface, t, tenorLeft) : 0.007;
+    const rateVolTerm = Math.pow(risk.dv01 * 1e4 * rateVol, 2);
+    const fxVolTerm = Object.entries(risk.fxDelta).reduce((acc, [pair, d]) => {
+      const surf = ctx.fxVols?.[pair] ?? ctx.fxVols?.[pair.slice(3) + pair.slice(0, 3)];
+      const v = surf ? fxAtmVol(surf, t) : 0.08;
+      return acc + Math.pow(d * 100 * v, 2);
+    }, 0);
+    const sigma = dfT * Math.sqrt((rateVolTerm + fxVolTerm) * t);
+    let epe: number;
+    let ene: number;
+    if (sigma < 1e-9) {
+      epe = Math.max(mu, 0);
+      ene = Math.max(-mu, 0);
+    } else {
+      const d = mu / sigma;
+      epe = sigma * normPdf(d) + mu * normCdf(d);
+      ene = epe - mu;
+    }
+    // Long options can never have negative value; short options never positive.
+    if (isOption(trade)) {
+      if (trade.payReceive === "Receive") ene = 0;
+      else epe = 0;
+    }
+    profile.push({ date, years: t, epe, ene, pdCpty: cptyPd(credit, prevT, t), pdOwn: ownPd(credit, prevT, t) });
+    prevT = t;
+  }
+  warnings.push("Näherungsverfahren: Delta-Normal-Exposure (DV01(t)/FX-Delta(t) × ATM-Vol) – konservativ für Optionen und Portfolios ohne Netting");
+  return aggregate(
+    trade.id,
+    reporting,
+    profile,
+    credit,
+    `Delta-normal exposure (rolled sensitivities, ATM vols at (t, remaining tenor)), ${hazardLabel(credit)}`,
+    warnings,
+  );
+}
+
+function discountCurveFor(ctx: MarketContext, reporting: string, fallbackCcy: string, collateral?: string) {
+  try {
+    return getDiscountCurve(ctx, reporting, collateral);
+  } catch {
+    return getDiscountCurve(ctx, fallbackCcy, collateral);
+  }
+}
+
+function isOption(t: Trade): t is Extract<Trade, { payReceive: "Pay" | "Receive"; type: "CapFloor" | "Swaption" | "FxOption" }> {
+  return t.type === "CapFloor" || t.type === "Swaption" || t.type === "FxOption";
+}
+
+/**
+ * Dispatch: fixed/float swaps → swaption replication; single-currency tenor
+ * basis swaps → basis-swaption replication; FX forwards → GK forward
+ * exposure; everything else → generic delta-normal exposure.
+ */
 export function computeXva(ctx: MarketContext, trade: Trade, credit: CreditInputs, reporting: string): XvaResult {
   switch (trade.type) {
-    case "InterestRateSwap":
-      return cvaSwap(ctx, trade, credit, reporting);
+    case "InterestRateSwap": {
+      const hasFixed = trade.legs.some((l) => l.type === "Fixed");
+      if (hasFixed) return cvaSwap(ctx, trade, credit, reporting);
+      const singleCcy = new Set(trade.legs.map((l) => l.currency)).size === 1;
+      if (trade.legs.length === 2 && singleCcy && trade.legs.every((l) => l.type === "Float")) return cvaBasisSwap(ctx, trade, credit, reporting);
+      return cvaGeneric(ctx, trade, credit, reporting);
+    }
     case "FxForward":
       return cvaFxForward(ctx, trade, credit, reporting);
     default:
-      return {
-        tradeId: trade.id,
-        currency: reporting,
-        cva: Number.NaN,
-        dva: Number.NaN,
-        bcva: Number.NaN,
-        profile: [],
-        method: "not supported",
-        warnings: [`XVA not implemented for ${trade.type} (v1 supports IRS and FX forwards)`],
-      };
+      return cvaGeneric(ctx, trade, credit, reporting);
   }
 }
 

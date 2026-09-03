@@ -1,7 +1,22 @@
 import { getIndex, getSwapConventions } from "../curves/index-definitions.js";
-import { addBusinessDays, advance, getCalendar } from "../dates/calendar.js";
-import { type SerialDate, addTenor } from "../dates/date.js";
-import { type CapFloor, type FxForward, type FxOption, type InterestRateSwap, type Swaption } from "./types.js";
+import { type CalendarId, addBusinessDays, advance, getCalendar } from "../dates/calendar.js";
+import { type SerialDate, addTenor, immDate, nextImmDate, today, toYMD } from "../dates/date.js";
+import { buildSchedule, frequencyPerYear } from "../dates/schedule.js";
+import { formatDe } from "../format.js";
+import { fxSpotDateFrom, pipFactor } from "../market/fx-spot.js";
+import {
+  type CapFloor,
+  type CrossCurrencySwap,
+  type FloatLeg,
+  type ForwardRateAgreement,
+  type FxForward,
+  type FxOption,
+  type FxSwap,
+  type InterestRateSwap,
+  type PayReceive,
+  type SwapLeg,
+  type Swaption,
+} from "./types.js";
 
 let counter = 0;
 export function nextTradeId(prefix = "T"): string {
@@ -26,6 +41,12 @@ export interface VanillaSwapParams {
   counterparty?: string;
   collateralCurrency?: string;
   name?: string;
+  /**
+   * Step-up / step-down coupon: from each `date` on the fixed leg pays `rate`
+   * instead of `fixedRate` (Zinstreppe). Stored as `FixedLeg.rateSchedule`
+   * with `fixedRate` applying to the first period(s).
+   */
+  stepUp?: { date: SerialDate; rate: number }[];
 }
 
 /** Build a market-standard fixed/float swap for the currency's conventions. */
@@ -41,22 +62,47 @@ export function makeVanillaSwap(p: VanillaSwapParams): InterestRateSwap {
   const floatFreq = p.floatFrequency ?? (isOis ? conv.oisFixedFrequency : idx.tenor);
   const payLag = isOis ? conv.oisPaymentLag : 0;
   const floatPR = p.payReceiveFixed === "Pay" ? "Receive" : "Pay";
+  const rateSchedule = p.stepUp?.length ? [{ date: p.effectiveDate, rate: p.fixedRate }, ...[...p.stepUp].sort((a, b) => a.date - b.date)] : undefined;
   return {
     id: p.id ?? nextTradeId("IRS"),
-    name: p.name ?? `${p.payReceiveFixed === "Pay" ? "Payer" : "Receiver"} ${p.currency} ${typeof p.maturity === "string" ? p.maturity : ""} @ ${(p.fixedRate * 100).toFixed(3)}%`,
+    name:
+      p.name ??
+      `${p.payReceiveFixed === "Pay" ? "Payer" : "Receiver"} ${p.currency} ${typeof p.maturity === "string" ? p.maturity : ""} @ ${(p.fixedRate * 100).toFixed(3)}%${rateSchedule ? " (Step-up)" : ""}`,
     type: "InterestRateSwap",
     counterparty: p.counterparty,
     collateralCurrency: p.collateralCurrency,
     legs: [
       {
-        type: "Fixed", payReceive: p.payReceiveFixed, notional: p.notional, currency: p.currency, effectiveDate: p.effectiveDate,
-        terminationDate: maturity, frequency: fixedFreq, dayCount: isOis ? conv.oisFixedDayCount : conv.fixedDayCount,
-        calendar: conv.calendar, businessDayConvention: "ModifiedFollowing", rate: p.fixedRate, paymentLag: payLag, stub: "ShortFront",
+        type: "Fixed",
+        payReceive: p.payReceiveFixed,
+        notional: p.notional,
+        currency: p.currency,
+        effectiveDate: p.effectiveDate,
+        terminationDate: maturity,
+        frequency: fixedFreq,
+        dayCount: isOis ? conv.oisFixedDayCount : conv.fixedDayCount,
+        calendar: conv.calendar,
+        businessDayConvention: "ModifiedFollowing",
+        rate: p.fixedRate,
+        paymentLag: payLag,
+        stub: "ShortFront",
+        ...(rateSchedule ? { rateSchedule } : {}),
       },
       {
-        type: "Float", payReceive: floatPR, notional: p.notional, currency: p.currency, effectiveDate: p.effectiveDate,
-        terminationDate: maturity, frequency: floatFreq, dayCount: idx.dayCount, calendar: conv.calendar,
-        businessDayConvention: "ModifiedFollowing", index: idx.name, spread: p.spread ?? 0, paymentLag: payLag, stub: "ShortFront",
+        type: "Float",
+        payReceive: floatPR,
+        notional: p.notional,
+        currency: p.currency,
+        effectiveDate: p.effectiveDate,
+        terminationDate: maturity,
+        frequency: floatFreq,
+        dayCount: idx.dayCount,
+        calendar: conv.calendar,
+        businessDayConvention: "ModifiedFollowing",
+        index: idx.name,
+        spread: p.spread ?? 0,
+        paymentLag: payLag,
+        stub: "ShortFront",
       },
     ],
   };
@@ -153,7 +199,7 @@ export function makeFxForward(p: {
   const abs = Math.abs(p.baseAmount);
   return {
     id: p.id ?? nextTradeId("FXF"),
-    name: `${buyBase ? "Buy" : "Sell"} ${base}${quote} ${abs.toLocaleString("de-DE")} @ ${p.rate}`,
+    name: `${buyBase ? "Buy" : "Sell"} ${base}${quote} ${formatDe(abs, 0)} @ ${p.rate}`,
     type: "FxForward",
     buyCurrency: buyBase ? base : quote,
     buyAmount: buyBase ? abs : abs * p.rate,
@@ -164,6 +210,11 @@ export function makeFxForward(p: {
   };
 }
 
+/**
+ * FX option. The delivery date defaults to the spot date of the expiry
+ * (T+2 / T+1 business days on the pair calendar), so it never falls on a
+ * weekend or holiday.
+ */
 export function makeFxOption(p: {
   id?: string;
   pair: string;
@@ -175,10 +226,11 @@ export function makeFxOption(p: {
   longShort?: "Long" | "Short";
   counterparty?: string;
 }): FxOption {
+  const base = p.pair.slice(0, 3).toUpperCase();
   const quote = p.pair.slice(3, 6).toUpperCase();
   return {
     id: p.id ?? nextTradeId("FXO"),
-    name: `${p.optionType} ${p.pair.toUpperCase()} ${p.notional.toLocaleString("de-DE")} @ ${p.strike}`,
+    name: `${p.optionType} ${p.pair.toUpperCase()} ${formatDe(p.notional, 0)} @ ${p.strike}`,
     type: "FxOption",
     payReceive: (p.longShort ?? "Long") === "Long" ? "Receive" : "Pay",
     optionType: p.optionType,
@@ -186,8 +238,362 @@ export function makeFxOption(p: {
     strike: p.strike,
     notional: p.notional,
     expiryDate: p.expiryDate,
-    deliveryDate: p.deliveryDate ?? p.expiryDate + 2,
+    deliveryDate: p.deliveryDate ?? fxSpotDateFrom(p.expiryDate, base, quote),
     premiumCurrency: quote,
+    counterparty: p.counterparty,
+  };
+}
+
+/** Tenor basis swap: receive index A + spread vs pay index B (same currency). */
+export function makeBasisSwap(p: {
+  id?: string;
+  currency: string;
+  notional: number;
+  effectiveDate: SerialDate;
+  maturity: string | SerialDate;
+  receiveIndex: string;
+  payIndex: string;
+  /** Spread (decimal) on the receive leg. */
+  spread: number;
+  counterparty?: string;
+  name?: string;
+}): InterestRateSwap {
+  const conv = getSwapConventions(p.currency);
+  const maturity = typeof p.maturity === "string" ? addTenor(p.effectiveDate, p.maturity) : p.maturity;
+  const mk = (index: string, payReceive: "Pay" | "Receive", spread: number) => {
+    const idx = getIndex(index);
+    const isOis = idx.type === "OIS";
+    return {
+      type: "Float" as const,
+      payReceive,
+      notional: p.notional,
+      currency: p.currency,
+      effectiveDate: p.effectiveDate,
+      terminationDate: maturity,
+      frequency: isOis ? "3M" : idx.tenor,
+      dayCount: idx.dayCount,
+      calendar: conv.calendar,
+      businessDayConvention: "ModifiedFollowing" as const,
+      index: idx.name,
+      spread,
+      paymentLag: isOis ? conv.oisPaymentLag : 0,
+      stub: "ShortFront" as const,
+    };
+  };
+  return {
+    id: p.id ?? nextTradeId("BASIS"),
+    name: p.name ?? `Basis ${p.receiveIndex} +${(p.spread * 1e4).toFixed(1)}bp vs ${p.payIndex} ${typeof p.maturity === "string" ? p.maturity : ""}`,
+    type: "InterestRateSwap",
+    counterparty: p.counterparty,
+    legs: [mk(p.receiveIndex, "Receive", p.spread), mk(p.payIndex, "Pay", 0)],
+  } as InterestRateSwap;
+}
+
+/**
+ * Linear amortisation schedule: notional steps down evenly at each fixed-leg
+ * period start from `notional` to `finalNotional` (default 0 → full amortisation).
+ */
+export function linearAmortisation(
+  leg: { effectiveDate: SerialDate; terminationDate: SerialDate; frequency: string; calendar: CalendarId },
+  notional: number,
+  finalNotional = 0,
+): { date: SerialDate; notional: number }[] {
+  // Outstanding notional during period i; the last period still carries one
+  // instalment (repaid at maturity), so the step is (N - N_final) / n.
+  const dates = scheduleStartDates(leg);
+  const n = dates.length;
+  const step = (notional - finalNotional) / Math.max(1, n);
+  return dates.map((d, i) => ({ date: d, notional: notional - step * i }));
+}
+
+function scheduleStartDates(leg: { effectiveDate: SerialDate; terminationDate: SerialDate; frequency: string; calendar: CalendarId }): SerialDate[] {
+  const s = buildSchedule({ effectiveDate: leg.effectiveDate, terminationDate: leg.terminationDate, frequency: leg.frequency, calendar: leg.calendar });
+  return s.periods.map((p) => p.accrualStart);
+}
+
+/**
+ * Annuity (constant-instalment) amortisation: outstanding notional at the
+ * start of each of `periods` periods for a loan of `notional` at the annual
+ * loan `rate`, repaid in equal instalments (interest + principal) per period.
+ * With `periodsPerYear` (default 1) the period rate is rate / periodsPerYear;
+ * `finalNotional` (default 0) is the balloon outstanding after the last period.
+ * The last entry still carries its instalment (repaid at maturity), so the
+ * array has exactly `periods` entries starting with `notional`.
+ */
+export function annuityAmortisation(notional: number, rate: number, periods: number, opts: { periodsPerYear?: number; finalNotional?: number } = {}): number[] {
+  const n = Math.max(1, Math.round(periods));
+  const r = rate / (opts.periodsPerYear ?? 1);
+  const final = opts.finalNotional ?? 0;
+  const out: number[] = [];
+  if (Math.abs(r) < 1e-12) {
+    const step = (notional - final) / n;
+    for (let i = 0; i < n; i++) out.push(notional - step * i);
+    return out;
+  }
+  // Instalment A such that the balance after n periods equals `final`:
+  // B_n = N (1+r)^n − A ((1+r)^n − 1)/r = final.
+  const g = Math.pow(1 + r, n);
+  const A = (notional * g - final) * (r / (g - 1));
+  let balance = notional;
+  for (let i = 0; i < n; i++) {
+    out.push(balance);
+    balance = balance * (1 + r) - A;
+  }
+  return out;
+}
+
+/**
+ * Annuity amortisation schedule for a leg: outstanding notional per fixed-leg
+ * period start, instalments from `annuityAmortisation` at the loan rate and
+ * the leg's coupon frequency (see `linearAmortisation` for the linear variant).
+ */
+export function annuityAmortisationSchedule(
+  leg: { effectiveDate: SerialDate; terminationDate: SerialDate; frequency: string; calendar: CalendarId },
+  notional: number,
+  loanRate: number,
+  finalNotional = 0,
+): { date: SerialDate; notional: number }[] {
+  const dates = scheduleStartDates(leg);
+  const balances = annuityAmortisation(notional, loanRate, dates.length, { periodsPerYear: frequencyPerYear(leg.frequency), finalNotional });
+  return dates.map((d, i) => ({ date: d, notional: balances[i]! }));
+}
+
+/** Amortising vanilla swap (e.g. hedging an annuity loan): notional declines linearly on both legs. */
+export function makeAmortisingSwap(p: VanillaSwapParams & { finalNotional?: number }): InterestRateSwap {
+  const swap = makeVanillaSwap(p);
+  const fixed = swap.legs[0]!;
+  const schedule = linearAmortisation(fixed, p.notional, p.finalNotional ?? 0);
+  return {
+    ...swap,
+    id: p.id ?? swap.id.replace("IRS", "AMORT"),
+    name: p.name ?? `${swap.name} (amortisierend)`,
+    legs: swap.legs.map((l) => ({ ...l, notionalSchedule: schedule })),
+  };
+}
+
+/**
+ * IMM-dated swap: effective on the next IMM date after `from`, maturity on the
+ * IMM date of the month `start + tenor` (so "1Y" is twelve months, never
+ * fifteen), and coupon periods rolling on IMM dates (`roll: "IMM"`).
+ */
+export function makeImmSwap(p: Omit<VanillaSwapParams, "effectiveDate" | "maturity"> & { from: SerialDate; tenor: string }): InterestRateSwap {
+  const start = nextImmDate(p.from);
+  const { year, month } = toYMD(addTenor(start, p.tenor));
+  const end = immDate(year, month);
+  const swap = makeVanillaSwap({
+    ...p,
+    effectiveDate: start,
+    maturity: end,
+    name: p.name ?? `IMM ${p.currency} ${p.tenor} @ ${(p.fixedRate * 100).toFixed(3)}%`,
+  });
+  return { ...swap, legs: swap.legs.map((l) => ({ ...l, roll: "IMM" as const })) };
+}
+
+export interface CrossCurrencySwapParams {
+  id?: string;
+  /** Pair "EURUSD": the first currency is the domestic, the second the foreign currency unless given explicitly. */
+  pair: string;
+  domesticCurrency?: string;
+  foreignCurrency?: string;
+  domesticNotional: number;
+  /** FX spot (1 domestic = fxSpot foreign) fixing the foreign notional; alternatively give `foreignNotional`. */
+  fxSpot?: number;
+  foreignNotional?: number;
+  /** Floating indices; default: RFR of each currency (ESTR, SOFR, …). */
+  domesticIndex?: string;
+  foreignIndex?: string;
+  /** Fixed-vs-float variant: the domestic leg pays/receives this fixed rate instead of floating. */
+  fixedRate?: number;
+  /** Basis spread (decimal, e.g. -0.0020 = -20bp). */
+  spread: number;
+  /** Leg carrying the spread; default "domestic" (foreign when the domestic leg is fixed). */
+  spreadOn?: "domestic" | "foreign";
+  /** Direction of the domestic leg (default "Receive": receive domestic, pay foreign). */
+  domesticPayReceive?: PayReceive;
+  effectiveDate: SerialDate;
+  /** Maturity as tenor ("5Y") or explicit date. */
+  tenor: string | SerialDate;
+  /** Mark-to-market reset of the notional (default false); `mtmResetLeg` selects the resetting leg (default foreign). */
+  mtmReset?: boolean;
+  mtmResetLeg?: "domestic" | "foreign";
+  /** Notional exchange (default initial + final, no interim). */
+  notionalExchange?: { initial?: boolean; final?: boolean; interim?: boolean };
+  /** Payment frequency of both legs (default "3M", market standard for RFR xccy swaps; IBOR legs default to their tenor). */
+  frequency?: string;
+  collateralCurrency?: string;
+  counterparty?: string;
+  name?: string;
+}
+
+/**
+ * Cross-currency swap analogous to `makeBasisSwap`: domestic leg (float + spread
+ * or fixed) vs foreign leg (float), notionals exchanged at start and maturity
+ * (foreign notional = domestic × `fxSpot`), quarterly payments on the joint
+ * calendar of both currencies. The leg carrying the spread is leg 0 so that
+ * `analytics.fairSpread` refers to it.
+ */
+export function makeCrossCurrencySwap(p: CrossCurrencySwapParams): CrossCurrencySwap {
+  const pair = p.pair.replace("/", "").toUpperCase();
+  if (pair.length !== 6) throw new Error(`Invalid FX pair: ${p.pair}`);
+  const dom = (p.domesticCurrency ?? pair.slice(0, 3)).toUpperCase();
+  const frn = (p.foreignCurrency ?? pair.slice(3, 6)).toUpperCase();
+  if (!pair.includes(dom) || !pair.includes(frn) || dom === frn) throw new Error(`Currencies ${dom}/${frn} do not match pair ${pair}`);
+  let foreignNotional = p.foreignNotional;
+  if (foreignNotional === undefined) {
+    if (p.fxSpot === undefined) throw new Error("makeCrossCurrencySwap: either fxSpot or foreignNotional is required");
+    // fxSpot is quoted for the pair: 1 base = fxSpot quote.
+    foreignNotional = pair.startsWith(dom) ? p.domesticNotional * p.fxSpot : p.domesticNotional / p.fxSpot;
+  }
+  const domConv = getSwapConventions(dom);
+  const frnConv = getSwapConventions(frn);
+  const domIdx = getIndex(p.domesticIndex ?? domConv.oisIndex);
+  const frnIdx = getIndex(p.foreignIndex ?? frnConv.oisIndex);
+  const calendar: CalendarId = domIdx.fixingCalendar === frnIdx.fixingCalendar ? domIdx.fixingCalendar : `${domIdx.fixingCalendar}+${frnIdx.fixingCalendar}`;
+  const maturity = typeof p.tenor === "string" ? addTenor(p.effectiveDate, p.tenor) : p.tenor;
+  const domPR: PayReceive = p.domesticPayReceive ?? "Receive";
+  const frnPR: PayReceive = domPR === "Receive" ? "Pay" : "Receive";
+  const nx = { initial: p.notionalExchange?.initial ?? true, final: p.notionalExchange?.final ?? true, interim: p.notionalExchange?.interim ?? false };
+  const payLag = Math.max(domIdx.type === "OIS" ? domConv.oisPaymentLag : 0, frnIdx.type === "OIS" ? frnConv.oisPaymentLag : 0);
+  const freqOf = (idx: ReturnType<typeof getIndex>) => p.frequency ?? (idx.type === "IBOR" ? idx.tenor : "3M");
+  const spreadOn = p.spreadOn ?? (p.fixedRate !== undefined ? "foreign" : "domestic");
+  const floatLeg = (idx: ReturnType<typeof getIndex>, ccy: string, payReceive: PayReceive, notional: number, spread: number): FloatLeg => ({
+    type: "Float",
+    payReceive,
+    notional,
+    currency: ccy,
+    effectiveDate: p.effectiveDate,
+    terminationDate: maturity,
+    frequency: freqOf(idx),
+    dayCount: idx.dayCount,
+    calendar,
+    businessDayConvention: "ModifiedFollowing",
+    index: idx.name,
+    spread,
+    paymentLag: payLag,
+    stub: "ShortFront",
+    notionalExchange: nx,
+  });
+  const domestic: SwapLeg =
+    p.fixedRate !== undefined
+      ? {
+          type: "Fixed",
+          payReceive: domPR,
+          notional: p.domesticNotional,
+          currency: dom,
+          effectiveDate: p.effectiveDate,
+          terminationDate: maturity,
+          frequency: p.frequency ?? domConv.fixedFrequency,
+          dayCount: domConv.fixedDayCount,
+          calendar,
+          businessDayConvention: "ModifiedFollowing",
+          rate: p.fixedRate,
+          paymentLag: payLag,
+          stub: "ShortFront",
+          notionalExchange: nx,
+        }
+      : floatLeg(domIdx, dom, domPR, p.domesticNotional, spreadOn === "domestic" ? p.spread : 0);
+  const foreign = floatLeg(frnIdx, frn, frnPR, foreignNotional, spreadOn === "foreign" ? p.spread : 0);
+  // Spread leg first so `analytics.fairSpread` (leg 0 for float/float) refers to it.
+  const legs: SwapLeg[] = spreadOn === "domestic" && p.fixedRate === undefined ? [domestic, foreign] : [foreign, domestic];
+  const resetLeg = p.mtmResetLeg ?? "foreign";
+  const resettingLegIndex = legs.indexOf(resetLeg === "foreign" ? foreign : domestic);
+  const bp = (p.spread * 1e4).toFixed(1);
+  const tenorLabel = typeof p.tenor === "string" ? p.tenor : "";
+  const desc =
+    p.fixedRate !== undefined
+      ? `${(p.fixedRate * 100).toFixed(3)}% ${dom} vs ${frnIdx.name}`
+      : `${domIdx.name} ${p.spread >= 0 ? "+" : ""}${bp}bp vs ${frnIdx.name}`;
+  return {
+    id: p.id ?? nextTradeId("CCS"),
+    name: p.name ?? `CCS ${dom}${frn} ${tenorLabel} ${desc}${p.mtmReset ? " (MtM-Reset)" : ""}`.replace(/\s+/g, " ").trim(),
+    type: "CrossCurrencySwap",
+    counterparty: p.counterparty,
+    collateralCurrency: p.collateralCurrency,
+    legs,
+    ...(p.mtmReset ? { mtmReset: { resettingLegIndex } } : {}),
+  };
+}
+
+/**
+ * Forward rate agreement. `start` is either a period string "3x6" (months from
+ * the spot date of `valuationDate`, default today) or the explicit accrual
+ * start date (then `end` is required, default start + index tenor).
+ * `payReceive: "Pay"` = pay the fixed rate.
+ */
+export function makeFra(p: {
+  id?: string;
+  currency: string;
+  notional: number;
+  payReceive: PayReceive;
+  index?: string;
+  start: string | SerialDate;
+  end?: SerialDate;
+  rate: number;
+  /** Anchor for the "3x6" form: valuation date whose spot date starts the count (default today). */
+  valuationDate?: SerialDate;
+  counterparty?: string;
+  collateralCurrency?: string;
+  name?: string;
+}): ForwardRateAgreement {
+  const conv = getSwapConventions(p.currency);
+  const idx = getIndex(p.index ?? conv.floatIndex);
+  const cal = getCalendar(idx.fixingCalendar);
+  let startDate: SerialDate;
+  let endDate: SerialDate;
+  let label: string;
+  if (typeof p.start === "string") {
+    const m = /^\s*(\d+)\s*[xX×]\s*(\d+)\s*$/.exec(p.start);
+    if (!m) throw new Error(`Invalid FRA period "${p.start}" – expected e.g. "3x6"`);
+    const val = p.valuationDate ?? today();
+    const spot = conv.spotLag === 0 ? val : addBusinessDays(val, conv.spotLag, cal);
+    startDate = advance(spot, `${m[1]}M`, cal, "ModifiedFollowing", idx.endOfMonth);
+    endDate = p.end ?? advance(spot, `${m[2]}M`, cal, "ModifiedFollowing", idx.endOfMonth);
+    label = `${m[1]}x${m[2]}`;
+  } else {
+    startDate = p.start;
+    endDate = p.end ?? advance(p.start, idx.tenor, cal, "ModifiedFollowing", idx.endOfMonth);
+    label = "";
+  }
+  if (endDate <= startDate) throw new Error("makeFra: end must be after start");
+  return {
+    id: p.id ?? nextTradeId("FRA"),
+    name: p.name ?? `FRA ${p.currency} ${label} ${p.payReceive === "Pay" ? "Pay" : "Receive"} @ ${(p.rate * 100).toFixed(3)}%`.replace(/\s+/g, " "),
+    type: "FRA",
+    payReceive: p.payReceive,
+    notional: p.notional,
+    currency: p.currency,
+    index: idx.name,
+    startDate,
+    endDate,
+    fixedRate: p.rate,
+    dayCount: idx.dayCount,
+    counterparty: p.counterparty,
+    collateralCurrency: p.collateralCurrency,
+  };
+}
+
+/** FX swap from spot leg and forward leg (base amount sign: + = buy base at near leg). */
+export function makeFxSwap(p: {
+  id?: string;
+  pair: string;
+  baseAmount: number;
+  nearRate: number;
+  farRate: number;
+  nearDate: SerialDate;
+  farDate: SerialDate;
+  counterparty?: string;
+}): FxSwap {
+  const near = makeFxForward({ pair: p.pair, baseAmount: p.baseAmount, rate: p.nearRate, deliveryDate: p.nearDate });
+  const far = makeFxForward({ pair: p.pair, baseAmount: -p.baseAmount, rate: p.farRate, deliveryDate: p.farDate });
+  const { id: _n, type: _tn, ...nearLeg } = near;
+  const { id: _f, type: _tf, ...farLeg } = far;
+  const pips = (p.farRate - p.nearRate) * pipFactor(p.pair.slice(0, 3), p.pair.slice(3, 6));
+  return {
+    id: p.id ?? nextTradeId("FXS"),
+    name: `FX-Swap ${p.pair.toUpperCase()} ${formatDe(Math.abs(p.baseAmount), 0)} ${pips >= 0 ? "+" : ""}${pips.toFixed(1)} Pkt`,
+    type: "FxSwap",
+    nearLeg,
+    farLeg,
     counterparty: p.counterparty,
   };
 }

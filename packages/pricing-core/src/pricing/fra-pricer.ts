@@ -1,11 +1,19 @@
 import { getIndex } from "../curves/index-definitions.js";
+import { addBusinessDays, getCalendar } from "../dates/calendar.js";
+import { toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
+import { PricingError } from "../errors.js";
 import { type ForwardRateAgreement, type PricingResult } from "../instruments/types.js";
-import { type MarketContext, getCurve, getDiscountCurve, getFxSpot } from "../market/market-context.js";
+import { type MarketContext, getCurve, getDiscountCurve, getFixing } from "../market/market-context.js";
+import { fxToReporting, missingFixingMessage } from "./leg-pricer.js";
 
 /**
  * FRA with ISDA-style settlement at the start date: payoff discounted over the
- * FRA period at the realised/forward rate.
+ * FRA period at the realised/forward rate. `payReceive: "Pay"` = pay the fixed
+ * rate (receive F − K). When the index fixing date (start − fixing lag on the
+ * index calendar) has passed and a fixing is loaded, the fixing replaces the
+ * curve forward; a missing published fixing produces a `MISSING_FIXING:`
+ * warning and the curve forward is used.
  */
 export function priceFra(ctx: MarketContext, trade: ForwardRateAgreement, reportingCurrency?: string): PricingResult {
   const reporting = reportingCurrency ?? trade.currency;
@@ -14,17 +22,35 @@ export function priceFra(ctx: MarketContext, trade: ForwardRateAgreement, report
   const disc = getDiscountCurve(ctx, trade.currency, trade.collateralCurrency);
   const dc = trade.dayCount ?? idx.dayCount;
   const tau = yearFraction(trade.startDate, trade.endDate, dc);
-  const fwd = proj.forwardRate(trade.startDate, trade.endDate, idx.dayCount);
+  const val = ctx.valuationDate;
+  const cal = getCalendar(idx.fixingCalendar);
+  const fixingDate = idx.fixingLag > 0 ? addBusinessDays(trade.startDate, -idx.fixingLag, cal) : trade.startDate;
+  const warnings: string[] = [];
+  const fixing = fixingDate <= val ? getFixing(ctx, idx.name, fixingDate) : undefined;
+  let fwd: number;
+  let isFixed = false;
+  if (fixing !== undefined) {
+    fwd = fixing;
+    isFixed = true;
+  } else {
+    fwd = proj.forwardRate(trade.startDate, trade.endDate, idx.dayCount);
+    if (fixingDate < val && trade.startDate > val) {
+      const message = missingFixingMessage(idx.name, fixingDate, "FRA settled on the curve forward");
+      if ((ctx.missingFixingPolicy ?? "curve") === "throw") throw new PricingError("MISSING_FIXING", message, { index: idx.name, fixingDate });
+      warnings.push(message);
+    }
+  }
   const sign = trade.payReceive === "Pay" ? 1 : -1; // pay fixed → receive (F - K)
   const settle = trade.startDate;
-  const df = settle > ctx.valuationDate ? disc.df(settle) : 0;
+  const df = settle > val ? disc.df(settle) : 0;
   const amount = (sign * trade.notional * (fwd - trade.fixedRate) * tau) / (1 + fwd * tau);
-  const fx = trade.currency === reporting ? 1 : getFxSpot(ctx, trade.currency, reporting);
+  const fx = fxToReporting(ctx, trade.currency, reporting, trade.collateralCurrency);
   const pv = amount * df * fx;
+  if (settle <= val) warnings.push("FRA already settled");
   return {
     tradeId: trade.id,
     tradeType: "FRA",
-    valuationDate: ctx.valuationDate,
+    valuationDate: val,
     currency: reporting,
     pv,
     legs: [
@@ -36,14 +62,27 @@ export function priceFra(ctx: MarketContext, trade: ForwardRateAgreement, report
         pvReporting: pv,
         cashflows: [
           {
-            legIndex: 0, legType: "FRA", currency: trade.currency, accrualStart: trade.startDate, accrualEnd: trade.endDate,
-            paymentDate: settle, fixingDate: trade.startDate, notional: trade.notional, rate: fwd, accrualFactor: tau,
-            amount, discountFactor: df, presentValue: amount * df, kind: "Settlement",
+            legIndex: 0,
+            legType: "FRA",
+            currency: trade.currency,
+            accrualStart: trade.startDate,
+            accrualEnd: trade.endDate,
+            paymentDate: settle,
+            fixingDate,
+            notional: trade.notional,
+            rate: fwd,
+            accrualFactor: tau,
+            amount,
+            discountFactor: df,
+            presentValue: amount * df,
+            isFixed,
+            kind: "Settlement",
           },
         ],
       },
     ],
-    analytics: { forwardRate: fwd, fixedRate: trade.fixedRate, accrualFactor: tau },
-    warnings: settle <= ctx.valuationDate ? ["FRA already settled"] : [],
+    analytics: { forwardRate: fwd, fixedRate: trade.fixedRate, accrualFactor: tau, isFixed: isFixed ? "yes" : "no" },
+    details: { fixingDate: toISO(fixingDate), settlementDate: toISO(settle) },
+    warnings,
   };
 }

@@ -15,13 +15,7 @@ export interface OptionGreeks {
  * Black-76 undiscounted option value on a forward with lognormal vol.
  * Returns the forward premium; multiply by the discount factor for PV.
  */
-export function black76(
-  type: OptionType,
-  forward: number,
-  strike: number,
-  vol: number,
-  timeToExpiry: number,
-): number {
+export function black76(type: OptionType, forward: number, strike: number, vol: number, timeToExpiry: number): number {
   const sign = type === "Call" ? 1 : -1;
   if (timeToExpiry <= 0 || vol <= 0) return Math.max(sign * (forward - strike), 0);
   if (forward <= 0 || strike <= 0) {
@@ -34,14 +28,7 @@ export function black76(
   return sign * (forward * normCdf(sign * d1) - strike * normCdf(sign * d2));
 }
 
-export function black76Greeks(
-  type: OptionType,
-  forward: number,
-  strike: number,
-  vol: number,
-  timeToExpiry: number,
-  discount = 1,
-): OptionGreeks {
+export function black76Greeks(type: OptionType, forward: number, strike: number, vol: number, timeToExpiry: number, discount = 1): OptionGreeks {
   const sign = type === "Call" ? 1 : -1;
   if (timeToExpiry <= 0 || vol <= 0 || forward <= 0 || strike <= 0) {
     const intrinsic = Math.max(sign * (forward - strike), 0);
@@ -64,13 +51,7 @@ export function black76Greeks(
  * since rates went negative. `vol` is an absolute (normal) volatility in the
  * same unit as forward/strike (e.g. 0.0065 for 65 bp).
  */
-export function bachelier(
-  type: OptionType,
-  forward: number,
-  strike: number,
-  normalVol: number,
-  timeToExpiry: number,
-): number {
+export function bachelier(type: OptionType, forward: number, strike: number, normalVol: number, timeToExpiry: number): number {
   const sign = type === "Call" ? 1 : -1;
   if (timeToExpiry <= 0 || normalVol <= 0) return Math.max(sign * (forward - strike), 0);
   const sd = normalVol * Math.sqrt(timeToExpiry);
@@ -78,14 +59,7 @@ export function bachelier(
   return sign * (forward - strike) * normCdf(sign * d) + sd * normPdf(d);
 }
 
-export function bachelierGreeks(
-  type: OptionType,
-  forward: number,
-  strike: number,
-  normalVol: number,
-  timeToExpiry: number,
-  discount = 1,
-): OptionGreeks {
+export function bachelierGreeks(type: OptionType, forward: number, strike: number, normalVol: number, timeToExpiry: number, discount = 1): OptionGreeks {
   const sign = type === "Call" ? 1 : -1;
   if (timeToExpiry <= 0 || normalVol <= 0) {
     const intrinsic = Math.max(sign * (forward - strike), 0);
@@ -103,14 +77,7 @@ export function bachelierGreeks(
 }
 
 /** Implied lognormal vol from an undiscounted Black-76 premium. */
-export function impliedBlackVol(
-  type: OptionType,
-  forward: number,
-  strike: number,
-  timeToExpiry: number,
-  premium: number,
-  guess = 0.2,
-): number {
+export function impliedBlackVol(type: OptionType, forward: number, strike: number, timeToExpiry: number, premium: number, guess = 0.2): number {
   const sign = type === "Call" ? 1 : -1;
   const intrinsic = Math.max(sign * (forward - strike), 0);
   if (premium < intrinsic - 1e-14) throw new Error("impliedBlackVol: premium below intrinsic value");
@@ -122,36 +89,18 @@ export function impliedBlackVol(
 }
 
 /** Implied normal vol from an undiscounted Bachelier premium. */
-export function impliedNormalVol(
-  type: OptionType,
-  forward: number,
-  strike: number,
-  timeToExpiry: number,
-  premium: number,
-  guess = 0.006,
-): number {
+export function impliedNormalVol(type: OptionType, forward: number, strike: number, timeToExpiry: number, premium: number, guess = 0.006): number {
   const sign = type === "Call" ? 1 : -1;
   const intrinsic = Math.max(sign * (forward - strike), 0);
   if (premium < intrinsic - 1e-14) throw new Error("impliedNormalVol: premium below intrinsic value");
-  return solveBracketed(
-    (v) => bachelier(type, forward, strike, v, timeToExpiry) - premium,
-    guess,
-    0.005,
-    { minX: 1e-10, maxX: 5, tolerance: 1e-14 },
-  );
+  return solveBracketed((v) => bachelier(type, forward, strike, v, timeToExpiry) - premium, guess, 0.005, { minX: 1e-10, maxX: 5, tolerance: 1e-14 });
 }
 
 /**
  * Convert a lognormal (Black) vol to an equivalent normal vol for the given
  * forward/strike/expiry by matching prices (exact via root search).
  */
-export function lognormalToNormalVol(
-  forward: number,
-  strike: number,
-  timeToExpiry: number,
-  blackVol: number,
-  shift = 0,
-): number {
+export function lognormalToNormalVol(forward: number, strike: number, timeToExpiry: number, blackVol: number, shift = 0): number {
   const f = forward + shift;
   const k = strike + shift;
   const p = black76("Call", f, k, blackVol, timeToExpiry);
@@ -159,13 +108,6 @@ export function lognormalToNormalVol(
 }
 
 /** Shifted-lognormal Black (displaced diffusion), common for EUR caps/swaptions with e.g. 3% shift. */
-export function shiftedBlack76(
-  type: OptionType,
-  forward: number,
-  strike: number,
-  vol: number,
-  timeToExpiry: number,
-  shift: number,
-): number {
+export function shiftedBlack76(type: OptionType, forward: number, strike: number, vol: number, timeToExpiry: number, shift: number): number {
   return black76(type, forward + shift, strike + shift, vol, timeToExpiry);
 }

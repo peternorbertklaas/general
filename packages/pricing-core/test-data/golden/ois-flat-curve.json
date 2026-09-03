@@ -1,0 +1,30 @@
+{
+  "case": "ois-flat-curve",
+  "description": "2Y EUR €STR OIS (payer), flat 2.5 % continuously compounded €STR curve, annual unadjusted periods, fixed ACT/360 vs. €STR compounded in arrears ACT/360, payment lag 0.",
+  "derivation": "Daily compounding Π(1 + f_j·τ_j) with f_j = (DF_j/DF_{j+1} − 1)/τ_j telescopes to DF_{start}/DF_{end}, so the compounded rate of period i is (DF_{i−1}/DF_i − 1)/τ_i independent of the business-day grid; float coupon = N·(DF_{i−1}/DF_i − 1); par = (1 − DF_2)/Σ τ_i·DF_i. Closed form.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "curveId": "EUR-ESTR",
+    "flatZeroRate": 0.025,
+    "notional": 10000000.0,
+    "fixedRate": 0.025,
+    "payReceiveFixed": "Pay",
+    "effectiveDate": "2026-09-03",
+    "terminationDate": "2028-09-03",
+    "index": "ESTR",
+    "frequency": "12M",
+    "dayCount": "ACT/360",
+    "calendar": "NONE",
+    "businessDayConvention": "Unadjusted",
+    "paymentLag": 0
+  },
+  "expected": {
+    "parRate": 0.024968762588923516,
+    "annuity": 19558728.949608643,
+    "compoundedRates": [0.024968338051491477, 0.02496919671400309],
+    "floatAmounts": [253151.20524428858, 253853.49992569807],
+    "pvFloat": 488357.25968388387,
+    "pvFixed": -488968.2237402161,
+    "pv": -610.9640563322464
+  }
+}

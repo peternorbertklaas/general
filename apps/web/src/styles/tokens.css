@@ -1,8 +1,10 @@
 /* DERIVA design tokens – keyboard-first trading workstation aesthetics.
-   Dark is the default (trading floor), light is available via [data-theme="light"]. */
+   Dark is the default (trading floor), light is available via [data-theme="light"].
+   All text/background pairs are checked for WCAG AA (≥ 4.5:1) in src/lib/contrast.test.ts.
+   Fonts: system stack with Inter / JetBrains Mono when installed locally – no external font requests. */
 :root {
-  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
 
   --bg-0: #0b0f17;
   --bg-1: #10161f;
@@ -14,20 +16,37 @@
 
   --fg-0: #e8edf5;
   --fg-1: #b7c2d3;
-  --fg-2: #7f8ca0;
+  --fg-2: #8f9cb0;
+  /* decorative only (separators, disabled) – never for text */
   --fg-3: #56627a;
 
   --accent: #4f8cff;
-  --accent-2: #8b5cf6;
-  --accent-soft: rgba(79, 140, 255, 0.16);
+  --accent-2: #a78bfa;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-line: color-mix(in srgb, var(--accent) 45%, transparent);
   --pos: #22c55e;
-  --pos-soft: rgba(34, 197, 94, 0.15);
-  --neg: #ef4444;
-  --neg-soft: rgba(239, 68, 68, 0.15);
+  --pos-soft: color-mix(in srgb, var(--pos) 15%, transparent);
+  --neg: #f25555;
+  --neg-soft: color-mix(in srgb, var(--neg) 15%, transparent);
   --warn: #f59e0b;
-  --warn-soft: rgba(245, 158, 11, 0.15);
-  --info: #06b6d4;
+  --warn-soft: color-mix(in srgb, var(--warn) 15%, transparent);
+  --info: #22d3ee;
 
+  /* badge foregrounds (on 18 % tints of the same hue over --bg-1) */
+  --badge-irs-fg: #7fb0ff;
+  --badge-opt-fg: #c4b5fd;
+  --badge-fx-fg: #67e8f9;
+  --badge-warn-fg: #fbbf24;
+  --badge-ok-fg: #4ade80;
+  --badge-neg-fg: #fca5a5;
+  /* primary button text on --accent */
+  --btn-primary-fg: #0b0f17;
+  /* KUNDENANSICHT chip text on --warn */
+  --chip-customer-fg: #1a1200;
+  /* active segment-button text on accent-soft over bg-0 / bg-1 */
+  --seg-active-fg: #7fb0ff;
+
+  --backdrop: rgba(0, 0, 0, 0.5);
   --radius-s: 4px;
   --radius-m: 8px;
   --radius-l: 12px;
@@ -55,22 +74,29 @@
   --bg-2: #f1f4f9;
   --bg-3: #e6ebf3;
   --bg-hover: #dfe6f0;
-  --border: #d7deea;
-  --border-strong: #b9c4d6;
+  --border: #cbd5e1;
+  --border-strong: #a3b0c4;
   --fg-0: #0f172a;
   --fg-1: #334155;
-  --fg-2: #64748b;
+  --fg-2: #56657b;
   --fg-3: #94a3b8;
   --accent: #2563eb;
-  --accent-2: #7c3aed;
-  --accent-soft: rgba(37, 99, 235, 0.12);
-  --pos: #16a34a;
-  --pos-soft: rgba(22, 163, 74, 0.12);
-  --neg: #dc2626;
-  --neg-soft: rgba(220, 38, 38, 0.12);
-  --warn: #d97706;
-  --warn-soft: rgba(217, 119, 6, 0.14);
-  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --accent-2: #6d28d9;
+  --pos: #15803d;
+  --neg: #b91c1c;
+  --warn: #b45309;
+  --info: #0e7490;
+  --badge-irs-fg: #1d4ed8;
+  --badge-opt-fg: #5b21b6;
+  --badge-fx-fg: #155e75;
+  --badge-warn-fg: #92400e;
+  --badge-ok-fg: #166534;
+  --badge-neg-fg: #991b1b;
+  --btn-primary-fg: #ffffff;
+  --chip-customer-fg: #ffffff;
+  --seg-active-fg: #1d4ed8;
+  --backdrop: rgba(15, 23, 42, 0.32);
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.08), 0 0 0 1px rgba(15, 23, 42, 0.04);
   --shadow-2: 0 12px 40px rgba(15, 23, 42, 0.18);
   color-scheme: light;
 }

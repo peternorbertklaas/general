@@ -1,15 +1,32 @@
+import { type CurveBuildSpec, type CurveQuote, bootstrapCurves, bumpQuote, curveDependencies, orderCurveSpecs, quoteLabel } from "../curves/bootstrap.js";
 import { type Curve } from "../curves/curve.js";
+import { getIndex } from "../curves/index-definitions.js";
 import { toISO } from "../dates/date.js";
-import { type Trade } from "../instruments/types.js";
-import { type MarketContext } from "../market/market-context.js";
+import { embeddedOptionLegs, tradeIndexNames } from "../instruments/trade-dates.js";
+import { type PricingResult, type Trade } from "../instruments/types.js";
+import { type MarketContext, getDiscountCurve, withCurves } from "../market/market-context.js";
 import { shiftFxSurface } from "../models/fx-vol-surface.js";
-import { shiftCapletSurface, shiftSwaptionSurface } from "../models/vol-surfaces.js";
+import { type CapletVolSurface, type SwaptionVolSurface, shiftCapletSurface, shiftSwaptionSurface } from "../models/vol-surfaces.js";
+import { splitPair } from "../pricing/fx-pricer.js";
+import { fxToReporting } from "../pricing/leg-pricer.js";
 import { priceTrade, tradeCurrencies } from "../pricing/price.js";
 
 export interface BucketedDelta {
   curveId: string;
   buckets: { date: string; label: string; delta: number }[];
   total: number;
+}
+
+/** Decomposition of the 1-day theta (all in reporting currency). */
+export interface ThetaDetail {
+  /** Carry-consistent theta: PV(t+1, constant-curve roll) + cashflows paid in (t, t+1] − PV(t). */
+  total: number;
+  /** Pure carry: PV(t+1, forward-roll of the curves) + cashflows paid − PV(t). */
+  carry: number;
+  /** Roll-down: total − carry (effect of the curve not realising its forwards). */
+  rollDown: number;
+  /** Cashflows paid in (t, t+1] (added back so a coupon dropping out of the PV is not counted as a loss). */
+  cashflows: number;
 }
 
 export interface RiskReport {
@@ -21,16 +38,27 @@ export interface RiskReport {
   /** Per-curve parallel DV01 */
   dv01ByCurve: Record<string, number>;
   bucketed: BucketedDelta[];
-  /** PV change per +1% spot move, per FX pair (base→reporting). */
+  /**
+   * PV change per +1% appreciation of the key's first currency against the
+   * reporting currency (key `${ccy}${reporting}`), i.e. positive = we gain when
+   * that currency strengthens.
+   */
   fxDelta: Record<string, number>;
-  /** PV change for +1bp normal vol (IR) / +1 vol point (FX). */
+  /** PV change for +1bp normal vol (IR, +1 vol point for lognormal surfaces) / +1 vol point (FX). */
   vega: Record<string, number>;
-  /** 1-day theta: PV(t+1) - PV(t) holding market data. */
+  /**
+   * 1-day theta, carry-consistent: PV(t+1) with curves rolled (constant zero
+   * rates per tenor) plus the cashflows paid in (t, t+1] minus PV(t). Vol
+   * surfaces are kept in expiry-years (sticky expiry).
+   */
   theta: number;
+  /** Carry / roll-down decomposition of `theta`. */
+  thetaDetail?: ThetaDetail;
   /** Second-order: PV(+1bp) + PV(-1bp) - 2PV. */
   gamma: number;
 }
 
+/** One basis point as a decimal rate / normal-vol shift (the `Curve.shifted*` methods take decimal shifts). */
 const BP = 1e-4;
 
 export function shiftCurvesParallel(ctx: MarketContext, curveIds: string[], shift: number): MarketContext {
@@ -48,6 +76,88 @@ export function relevantCurveIds(ctx: MarketContext, trade: Trade): string[] {
   return Object.entries(ctx.curves)
     .filter(([, c]) => ccys.includes(c.currency))
     .map(([id]) => id);
+}
+
+/**
+ * Curves a trade actually uses for its valuation: the discount curve of every
+ * trade currency under the trade's collateral currency (CSA curve when
+ * configured) plus the projection curve of every referenced index. Unlike
+ * `relevantCurveIds` (all curves of the currencies, used for risk scoping)
+ * this excludes e.g. a USD-CSA discount curve for an EUR-collateralised swap.
+ */
+export function tradeCurveIds(ctx: MarketContext, trade: Trade): string[] {
+  const ids = new Set<string>();
+  for (const ccy of tradeCurrencies(trade)) {
+    try {
+      ids.add(getDiscountCurve(ctx, ccy, trade.collateralCurrency).id);
+    } catch {
+      // no discount curve configured – nothing to report
+    }
+  }
+  for (const name of tradeIndexNames(trade)) {
+    try {
+      const id = getIndex(name).curveId;
+      if (ctx.curves[id]) ids.add(id);
+    } catch {
+      // unknown index – pricing would have failed already
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Keys of the caplet surfaces a trade's valuation reads: for caps/floors and
+ * for swap legs with embedded caps/floors the leg pricer looks up
+ * `${ccy}-${index}` first and falls back to `${ccy}`.
+ */
+export function capletSurfaceKeysFor(ctx: MarketContext, trade: Trade): string[] {
+  const vols = ctx.capletVols;
+  if (!vols) return [];
+  const pick = (ccy: string, indexName: string): string | undefined => {
+    const exact = `${ccy}-${getIndex(indexName).name}`;
+    if (vols[exact]) return exact;
+    return vols[ccy] ? ccy : undefined;
+  };
+  const keys = new Set<string>();
+  if (trade.type === "CapFloor") {
+    const k = pick(trade.currency, trade.index);
+    if (k) keys.add(k);
+  }
+  for (const leg of embeddedOptionLegs(trade)) {
+    const k = pick(leg.currency, leg.index);
+    if (k) keys.add(k);
+  }
+  return [...keys];
+}
+
+/**
+ * Cashflows of a priced trade that are paid in (valuationDate, valuationDate + days],
+ * converted to the reporting currency (undiscounted amounts). Option payoff
+ * placeholders of swaptions / FX options are excluded (their value change is
+ * captured by repricing).
+ */
+export function cashflowsPaidWithin(ctx: MarketContext, trade: Trade, base: PricingResult, days: number, reportingCurrency: string): number {
+  const val = ctx.valuationDate;
+  let paid = 0;
+  for (const leg of base.legs) {
+    for (const c of leg.cashflows) {
+      if (!(c.paymentDate > val && c.paymentDate <= val + days)) continue;
+      if (c.kind === "OptionPayoff" && (trade.type === "Swaption" || trade.type === "FxOption")) continue;
+      paid += c.amount * fxToReporting(ctx, c.currency, reportingCurrency, trade.collateralCurrency);
+    }
+  }
+  return paid;
+}
+
+/** Carry-consistent 1-day theta with carry / roll-down decomposition. */
+export function computeTheta(ctx: MarketContext, trade: Trade, reportingCurrency: string, base?: PricingResult, days = 1): ThetaDetail {
+  const b = base ?? priceTrade(ctx, trade, reportingCurrency);
+  const paid = cashflowsPaidWithin(ctx, trade, b, days, reportingCurrency);
+  const pvRolled = priceTrade(rollMarket(ctx, days), trade, reportingCurrency).pv;
+  const pvForward = priceTrade(rollMarketForward(ctx, days), trade, reportingCurrency).pv;
+  const total = pvRolled + paid - b.pv;
+  const carry = pvForward + paid - b.pv;
+  return { total, carry, rollDown: total - carry, cashflows: paid };
 }
 
 export function computeRisk(
@@ -88,8 +198,7 @@ export function computeRisk(
     if (ccy === reportingCurrency) continue;
     const shifted = shiftFxSpots(ctx, ccy, 0.01);
     const shiftedDown = shiftFxSpots(ctx, ccy, -0.01);
-    fxDelta[`${ccy}${reportingCurrency}`] =
-      (priceTrade(shifted, trade, reportingCurrency).pv - priceTrade(shiftedDown, trade, reportingCurrency).pv) / 2;
+    fxDelta[`${ccy}${reportingCurrency}`] = (priceTrade(shifted, trade, reportingCurrency).pv - priceTrade(shiftedDown, trade, reportingCurrency).pv) / 2;
   }
 
   const vega: Record<string, number> = {};
@@ -102,17 +211,22 @@ export function computeRisk(
         vega[`swaption:${k}`] = u - base.pv;
       }
     }
-    if (trade.type === "CapFloor" && ctx.capletVols) {
-      for (const [k, s] of Object.entries(ctx.capletVols)) {
-        if (s.currency !== trade.currency) continue;
+    // Caps/floors and swaps with embedded caps/floors (feature detection, R2-2):
+    // bump the caplet surface(s) the valuation actually reads.
+    if (ctx.capletVols) {
+      for (const k of capletSurfaceKeysFor(ctx, trade)) {
+        const s = ctx.capletVols[k]!;
         const shift = s.volType === "Normal" ? BP : 0.01;
         const u = priceTrade({ ...ctx, capletVols: { ...ctx.capletVols, [k]: shiftCapletSurface(s, shift) } }, trade, reportingCurrency).pv;
         vega[`caplet:${k}`] = u - base.pv;
       }
     }
     if (trade.type === "FxOption" && ctx.fxVols) {
+      const { base: b, quote: q } = splitPair(trade.pair);
       for (const [k, s] of Object.entries(ctx.fxVols)) {
-        if (!trade.pair.toUpperCase().includes(k.slice(0, 3))) continue;
+        const key = k.toUpperCase();
+        // Exact pair match, including the inverted quotation of the same pair.
+        if (key !== `${b}${q}` && key !== `${q}${b}`) continue;
         const u = priceTrade({ ...ctx, fxVols: { ...ctx.fxVols, [k]: shiftFxSurface(s, 0.01) } }, trade, reportingCurrency).pv;
         vega[`fx:${k}`] = u - base.pv;
       }
@@ -120,25 +234,42 @@ export function computeRisk(
   }
 
   let theta = 0;
+  let thetaDetail: ThetaDetail | undefined;
   if (opts.theta ?? true) {
     try {
-      theta = priceTrade(rollMarket(ctx, 1), trade, reportingCurrency).pv - base.pv;
+      thetaDetail = computeTheta(ctx, trade, reportingCurrency, base, 1);
+      theta = thetaDetail.total;
     } catch {
       theta = Number.NaN;
     }
   }
 
-  return { tradeId: trade.id, currency: reportingCurrency, pv: base.pv, dv01, dv01ByCurve, bucketed, fxDelta, vega, theta, gamma };
+  return { tradeId: trade.id, currency: reportingCurrency, pv: base.pv, dv01, dv01ByCurve, bucketed, fxDelta, vega, theta, thetaDetail, gamma };
 }
 
 /**
  * Roll the market forward by `days` keeping zero rates per tenor constant
- * (constant-curve roll). Used for theta and time-shift scenarios.
+ * (constant-curve roll). Used for theta and time-shift scenarios. Fixings are
+ * not extended: periods that start to accrue inside the roll window are
+ * projected with the curve's first forward.
  */
 export function rollMarket(ctx: MarketContext, days: number): MarketContext {
   const newDate = ctx.valuationDate + days;
   const curves: Record<string, Curve> = {};
   for (const [id, c] of Object.entries(ctx.curves)) curves[id] = c.rolledTo(newDate);
+  return { ...ctx, valuationDate: newDate, curves };
+}
+
+/**
+ * Roll the market forward by `days` along the forward curves (the curve at
+ * t + days is today's implied forward curve). Used for the carry component of
+ * theta; falls back to the constant-curve roll for curve implementations
+ * without `forwardRolledTo`.
+ */
+export function rollMarketForward(ctx: MarketContext, days: number): MarketContext {
+  const newDate = ctx.valuationDate + days;
+  const curves: Record<string, Curve> = {};
+  for (const [id, c] of Object.entries(ctx.curves)) curves[id] = c.forwardRolledTo ? c.forwardRolledTo(newDate) : c.rolledTo(newDate);
   return { ...ctx, valuationDate: newDate, curves };
 }
 
@@ -159,6 +290,243 @@ export function tenorLabel(valuationDate: number, date: number): string {
   const days = date - valuationDate;
   if (days < 20) return `${days}D`;
   if (days < 360) return `${Math.round(days / 30.4375)}M`;
-  const years = days / 365.25;
-  return `${Math.round(years * 2) / 2}Y`.replace(".5Y", ".5Y");
+  const years = Math.round((days / 365.25) * 2) / 2;
+  return `${years}Y`;
+}
+
+// ---------------------------------------------------------------------------
+// Par-rate (market-quote) risk
+// ---------------------------------------------------------------------------
+
+/**
+ * Curve build definitions for `parRisk`, keyed by curve id. `id` may be
+ * omitted (the key is used). Same shape as `CurveBuildSpec`, i.e. quotes +
+ * index + currency + optional `discountCurveId` / `referenceCurveIds`.
+ */
+export type ParRiskSpecs = Record<string, Omit<CurveBuildSpec, "id"> & { id?: string }>;
+
+export interface ParRiskBucket {
+  /** Instrument label, e.g. "OIS 5Y", "Swap 10Y", "FRA 6x12". */
+  label: string;
+  quote: CurveQuote;
+  /** PV change (reporting currency) for +`bumpBp` on this quote, all dependent curves re-bootstrapped. */
+  delta: number;
+}
+
+export interface ParRiskCurve {
+  curveId: string;
+  buckets: ParRiskBucket[];
+  total: number;
+}
+
+export interface ParRiskReport {
+  tradeId: string;
+  currency: string;
+  pv: number;
+  curves: ParRiskCurve[];
+  /** Sum over all curves and quotes (≈ parallel DV01 in par-rate terms). */
+  total: number;
+  /** Bump size used (bp). */
+  bumpBp: number;
+}
+
+export interface ParRiskOptions {
+  /** Curves to bump (default: all specs whose currency the trade references and that exist in `ctx`). */
+  curveIds?: string[];
+  /** Bump size in bp (default 1). */
+  bumpBp?: number;
+}
+
+/**
+ * Market-quote ("par") risk: for every curve and every bootstrap quote, bump
+ * the quote by +1bp, re-bootstrap the curve and – in dependency order – every
+ * curve built on top of it (OIS → dual-curve projection curves → basis /
+ * collateral curves), reprice and report the PV change. Curves not affected
+ * by the bump are taken unchanged from `ctx`. Thin wrapper around
+ * `parRiskPortfolio` for a single trade.
+ */
+export function parRisk(ctx: MarketContext, trade: Trade, reportingCurrency: string, specs: ParRiskSpecs, opts: ParRiskOptions = {}): ParRiskReport {
+  return parRiskPortfolio(ctx, [trade], reportingCurrency, specs, opts)[0]!;
+}
+
+/**
+ * Par-rate risk for a portfolio: every bumped curve set (one per quote of
+ * every targeted curve, including the re-bootstrap of all dependent curves)
+ * is built exactly once and all trades are repriced on it, so the cost of the
+ * expensive re-bootstrapping is shared across the book instead of paid per
+ * trade. Each trade's report only contains the curves that would be targeted
+ * for it alone (`opts.curveIds` overrides this for all trades), so the result
+ * is identical to calling `parRisk` trade by trade.
+ */
+export function parRiskPortfolio(
+  ctx: MarketContext,
+  trades: Trade[],
+  reportingCurrency: string,
+  specs: ParRiskSpecs,
+  opts: ParRiskOptions = {},
+): ParRiskReport[] {
+  const bumpBp = opts.bumpBp ?? 1;
+  const all: CurveBuildSpec[] = Object.entries(specs).map(([key, s]) => ({ ...s, id: s.id ?? key }));
+  const ordered = orderCurveSpecs(all);
+  const bases = trades.map((t) => priceTrade(ctx, t, reportingCurrency).pv);
+  // Curves targeted per trade (default: specs of the trade's currencies that exist in ctx).
+  const targetsPerTrade = trades.map((t) => {
+    if (opts.curveIds) return opts.curveIds;
+    const ccys = tradeCurrencies(t);
+    return ordered.filter((s) => ccys.includes(s.currency) && ctx.curves[s.id] !== undefined).map((s) => s.id);
+  });
+  const union: string[] = [];
+  for (const ts of targetsPerTrade) for (const id of ts) if (!union.includes(id)) union.push(id);
+
+  // Transitive dependency closure (ordered is topological, so deps are already resolved).
+  const closure = new Map<string, Set<string>>();
+  for (const s of ordered) {
+    const set = new Set<string>();
+    for (const d of curveDependencies(s)) {
+      set.add(d);
+      for (const dd of closure.get(d) ?? []) set.add(dd);
+    }
+    closure.set(s.id, set);
+  }
+
+  // curveId → per-trade bucket lists (only for trades targeting the curve).
+  const bucketsByCurve = new Map<string, Map<number, ParRiskBucket[]>>();
+  for (const id of ordered.map((s) => s.id)) {
+    if (!union.includes(id)) continue;
+    const spec = ordered.find((s) => s.id === id)!;
+    const tradeIdx = trades.map((_, i) => i).filter((i) => targetsPerTrade[i]!.includes(id));
+    const perTrade = new Map<number, ParRiskBucket[]>(tradeIdx.map((i) => [i, []]));
+    const rebuild = ordered.filter((s) => s.id === id || closure.get(s.id)!.has(id));
+    spec.quotes.forEach((q, qi) => {
+      const bumped = rebuild.map((s) => (s.id === id ? { ...s, quotes: s.quotes.map((qq, j) => (j === qi ? bumpQuote(qq, bumpBp) : qq)) } : s));
+      const { curves: rebuilt } = bootstrapCurves(ctx.valuationDate, bumped, ctx.curves);
+      const shifted = withCurves(ctx, rebuilt);
+      for (const i of tradeIdx) {
+        const pv = priceTrade(shifted, trades[i]!, reportingCurrency).pv;
+        perTrade.get(i)!.push({ label: quoteLabel(q), quote: q, delta: pv - bases[i]! });
+      }
+    });
+    bucketsByCurve.set(id, perTrade);
+  }
+
+  return trades.map((trade, i): ParRiskReport => {
+    const curves: ParRiskCurve[] = [];
+    for (const id of targetsPerTrade[i]!) {
+      const buckets = bucketsByCurve.get(id)?.get(i);
+      if (!buckets) continue;
+      curves.push({ curveId: id, buckets, total: buckets.reduce((s, b) => s + b.delta, 0) });
+    }
+    return {
+      tradeId: trade.id,
+      currency: reportingCurrency,
+      pv: bases[i]!,
+      curves,
+      total: curves.reduce((s, c) => s + c.total, 0),
+      bumpBp,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Bucketed vega (per expiry, or expiry × tenor for swaptions)
+// ---------------------------------------------------------------------------
+
+export interface VegaBucket {
+  /** Expiry in years (surface grid point). */
+  expiry: number;
+  /** Underlying swap tenor in years – only set for `dimension: "expiry-tenor"` swaption buckets. */
+  tenor?: number;
+  /** "2Y" (expiry rows) or "2Yx5Y" (expiry × tenor cells). */
+  label: string;
+  /** PV change for +1bp normal vol (+1 vol point for lognormal surfaces) on this expiry row / cell. */
+  vega: number;
+}
+
+export interface VegaBucketReport {
+  /** Key of the surface in the market context (e.g. "EUR" or "EUR-EURIBOR-6M"). */
+  key: string;
+  surfaceId: string;
+  kind: "swaption" | "caplet";
+  /** Bucket layout: expiry rows (default) or expiry × tenor cells (swaption cubes only). */
+  dimension: "expiry" | "expiry-tenor";
+  buckets: VegaBucket[];
+  total: number;
+}
+
+export interface VegaBucketOptions {
+  /**
+   * "expiry" (default): one bucket per expiry row of the surface. "expiry-tenor":
+   * one bucket per (expiry, tenor) cell of the swaption cube (Bloomberg / ORE
+   * layout, needed to read off the tenor hedge of a swaption book); caplet
+   * surfaces have no tenor dimension and always report expiry rows.
+   */
+  dimension?: "expiry" | "expiry-tenor";
+}
+
+function expiryLabel(years: number): string {
+  if (years < 1) return `${Math.round(years * 12)}M`;
+  return Number.isInteger(years) ? `${years}Y` : `${years.toFixed(2)}Y`;
+}
+
+function shiftSwaptionRow(s: SwaptionVolSurface, row: number, shift: number): SwaptionVolSurface {
+  return { ...s, atm: s.atm.map((r, i) => (i === row ? r.map((v) => Math.max(1e-6, v + shift)) : r)) };
+}
+
+function shiftSwaptionCell(s: SwaptionVolSurface, row: number, col: number, shift: number): SwaptionVolSurface {
+  return { ...s, atm: s.atm.map((r, i) => (i === row ? r.map((v, j) => (j === col ? Math.max(1e-6, v + shift) : v)) : r)) };
+}
+
+function shiftCapletRow(s: CapletVolSurface, row: number, shift: number): CapletVolSurface {
+  return { ...s, vols: s.vols.map((r, i) => (i === row ? r.map((v) => Math.max(1e-6, v + shift)) : r)) };
+}
+
+/**
+ * Vega per bucket for swaptions (swaption cube rows, or expiry × tenor cells
+ * with `dimension: "expiry-tenor"`), caps/floors and swaps with embedded
+ * caps/floors (caplet surface rows): each row / cell is bumped by +1bp normal
+ * vol (or +1 vol point for lognormal surfaces) and the trade repriced. The
+ * buckets sum to the parallel vega up to smile (SABR) non-linearity. Trades
+ * without optionality return an empty list.
+ */
+export function vegaBuckets(ctx: MarketContext, trade: Trade, reportingCurrency: string, opts: VegaBucketOptions = {}): VegaBucketReport[] {
+  const out: VegaBucketReport[] = [];
+  const dimension = opts.dimension ?? "expiry";
+  const capletKeys = capletSurfaceKeysFor(ctx, trade);
+  if (trade.type !== "Swaption" && capletKeys.length === 0) return out;
+  const base = priceTrade(ctx, trade, reportingCurrency).pv;
+  if (trade.type === "Swaption" && ctx.swaptionVols) {
+    for (const [k, s] of Object.entries(ctx.swaptionVols)) {
+      if (!tradeCurrencies(trade).includes(s.currency)) continue;
+      const shift = s.volType === "Normal" ? BP : 0.01;
+      const reprice = (shifted: SwaptionVolSurface) =>
+        priceTrade({ ...ctx, swaptionVols: { ...ctx.swaptionVols, [k]: shifted } }, trade, reportingCurrency).pv - base;
+      let buckets: VegaBucket[];
+      if (dimension === "expiry-tenor") {
+        buckets = s.expiries.flatMap((e, i) =>
+          s.tenors.map((tn, j): VegaBucket => ({
+            expiry: e,
+            tenor: tn,
+            label: `${expiryLabel(e)}x${expiryLabel(tn)}`,
+            vega: reprice(shiftSwaptionCell(s, i, j, shift)),
+          })),
+        );
+      } else {
+        buckets = s.expiries.map((e, i): VegaBucket => ({ expiry: e, label: expiryLabel(e), vega: reprice(shiftSwaptionRow(s, i, shift)) }));
+      }
+      out.push({ key: k, surfaceId: s.id, kind: "swaption", dimension, buckets, total: buckets.reduce((a, b) => a + b.vega, 0) });
+    }
+  }
+  if (ctx.capletVols) {
+    for (const k of capletKeys) {
+      const s = ctx.capletVols[k]!;
+      const shift = s.volType === "Normal" ? BP : 0.01;
+      const buckets = s.expiries.map((e, i): VegaBucket => {
+        const shifted = shiftCapletRow(s, i, shift);
+        const pv = priceTrade({ ...ctx, capletVols: { ...ctx.capletVols, [k]: shifted } }, trade, reportingCurrency).pv;
+        return { expiry: e, label: expiryLabel(e), vega: pv - base };
+      });
+      out.push({ key: k, surfaceId: s.id, kind: "caplet", dimension: "expiry", buckets, total: buckets.reduce((a, b) => a + b.vega, 0) });
+    }
+  }
+  return out;
 }

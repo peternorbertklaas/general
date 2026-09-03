@@ -2,28 +2,74 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main, "claude/**"]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  build:
+  build-test:
+    name: Build & test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
+      - uses: pnpm/action-setup@v4 # version from package.json#packageManager
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @deriva/pricing-core run build
-      - run: pnpm -r run typecheck
-      - run: pnpm -r run test
-      - run: pnpm --filter @deriva/api run build
-      - run: pnpm --filter @deriva/web run build
-      - uses: actions/upload-artifact@v4
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: Build pricing core (consumed by api/web)
+        run: pnpm --filter @deriva/pricing-core run build
+      - name: Typecheck
+        run: pnpm -r run typecheck
+      - name: Lint (ESLint, zero warnings)
+        run: pnpm -r run lint
+      - name: Format check (Prettier)
+        run: pnpm format:check
+      - name: Unit & integration tests with coverage (core, api, web)
+        run: pnpm -r run test -- --coverage
+      - name: Dependency audit (production, high+)
+        run: pnpm audit --prod --audit-level=high
+        continue-on-error: false
+      - name: Build API
+        run: pnpm --filter @deriva/api run build
+      - name: Build Web
+        run: pnpm --filter @deriva/web run build
+      - name: Install Playwright Chromium
+        if: matrix.node == 22
+        run: pnpm --filter @deriva/web exec playwright install --with-deps chromium
+      - name: E2E smoke (Playwright against production build)
+        if: matrix.node == 22
+        run: pnpm --filter @deriva/web run test:e2e
+      - name: Upload coverage (all packages)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-node${{ matrix.node }}
+          path: |
+            packages/pricing-core/coverage
+            apps/api/coverage
+            apps/web/coverage
+          if-no-files-found: warn
+      - name: Upload web build (without source maps) and E2E screenshots
+        uses: actions/upload-artifact@v4
+        if: always() && matrix.node == 22
         with:
           name: web-dist
-          path: apps/web/dist
+          path: |
+            apps/web/dist
+            !apps/web/dist/**/*.map
+            apps/web/e2e-screenshots
+          if-no-files-found: warn

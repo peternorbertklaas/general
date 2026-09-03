@@ -29,19 +29,12 @@ export function sabrLognormalVol(forward: number, strike: number, t: number, p: 
     const term1 = alpha / fPow;
     const term2 =
       1 +
-      ((oneMinusBeta * oneMinusBeta * alpha * alpha) / (24 * fPow * fPow) +
-        (rho * beta * nu * alpha) / (4 * fPow) +
-        ((2 - 3 * rho * rho) * nu * nu) / 24) *
-        t;
+      ((oneMinusBeta * oneMinusBeta * alpha * alpha) / (24 * fPow * fPow) + (rho * beta * nu * alpha) / (4 * fPow) + ((2 - 3 * rho * rho) * nu * nu) / 24) * t;
     return term1 * term2;
   }
   const z = (nu / alpha) * fkPow * logFK;
   const xz = Math.log((Math.sqrt(1 - 2 * rho * z + z * z) + z - rho) / (1 - rho));
-  const denom =
-    fkPow *
-    (1 +
-      (oneMinusBeta * oneMinusBeta * logFK * logFK) / 24 +
-      (Math.pow(oneMinusBeta, 4) * Math.pow(logFK, 4)) / 1920);
+  const denom = fkPow * (1 + (oneMinusBeta * oneMinusBeta * logFK * logFK) / 24 + (Math.pow(oneMinusBeta, 4) * Math.pow(logFK, 4)) / 1920);
   const term2 =
     1 +
     ((oneMinusBeta * oneMinusBeta * alpha * alpha) / (24 * Math.pow(fk, oneMinusBeta)) +
@@ -56,6 +49,7 @@ export function sabrNormalVol(forward: number, strike: number, t: number, p: Sab
   const f = forward + s;
   const k = strike + s;
   const { alpha, beta, rho, nu } = p;
+  if (f <= 0 || k <= 0) throw new Error("SABR normal vol requires positive shifted forward/strike");
   const oneMinusBeta = 1 - beta;
   const fk = f * k;
   const fMid = (f + k) / 2;
@@ -75,16 +69,16 @@ export function sabrNormalVol(forward: number, strike: number, t: number, p: Sab
   } else {
     xz = zeta / Math.log((Math.sqrt(1 - 2 * rho * zeta + zeta * zeta) + zeta - rho) / (1 - rho));
   }
+  // ∫_k^f dx / C(x) with C(x) = x^β: (f^{1−β} − k^{1−β})/(1−β), or log(f/k) for β = 1.
   const prefactor =
     Math.abs(f - k) < 1e-12
       ? alpha * cMid
-      : (alpha * oneMinusBeta * (f - k)) / (Math.pow(f, oneMinusBeta) - Math.pow(k, oneMinusBeta));
+      : beta === 1
+        ? (alpha * (f - k)) / logFK
+        : (alpha * oneMinusBeta * (f - k)) / (Math.pow(f, oneMinusBeta) - Math.pow(k, oneMinusBeta));
   const term =
     1 +
-    (((2 * gamma2 - gamma1 * gamma1) / 24) * alpha * alpha * cMid * cMid +
-      (rho * nu * alpha * gamma1 * cMid) / 4 +
-      ((2 - 3 * rho * rho) * nu * nu) / 24) *
-      t;
+    (((2 * gamma2 - gamma1 * gamma1) / 24) * alpha * alpha * cMid * cMid + (rho * nu * alpha * gamma1 * cMid) / 4 + ((2 - 3 * rho * rho) * nu * nu) / 24) * t;
   return prefactor * xz * term;
 }
 
@@ -104,9 +98,7 @@ export function sabrAlphaFromAtm(
   let lo = alpha0 * 0.05;
   let hi = alpha0 * 3;
   const fn = (a: number) =>
-    (mode === "normal"
-      ? sabrNormalVol(forward, forward, t, { ...params, alpha: a })
-      : sabrLognormalVol(forward, forward, t, { ...params, alpha: a })) - atmVol;
+    (mode === "normal" ? sabrNormalVol(forward, forward, t, { ...params, alpha: a }) : sabrLognormalVol(forward, forward, t, { ...params, alpha: a })) - atmVol;
   for (let i = 0; i < 200; i++) {
     const mid = (lo + hi) / 2;
     if (fn(mid) > 0) hi = mid;

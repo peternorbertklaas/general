@@ -1,0 +1,18 @@
+# Code owners – reviews are requested automatically for matching paths.
+# Order matters: the last matching pattern wins.
+
+*                               @peternorbertklaas
+
+# Pricing core: model changes need an independent reference (CONTRIBUTING.md, "Modellvalidierung").
+/packages/pricing-core/         @peternorbertklaas
+
+# API contract (OpenAPI, schemas, error envelope) and security baseline.
+/apps/api/                      @peternorbertklaas
+/SECURITY.md                    @peternorbertklaas
+
+# Compliance mapping and ADRs.
+/docs/compliance/               @peternorbertklaas
+/docs/architecture/             @peternorbertklaas
+
+# CI / dependency automation.
+/.github/                       @peternorbertklaas

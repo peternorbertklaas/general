@@ -1,6 +1,6 @@
 {
   "name": "@deriva/pricing-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pricing engine for interest rate and FX derivatives: calendars, day counts, schedules, multi-curve bootstrapping, IRS/OIS/FRA/Cap/Floor/Swaption, FX forward/option/CCS, sensitivities and scenarios.",
   "license": "MIT",
   "type": "module",
@@ -12,15 +12,21 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "version:gen": "node tools/gen-version.mjs",
+    "prebuild": "node tools/gen-version.mjs",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "node tools/gen-version.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "lint": "eslint . --max-warnings 0"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^3.2.7",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   }

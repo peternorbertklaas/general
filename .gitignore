@@ -9,3 +9,4 @@ coverage/
 *.tsbuildinfo
 .vite/
 .turbo/
+apps/web/e2e-screenshots/

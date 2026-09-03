@@ -39,13 +39,13 @@ Capmatix, den Treasury-Management-Systemen und Excel + QuantLib schließt:
 │  Command Palette · Hotkeys · Inspector · What-if · Dark/Light               │
 ├────────────────────────────────────────────────────────────────────────────┤
 │  M7 API & Integration (Fastify, OpenAPI)   │  M6 Reporting & Compliance     │
-│  /price /risk /scenarios /xva /report      │  Bewertungsreport, Cashflow-   │
-│  /market /trades · ISO-Dates · CSV         │  CSV, Kostentransparenz, IFRS13│
+│  /price /risk /scenarios /xva /report      │  Bewertungsreport + Hashes,    │
+│  /hedge /documents /emir /audit /snapshot  │  EMIR, Termsheet, Geeignetheit │
 ├────────────────────────────────────────────┴───────────────────────────────┤
-│  M5 Risiko & Szenarien        │  M4 XVA                                     │
-│  DV01, Key-Rate, FX-Delta,    │  CVA/DVA semi-analytisch (Swaption-        │
-│  Vega, Theta, Gamma,          │  Replikation, GK-Forward), Exposure-        │
-│  Standard-Szenarien, Grid     │  Profile, Hazard aus CDS-Spread             │
+│  M5 Risiko & Szenarien        │  M4 XVA · M11 Hedge Accounting              │
+│  DV01, Key-Rate, Par-Risk,    │  CVA/DVA (Swaption-Replikation, GK,         │
+│  FX-Delta, Vega-Buckets,      │  Delta-Normal), Exposure-Profile;           │
+│  IRRBB-Szenarien, Grid        │  hypothetisches Derivat, Dollar-Offset, OLS │
 ├───────────────────────────────┴────────────────────────────────────────────┤
 │  M3 Instrumente & Pricer                                                    │
 │  IRS (fix/float/OIS/Basis, amortisierend), FRA, Cap/Floor/Collar, Swaption  │
@@ -65,26 +65,27 @@ Capmatix, den Treasury-Management-Systemen und Excel + QuantLib schließt:
 
 ### Modulbeschreibungen
 
-| Modul | Zweck | Paket / Ort | Status v0.1 |
+| Modul | Zweck | Paket / Ort | Status v0.2 |
 |---|---|---|---|
 | **M1 Fundament** | Fehlerfreie Datums- und Konventionslogik als Basis jeder Bewertung | `packages/pricing-core/src/dates`, `src/math` | ✅ implementiert, getestet |
-| **M2 Marktdaten & Kurven** | Kurven aus Quotes bauen, Vol-Flächen abfragen, Marktkontext bereitstellen | `src/curves`, `src/models`, `src/market` | ✅ Sample-Markt; Adapter für Live-Daten offen |
+| **M2 Marktdaten & Kurven** | Kurven aus Depos/FRAs/Futures/Swaps/OIS/Tenor-Basis/XCCY-Basis bauen, Vol-Flächen abfragen, Snapshots exportieren/importieren | `src/curves`, `src/models`, `src/market` | ✅ inkl. Snapshot-Format; Live-Adapter offen |
 | **M3 Instrumente & Pricer** | Trade-Modell und analytische Bewertung aller v1-Instrumente | `src/instruments`, `src/pricing` | ✅ |
-| **M4 XVA** | Kreditrisikoadjustierung für Fair Value nach IFRS 13 | `src/xva` | ✅ IRS & FX-Forward; weitere Typen v1.1 |
+| **M4 XVA** | Kreditrisikoadjustierung für Fair Value nach IFRS 13 | `src/xva` | ✅ alle Instrumente (Swaption-Replikation, GK, Delta-Normal) |
 | **M5 Risiko & Szenarien** | Sensitivitäten und Stress für Steuerung und IPV | `src/risk` | ✅ |
-| **M6 Reporting & Compliance** | Prüfungsfähige Reports, MiFID-Kosten, Exporte | `src/reporting`, UI Report-View | ✅ JSON/CSV; PDF-Rendering v1.1 |
-| **M7 API & Integration** | REST/OpenAPI für Kernbank, TMS, Excel | `apps/api` | ✅ In-Memory-Store; Persistenz-Adapter offen |
+| **M6 Reporting & Compliance** | Prüfungsfähige Reports mit Hashes, IFRS-13-Level, MiFID-Kosten, EMIR-Felder, Termsheet/Geeignetheitserklärung, Exporte | `src/reporting`, UI Report-View | ✅ JSON/CSV/Markdown; PDF-Template v1.0 |
+| **M7 API & Integration** | REST/OpenAPI (operationId, Response-Schemas) mit diskriminierter Trade-Validierung, ETag/If-Match/If-None-Match, Snapshot-ID-Header, Audit-Trail, Security-Header | `apps/api` | ✅ In-Memory-Store; Persistenz/Auth-Adapter offen |
 | **M8 Workstation** | Keyboard-first UI | `apps/web` | ✅ |
 | **M9 Marktdaten-Adapter** | Refinitiv/Bloomberg/ICE/EZB/EMMI-Konnektoren, Snapshot-Store | – | ⏳ Roadmap |
-| **M10 Beratungsprozess** | MiFID-Geeignetheit, Beratungsprotokoll, Dokumentenerzeugung | – | ⏳ Roadmap |
-| **M11 Hedge Accounting** | IFRS 9 / HGB Effektivitätstests, hypothetisches Derivat | – | ⏳ Roadmap |
+| **M10 Beratungsprozess** | Termsheet, Geeignetheitserklärung (§ 64 WpHG) mit Kostenausweis und Szenarien | `src/reporting/documents.ts`, API `/api/documents/*` | ✅ Dokumente; Workflow/Signatur ⏳ |
+| **M11 Hedge Accounting** | IFRS 9 / HGB Effektivitätstests, hypothetisches Derivat, OCI/GuV-Split | `src/hedge`, API `/api/hedge/*` | ✅ |
 | **M12 Excel-Add-in** | Funktionen `DERIVA.PV`, `DERIVA.PAR` gegen API | – | ⏳ Roadmap |
 
 ## 4. Abgrenzung v1 (bewusst nicht enthalten)
 
 - Bermudan-Swaptions, CMS-Spread-Optionen, Range Accruals, TARF/Accumulator (erfordern Modellkalibrierung / Monte Carlo).
+- Inflationsderivate (Zero-Coupon-Inflationsswap auf EUR HICPxT, Inflationskurve mit Index-Lag und Saisonalität) – Roadmap v1.1 als US-3.15; Zielsegment Versicherer/Pensionskassen, setzt die Inflations-Indexhistorie des Marktdaten-Adapters (M9) voraus.
 - Vollständiges XVA (FVA, KVA, MVA), ISDA-SIMM-Berechnung (nur CRIF-Export geplant).
-- Live-Marktdaten (Lizenzthema), Persistenz, Mandanten/Rollen (v1.1 via Adapter).
+- Live-Marktdaten (Lizenzthema), Persistenz, Mandanten/Rollen (v1.0 via Adapter, siehe Release-Plan in `02-epics-und-user-stories.md`).
 
 ## 5. Erfolgskriterien
 

@@ -1,0 +1,660 @@
+/**
+ * End-to-end smoke test against the production build (vite preview).
+ * Run: pnpm --filter @deriva/web run test:e2e   (requires `vite build` first)
+ * Uses the system Chromium when PLAYWRIGHT_CHROMIUM_PATH is set (CI installs one via `playwright install`).
+ * Port: E2E_PORT or a random port in 4180–4279.
+ */
+import { chromium } from "playwright";
+import { spawn } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const webDir = join(here, "..");
+const outDir = join(webDir, "e2e-screenshots");
+mkdirSync(outDir, { recursive: true });
+const port = Number(process.env.E2E_PORT) || 4180 + Math.floor(Math.random() * 100);
+
+const preview = spawn("npx", ["vite", "preview", "--port", String(port), "--strictPort"], { cwd: webDir, stdio: "ignore" });
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+let browser;
+const failures = [];
+let checks = 0;
+const check = (cond, msg) => {
+  checks++;
+  if (!cond) failures.push(msg);
+};
+const VIEWS = [
+  ["b", "Blotter"],
+  ["p", "Pricing"],
+  ["c", "Kurven"],
+  ["s", "Szenarien"],
+  ["m", "Markt"],
+  ["r", "Report"],
+  ["v", "Vergleich"],
+  ["h", "Hedge Accounting"],
+];
+const chord = async (page, k) => {
+  await page.keyboard.press("g");
+  await page.keyboard.press(k);
+  await wait(400);
+};
+const noOverflow = async (page) =>
+  page.evaluate(() => {
+    const main = document.querySelector(".main");
+    return { page: document.documentElement.scrollWidth <= window.innerWidth, main: main ? main.scrollWidth <= main.clientWidth + 1 : true };
+  });
+const crumb = (page) => page.locator(".topbar .crumb").innerText();
+
+try {
+  await wait(2500);
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined;
+  browser = await chromium.launch(executablePath ? { executablePath } : {});
+  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, locale: "de-DE" });
+  const page = await context.newPage();
+  const errors = [];
+  const consoleErrors = [];
+  const failedRequests = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  page.on("console", (m) => {
+    if (m.type() === "error" || m.type() === "warning") consoleErrors.push(m.text());
+  });
+  page.on("requestfailed", (r) => failedRequests.push(r.url()));
+  await page.goto(`http://localhost:${port}/`, { waitUntil: "networkidle" });
+
+  // Blotter renders portfolio, no external font requests, favicon present
+  check((await page.locator("table.grid-table tbody tr").count()) >= 10, "blotter rows");
+  check((await page.locator('[data-testid="onboarding"]').count()) === 1, "onboarding hint on first launch");
+  check((await page.locator("h1").innerText()) === "DERIVA", "h1 title");
+  check((await page.locator('link[rel="icon"]').count()) === 1, "favicon link present");
+  check(!failedRequests.some((u) => u.includes("fonts.googleapis")), "no external font requests");
+  check((await page.locator("th[aria-sort]").count()) >= 5, "sortable headers carry aria-sort");
+  check((await page.locator('.seg button[aria-pressed="true"]').count()) >= 1, "segment buttons carry aria-pressed");
+  check((await page.locator('a.skip[href="#main"]').count()) === 1, "skip link present (N-13)");
+  check((await page.locator('table.blotter[role="grid"] tr[data-nav="trade"]').count()) >= 10, "blotter rows marked data-nav=trade in a grid (N-02/N-13)");
+  await page.screenshot({ path: join(outDir, "01-blotter.png") });
+
+  // Grouping with subtotals (Markt N19)
+  await page.locator('[data-testid="group-select"]').selectOption("cpty");
+  await wait(200);
+  const subtotals = await page.locator('[data-testid="group-subtotal"]').count();
+  check(subtotals >= 3, `grouping by counterparty adds subtotal rows (${subtotals})`);
+  check((await page.locator('[data-testid="group-subtotal"]').first().innerText()).startsWith("Σ"), "subtotal row shows Σ label");
+  await page.locator('[data-testid="group-select"]').selectOption("book");
+  await wait(200);
+  check((await page.locator('[data-testid="group-subtotal"]').count()) >= 3, "grouping by book works");
+  await page.locator('[data-testid="group-select"]').selectOption("none");
+  await wait(200);
+  check((await page.locator('[data-testid="group-subtotal"]').count()) === 0, "no subtotals without grouping");
+
+  // CSV import with column mapping template (Markt N16) → duplicate strategy dialog not needed for fresh ids
+  const csvPath = join(tmpdir(), `deriva-e2e-${port}.csv`);
+  writeFileSync(
+    csvPath,
+    "\uFEFFtype;id;name;counterparty;book;currency;notional;direction;rate;start;maturity;index\r\nIRS;IRS-CSV-1;CSV Payer;Sparkasse Test;Treasury;EUR;7500000;Pay;2,9 %;2026-09-07;7Y;EURIBOR-6M\r\nFXF;FXF-CSV-1;CSV Forward;Sparkasse Test;Einkauf;;;;;;;\r\n",
+    "utf8",
+  );
+  const tradesBefore = Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]);
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
+  check((await page.locator('[role="menu"][aria-label="Export und Import"] [role="menuitem"]').count()) >= 5, "export menu lists export/import entries (N-12)");
+  await page.locator('[data-testid="import-csv"]').setInputFiles(csvPath);
+  await wait(800);
+  const tradesAfterCsv = Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]);
+  check(tradesAfterCsv === tradesBefore + 1, `CSV import adds the valid IRS row (${tradesBefore} → ${tradesAfterCsv})`);
+  check((await page.locator(".toast", { hasText: "CSV" }).count()) >= 1, "CSV import toast");
+  check((await page.locator("td.id-cell", { hasText: "IRS-CSV-1" }).count()) === 1, "imported CSV trade visible in blotter");
+  // re-import the same file → duplicate dialog with three strategies (N-24)
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
+  await page.locator('[data-testid="import-csv"]').setInputFiles(csvPath);
+  await wait(600);
+  check((await page.locator('[data-testid="import-strategy"]').count()) === 1, "duplicate ids open the import strategy dialog");
+  await page.locator('[data-testid="import-skip"]').click();
+  await wait(500);
+  check(Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]) === tradesAfterCsv, "skip strategy keeps the trade count");
+
+  // Compare: Space marks trades, g v opens the compare view
+  await page.locator("td.id-cell", { hasText: "IRS-0001" }).click();
+  await page.keyboard.press("Space");
+  await page.keyboard.press("j");
+  await page.keyboard.press("Space");
+  await wait(200);
+  check((await page.locator(".compare-check:checked").count()) === 2, "space marks two trades for comparison");
+  await chord(page, "v");
+  check((await crumb(page)).includes("Vergleich"), "g v → compare view");
+  check((await page.locator('[data-testid="compare-table"]').count()) === 1, "compare table renders");
+  check((await page.locator('[data-testid="compare-table"] thead th').count()) === 3, "compare table has two trade columns");
+  await page.screenshot({ path: join(outDir, "view-Vergleich.png") });
+  await chord(page, "b");
+
+  // Customer mode hides internal columns and shows the chip
+  check((await page.locator("table.grid-table thead th", { hasText: "Kontrahent" }).count()) === 1, "counterparty column visible before customer mode");
+  await page.keyboard.press("Shift+K");
+  await wait(300);
+  check((await page.locator('[data-testid="customer-chip"]').count()) === 1, "customer mode chip");
+  check((await page.locator("table.grid-table thead th", { hasText: "Kontrahent" }).count()) === 0, "customer mode hides counterparty column");
+  check((await page.locator("table.grid-table thead th", { hasText: "DV01" }).count()) === 0, "customer mode hides DV01 column");
+  await page.screenshot({ path: join(outDir, "04-customer-mode.png") });
+  await page.keyboard.press("Shift+K");
+  await wait(300);
+  check((await page.locator('[data-testid="customer-chip"]').count()) === 0, "customer mode toggled off");
+
+  // Enter on a focused rail button must not navigate (F-02)
+  await page.locator(".rail button", { hasText: "∿" }).focus();
+  await page.keyboard.press("Enter");
+  await wait(200);
+  check((await crumb(page)).includes("Kurven"), "enter on rail button = click only");
+  // Enter on a focused pillar row must stay in the curves view (N-02)
+  await page.locator('[data-testid="pillar-table"] tbody tr').first().focus();
+  await page.keyboard.press("Enter");
+  await wait(300);
+  check((await crumb(page)).includes("Kurven"), "enter on pillar row does not navigate to pricing (N-02)");
+  await chord(page, "s");
+  await page.locator('[data-testid="scenario-table"] tbody tr').first().focus();
+  await page.keyboard.press("Enter");
+  await wait(300);
+  check((await crumb(page)).includes("Szenarien"), "enter on scenario row does not navigate (N-02)");
+  // heatmap ARIA: rows/gridcells + arrow-key navigation (N-13)
+  check((await page.locator('.heat[role="grid"] [role="row"]').count()) >= 5, "what-if heatmap has role=row children");
+  check((await page.locator('.heat[role="grid"] [role="gridcell"]').count()) >= 20, "what-if heatmap has gridcells");
+  await page.locator('.heat[role="grid"] [role="gridcell"]').first().focus();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowDown");
+  const focusedCell = await page.evaluate(() => {
+    const cells = Array.from(document.querySelectorAll('.heat[role="grid"] [role="gridcell"]'));
+    return cells.indexOf(document.activeElement);
+  });
+  check(focusedCell > 0, `arrow keys move the heatmap focus (index ${focusedCell})`);
+  await chord(page, "b");
+  await page.locator(".seg button", { hasText: "Zins" }).focus();
+  await page.keyboard.press("Enter");
+  await wait(200);
+  check((await crumb(page)).includes("Blotter"), "enter on filter button stays in blotter");
+  check((await page.locator('.seg button[aria-pressed="true"]', { hasText: "Zins" }).count()) === 1, "enter activated the filter");
+  await page.locator(".seg button", { hasText: "Alle" }).click();
+
+  // Esc leaves an input (F-05) and the status bar shows the input mode
+  await page.locator('input[aria-label="Blotter durchsuchen"]').click();
+  await page.keyboard.type("IRS");
+  await wait(150);
+  check((await page.locator('[data-testid="input-mode"]').count()) === 1, "statusbar shows Eingabemodus");
+  await page.keyboard.press("Escape");
+  await wait(150);
+  check((await page.evaluate(() => document.activeElement === document.body)) === true, "esc blurs the input");
+  check((await page.locator('[data-testid="input-mode"]').count()) === 0, "input mode indicator gone after Esc");
+  // j/k follow the filtered order
+  await page.keyboard.press("j");
+  await wait(100);
+  const selectedId = await page.locator("tr.selected td.id-cell").innerText();
+  check(selectedId.startsWith("IRS"), `j follows the filtered order (${selectedId})`);
+  await page.locator('input[aria-label="Blotter durchsuchen"]').fill("");
+  await page.keyboard.press("Escape");
+  // Blotter sort is persisted (N-24)
+  await page.locator("th button.th-btn", { hasText: "PV" }).click();
+  await wait(200);
+  check((await page.evaluate(() => localStorage.getItem("deriva.blotter.sort") ?? "")).includes('"key":"pv"'), "blotter sort persisted to localStorage");
+  await page.locator("th button.th-btn", { hasText: "ID" }).click();
+
+  // Palette: focus returns to the opener after Esc in a real browser (N-03), aria-activedescendant (N-06)
+  await page.locator('[data-testid="cmd-button"]').focus();
+  await page.keyboard.press("Control+k");
+  await wait(200);
+  check((await page.locator('[role="combobox"][aria-activedescendant^="pal-opt-"]').count()) === 1, "palette input carries aria-activedescendant (N-06)");
+  await page.keyboard.type("+");
+  await wait(100);
+  check(
+    (await page.evaluate(() => Array.from(document.querySelectorAll(".palette kbd")).filter((k) => k.textContent.trim() === "").length)) === 0,
+    "no empty kbd boxes for the + alias (N-04)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(300);
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "cmd-button",
+    "palette returns focus to the opener after inert is lifted (N-03)",
+  );
+  // ↑ rotates examples repeatedly (N-05)
+  await page.keyboard.press("Control+k");
+  await wait(150);
+  await page.keyboard.press("ArrowUp");
+  const ex1 = await page.locator('[role="combobox"]').inputValue();
+  await page.keyboard.press("ArrowUp");
+  const ex2 = await page.locator('[role="combobox"]').inputValue();
+  check(ex1 !== "" && ex2 !== ex1, `↑ rotates through examples repeatedly (${ex1} → ${ex2})`);
+  await page.keyboard.press("Escape");
+  await wait(200);
+
+  // Chord navigation
+  await chord(page, "p");
+  check((await crumb(page)).includes("Pricing"), "g p → pricing");
+
+  // Quick entry creates a trade with a readable id and a multi-word counterparty token (N-15)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("irs 10y pay 3.1% 10m @Landesbank Hessen");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(400);
+  const before = (await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1];
+  check(Number(before) >= 12, `quick entry added trade (${before})`);
+  check((await page.locator(".toast").count()) >= 1, "toast shown after quick entry");
+  check((await page.locator(".toast").first().innerText()).includes("PV"), "toast contains the PV");
+  check((await page.locator(".badge.st-indication").count()) >= 1, "new trade carries Indication status badge");
+  const newId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
+  check(/^IRS-\d{4}$/.test(newId), `readable sequential id (${newId})`);
+  check((await page.locator('input[aria-label="Kontrahent"]').inputValue()) === "Landesbank Hessen", "@token keeps the whole counterparty phrase (N-15)");
+  // Book field and CSA select in the common block (Markt N19 / N7)
+  check((await page.locator('input[aria-label="Buch"]').count()) === 1, "book field in editor");
+  check((await page.locator('select[aria-label="Collateral-Währung"]').count()) === 1, "collateral currency select in editor");
+  check((await page.locator('input[aria-label="Upfront-Betrag"]').count()) === 1, "upfront field in editor");
+  // Tenor-aware date field (F-39)
+  const endDate = page.locator('input[aria-label="Enddatum"]');
+  check((await endDate.getAttribute("type")) === "text", "date field is a text input");
+  await endDate.click();
+  await endDate.fill("12y");
+  await page.keyboard.press("Enter");
+  await wait(300);
+  check(/^\d{2}\.\d{2}\.2038$/.test(await endDate.inputValue()), `tenor 12y sets the end date (${await endDate.inputValue()})`);
+  await endDate.click();
+  await endDate.fill("31.12.2036");
+  await page.keyboard.press("Enter");
+  await wait(300);
+  check((await endDate.inputValue()) === "31.12.2036", "German date accepted");
+  await endDate.click();
+  await endDate.fill("quatsch");
+  await wait(100);
+  await page.keyboard.press("Tab");
+  await wait(200);
+  check((await endDate.inputValue()) === "31.12.2036", "invalid date text is not committed");
+  await page.locator(".date-input .date-presets-btn").first().click();
+  await wait(150);
+  check((await page.locator('.popover.date-presets [role="option"]').count()) >= 8, "date presets popover opens");
+  await page.keyboard.press("Escape");
+  // Conventions section is collapsed by default and expands on click
+  check((await page.locator(".collapsible .body").count()) === 0, "conventions collapsed by default");
+  await page.locator(".collapsible > button").first().click();
+  await wait(200);
+  check((await page.locator(".collapsible .body").count()) >= 1, "conventions expand");
+  check((await page.locator(".collapsible .body select").count()) >= 2, "stub / BDC selects present");
+  // Amortisation: linear / annuity / custom profiles (Markt N17)
+  await page.locator("label.check", { hasText: "Amortisierend" }).locator("input").check();
+  await wait(300);
+  check((await page.locator('[data-testid="amortisation-table"]').count()) === 1, "amortisation table");
+  await page.locator('[aria-label="Tilgungsprofil"] button', { hasText: "Annuität" }).click();
+  await wait(300);
+  check((await page.locator('input[aria-label="Kreditzins"]').count()) === 1, "annuity profile shows the loan rate");
+  const n1 = await page.locator('input[aria-label="Nominal Periode 1"]').inputValue();
+  const n2 = await page.locator('input[aria-label="Nominal Periode 2"]').inputValue();
+  check(n1 !== n2, `annuity profile amortises (${n1} → ${n2})`);
+  await page.locator("button.btn", { hasText: "Konstant" }).click();
+  await wait(300);
+  check((await page.locator('[data-testid="amortisation-table"]').count()) === 0, "konstant removes amortisation table");
+
+  // NumInput: German comma, no snap to 0 when cleared, validation
+  const rate = page.locator('input[aria-label="Festsatz Leg 1"]');
+  check((await rate.getAttribute("type")) === "text", "rate field is a text input");
+  check(/^3,10?$/.test(await rate.inputValue()), `rate shows decimal comma (${await rate.inputValue()})`);
+  await rate.click();
+  await rate.fill("");
+  await wait(100);
+  check((await rate.inputValue()) === "", "cleared field stays empty");
+  await rate.type("3,25");
+  await wait(200);
+  check((await rate.inputValue()) === "3,25", "typing 3,25 keeps the text");
+  await rate.fill("325");
+  await wait(200);
+  check((await page.locator(".field-msg.warn", { hasText: "Plausibilität" }).count()) >= 1, "implausible rate shows a German warning");
+  await rate.fill("3,1");
+  await page.keyboard.press("Escape");
+  await wait(150);
+  const notional = page.locator('input[aria-label="Nominal"]').first();
+  check((await notional.inputValue()) === "10.000.000", `notional grouped (${await notional.inputValue()})`);
+  await notional.click();
+  await notional.fill("12,5m");
+  await page.keyboard.press("Enter");
+  await wait(200);
+  check((await notional.inputValue()) === "12.500.000", `shorthand 12,5m → 12.500.000 (${await notional.inputValue()})`);
+  await notional.click();
+  await notional.fill("10m");
+  await page.keyboard.press("Enter");
+  await wait(200);
+  check((await page.locator('[data-testid="par-risk-card"]').count()) === 1, "par risk card present");
+  check((await page.locator('[data-testid="keyrate-curves"]').count()) === 1, "key-rate curve chips (N-11)");
+  await page.screenshot({ path: join(outDir, "02-pricing.png") });
+
+  // What-if bump changes PV display – plain "]", AltGr (Windows), Option (mac) and the + / 0 aliases
+  const pvBefore = await page.locator('[data-testid="pv-value"]').innerText();
+  await page.keyboard.press("]");
+  await wait(300);
+  const pvAfter = await page.locator('[data-testid="pv-value"]').innerText();
+  check(pvBefore !== pvAfter, "what-if bump changes PV");
+  await page.keyboard.press("\\");
+  await wait(200);
+  await page.evaluate(() =>
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "]", code: "Digit9", ctrlKey: true, altKey: true, bubbles: true })),
+  );
+  await wait(300);
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("+10 bp"), "AltGr+9 bracket bumps what-if");
+  await page.evaluate(() => document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "[", code: "Digit5", altKey: true, bubbles: true })));
+  await wait(300);
+  check(!(await page.locator('[data-testid="market-chip"]').innerText()).includes("What-if"), "Option+5 bracket bumps back (no view switch)");
+  check((await crumb(page)).includes("Pricing"), "Option+5 did not switch to view 5");
+  await page.keyboard.press("+");
+  await wait(300);
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("+10 bp"), "+ alias bumps what-if");
+  await page.keyboard.press("0");
+  await wait(300);
+  check(!(await page.locator('[data-testid="market-chip"]').innerText()).includes("What-if"), "0 alias resets what-if");
+
+  // FX option analytics: sane values, no raw keys, strike as price (N-01)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("FXO-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(600);
+  const analytics = await page.locator('[data-testid="analytics-table"]').innerText();
+  check(!/spotDate|greeksMethod|deltaPct|deltaAmount|spotAtValuationDate|fxDeltaCurrency/.test(analytics), "FX option analytics show no raw keys");
+  check(!/\d{1,3}(\.\d{3}){2,},\d{2} %/.test(analytics), "no six-digit percentage in FX option analytics");
+  check(/Strike\s*1,1500/.test(analytics.replace(/\n/g, " ")), "FX option strike shown as price 1,1500");
+  const riskTxt = await page.locator('[data-testid="risk-table"]').innerText();
+  check(/FX-Delta/.test(riskTxt), "FX delta in risk table");
+  const cf = await page.locator('[data-testid="cashflow-table"]').innerText();
+  check(!cf.includes("115,0000 %"), "cashflow strike not rendered as 115 % (N-01)");
+  check(!/Vanilla Put EURUSD/.test(cf), "cashflow leg badge is German (N-07)");
+  await page.screenshot({ path: join(outDir, "06-fxo-analytics.png") });
+  // Swaption vega heatmap toggle (coordinator 2)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("SWPT-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(600);
+  check((await page.locator('[data-testid="vega-dimension"]').count()) === 1, "swaption offers the vega dimension toggle");
+  await page.locator('[data-testid="vega-dimension"] button', { hasText: "Tenor" }).click();
+  await wait(800);
+  check((await page.locator('[data-testid="vega-heatmap"]').count()) === 1, "expiry × tenor vega heatmap renders");
+  // back to the new IRS
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type(newId);
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(400);
+
+  // Report: generate, audit line, governance, perspective, what-if badge, documents
+  await chord(page, "r");
+  check((await page.locator('[data-testid="report-generate-btn"]').count()) === 1, "report requires explicit generation");
+  await page.keyboard.press("Control+Shift+R");
+  await wait(600);
+  check((await page.locator('[data-testid="audit-hashes"]').count()) === 1, "report audit line");
+  check((await page.locator('[data-testid="audit-hashes"]').innerText()).includes("deriva-pricing-core"), "engine version shown");
+  check((await page.locator('[data-testid="report-governance"]').innerText()).includes("indikativ"), "governance line shows snapshot status");
+  check((await page.locator('[data-testid="perspective-seg"] button[aria-pressed="true"]').innerText()) === "Kunde", "default perspective is Kunde");
+  check(
+    (await page.locator('[data-testid="xva-method"]').innerText()).match(/Sorensen|Delta-Normal|Methode:\s*$/) !== null &&
+      !/smile vol at strike|flat hazard/.test(await page.locator('[data-testid="xva-method"]').innerText()),
+    "XVA method string is German (N-07)",
+  );
+  const gen1 = await page.locator('[data-testid="report-header"]').innerText();
+  await page.locator('[data-testid="offer-pv"]').fill("25000");
+  await page.keyboard.press("Enter");
+  await wait(300);
+  const gen2 = await page.locator('[data-testid="report-header"]').innerText();
+  check(gen1.split("erstellt")[1] === gen2.split("erstellt")[1], "generatedAt stable while editing inputs");
+  check((await page.locator('[data-testid="report-stale"]').count()) === 1, "changed inputs flag the report as stale");
+  check((await page.locator('[data-testid="cost-table"]').innerText()).includes("bp"), "margin row uses de-DE bp");
+  // cost inputs survive a view switch (N-17)
+  await chord(page, "p");
+  await chord(page, "r");
+  check(
+    (await page.locator('[data-testid="offer-pv"]').inputValue()) === "25.000",
+    `transaction price persisted across views (${await page.locator('[data-testid="offer-pv"]').inputValue()})`,
+  );
+  await page.keyboard.press("]");
+  await wait(400);
+  check((await page.locator('[data-testid="report-whatif-badge"]').count()) === 1, "what-if badge on report");
+  await page.keyboard.press("\\");
+  await wait(300);
+  // quote change → stale + "modifiziert" (N-18)
+  await page.keyboard.press("Control+Shift+R");
+  await wait(400);
+  await chord(page, "c");
+  await page.locator("button.btn", { hasText: "Quotes +10 bp" }).click();
+  await wait(500);
+  await chord(page, "r");
+  await wait(300);
+  check((await page.locator('[data-testid="report-stale"]').count()) === 1, "quote change flags the report as stale (N-18)");
+  await page.keyboard.press("Control+Shift+R");
+  await wait(500);
+  check(
+    (await page.locator('[data-testid="report-header"]').innerText()).includes("modifiziert"),
+    "report header says modifiziert after a quote change (N-18)",
+  );
+  await page.keyboard.press("Control+z");
+  await wait(400);
+  check((await page.locator(".toast", { hasText: "Rückgängig: Quotes" }).count()) === 1, "Ctrl+Z undoes the quote change (N-14)");
+  await page.keyboard.press("Control+Shift+R");
+  await wait(400);
+  // Termsheet via hotkey, with initial market value and German numbers
+  await page.locator('[data-testid="open-termsheet"]').click();
+  await wait(400);
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "termsheet modal opens");
+  check((await page.locator('[data-testid="document-body"] .doc-section').count()) >= 2, "termsheet sections rendered");
+  const docText = await page.locator('[data-testid="document-body"]').innerText();
+  check(docText.includes("Anfänglicher Marktwert"), "termsheet carries the initial market value (N-22)");
+  check(!/\d\.\d{3} %/.test(docText), "termsheet numbers use decimal commas (N-07)");
+  check(!/smile vol at strike|flat hazard|Swaption-replication/.test(docText), "termsheet methodology paragraphs are German (N-07)");
+  // Print emulation of the document: title dark on light, content starts at the top (N-16)
+  await page.evaluate(() => document.body.classList.add("print-doc"));
+  await page.emulateMedia({ media: "print" });
+  await wait(300);
+  const printDoc = await page.evaluate(() => {
+    const h1 = document.querySelector(".doc-head h1");
+    const cs = h1 ? getComputedStyle(h1) : null;
+    const rect = h1?.getBoundingClientRect();
+    const bg = document.querySelector(".modal") ? getComputedStyle(document.querySelector(".modal")).backgroundColor : "";
+    return { color: cs?.color, top: rect?.top, bg, appHidden: document.querySelector(".app") ? getComputedStyle(document.querySelector(".app")).display : "" };
+  });
+  check(printDoc.color === "rgb(17, 17, 17)", `print: document title is dark (${printDoc.color})`);
+  check(printDoc.top !== undefined && printDoc.top < 200, `print: document starts on the first page (title top ${Math.round(printDoc.top ?? -1)} px)`);
+  check(printDoc.bg === "rgb(255, 255, 255)", `print: modal background is white (${printDoc.bg})`);
+  check(printDoc.appHidden === "none", "print: app shell hidden behind the document");
+  await page.screenshot({ path: join(outDir, "07-termsheet-print.png"), fullPage: true });
+  await page.emulateMedia({ media: "screen" });
+  await page.evaluate(() => document.body.classList.remove("print-doc"));
+  await page.keyboard.press("Escape");
+  await wait(300);
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 0, "esc closes the modal");
+  check((await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "open-termsheet", "modal returns focus to the opener (N-03)");
+  await page.keyboard.press("Control+Shift+G");
+  await wait(400);
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "Ctrl+Shift+G opens the suitability statement (N-22)");
+  await page.locator('[data-testid="suitability-generate"]').click();
+  await wait(500);
+  check((await page.locator('[data-testid="document-body"]').count()) === 1, "suitability statement generated");
+  await page.keyboard.press("Escape");
+  await wait(200);
+  await page.screenshot({ path: join(outDir, "view-Report.png") });
+  // Print emulation of the report
+  await page.emulateMedia({ media: "print" });
+  await wait(300);
+  check((await page.locator(".report-print-header").isVisible()) === true, "print header visible in print media");
+  check((await page.locator('[data-testid="offer-pv"]').isVisible()) === false, "inputs hidden in print");
+  await page.screenshot({ path: join(outDir, "05-report-print.png"), fullPage: true });
+  await page.emulateMedia({ media: "screen" });
+
+  // Hedge accounting view: designation before valuation date, stale flag, export (N-20)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("IRS-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(300);
+  await chord(page, "h");
+  check((await crumb(page)).includes("Hedge"), "g h → hedge view");
+  check(
+    (await page.locator('input[aria-label="Designationsdatum"]').inputValue()) === "17.06.2024",
+    "default designation date = instrument effective date (N-20)",
+  );
+  await page.locator('[data-testid="hedge-test"]').click();
+  await wait(2500);
+  check((await page.locator('[data-testid="hedge-verdict-badge"]').count()) === 1, "hedge effectiveness verdict");
+  check((await page.locator('[data-testid="hedge-regression"]').count()) === 1, "regression card");
+  check(
+    (await page.locator('[data-testid="do-Kumulativ (seit Designation)"] .badge').first().innerText()) !== "nicht beurteilbar",
+    "cumulative dollar-offset is assessable with a past designation date",
+  );
+  check(
+    !/\d{4}-\d{2}-\d{2}|InterestRateSwap/.test(await page.locator('[data-testid="hedge-summary"]').innerText()),
+    "hedge summary without ISO dates / English type names (N-07)",
+  );
+  await page.locator('input[aria-label="Hedge Ratio"]').fill("50");
+  await page.keyboard.press("Enter");
+  await wait(300);
+  check((await page.locator('[data-testid="hedge-stale"]').count()) === 1, "changed hedge ratio flags the result as stale (N-20)");
+  check((await page.locator('[data-testid="hedge-export"]').count()) === 1, "hedge documentation export button");
+  await page.screenshot({ path: join(outDir, "view-Hedge.png") });
+
+  // Views render without errors (dark)
+  for (const [k, name] of VIEWS.filter(([, n]) => ["Kurven", "Szenarien", "Markt"].includes(n))) {
+    await chord(page, k);
+    check((await crumb(page)).includes(name), `view ${name}`);
+    await page.screenshot({ path: join(outDir, `view-${name}.png`) });
+  }
+  // Curves: interpolation override survives a valuation-date change (N-23), quotes flagged as modified
+  await chord(page, "c");
+  await page.locator('[data-testid="interp-select"]').selectOption("linearZero");
+  await wait(500);
+  check((await page.locator(".card h3", { hasText: "EUR-ESTR" }).first().innerText()).includes("linear (Zero)"), "interpolation override applied");
+  check((await page.locator('[data-testid="market-modified-chip"]').count()) === 1, "interpolation override marks the market as modified");
+  await page.keyboard.press("Shift+T");
+  await wait(200);
+  await page.locator('[data-testid="valdate-popover"] .chip', { hasText: "Monatsende" }).click();
+  await wait(800);
+  check((await page.locator(".statusbar").innerText()).includes("30.09.2026"), "monatsende preset applied");
+  check(
+    (await page.locator('[data-testid="interp-select"]').inputValue()) === "linearZero",
+    "interpolation override survives the valuation-date change (N-23)",
+  );
+  await page.locator('[data-testid="interp-select"]').selectOption("logLinear");
+  await wait(400);
+  await page.locator("button.btn", { hasText: "Quotes +10 bp" }).click();
+  await wait(500);
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"), "chip shows modifiziert after quote edit");
+  check((await page.locator("tr.edited").count()) >= 1, "edited quote rows highlighted");
+  await page.locator("button.btn", { hasText: "Zurücksetzen" }).click();
+  await wait(400);
+
+  // Scenario heatmap click sets the what-if
+  await chord(page, "s");
+  await page.locator(".heat button.cell").nth(1).click();
+  await wait(400);
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("What-if"), "heatmap cell sets what-if");
+  await page.keyboard.press("0");
+  await wait(200);
+
+  // Toast stack is capped at four (N-09)
+  await chord(page, "b");
+  for (let i = 0; i < 6; i++) {
+    await page.keyboard.press("c");
+    await wait(60);
+  }
+  await wait(200);
+  check((await page.locator(".toast").count()) <= 4, `toast stack capped (${await page.locator(".toast").count()})`);
+  await wait(3500);
+
+  // Light theme – all views
+  await page.keyboard.press("t");
+  await wait(200);
+  check((await page.evaluate(() => document.documentElement.dataset.theme)) === "light", "theme toggle");
+  const segContrast = await page.evaluate(() => {
+    const lum = (c) => {
+      const [r, g, b] = c
+        .match(/\d+(\.\d+)?/g)
+        .map(Number)
+        .slice(0, 3)
+        .map((v) => v / 255)
+        .map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)));
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const el = document.querySelector('.seg button[aria-pressed="true"]');
+    if (!el) return 0;
+    const fg = lum(getComputedStyle(el).color);
+    // composite against the card surface (bg-1)
+    const bg = lum(getComputedStyle(document.querySelector(".card")).backgroundColor);
+    return (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+  });
+  check(segContrast >= 4.5, `light theme: active segment text contrast ≥ 4.5 (${segContrast.toFixed(2)}) (N-08)`);
+  for (const [k, name] of VIEWS) {
+    await chord(page, k);
+    await page.screenshot({ path: join(outDir, `light-${name}.png`) });
+  }
+  await chord(page, "b");
+  await page.screenshot({ path: join(outDir, "03-light.png") });
+  await page.keyboard.press("t");
+
+  // Help overlay: dialog, focus trap, background hotkeys suspended, no empty kbd boxes
+  await page.keyboard.press("?");
+  await wait(200);
+  check((await page.locator('[role="dialog"][aria-label="Tastenkürzel"]').count()) === 1, "hotkey overlay");
+  check(
+    (await page
+      .locator('[role="dialog"][aria-label="Tastenkürzel"] [aria-modal="true"], [role="dialog"][aria-label="Tastenkürzel"][aria-modal="true"]')
+      .count()) >= 1,
+    "overlay is aria-modal",
+  );
+  check(
+    (await page.evaluate(() => document.querySelector('[role="dialog"][aria-label="Tastenkürzel"]')?.contains(document.activeElement))) === true,
+    "overlay takes focus",
+  );
+  check(
+    (await page.evaluate(
+      () => Array.from(document.querySelectorAll('[role="dialog"][aria-label="Tastenkürzel"] kbd')).filter((k) => k.textContent.trim() === "").length,
+    )) === 0,
+    "help sheet: no empty kbd boxes (N-04)",
+  );
+  await page.keyboard.press("t");
+  await wait(150);
+  check((await page.evaluate(() => document.documentElement.dataset.theme)) === "dark", "background hotkeys suspended while overlay open");
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check((await page.locator('[role="dialog"][aria-label="Tastenkürzel"]').count()) === 0, "esc closes overlay");
+
+  // Context menu: roving focus with aria-activedescendant (N-06)
+  await page.locator("td.id-cell").first().click({ button: "right" });
+  await wait(200);
+  check((await page.locator('[role="menu"][aria-activedescendant]').count()) === 1, "context menu carries aria-activedescendant");
+  check((await page.evaluate(() => document.activeElement?.getAttribute("role"))) === "menuitem", "context menu focuses the active menuitem");
+  await page.keyboard.press("Escape");
+  await wait(200);
+
+  // Persistence: reload keeps the book and shows the restore toast
+  await page.reload({ waitUntil: "networkidle" });
+  await wait(600);
+  const afterReload = (await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1];
+  check(afterReload === before, `trades persisted across reload (${before} → ${afterReload})`);
+  check((await page.locator(".toast", { hasText: "lokalem Speicher" }).count()) === 1, "restore toast");
+  check((await page.locator(".toast button", { hasText: "Zurücksetzen" }).count()) === 1, "restore toast offers reset");
+
+  // 1280 px layout: no horizontal overflow with the inspector open
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await wait(300);
+  for (const [k, name] of VIEWS) {
+    await chord(page, k);
+    const o = await noOverflow(page);
+    check(o.page && o.main, `1280px no horizontal overflow (${name})`);
+    if (name === "Blotter" || name === "Pricing" || name === "Kurven") await page.screenshot({ path: join(outDir, `1280-${name}.png`) });
+  }
+
+  check(errors.length === 0, `page errors: ${errors.join(" | ")}`);
+  const relevantConsole = consoleErrors.filter((m) => !/favicon|ResizeObserver loop/.test(m));
+  check(relevantConsole.length === 0, `console errors/warnings: ${relevantConsole.slice(0, 5).join(" | ")}`);
+} catch (e) {
+  failures.push(`exception: ${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+} finally {
+  await browser?.close();
+  preview.kill();
+}
+if (failures.length) {
+  console.error(`E2E FAILED (${failures.length} of ${checks} checks):\n - ` + failures.join("\n - "));
+  process.exit(1);
+}
+console.log(`E2E OK (${checks} checks)`);

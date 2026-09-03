@@ -1,40 +1,15 @@
-import {
-  type SerialDate,
-  addDays,
-  addTenor,
-  dayOfWeek,
-  endOfMonth,
-  fromYMD,
-  isEndOfMonth,
-  isWeekend,
-  parseTenor,
-  toYMD,
-} from "./date.js";
+import { type SerialDate, addDays, addTenor, dayOfWeek, endOfMonth, fromYMD, isEndOfMonth, isWeekend, parseTenor, toYMD } from "./date.js";
 
-export type BusinessDayConvention =
-  | "Following"
-  | "ModifiedFollowing"
-  | "Preceding"
-  | "ModifiedPreceding"
-  | "Unadjusted";
+import { PricingError } from "../errors.js";
+
+export type BusinessDayConvention = "Following" | "ModifiedFollowing" | "Preceding" | "ModifiedPreceding" | "Unadjusted";
 
 export interface Calendar {
   readonly name: string;
   isHoliday(d: SerialDate): boolean;
 }
 
-export type CalendarId =
-  | "TARGET"
-  | "NONE"
-  | "WEEKEND"
-  | "US"
-  | "USNY"
-  | "UK"
-  | "GB"
-  | "CH"
-  | "DE"
-  | "JP"
-  | string;
+export type CalendarId = "TARGET" | "NONE" | "WEEKEND" | "US" | "USNY" | "UK" | "GB" | "CH" | "DE" | "JP" | string;
 
 /** Anonymous Gregorian algorithm (Meeus/Jones/Butcher) for Easter Sunday. */
 export function easterSunday(year: number): SerialDate {
@@ -143,7 +118,12 @@ class GermanyCalendar extends RuleCalendar {
   }
 }
 
-/** United States (SIFMA / Federal Reserve style, New York). */
+/**
+ * United States (SIFMA / Federal Reserve style, New York) – rule-based
+ * approximation; override with the SIFMA holiday schedule via
+ * `registerCalendarHolidays("US", dates)` in production (early closes and
+ * ad-hoc closures such as national days of mourning are not rule-based).
+ */
 class UnitedStatesCalendar extends RuleCalendar {
   readonly name = "US";
   protected holidaysInYear(y: number): SerialDate[] {
@@ -215,7 +195,12 @@ class SwitzerlandCalendar extends RuleCalendar {
   }
 }
 
-/** Japan (Tokyo) – simplified rule set for the major national holidays. */
+/**
+ * Japan (Tokyo) – simplified rule set for the major national holidays
+ * (equinoxes approximated by fixed dates, no substitute-holiday chains).
+ * Override with the JPX / BoJ published schedule via
+ * `registerCalendarHolidays("JP", dates)` in production.
+ */
 class JapanCalendar extends RuleCalendar {
   readonly name = "JP";
   protected holidaysInYear(y: number): SerialDate[] {
@@ -270,11 +255,90 @@ export class CustomCalendar implements Calendar {
   }
 }
 
+/**
+ * Rule-based calendar overlaid with an explicit holiday feed. For every year
+ * covered by the feed the feed is authoritative (rule-based holidays of that
+ * year are ignored, so e.g. a one-off bridge day or a cancelled observance
+ * from the SIFMA / JPX / TARGET publication wins); years outside the feed fall
+ * back to the rules. Weekends are always holidays.
+ */
+class FeedOverlayCalendar implements Calendar {
+  readonly name: string;
+  private readonly byYear = new Map<number, Set<number>>();
+  constructor(
+    private readonly base: Calendar,
+    feed: SerialDate[],
+  ) {
+    this.name = base.name;
+    for (const d of feed) {
+      const { year } = toYMD(d);
+      let set = this.byYear.get(year);
+      if (!set) {
+        set = new Set<number>();
+        this.byYear.set(year, set);
+      }
+      set.add(d);
+    }
+  }
+  isHoliday(d: SerialDate): boolean {
+    if (isWeekend(d)) return true;
+    const set = this.byYear.get(toYMD(d).year);
+    return set ? set.has(d) : this.base.isHoliday(d);
+  }
+  /** The calendar underneath the feed. */
+  get underlying(): Calendar {
+    return this.base;
+  }
+  /** New overlay where the years of `dates` replace the same years of this feed; other years are kept. */
+  withFeed(dates: SerialDate[]): FeedOverlayCalendar {
+    const newYears = new Set(dates.map((d) => toYMD(d).year));
+    const kept: SerialDate[] = [];
+    for (const [year, set] of this.byYear) if (!newYears.has(year)) kept.push(...set);
+    return new FeedOverlayCalendar(this.base, [...kept, ...dates]);
+  }
+}
+
 const registry = new Map<string, Calendar>();
 
 export function registerCalendar(cal: Calendar, ...aliases: string[]): void {
   registry.set(cal.name.toUpperCase(), cal);
   for (const a of aliases) registry.set(a.toUpperCase(), cal);
+}
+
+function replaceInRegistry(from: Calendar, to: Calendar): void {
+  for (const [key, cal] of registry) if (cal === from) registry.set(key, to);
+}
+
+/**
+ * Override a registered calendar (and all of its aliases) with an explicit
+ * holiday list from a production feed (e.g. SIFMA for US, JPX/BoJ for JP,
+ * ECB for TARGET). The built-in US / JP / UK / CH / TARGET calendars are
+ * rule-based approximations of the major holidays and are meant to be
+ * superseded by such a feed in production: for every calendar year that
+ * appears in `dates` the feed replaces the rules entirely; other years keep
+ * the rule-based holidays. Calling it again for the same id merges the years
+ * (a year present in the new feed overrides the previous feed for that year).
+ * Joint calendars ("TARGET+US") pick the override up automatically because
+ * they are resolved from the registry on each `getCalendar` call.
+ */
+export function registerCalendarHolidays(id: CalendarId, dates: SerialDate[]): Calendar {
+  const key = id.trim().toUpperCase();
+  const current = registry.get(key);
+  if (!current) throw new PricingError("UNKNOWN_CALENDAR", `Unknown calendar: ${id}`, { calendar: id });
+  const overlay = current instanceof FeedOverlayCalendar ? current.withFeed(dates) : new FeedOverlayCalendar(current, dates);
+  replaceInRegistry(current, overlay);
+  return overlay;
+}
+
+/** Remove a holiday-feed override again (restores the rule-based calendar). */
+export function clearCalendarHolidays(id: CalendarId): void {
+  const current = registry.get(id.trim().toUpperCase());
+  if (current instanceof FeedOverlayCalendar) replaceInRegistry(current, current.underlying);
+}
+
+/** True when the calendar registered under `id` carries a holiday-feed override. */
+export function hasCalendarHolidayFeed(id: CalendarId): boolean {
+  return registry.get(id.trim().toUpperCase()) instanceof FeedOverlayCalendar;
 }
 
 registerCalendar(new WeekendCalendar(), "NONE", "NULL");
@@ -290,10 +354,13 @@ registerCalendar(new JapanCalendar(), "JPY", "JPTO", "TOKYO");
  */
 export function getCalendar(id: CalendarId | Calendar): Calendar {
   if (typeof id !== "string") return id;
-  const parts = id.split(/[+,]/).map((s) => s.trim()).filter(Boolean);
+  const parts = id
+    .split(/[+,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
   if (parts.length > 1) return new JointCalendar(parts.map((p) => getCalendar(p)));
   const cal = registry.get(id.trim().toUpperCase());
-  if (!cal) throw new Error(`Unknown calendar: ${id}`);
+  if (!cal) throw new PricingError("UNKNOWN_CALENDAR", `Unknown calendar: ${id}`, { calendar: id });
   return cal;
 }
 

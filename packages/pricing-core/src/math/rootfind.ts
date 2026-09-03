@@ -6,12 +6,7 @@ export interface RootFindOptions {
 /**
  * Brent's method on a bracketed root. Throws when the bracket is invalid.
  */
-export function brent(
-  f: (x: number) => number,
-  lower: number,
-  upper: number,
-  opts: RootFindOptions = {},
-): number {
+export function brent(f: (x: number) => number, lower: number, upper: number, opts: RootFindOptions = {}): number {
   const tol = opts.tolerance ?? 1e-12;
   const maxIter = opts.maxIterations ?? 200;
   let a = lower;

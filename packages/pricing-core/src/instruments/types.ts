@@ -1,7 +1,7 @@
 import { type BusinessDayConvention, type CalendarId } from "../dates/calendar.js";
 import { type SerialDate } from "../dates/date.js";
 import { type DayCountConvention } from "../dates/daycount.js";
-import { type StubType } from "../dates/schedule.js";
+import { type RollConvention, type StubType } from "../dates/schedule.js";
 import { type OptionType } from "../models/black.js";
 import { type BarrierType } from "../models/garman-kohlhagen.js";
 
@@ -20,6 +20,19 @@ export interface TradeBase {
   /** Premium/upfront paid (positive = we pay) on `upfrontDate`. */
   upfront?: { amount: number; currency: string; date: SerialDate };
   tags?: string[];
+  /**
+   * Lifecycle status (informational): indicative quote, firm quote ("Quoted",
+   * valid until `quoteValidUntil`), live trade, matured or cancelled.
+   */
+  status?: "Indication" | "Quoted" | "Live" | "Matured" | "Cancelled";
+  /** Validity of a firm quote (status "Quoted"); informational. */
+  quoteValidUntil?: SerialDate;
+  /** Unique Transaction Identifier (EMIR Refit / UTI, ISO 23897) – reported in the EMIR valuation export. */
+  uti?: string;
+  /** Centrally cleared (EMIR Art. 4 / 4a clearing obligation). Undefined = bilateral / unknown. */
+  cleared?: boolean;
+  /** Clearing member (when `cleared`), informational. */
+  clearingMember?: string;
 }
 
 export interface LegBase {
@@ -34,6 +47,8 @@ export interface LegBase {
   businessDayConvention?: BusinessDayConvention;
   stub?: StubType;
   endOfMonth?: boolean;
+  /** Roll convention of the unadjusted dates ("IMM" = third Wednesdays, e.g. IMM swaps). */
+  roll?: RollConvention;
   paymentLag?: number;
   /** Amortisation: explicit notional per period index (overrides `notional`). */
   notionalSchedule?: { date: SerialDate; notional: number }[];
@@ -44,12 +59,23 @@ export interface LegBase {
 export interface FixedLeg extends LegBase {
   type: "Fixed";
   rate: number;
+  /**
+   * Coupon schedule (step-up / step-down): the last entry with `date` ≤ the
+   * period's accrual start applies; periods before the first entry use `rate`
+   * (same rule as `notionalSchedule`).
+   */
+  rateSchedule?: { date: SerialDate; rate: number }[];
 }
 
 export interface FloatLeg extends LegBase {
   type: "Float";
   index: string;
   spread?: number;
+  /**
+   * Spread schedule (decimal): the last entry with `date` ≤ the period's
+   * accrual start applies; periods before the first entry use `spread`.
+   */
+  spreadSchedule?: { date: SerialDate; spread: number }[];
   /** Fixing lag override in business days. */
   fixingLag?: number;
   /** Optional embedded cap/floor on the coupon. */
@@ -59,6 +85,10 @@ export interface FloatLeg extends LegBase {
   gearing?: number;
   /** For OIS legs: compounding ("Compound" default) or averaging. */
   compounding?: "Compound" | "Average";
+  /** RFR conventions: lookback (business days the observation period is shifted back per fixing). */
+  lookbackDays?: number;
+  /** Observation shift: weights taken from the shifted observation period (true) vs. lookback without shift (false). */
+  observationShift?: boolean;
 }
 
 export type SwapLeg = FixedLeg | FloatLeg;
@@ -110,6 +140,12 @@ export interface Swaption extends TradeBase {
   payerReceiver: "Payer" | "Receiver";
   expiryDate: SerialDate;
   settlement: "Physical" | "Cash";
+  /**
+   * Cash-settlement convention. "CollateralisedCashPrice" (EUR market standard since 2018/ICE
+   * Swap Rate) values the cash-settled option with the discount (physical) annuity;
+   * "IRR" is the legacy yield-based cash annuity. Default: CollateralisedCashPrice.
+   */
+  cashSettlementConvention?: "CollateralisedCashPrice" | "IRR";
   underlying: InterestRateSwap;
   model?: "Bachelier" | "Black" | "ShiftedBlack";
   volOverride?: number;
@@ -160,15 +196,7 @@ export interface CrossCurrencySwap extends TradeBase {
   mtmReset?: { resettingLegIndex: number };
 }
 
-export type Trade =
-  | InterestRateSwap
-  | ForwardRateAgreement
-  | CapFloor
-  | Swaption
-  | FxForward
-  | FxSwap
-  | FxOption
-  | CrossCurrencySwap;
+export type Trade = InterestRateSwap | ForwardRateAgreement | CapFloor | Swaption | FxForward | FxSwap | FxOption | CrossCurrencySwap;
 
 export type TradeType = Trade["type"];
 
@@ -192,6 +220,12 @@ export interface Cashflow {
   presentValue: number;
   /** Whether the rate came from a historical fixing. */
   isFixed?: boolean;
+  /**
+   * Accrued interest of this period up to the valuation date (signed, leg
+   * currency). Only set on the period containing the valuation date; for
+   * compounded RFR legs this is the realised compounding to date.
+   */
+  accrued?: number;
   kind: "Interest" | "Notional" | "Premium" | "OptionPayoff" | "Settlement";
 }
 
@@ -215,8 +249,20 @@ export interface PricingResult {
   /** PV in reporting currency, positive = asset to us. */
   pv: number;
   legs: LegResult[];
-  /** Instrument-specific analytics (par rate, forward, implied vol, Greeks, ...). */
+  /**
+   * Instrument-specific analytics (par rate, forward, implied vol, Greeks, ...).
+   * Contract: numeric measures (numbers) plus short enumerated strings (e.g.
+   * `model`, `kind`, `mtmReset: "yes" | "no"`). Dates are **not** serial numbers
+   * here – they live in `details` as ISO strings. The only legacy exception is
+   * the swap `maturity` (serial date, kept for backward compatibility and
+   * mirrored as `details.maturity`).
+   */
   analytics: Record<string, number | string | undefined>;
+  /**
+   * Non-numeric details (ISO dates, identifiers) that complement `analytics`,
+   * e.g. `spotDate` of FX trades, `fixingDate` of FRAs, `maturity` of swaps.
+   */
+  details?: Record<string, string | undefined>;
   /** Accrued interest in reporting currency (dirty vs clean split). */
   accrued?: number;
   warnings: string[];

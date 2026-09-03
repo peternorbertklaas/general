@@ -1,5 +1,6 @@
 import { type Curve } from "../curves/curve.js";
 import { type SerialDate } from "../dates/date.js";
+import { PricingError } from "../errors.js";
 import { type SwaptionVolSurface, type CapletVolSurface } from "../models/vol-surfaces.js";
 import { type FxVolSurface } from "../models/fx-vol-surface.js";
 
@@ -18,6 +19,14 @@ export interface Fixing {
 }
 
 /**
+ * Policy for historical fixings that are required but not loaded.
+ * - "curve" (default): estimate with the first available curve forward and
+ *   emit a `MISSING_FIXING:` warning.
+ * - "throw": fail the valuation.
+ */
+export type MissingFixingPolicy = "curve" | "throw";
+
+/**
  * The full set of market data needed to price a portfolio on a valuation date.
  * Curves are keyed by id; discount curves per currency (and collateral) are
  * looked up via `discountCurveId`. Everything is immutable by convention –
@@ -30,8 +39,13 @@ export interface MarketContext {
   discountCurveId: Record<string, string>;
   /** Optional collateral-specific overrides: key `${ccy}|${collateralCcy}` */
   collateralDiscountCurveId?: Record<string, string>;
+  /** Spot rates keyed by pair ("EURUSD"), quoted for value on the pair's spot date (T+2 by convention). */
   fxSpots: Record<string, number>;
+  /** Optional explicit spot dates per pair (default: T+2 / T+1 on the pair calendar). */
+  fxSpotDates?: Record<string, SerialDate>;
   fixings?: Fixing[];
+  /** How to treat missing historical fixings (default "curve"). */
+  missingFixingPolicy?: MissingFixingPolicy;
   swaptionVols?: Record<string, SwaptionVolSurface>;
   capletVols?: Record<string, CapletVolSurface>;
   fxVols?: Record<string, FxVolSurface>;
@@ -42,7 +56,7 @@ export interface MarketContext {
 
 export function getCurve(ctx: MarketContext, id: string): Curve {
   const c = ctx.curves[id];
-  if (!c) throw new Error(`Curve not found in market context: ${id}`);
+  if (!c) throw new PricingError("CURVE_NOT_FOUND", `Curve not found in market context: ${id}`, { curveId: id });
   return c;
 }
 
@@ -53,7 +67,7 @@ export function getDiscountCurve(ctx: MarketContext, currency: string, collatera
     if (id) return getCurve(ctx, id);
   }
   const id = ctx.discountCurveId[currency];
-  if (!id) throw new Error(`No discount curve configured for ${currency}`);
+  if (!id) throw new PricingError("NO_DISCOUNT_CURVE", `No discount curve configured for ${currency}`, { currency, collateralCurrency: collateralCcy });
   return getCurve(ctx, id);
 }
 
@@ -71,11 +85,26 @@ export function getFxSpot(ctx: MarketContext, base: string, quote: string): numb
     const b = ctx.fxSpots[`${pivot}${quote}`] ?? (ctx.fxSpots[`${quote}${pivot}`] ? 1 / ctx.fxSpots[`${quote}${pivot}`]! : undefined);
     if (a !== undefined && b !== undefined) return a * b;
   }
-  throw new Error(`FX spot not available for ${base}${quote}`);
+  throw new PricingError("NO_FX_SPOT", `FX spot not available for ${base}${quote}`, { pair: `${base}${quote}` });
+}
+
+/** Per-fixing-array lookup index (built once, cached on the array identity). */
+const fixingIndexCache = new WeakMap<Fixing[], Map<string, number>>();
+
+function fixingKey(index: string, date: SerialDate): string {
+  return `${index.toUpperCase()}|${date}`;
 }
 
 export function getFixing(ctx: MarketContext, index: string, date: SerialDate): number | undefined {
-  return ctx.fixings?.find((f) => f.index.toUpperCase() === index.toUpperCase() && f.date === date)?.value;
+  const fixings = ctx.fixings;
+  if (!fixings || fixings.length === 0) return undefined;
+  let map = fixingIndexCache.get(fixings);
+  if (!map) {
+    map = new Map<string, number>();
+    for (const f of fixings) map.set(fixingKey(f.index, f.date), f.value);
+    fixingIndexCache.set(fixings, map);
+  }
+  return map.get(fixingKey(index, date));
 }
 
 export function withCurves(ctx: MarketContext, curves: Record<string, Curve>): MarketContext {

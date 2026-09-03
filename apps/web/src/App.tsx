@@ -1,68 +1,193 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { cashflowTable, toCsv, toISO } from "@deriva/pricing-core";
 import { CommandPalette } from "./components/CommandPalette.js";
+import { ErrorBoundary } from "./components/ErrorBoundary.js";
 import { HotkeyOverlay } from "./components/HotkeyOverlay.js";
 import { Inspector } from "./components/Inspector.js";
-import { HOTKEYS, keyTokens, type HotkeyDef, type ViewId } from "./hotkeys/keymap.js";
-import { useHotkeys } from "./hotkeys/useHotkeys.js";
-import { fmtDate } from "./lib/format.js";
-import { selectedTrade, useStore } from "./state/store.js";
+import { ValuationDatePopover } from "./components/ValuationDatePopover.js";
+import { HOTKEYS, VIEW_HOTKEYS, keyList, keyTokens, keysText, primaryKeys, type HotkeyDef, type ViewId } from "./hotkeys/keymap.js";
+import { isTextEntry, useHotkeys } from "./hotkeys/useHotkeys.js";
+import { blotterCsv, buildBlotterRows, readBlotterColumns } from "./lib/blotter-export.js";
+import { fmtDate, fmtMs } from "./lib/format.js";
+import { copyText, indicationText } from "./lib/indication.js";
+import { downloadText } from "./lib/portfolio-io.js";
+import { deleteWithUndo, marketModified, selectedTrade, setToastHover, useStore, whatIfActive, whatIfLabel } from "./state/store.js";
 import { Blotter } from "./views/Blotter.js";
+import { CompareView } from "./views/CompareView.js";
 import { CurvesView } from "./views/CurvesView.js";
+import { HedgeView } from "./views/HedgeView.js";
 import { MarketView } from "./views/MarketView.js";
 import { PricingWorkspace } from "./views/PricingWorkspace.js";
 import { ReportView } from "./views/ReportView.js";
 import { ScenariosView } from "./views/ScenariosView.js";
-import { newTradeTemplate } from "./lib/templates.js";
+import { isTemplateId, newTradeTemplate } from "./lib/templates.js";
 import { applyParSolve, flipTrade } from "./lib/trade-ops.js";
 
-const VIEWS: { id: ViewId; label: string; icon: string; hint: string }[] = [
+export const VIEWS: { id: ViewId; label: string; icon: string; hint: string }[] = [
   { id: "blotter", label: "Blotter", icon: "▤", hint: "1" },
   { id: "pricing", label: "Pricing", icon: "ƒ", hint: "2" },
   { id: "curves", label: "Kurven", icon: "∿", hint: "3" },
   { id: "scenarios", label: "Szenarien", icon: "⊞", hint: "4" },
   { id: "market", label: "Markt", icon: "◔", hint: "5" },
   { id: "report", label: "Report", icon: "▣", hint: "6" },
+  { id: "compare", label: "Vergleich", icon: "⇆", hint: "7" },
+  { id: "hedge", label: "Hedge Accounting", icon: "⛨", hint: "8" },
 ];
 
+/** Chord keys ("g b") of a view, taken from the hotkey registry. */
+function chordOf(view: ViewId): string {
+  const def = VIEW_HOTKEYS.find((v) => v.view === view)?.def;
+  return def ? primaryKeys(def) : "";
+}
+
+const hk = (id: string) => HOTKEYS.find((h) => h.id === id)!;
+
+/** Context hints for the status bar, per view (F-43). */
+function statusHintIds(view: ViewId): string[] {
+  switch (view) {
+    case "blotter":
+      return ["palette", "open", "duplicate", "delete", "compare.toggle"];
+    case "pricing":
+      return ["palette", "bump.up", "solve.par", "flip", "doc.termsheet"];
+    case "curves":
+      return ["palette", "valdate", "bump.up", "undo"];
+    case "report":
+      return ["palette", "report.generate", "doc.termsheet", "customer"];
+    case "hedge":
+      return ["palette", "go.pricing", "go.blotter", "help"];
+    default:
+      return ["palette", "help", "go.pricing", "new.irs", "bump.up"];
+  }
+}
+
 export function App() {
-  const s = useStore();
-  const trade = useStore(selectedTrade);
+  // Narrow selectors: the shell re-renders only when one of these slices changes (arch N-09).
+  const s = useStore(
+    useShallow((st) => ({
+      theme: st.theme,
+      view: st.view,
+      inspectorOpen: st.inspectorOpen,
+      customerMode: st.customerMode,
+      paletteOpen: st.paletteOpen,
+      helpOpen: st.helpOpen,
+      valDateOpen: st.valDateOpen,
+      modalDepth: st.modalDepth,
+      toasts: st.toasts,
+      chordPrefix: st.chordPrefix,
+      restored: st.restored,
+      whatIf: st.whatIf,
+      quotes: st.quotes,
+      interpolation: st.interpolation,
+      valuationDate: st.valuationDate,
+      reportingCurrency: st.reportingCurrency,
+      tradesCount: st.trades.length,
+      lastPricingMs: st.lastPricingMs,
+      compareCount: st.compareIds.length,
+      lastUndo: st.undoStack[st.undoStack.length - 1],
+      marketLabel: st.baseMarket.meta?.label,
+    })),
+  );
+  const act = useStore.getState;
+  const [inputMode, setInputMode] = useState(false);
+  const restoredShown = useRef(false);
 
   useEffect(() => {
     document.documentElement.dataset.theme = s.theme;
   }, [s.theme]);
 
+  // "Eingabemodus" indicator (F-05): track whether a text field owns the focus.
+  useEffect(() => {
+    const update = () => setInputMode(isTextEntry(document.activeElement));
+    const onOut = () => window.setTimeout(update, 0);
+    document.addEventListener("focusin", update);
+    document.addEventListener("focusout", onOut);
+    return () => {
+      document.removeEventListener("focusin", update);
+      document.removeEventListener("focusout", onOut);
+    };
+  }, []);
+
+  // Restore toast (F-13) – once after hydration.
+  useEffect(() => {
+    if (!s.restored || restoredShown.current) return;
+    restoredShown.current = true;
+    const info = s.restored;
+    act().clearRestored();
+    act().showToast(`Bestand aus lokalem Speicher geladen (${info.trades} Trades${info.quotesModified ? ", Markt modifiziert" : ""})`, {
+      action: {
+        label: "Zurücksetzen",
+        run: () => {
+          useStore.getState().resetPortfolio();
+          useStore.getState().showToast("Beispielportfolio geladen");
+        },
+      },
+      ms: 8000,
+    });
+  }, [s.restored, act]);
+
   const exportCsv = useCallback(() => {
-    if (!trade) return;
-    const r = s.results[trade.id]?.result;
-    if (!r) return;
-    const csv = toCsv(cashflowTable(r));
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${trade.id}-cashflows.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-    s.showToast("Cashflows als CSV exportiert");
-  }, [trade, s]);
+    const st = useStore.getState();
+    const t = selectedTrade(st);
+    if (!t) {
+      st.showToast("Kein Trade ausgewählt");
+      return;
+    }
+    const r = st.results[t.id]?.result;
+    if (!r) {
+      st.showToast("Keine Bewertung für diesen Trade");
+      return;
+    }
+    downloadText(
+      `${t.id}-cashflows-${toISO(st.valuationDate)}.csv`,
+      toCsv(cashflowTable(r), { sep: ";", decimalComma: true, bom: true }),
+      "text/csv;charset=utf-8",
+    );
+    st.showToast("Cashflows als CSV exportiert");
+  }, []);
+
+  const exportBlotter = useCallback(() => {
+    const st = useStore.getState();
+    const order = st.visibleIds.length ? st.visibleIds : st.trades.map((t) => t.id);
+    const trades = order.map((id) => st.trades.find((t) => t.id === id)!).filter(Boolean);
+    const rows = buildBlotterRows(trades, st.results, st.market, st.reportingCurrency);
+    downloadText(
+      `blotter-${toISO(st.valuationDate)}.csv`,
+      blotterCsv(rows, readBlotterColumns(), st.reportingCurrency, { customer: st.customerMode }),
+      "text/csv;charset=utf-8",
+    );
+    st.showToast(`Blotter als CSV exportiert (${rows.length} Trades)`);
+  }, []);
 
   const onHotkey = useCallback(
     (def: HotkeyDef) => {
-      const go = (v: ViewId) => s.setView(v);
+      const st = useStore.getState();
+      const t = selectedTrade(st);
+      const go = (v: ViewId) => st.setView(v);
+      const needTrade = (): boolean => {
+        if (t) return true;
+        st.showToast("Kein Trade ausgewählt");
+        return false;
+      };
       switch (def.id) {
         case "palette":
         case "palette2":
-          s.setPalette(true);
+          st.setPalette(true);
           break;
         case "help":
-          s.setHelp(!s.helpOpen);
+          st.setHelp(!st.helpOpen);
           break;
-        case "escape":
-          if (s.paletteOpen) s.setPalette(false);
-          else if (s.helpOpen) s.setHelp(false);
+        case "escape": {
+          const el = document.activeElement as HTMLElement | null;
+          if (el && isTextEntry(el)) {
+            el.blur();
+            break;
+          }
+          if (st.paletteOpen) st.setPalette(false);
+          else if (st.helpOpen) st.setHelp(false);
+          else if (st.valDateOpen) st.setValDateOpen(false);
           break;
+        }
         case "go.blotter":
         case "view.1":
           go("blotter");
@@ -87,174 +212,356 @@ export function App() {
         case "view.6":
           go("report");
           break;
+        case "go.compare":
+        case "view.7":
+          go("compare");
+          break;
+        case "go.hedge":
+        case "view.8":
+          go("hedge");
+          break;
+        case "valdate":
+          st.setValDateOpen(!st.valDateOpen);
+          break;
         case "new.irs":
         case "new.cap":
         case "new.swpt":
         case "new.fxf":
-        case "new.fxo": {
-          const t = newTradeTemplate(def.id.replace("new.", "") as "irs" | "cap" | "swpt" | "fxf" | "fxo", s.valuationDate);
-          s.addTrade(t, { goToPricing: true });
-          s.showToast(`Neu: ${t.name ?? t.id}`);
+        case "new.fxo":
+        case "new.basis":
+        case "new.amort":
+        case "new.imm":
+        case "new.fxs": {
+          const kind = def.id.replace("new.", "");
+          if (!isTemplateId(kind)) break;
+          const nt = st.addTrade(newTradeTemplate(kind, st.valuationDate), { goToPricing: true, autoId: true });
+          st.showToast(`Neu: ${nt.id} · ${nt.name ?? ""}`);
           break;
         }
-        case "duplicate":
-          s.duplicateSelected();
-          s.showToast("Trade dupliziert");
+        case "duplicate": {
+          if (!needTrade()) break;
+          const c = st.duplicateSelected();
+          if (c) st.showToast(`Dupliziert: ${c.id}`, { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
           break;
+        }
         case "delete":
-          if (trade) {
-            s.removeTrade(trade.id);
-            s.showToast(`Gelöscht: ${trade.id}`);
-          }
+          if (needTrade()) deleteWithUndo(t!.id);
           break;
+        case "undo": {
+          const label = st.undo();
+          st.showToast(label ? `Rückgängig: ${label}` : "Nichts rückgängig zu machen");
+          break;
+        }
         case "down":
-          s.selectNext(1);
+          st.selectNext(1);
           break;
         case "up":
-          s.selectNext(-1);
+          st.selectNext(-1);
           break;
         case "open":
-          if (trade) go("pricing");
+          if (t) go("pricing");
+          break;
+        case "compare.toggle":
+          if (t && (st.view === "blotter" || st.view === "compare")) st.toggleCompare(t.id);
           break;
         case "reprice":
-          s.repriceAll();
-          s.showToast("Portfolio neu bewertet");
+          st.repriceAll();
+          st.showToast("Portfolio neu bewertet");
           break;
         case "solve.par":
-          if (trade) {
-            const r = s.results[trade.id]?.result;
-            const t2 = applyParSolve(trade, r);
+          if (needTrade()) {
+            const r = st.results[t!.id]?.result;
+            const t2 = applyParSolve(t!, r);
             if (t2) {
-              s.updateTrade(t2);
-              s.showToast("Par-Satz / fairer Preis übernommen");
-            }
+              st.updateTrade(t2);
+              st.showToast("Par-Satz / fairer Preis übernommen", { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+            } else st.showToast("Kein Par-Wert für diesen Trade verfügbar");
           }
           break;
         case "bump.up":
-          s.setWhatIf({ ratesBp: s.whatIf.ratesBp + 10 });
+          st.setWhatIf({ ratesBp: st.whatIf.ratesBp + 10 });
           break;
         case "bump.down":
-          s.setWhatIf({ ratesBp: s.whatIf.ratesBp - 10 });
+          st.setWhatIf({ ratesBp: st.whatIf.ratesBp - 10 });
           break;
         case "bump.reset":
-          s.resetWhatIf();
-          s.showToast("What-if zurückgesetzt");
+          st.resetWhatIf();
+          st.showToast("What-if zurückgesetzt");
           break;
         case "flip":
-          if (trade) {
-            s.updateTrade(flipTrade(trade));
-            s.showToast("Pay/Receive getauscht");
+          if (needTrade()) {
+            st.updateTrade(flipTrade(t!));
+            st.showToast("Richtung getauscht", { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
           }
           break;
-        case "ccy":
-          s.cycleReportingCurrency();
+        case "ccy": {
+          st.cycleReportingCurrency();
+          st.showToast(`Reporting-Währung ${useStore.getState().reportingCurrency}`);
           break;
+        }
         case "theme":
-          s.toggleTheme();
+          st.toggleTheme();
           break;
         case "inspector":
-          s.toggleInspector();
+          st.toggleInspector();
+          st.showToast(st.inspectorOpen ? "Inspector ausgeblendet" : "Inspector eingeblendet");
+          break;
+        case "customer":
+          st.toggleCustomerMode();
+          st.showToast(st.customerMode ? "Kundenmodus aus – interne Daten sichtbar" : "Kundenmodus an – interne Daten ausgeblendet");
           break;
         case "export.csv":
           exportCsv();
           break;
+        case "export.blotter":
+          exportBlotter();
+          break;
+        case "copy.indication":
+          if (needTrade()) {
+            void copyText(
+              indicationText(t!, st.results[t!.id]?.result, st.risk(t!.id), st.reportingCurrency, st.valuationDate, { customer: st.customerMode }),
+            ).then((ok) => useStore.getState().showToast(ok ? "Indikation in die Zwischenablage kopiert" : "Kopieren nicht möglich"));
+          }
+          break;
+        case "report.generate":
+          if (!needTrade()) break;
+          st.generateReport();
+          if (st.view !== "report") go("report");
+          st.showToast("Report erzeugt – Zeitstempel fixiert");
+          break;
+        case "doc.termsheet":
+        case "doc.suitability":
+          // Documents need a generated report: generate implicitly, then open the dialog in the report view (N-22).
+          if (!needTrade()) break;
+          if (!st.reportStamp) st.generateReport();
+          st.setDoc(def.id === "doc.termsheet" ? "Termsheet" : "Geeignetheitserklaerung");
+          if (st.view !== "report") go("report");
+          break;
       }
     },
-    [s, trade, exportCsv],
+    [exportCsv, exportBlotter],
   );
 
-  useHotkeys(onHotkey, { onChord: s.setChord });
+  const dialogOpen = s.paletteOpen || s.helpOpen || s.modalDepth > 0;
+  const hotkeyFilter = useCallback((def: HotkeyDef) => {
+    const st = useStore.getState();
+    const anyDialog = st.paletteOpen || st.helpOpen || st.modalDepth > 0 || st.valDateOpen;
+    if (!anyDialog) return true;
+    if (def.id === "escape") return true;
+    if (st.helpOpen && def.id === "help") return true;
+    return false;
+  }, []);
+  const setChord = useStore((st) => st.setChord);
+  useHotkeys(onHotkey, { onChord: setChord, filter: hotkeyFilter });
 
-  const whatIfActive = s.whatIf.ratesBp !== 0 || s.whatIf.fxPct !== 0 || s.whatIf.volBp !== 0;
+  const wiActive = whatIfActive(s.whatIf);
+  const modified = marketModified(s);
   const view = VIEWS.find((v) => v.id === s.view)!;
+  const customerKeys = keysText(hk("customer"));
+  const lastUndo = s.lastUndo;
 
   return (
-    <div className={`app ${s.inspectorOpen && s.view !== "pricing" ? "with-inspector" : ""}`}>
-      <nav className="rail" aria-label="Hauptnavigation">
-        <div className="logo" title="DERIVA">
-          Δ
-        </div>
-        {VIEWS.map((v) => (
-          <button key={v.id} className={s.view === v.id ? "active" : ""} title={`${v.label} (Alt+${v.hint} oder g ${v.id[0]})`} onClick={() => s.setView(v.id)}>
-            <span style={{ fontSize: 18 }}>{v.icon}</span>
-            <span className="hint">{v.hint}</span>
-          </button>
-        ))}
-        <div className="spacer" />
-        <button title="Tastenkürzel (?)" onClick={() => s.setHelp(true)}>
-          <span style={{ fontSize: 16 }}>?</span>
-        </button>
-        <button title="Theme (t)" onClick={s.toggleTheme}>
-          <span style={{ fontSize: 15 }}>{s.theme === "dark" ? "☾" : "☀"}</span>
-        </button>
-      </nav>
-
-      <header className="topbar">
-        <span className="title">DERIVA</span>
-        <span className="crumb">/ {view.label}</span>
-        <div className="grow" />
-        <button className="cmd-button" onClick={() => s.setPalette(true)}>
-          <span>Befehl oder Schnelleingabe … (z.B. „irs 10y pay 3.1% 10m")</span>
-          <span className="row" style={{ gap: 4 }}>
-            {keyTokens("mod+k")[0]!.map((k) => (
-              <kbd key={k}>{k}</kbd>
-            ))}
-          </span>
-        </button>
-        <span className={`chip ${whatIfActive ? "warn" : ""}`} title="Marktdaten-Snapshot">
-          <span className="dot" /> {s.baseMarket.meta?.label ?? "Markt"} · {fmtDate(s.valuationDate)}
-          {whatIfActive && ` · What-if ${s.whatIf.ratesBp >= 0 ? "+" : ""}${s.whatIf.ratesBp}bp / FX ${s.whatIf.fxPct}%`}
-        </span>
-        <button className="chip" onClick={s.cycleReportingCurrency} title="Reporting-Währung (c)">
-          {s.reportingCurrency}
-        </button>
-      </header>
-
-      <main className="main">
-        {s.view === "blotter" && <Blotter />}
-        {s.view === "pricing" && <PricingWorkspace />}
-        {s.view === "curves" && <CurvesView />}
-        {s.view === "scenarios" && <ScenariosView />}
-        {s.view === "market" && <MarketView />}
-        {s.view === "report" && <ReportView />}
-      </main>
-
-      {s.inspectorOpen && s.view !== "pricing" && (
-        <aside className="inspector">
-          <Inspector />
-        </aside>
-      )}
-
-      <footer className="statusbar">
-        <span>
-          {s.trades.length} Trades · Bewertung {s.lastPricingMs.toFixed(1)} ms
-        </span>
-        <span>Bewertungstag {toISO(s.valuationDate)}</span>
-        {s.chordPrefix && (
-          <span className="chord-indicator">
-            {s.chordPrefix} … <span className="muted">(zweite Taste)</span>
-          </span>
-        )}
-        <div className="grow" />
-        <span className="row" style={{ gap: 14 }}>
-          {HOTKEYS.filter((h) => ["palette", "help", "go.pricing", "new.irs", "bump.up"].includes(h.id)).map((h) => (
-            <span key={h.id} className="row" style={{ gap: 4 }}>
-              {keyTokens(h.keys).map((combo, i) => (
-                <span key={i} className="row" style={{ gap: 2 }}>
-                  {combo.map((k) => (
-                    <kbd key={k}>{k}</kbd>
-                  ))}
-                </span>
-              ))}
-              <span>{h.label}</span>
-            </span>
+    <>
+      <a className="skip" href="#main">
+        Zum Inhalt
+      </a>
+      <div
+        className={`app ${s.inspectorOpen && s.view !== "pricing" ? "with-inspector" : ""} ${s.customerMode ? "customer-mode" : ""}`}
+        inert={dialogOpen || undefined}
+      >
+        <nav className="rail" aria-label="Hauptnavigation">
+          <div className="logo" title="DERIVA" aria-hidden="true">
+            Δ
+          </div>
+          {VIEWS.map((v) => (
+            <button
+              key={v.id}
+              className={s.view === v.id ? "active" : ""}
+              aria-current={s.view === v.id ? "page" : undefined}
+              aria-label={v.label}
+              title={`${v.label} (Alt+${v.hint} oder ${chordOf(v.id)})`}
+              onClick={() => act().setView(v.id)}
+            >
+              <span style={{ fontSize: 18 }} aria-hidden="true">
+                {v.icon}
+              </span>
+              <span className="hint" aria-hidden="true">
+                {v.hint}
+              </span>
+            </button>
           ))}
-        </span>
-      </footer>
+          <div className="spacer" />
+          <button title="Tastenkürzel (?)" aria-label="Tastenkürzel anzeigen" onClick={() => act().setHelp(true)}>
+            <span style={{ fontSize: 16 }}>?</span>
+          </button>
+          <button title="Theme (t)" aria-label={s.theme === "dark" ? "Helles Theme" : "Dunkles Theme"} onClick={() => act().toggleTheme()}>
+            <span style={{ fontSize: 15 }}>{s.theme === "dark" ? "☾" : "☀"}</span>
+          </button>
+        </nav>
 
-      {s.paletteOpen && <CommandPalette />}
+        <header className="topbar">
+          <h1 className="title">DERIVA</h1>
+          <span className="crumb">/ {view.label}</span>
+          {s.customerMode && (
+            <button
+              className="chip customer"
+              onClick={() => act().toggleCustomerMode()}
+              title={`Kundenmodus beenden (${customerKeys})`}
+              data-testid="customer-chip"
+            >
+              ◉ KUNDENANSICHT
+            </button>
+          )}
+          <div className="grow" />
+          <button className="cmd-button" onClick={() => act().setPalette(true)} aria-label="Command Palette öffnen" data-testid="cmd-button">
+            <span className="cmd-text">Befehl oder Schnelleingabe … (z.B. „irs 10y pay 3.1% 10m“)</span>
+            <span className="row" style={{ gap: 4 }}>
+              {keyTokens("mod+k")[0]!.map((k) => (
+                <kbd key={k}>{k}</kbd>
+              ))}
+            </span>
+          </button>
+          <span className="anchor">
+            <button
+              className={`chip market ${wiActive ? "warn" : modified ? "modified" : ""}`}
+              onClick={() => act().setValDateOpen(!s.valDateOpen)}
+              aria-expanded={s.valDateOpen}
+              aria-haspopup="dialog"
+              data-testid="market-chip"
+              title={`Bewertungstag setzen (${keysText(hk("valdate"))})${modified ? " · Quotes/Interpolation weichen vom Sample ab" : ""}`}
+            >
+              <span className="dot" /> {s.marketLabel ?? "Markt"}
+              {modified && " · modifiziert"} · {fmtDate(s.valuationDate)}
+              {wiActive && ` · What-if ${whatIfLabel(s.whatIf)}`}
+            </button>
+            {s.valDateOpen && <ValuationDatePopover />}
+          </span>
+          <button
+            className="chip"
+            onClick={() => {
+              act().cycleReportingCurrency();
+              act().showToast(`Reporting-Währung ${useStore.getState().reportingCurrency}`);
+            }}
+            title="Reporting-Währung (c)"
+            aria-label={`Reporting-Währung ${s.reportingCurrency} – wechseln`}
+          >
+            {s.reportingCurrency}
+          </button>
+        </header>
+
+        <main className="main" id="main" tabIndex={-1}>
+          <ErrorBoundary key={s.view} scope={view.label}>
+            {s.view === "blotter" && <Blotter />}
+            {s.view === "pricing" && <PricingWorkspace />}
+            {s.view === "curves" && <CurvesView />}
+            {s.view === "scenarios" && <ScenariosView />}
+            {s.view === "market" && <MarketView />}
+            {s.view === "report" && <ReportView />}
+            {s.view === "compare" && <CompareView />}
+            {s.view === "hedge" && <HedgeView />}
+          </ErrorBoundary>
+        </main>
+
+        {s.inspectorOpen && s.view !== "pricing" && (
+          <aside className="inspector" aria-label="Inspector">
+            <ErrorBoundary scope="Inspector">
+              <Inspector />
+            </ErrorBoundary>
+          </aside>
+        )}
+
+        <footer className="statusbar" data-testid="statusbar">
+          <span>
+            {s.tradesCount} Trades · Bewertung {fmtMs(s.lastPricingMs, 1)}
+          </span>
+          <button className="link" onClick={() => act().setValDateOpen(true)} title="Bewertungstag ändern (⇧T)">
+            Bewertungstag {fmtDate(s.valuationDate)}
+          </button>
+          {modified && (
+            <span className="warn-text" title="Marktquotes oder Interpolation wurden geändert">
+              ● Markt modifiziert
+            </span>
+          )}
+          {s.compareCount > 0 && (
+            <span className="muted" title="Trades im Vergleich (g v)">
+              ⇆ {s.compareCount} im Vergleich
+            </span>
+          )}
+          {lastUndo && (
+            <span className="muted" title={`Rückgängig: ${lastUndo.label}`}>
+              {keysText(hk("undo"))} ↶ {lastUndo.label}
+            </span>
+          )}
+          {s.chordPrefix && (
+            <span className="chord-indicator">
+              {s.chordPrefix} … <span className="muted">(zweite Taste)</span>
+            </span>
+          )}
+          {inputMode && (
+            <span className="input-mode" data-testid="input-mode">
+              Eingabemodus – <kbd>Esc</kbd> beendet
+            </span>
+          )}
+          <div className="grow" />
+          <span className="row hints" style={{ gap: 14 }}>
+            {statusHintIds(s.view).map((id) => {
+              const h = hk(id);
+              return (
+                <span key={h.id} className="row" style={{ gap: 4 }}>
+                  {keyTokens(keyList(h)[0]!).map((combo, i) => (
+                    <span key={i} className="row" style={{ gap: 2 }}>
+                      {combo.map((k) => (
+                        <kbd key={k}>{k}</kbd>
+                      ))}
+                    </span>
+                  ))}
+                  <span>{h.label.replace(/ \(.*\)$/, "")}</span>
+                </span>
+              );
+            })}
+          </span>
+        </footer>
+      </div>
+
+      {s.paletteOpen && <CommandPalette onHotkey={onHotkey} />}
       {s.helpOpen && <HotkeyOverlay />}
-      {s.toast && <div className="toast">{s.toast}</div>}
-    </div>
+      {s.toasts.length > 0 && (
+        <div
+          className="toast-stack"
+          role="status"
+          aria-live="polite"
+          onMouseEnter={() => setToastHover(true)}
+          onMouseLeave={() => setToastHover(false)}
+          data-testid="toast-stack"
+        >
+          {s.toasts.map((t) => (
+            <div key={t.id} className={`toast ${t.action ? "with-action" : ""}`}>
+              <span className="msg" onClick={() => act().dismissToast(t.id)}>
+                {t.msg}
+                {t.count > 1 && (
+                  <span className="badge count" aria-label={`${t.count}-mal`}>
+                    ×{t.count}
+                  </span>
+                )}
+              </span>
+              {t.action && (
+                <button
+                  className="btn xs"
+                  onClick={() => {
+                    t.action!.run();
+                    act().dismissToast(t.id);
+                  }}
+                >
+                  {t.action.label}
+                </button>
+              )}
+              <button className="close" onClick={() => act().dismissToast(t.id)} aria-label="Meldung schließen">
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
   );
 }

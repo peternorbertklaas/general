@@ -1,3 +1,7 @@
+// Errors, formatting, version
+export * from "./errors.js";
+export * from "./format.js";
+export * from "./version.js";
 // Math
 export * from "./math/normal.js";
 export * from "./math/rootfind.js";
@@ -12,6 +16,7 @@ export * from "./curves/curve.js";
 export * from "./curves/index-definitions.js";
 export * from "./curves/bootstrap.js";
 export * from "./market/market-context.js";
+export * from "./market/fx-spot.js";
 export * from "./market/sample-market.js";
 // Models
 export * from "./models/black.js";
@@ -22,6 +27,7 @@ export * from "./models/fx-vol-surface.js";
 // Instruments & pricing
 export * from "./instruments/types.js";
 export * from "./instruments/builders.js";
+export * from "./instruments/trade-dates.js";
 export * from "./pricing/leg-pricer.js";
 export * from "./pricing/swap-pricer.js";
 export * from "./pricing/fra-pricer.js";
@@ -35,3 +41,7 @@ export * from "./risk/scenarios.js";
 export * from "./xva/cva.js";
 // Reporting
 export * from "./reporting/valuation-report.js";
+export * from "./market/snapshot.js";
+export * from "./reporting/emir.js";
+export * from "./reporting/documents.js";
+export * from "./hedge/hedge.js";

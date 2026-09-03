@@ -1,0 +1,134 @@
+{
+  "case": "swap-flat-curve",
+  "description": "5Y EUR payer swap, flat 3 % continuously compounded curve (ACT/365F) used for discounting and projection (single curve), annual unadjusted periods 2026-09-03 → 2031-09-03, fixed 30E/360 (τ = 1), float EURIBOR-12M ACT/360 with fixing lag 0.",
+  "derivation": "DF_i = exp(−0.03·days(2026-09-03, d_i)/365); par = (DF_0 − DF_5)/Σ_{i=1..5} DF_i (τ_fix = 1); float coupon_i = N·(DF_{i−1}/DF_i − 1) (forward × ACT/360 accrual telescopes), PV_float = N·(1 − DF_5); PV = PV_float − 0.03·N·Σ DF_i. Pure closed form, no QuantLib needed.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "curveId": "EUR-EURIBOR-12M",
+    "flatZeroRate": 0.03,
+    "curveDayCount": "ACT/365F",
+    "notional": 10000000.0,
+    "fixedRate": 0.03,
+    "payReceiveFixed": "Pay",
+    "effectiveDate": "2026-09-03",
+    "terminationDate": "2031-09-03",
+    "fixedDayCount": "30E/360",
+    "floatIndex": "EURIBOR-12M",
+    "floatDayCount": "ACT/360",
+    "frequency": "12M",
+    "calendar": "NONE",
+    "businessDayConvention": "Unadjusted"
+  },
+  "expected": {
+    "discountFactors": [
+      {
+        "date": "2026-09-03",
+        "df": 1.0
+      },
+      {
+        "date": "2027-09-03",
+        "df": 0.9704455335485082
+      },
+      {
+        "date": "2028-09-03",
+        "df": 0.9416871314610712
+      },
+      {
+        "date": "2029-09-03",
+        "df": 0.9138560707265034
+      },
+      {
+        "date": "2030-09-03",
+        "df": 0.8868475421427249
+      },
+      {
+        "date": "2031-09-03",
+        "df": 0.8606372362108797
+      }
+    ],
+    "parRate": 0.030471973514174664,
+    "annuity": 45734735.14089687,
+    "pvFixed": -1372042.0542269063,
+    "pvFloat": 1393627.637891203,
+    "pv": 21585.58366429666,
+    "fixedCashflows": [
+      {
+        "paymentDate": "2027-09-03",
+        "accrualFactor": 1.0,
+        "amount": -300000.0,
+        "discountFactor": 0.9704455335485082,
+        "presentValue": -291133.66006455244
+      },
+      {
+        "paymentDate": "2028-09-03",
+        "accrualFactor": 1.0,
+        "amount": -300000.0,
+        "discountFactor": 0.9416871314610712,
+        "presentValue": -282506.13943832135
+      },
+      {
+        "paymentDate": "2029-09-03",
+        "accrualFactor": 1.0,
+        "amount": -300000.0,
+        "discountFactor": 0.9138560707265034,
+        "presentValue": -274156.821217951
+      },
+      {
+        "paymentDate": "2030-09-03",
+        "accrualFactor": 1.0,
+        "amount": -300000.0,
+        "discountFactor": 0.8868475421427249,
+        "presentValue": -266054.26264281746
+      },
+      {
+        "paymentDate": "2031-09-03",
+        "accrualFactor": 1.0,
+        "amount": -300000.0,
+        "discountFactor": 0.8606372362108797,
+        "presentValue": -258191.17086326392
+      }
+    ],
+    "floatCashflows": [
+      {
+        "paymentDate": "2027-09-03",
+        "rate": 0.03003734855689342,
+        "accrualFactor": 1.0138888888888888,
+        "amount": 304545.33953516936,
+        "discountFactor": 0.9704455335485082,
+        "presentValue": 295544.664514919
+      },
+      {
+        "paymentDate": "2028-09-03",
+        "rate": 0.030038589174517436,
+        "accrualFactor": 1.0166666666666666,
+        "amount": 305392.32327426056,
+        "discountFactor": 0.9416871314610712,
+        "presentValue": 287584.02087437053
+      },
+      {
+        "paymentDate": "2029-09-03",
+        "rate": 0.0300373485568932,
+        "accrualFactor": 1.0138888888888888,
+        "amount": 304545.33953516715,
+        "discountFactor": 0.9138560707265034,
+        "presentValue": 278310.6073456767
+      },
+      {
+        "paymentDate": "2030-09-03",
+        "rate": 0.0300373485568932,
+        "accrualFactor": 1.0138888888888888,
+        "amount": 304545.33953516715,
+        "discountFactor": 0.8868475421427249,
+        "presentValue": 270085.2858377846
+      },
+      {
+        "paymentDate": "2031-09-03",
+        "rate": 0.03003734855689342,
+        "accrualFactor": 1.0138888888888888,
+        "amount": 304545.33953516936,
+        "discountFactor": 0.8606372362108797,
+        "presentValue": 262103.0593184521
+      }
+    ]
+  }
+}

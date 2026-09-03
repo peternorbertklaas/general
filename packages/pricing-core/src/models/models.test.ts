@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { normCdf, normInv, normPdf } from "../math/normal.js";
+import { bivariateNormCdf, normCdf, normInv, normPdf } from "../math/normal.js";
 import { brent, solveBracketed } from "../math/rootfind.js";
 import { bachelier, black76, black76Greeks, impliedBlackVol, impliedNormalVol, lognormalToNormalVol } from "./black.js";
-import { fxBarrier, fxDigital, garmanKohlhagen, impliedFxVol } from "./garman-kohlhagen.js";
+import { type FxOptionInputs, fxBarrier, fxDigital, fxExoticGreeks, garmanKohlhagen, impliedFxVol } from "./garman-kohlhagen.js";
 import { sabrAlphaFromAtm, sabrLognormalVol, sabrNormalVol } from "./sabr.js";
-import { fxAtmVol, fxVolAtDelta, fxVolAtStrike } from "./fx-vol-surface.js";
-import { swaptionAtmVol, swaptionVol } from "./vol-surfaces.js";
+import { type FxDeltaConvention, fxAtmVol, fxDeltaFromMoneyness, fxStrikeFromDelta, fxVolAtDelta, fxVolAtStrike } from "./fx-vol-surface.js";
+import { type SwaptionVolSurface, sabrParamsAt, swaptionAtmVol, swaptionVol } from "./vol-surfaces.js";
 import { SAMPLE_EURUSD_VOLS, SAMPLE_EUR_SWAPTION_VOLS } from "../market/sample-market.js";
 
 describe("normal distribution", () => {
@@ -167,5 +167,171 @@ describe("FX vol surface", () => {
     expect(v).toBeGreaterThan(0.077);
     const vAtm = fxVolAtStrike(SAMPLE_EURUSD_VOLS, 1, 1.17, 1.17);
     expect(vAtm).toBeCloseTo(0.077, 3);
+  });
+  it("M11: strike ↔ delta round trip holds for forward, spot and premium-adjusted spot delta conventions", () => {
+    const dff = Math.exp(-0.021);
+    const F = 1.177;
+    for (const conv of ["Forward", "Spot", "PremiumAdjustedSpot"] as FxDeltaConvention[]) {
+      const s = { ...SAMPLE_EURUSD_VOLS, deltaConvention: conv };
+      for (const delta of [0.25, -0.25, 0.1, -0.1]) {
+        const K = fxStrikeFromDelta(s, 1, F, delta, { dfForeign: dff });
+        const volK = fxVolAtStrike(s, 1, F, K, { dfForeign: dff });
+        expect(volK).toBeCloseTo(fxVolAtDelta(s, 1, delta, { dfForeign: dff }), 9);
+        // the strike really carries the quoted delta under the convention
+        expect(fxDeltaFromMoneyness(delta > 0, K / F, volK, 1, conv, dff)).toBeCloseTo(delta, 9);
+      }
+      // pillar vols are reproduced: 25Δ RR
+      expect(fxVolAtDelta(s, 1, 0.25, { dfForeign: dff }) - fxVolAtDelta(s, 1, -0.25, { dfForeign: dff })).toBeCloseTo(0.004, 10);
+    }
+    // premium-adjusted 25Δ call strike lies below the unadjusted one (premium in base currency reduces the delta)
+    const kFwd = fxStrikeFromDelta({ ...SAMPLE_EURUSD_VOLS, deltaConvention: "Forward" }, 1, F, 0.25, { dfForeign: dff });
+    const kSpot = fxStrikeFromDelta({ ...SAMPLE_EURUSD_VOLS, deltaConvention: "Spot" }, 1, F, 0.25, { dfForeign: dff });
+    const kPa = fxStrikeFromDelta({ ...SAMPLE_EURUSD_VOLS, deltaConvention: "PremiumAdjustedSpot" }, 1, F, 0.25, { dfForeign: dff });
+    expect(kSpot).toBeLessThan(kFwd);
+    expect(kPa).toBeLessThan(kSpot);
+    // flat extrapolation beyond the 10Δ pillars
+    expect(fxVolAtStrike(SAMPLE_EURUSD_VOLS, 1, F, 1.6)).toBeCloseTo(fxVolAtDelta(SAMPLE_EURUSD_VOLS, 1, 0.1), 10);
+  });
+});
+
+describe("review regressions – barriers (Haug Tab. 4-13, S=100, K=3, T=0.5, r=8%, b=4%, σ=25%)", () => {
+  const base = { spot: 100, vol: 0.25, timeToExpiry: 0.5, rd: 0.08, rf: 0.04, rebate: 3 };
+  const cases: { type: "Call" | "Put"; strike: number; barrier: number; barrierType: "UpIn" | "UpOut" | "DownIn" | "DownOut"; value: number }[] = [
+    { type: "Call", strike: 90, barrier: 95, barrierType: "DownOut", value: 9.0246 },
+    { type: "Call", strike: 100, barrier: 95, barrierType: "DownIn", value: 4.0109 },
+    { type: "Call", strike: 110, barrier: 105, barrierType: "UpOut", value: 2.3453 },
+    { type: "Put", strike: 90, barrier: 105, barrierType: "UpIn", value: 1.4653 },
+    { type: "Put", strike: 100, barrier: 105, barrierType: "UpOut", value: 5.4932 },
+    { type: "Put", strike: 110, barrier: 95, barrierType: "DownIn", value: 11.9752 },
+  ];
+  it("reproduces the table values to 4 decimals", () => {
+    for (const c of cases) expect(fxBarrier({ ...base, ...c })).toBeCloseTo(c.value, 3);
+  });
+  it("M17: a knock-out with the barrier at the spot pays the rebate immediately (3.0000), at expiry only when requested", () => {
+    expect(fxBarrier({ ...base, type: "Call", strike: 90, barrier: 100, barrierType: "DownOut" })).toBeCloseTo(3, 12);
+    expect(fxBarrier({ ...base, type: "Call", strike: 90, barrier: 100, barrierType: "DownOut", rebateAtExpiry: true })).toBeCloseTo(
+      3 * Math.exp(-0.08 * 0.5),
+      12,
+    );
+    // knock-out rebate at expiry is worth less than at hit for a live barrier
+    const atHit = fxBarrier({ ...base, type: "Call", strike: 90, barrier: 95, barrierType: "DownOut" });
+    const atExp = fxBarrier({ ...base, type: "Call", strike: 90, barrier: 95, barrierType: "DownOut", rebateAtExpiry: true });
+    expect(atExp).toBeLessThan(atHit);
+    expect(atHit - atExp).toBeLessThan(0.2);
+  });
+  it("M6: finite-difference Greeks of a barrier differ from the vanilla's and vanilla FD Greeks match the analytic ones", () => {
+    const i: FxOptionInputs = { type: "Call", spot: 1.1625, strike: 1.18, vol: 0.077, timeToExpiry: 1, rd: 0.035, rf: 0.021 };
+    const gk = garmanKohlhagen(i);
+    const fd = fxExoticGreeks((x) => garmanKohlhagen(x).premiumDomestic, i);
+    expect(fd.spotDelta).toBeCloseTo(gk.spotDelta, 6);
+    expect(fd.gamma).toBeCloseTo(gk.gamma, 4);
+    expect(fd.vega).toBeCloseTo(gk.vega, 6);
+    expect(fd.rhoDomestic).toBeCloseTo(gk.rhoDomestic, 6);
+    expect(fd.rhoForeign).toBeCloseTo(gk.rhoForeign, 6);
+    expect(fd.theta).toBeCloseTo(gk.theta, 6);
+    const ko = fxExoticGreeks((x) => fxBarrier({ ...x, barrier: 1.25, barrierType: "UpOut" }), i, { barrier: 1.25 });
+    expect(ko.vega).toBeLessThan(gk.vega); // knock-out call loses value when vol rises near the barrier
+    expect(ko.spotDelta).not.toBeCloseTo(gk.spotDelta, 3);
+  });
+});
+
+describe("review regressions – Garman-Kohlhagen Greeks vs central differences (S 1.1625, K 1.18, σ 7.7%, T 1, rd 3.5%, rf 2.1%)", () => {
+  it("delta, gamma, vega, rho_d, rho_f, theta agree to 1e-6", () => {
+    const i: FxOptionInputs = { type: "Call", spot: 1.1625, strike: 1.18, vol: 0.077, timeToExpiry: 1, rd: 0.035, rf: 0.021 };
+    const p = (x: Partial<FxOptionInputs>) => garmanKohlhagen({ ...i, ...x }).premiumDomestic;
+    const g = garmanKohlhagen(i);
+    const h = 1e-5;
+    expect(g.spotDelta).toBeCloseTo((p({ spot: i.spot + h }) - p({ spot: i.spot - h })) / (2 * h), 6);
+    expect(g.gamma).toBeCloseTo((p({ spot: i.spot + h }) - 2 * p({}) + p({ spot: i.spot - h })) / (h * h), 3);
+    expect(g.vega).toBeCloseTo((p({ vol: i.vol + h }) - p({ vol: i.vol - h })) / (2 * h), 6);
+    expect(g.rhoDomestic).toBeCloseTo((p({ rd: i.rd + h }) - p({ rd: i.rd - h })) / (2 * h), 6);
+    expect(g.rhoForeign).toBeCloseTo((p({ rf: i.rf + h }) - p({ rf: i.rf - h })) / (2 * h), 6);
+    expect(g.theta).toBeCloseTo((p({ timeToExpiry: 1 - h, timeToDelivery: 1 - h }) - p({ timeToExpiry: 1 + h, timeToDelivery: 1 + h })) / (2 * h), 6);
+  });
+});
+
+describe("review regressions – digital with base-currency payout (H2)", () => {
+  const i: FxOptionInputs = { type: "Call", spot: 1.1625, strike: 1.18, vol: 0.077, timeToExpiry: 1, rd: 0.035, rf: 0.021 };
+  it("asset-or-nothing = S·e^{-rf T}·N(d1); cash-or-nothing = e^{-rd T}·N(d2)", () => {
+    const g = garmanKohlhagen(i);
+    expect(fxDigital(i, true)).toBeCloseTo(i.spot * Math.exp(-i.rf) * normCdf(g.d1), 12);
+    expect(fxDigital(i)).toBeCloseTo(Math.exp(-i.rd) * normCdf(g.d2), 12);
+    // and the wrong conversion (cash digital × spot) is not the asset digital
+    expect(Math.abs(fxDigital(i) * i.spot - fxDigital(i, true)) / fxDigital(i, true)).toBeGreaterThan(0.05);
+  });
+  it("vanilla decomposition: call = asset-or-nothing − K × cash-or-nothing (calls and puts)", () => {
+    expect(fxDigital(i, true) - i.strike * fxDigital(i)).toBeCloseTo(garmanKohlhagen(i).premiumDomestic, 12);
+    const put = { ...i, type: "Put" as const };
+    expect(i.strike * fxDigital(put) - fxDigital(put, true)).toBeCloseTo(garmanKohlhagen(put).premiumDomestic, 12);
+  });
+});
+
+describe("review regressions – bivariate normal (M7)", () => {
+  it("Φ₂(0,0,ρ) = ¼ + asin(ρ)/(2π) for all Gauss–Legendre branches", () => {
+    for (const rho of [-0.9, -0.5, -0.2, 0, 0.2, 0.5, 0.8, 0.9]) {
+      expect(bivariateNormCdf(0, 0, rho)).toBeCloseTo(0.25 + Math.asin(rho) / (2 * Math.PI), 12);
+    }
+    expect(bivariateNormCdf(0, 0, 0.5)).toBeCloseTo(1 / 3, 12);
+  });
+  it("reference values Φ₂(0.5, 0.5, 0.5) = 0.546244 and Φ₂(1, 1, 0.95) = 0.810820 (Simpson branch)", () => {
+    expect(bivariateNormCdf(0.5, 0.5, 0.5)).toBeCloseTo(0.546244, 6);
+    expect(bivariateNormCdf(1, 1, 0.95)).toBeCloseTo(0.81082, 6);
+  });
+  it("limits: ρ → 0 factorises, ρ → ±1 collapses", () => {
+    expect(bivariateNormCdf(0.3, -0.7, 0)).toBeCloseTo(normCdf(0.3) * normCdf(-0.7), 12);
+    expect(bivariateNormCdf(0.3, -0.7, 1)).toBeCloseTo(normCdf(-0.7), 12);
+    expect(bivariateNormCdf(0.3, 0.7, -1)).toBeCloseTo(normCdf(0.3) - normCdf(-0.7), 12);
+  });
+});
+
+describe("review regressions – SABR (M15/M18 and Hagan consistency)", () => {
+  const p = { alpha: 0.04, beta: 0.5, rho: -0.2, nu: 0.3 };
+  it("lognormal fixture (f 3%, T 2): 27.816% / 23.365% / 21.032% at K 2% / 3% / 4.5%", () => {
+    expect(sabrLognormalVol(0.03, 0.02, 2, p)).toBeCloseTo(0.27816, 4);
+    expect(sabrLognormalVol(0.03, 0.03, 2, p)).toBeCloseTo(0.23365, 4);
+    expect(sabrLognormalVol(0.03, 0.045, 2, p)).toBeCloseTo(0.21032, 4);
+  });
+  it("LN → price → implied normal vol agrees with the normal expansion within 0.2bp (68.16 / 69.78 / 77.52 bp)", () => {
+    const expected = [
+      [0.02, 68.16],
+      [0.03, 69.78],
+      [0.045, 77.52],
+    ];
+    for (const [K, bp] of expected) {
+      const ln = sabrLognormalVol(0.03, K!, 2, p);
+      const implN = impliedNormalVol("Call", 0.03, K!, 2, black76("Call", 0.03, K!, ln, 2)) * 1e4;
+      expect(implN).toBeCloseTo(bp!, 1);
+      expect(Math.abs(implN - sabrNormalVol(0.03, K!, 2, p) * 1e4)).toBeLessThan(0.2);
+    }
+  });
+  it("β = 1 gives a finite normal vol and non-positive shifted rates throw instead of returning NaN", () => {
+    const v = sabrNormalVol(0.03, 0.025, 2, { alpha: 0.2, beta: 1, rho: -0.2, nu: 0.3 });
+    expect(Number.isFinite(v)).toBe(true);
+    expect(v).toBeGreaterThan(0.003);
+    expect(v).toBeLessThan(0.01);
+    expect(() => sabrNormalVol(-0.01, 0.02, 1, { ...p, shift: 0 })).toThrow(/positive/);
+    expect(() => sabrLognormalVol(0.02, -0.01, 1, { ...p, shift: 0 })).toThrow(/positive/);
+  });
+  it("swaption cube: lognormal surfaces are evaluated with the lognormal expansion and parameters blend between grid points", () => {
+    const ln: SwaptionVolSurface = {
+      ...SAMPLE_EUR_SWAPTION_VOLS,
+      id: "LN",
+      volType: "Lognormal",
+      atm: SAMPLE_EUR_SWAPTION_VOLS.atm.map((r) => r.map(() => 0.25)),
+    };
+    expect(swaptionVol(ln, 1, 5, 0.03, 0.03)).toBeCloseTo(0.25, 8);
+    const otm = swaptionVol(ln, 1, 5, 0.03, 0.045);
+    expect(otm).toBeGreaterThan(0.1);
+    expect(otm).toBeLessThan(0.5);
+    expect(otm).not.toBeCloseTo(0.25, 3);
+    // blended parameters between 1x5 (rho −0.2, nu 0.35) and 5x5 (rho −0.25, nu 0.3)
+    const blend = sabrParamsAt(SAMPLE_EUR_SWAPTION_VOLS, 2, 5)!;
+    expect(blend.rho).toBeGreaterThan(-0.25);
+    expect(blend.rho).toBeLessThan(-0.2);
+    expect(sabrParamsAt(SAMPLE_EUR_SWAPTION_VOLS, 1, 5)).toEqual(SAMPLE_EUR_SWAPTION_VOLS.sabr!["1x5"]);
+    // continuity: moving the expiry slightly changes the smile vol slightly (no hard switch)
+    const a = swaptionVol(SAMPLE_EUR_SWAPTION_VOLS, 2.99, 5, 0.03, 0.04);
+    const b = swaptionVol(SAMPLE_EUR_SWAPTION_VOLS, 3.01, 5, 0.03, 0.04);
+    expect(Math.abs(a - b)).toBeLessThan(1e-5);
   });
 });

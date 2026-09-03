@@ -85,11 +85,19 @@ export function isEndOfMonth(d: SerialDate): boolean {
   return endOfMonth(d) === d;
 }
 
+/**
+ * Parse a tenor string. Money-market aliases are mapped to business-day
+ * tenors from today: ON = 1D, TN = 2D (tomorrow → next), SN = 3D (spot →
+ * next, assuming a T+2 spot lag; for T+0/T+1 currencies pass the explicit
+ * day count instead).
+ */
 export function parseTenor(t: string | Tenor): Tenor {
   if (typeof t !== "string") return t;
   const m = /^\s*(-?\d+)\s*([DdWwMmYy])\s*$/.exec(t);
   if (!m) {
-    if (/^\s*(ON|O\/N|TN|T\/N|SN|S\/N)\s*$/i.test(t)) return { n: 1, unit: "D" };
+    if (/^\s*(ON|O\/N)\s*$/i.test(t)) return { n: 1, unit: "D" };
+    if (/^\s*(TN|T\/N)\s*$/i.test(t)) return { n: 2, unit: "D" };
+    if (/^\s*(SN|S\/N)\s*$/i.test(t)) return { n: 3, unit: "D" };
     throw new Error(`Invalid tenor: ${t}`);
   }
   return { n: Number(m[1]), unit: m[2]!.toUpperCase() as TenorUnit };

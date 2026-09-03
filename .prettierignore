@@ -1,0 +1,15 @@
+# Build output, dependencies, generated files
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+.turbo/
+*.tsbuildinfo
+pnpm-lock.yaml
+apps/web/e2e-screenshots/
+
+# Prose documentation is hand-formatted (aligned Markdown tables, ADR layout);
+# README/CHANGELOG/CONTRIBUTING/SECURITY at the root stay under Prettier.
+docs/**/*.md
+LICENSE

@@ -1,15 +1,8 @@
 import { type FastifyInstance } from "fastify";
-import {
-  type BootstrapSpec,
-  type Curve,
-  type Fixing,
-  type InterpolatedCurve,
-  bootstrapCurve,
-  parseISO,
-  toISO,
-} from "@deriva/pricing-core";
+import { type BootstrapSpec, type Curve, type Fixing, type InterpolatedCurve, type MarketContext, bootstrapCurve, parseISO, toISO } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
+import { arrayResponse, bootstrapBodySchema, marketPutSchema, objectResponse, responses } from "../schemas.js";
 
 function curveSummary(c: Curve, valuationDate: number) {
   const ic = c as InterpolatedCurve;
@@ -38,87 +31,308 @@ function curveSummary(c: Curve, valuationDate: number) {
   };
 }
 
-export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext) {
-  app.get("/api/market", { schema: { tags: ["market"], summary: "Marktdaten-Snapshot" } }, async () => {
-    const m = ctx.market.get();
-    return {
-      valuationDate: toISO(m.valuationDate),
-      meta: m.meta,
-      discountCurveId: m.discountCurveId,
-      curves: Object.values(m.curves).map((c) => ({ id: c.id, currency: c.currency, nodes: c.nodeDates.length })),
-      fxSpots: m.fxSpots,
-      swaptionVols: Object.keys(m.swaptionVols ?? {}),
-      capletVols: Object.keys(m.capletVols ?? {}),
-      fxVols: Object.keys(m.fxVols ?? {}),
-      fixings: m.fixings?.length ?? 0,
-      credit: m.credit,
-    };
-  });
+const curveSummarySchema = {
+  type: "object",
+  description: "Curve with pillars (date, years, zero, df) and a 6M-forward grid for charting.",
+  properties: {
+    id: { type: "string" },
+    currency: { type: "string" },
+    dayCount: { type: "string" },
+    interpolation: { type: "string" },
+    meta: objectResponse("Curve metadata (source, quotes …)"),
+    referenceDate: { type: "string" },
+    nodes: arrayResponse("{ date, years, zero, df }[]"),
+    forwards: arrayResponse("{ date, years, forward6M }[]"),
+  },
+  additionalProperties: true,
+} as const;
 
-  app.get<{ Params: { id: string } }>(
-    "/api/market/curves/:id",
-    { schema: { tags: ["market"], summary: "Kurve mit Pillars, Zero-Rates und Forwards" } },
-    async (req, reply) => {
-      const m = ctx.market.get();
-      const c = m.curves[req.params.id];
-      if (!c) return reply.status(404).send({ error: `Curve ${req.params.id} not found` });
-      return curveSummary(c, m.valuationDate);
+const curveIdParams = { type: "object", required: ["id"], properties: { id: { type: "string", minLength: 1, maxLength: 64 } } } as const;
+
+type BootstrapBody = {
+  valuationDate?: string;
+  spec: Omit<BootstrapSpec, "discountCurve" | "referenceCurves" | "turnOfYear"> & {
+    discountCurveId?: string;
+    referenceCurveIds?: string[];
+    turnOfYear?: { date: string; bp: number; days?: number }[];
+  };
+};
+
+/**
+ * Resolve an API bootstrap body against the market: curve ids → curve objects
+ * (all market curves are offered as references unless `referenceCurveIds`
+ * narrows them, so BasisSwap/XccyBasis/FxSwapPoints quotes find their curves)
+ * and ISO turn-of-year dates → serial dates. Quotes are passed through
+ * untouched: a Future `start` may be an ISO date string the core resolves itself.
+ */
+function resolveBootstrap(m: MarketContext, body: BootstrapBody): { valuationDate: number; spec: BootstrapSpec } {
+  const valuationDate = body.valuationDate ? parseISO(body.valuationDate) : m.valuationDate;
+  const { discountCurveId, referenceCurveIds, turnOfYear, ...rest } = body.spec;
+  const discountCurve = discountCurveId ? (m.curves[discountCurveId] as InterpolatedCurve | undefined) : undefined;
+  const referenceCurves = Object.fromEntries((referenceCurveIds ?? Object.keys(m.curves)).filter((id) => m.curves[id]).map((id) => [id, m.curves[id]!]));
+  return {
+    valuationDate,
+    spec: {
+      ...rest,
+      discountCurve,
+      referenceCurves,
+      ...(turnOfYear ? { turnOfYear: turnOfYear.map((j) => ({ ...j, date: parseISO(j.date) })) } : {}),
     },
-  );
+  };
+}
 
-  app.get("/api/market/curves", { schema: { tags: ["market"], summary: "Alle Kurven" } }, async () => {
-    const m = ctx.market.get();
-    return Object.values(m.curves).map((c) => curveSummary(c, m.valuationDate));
-  });
-
-  app.get("/api/market/vols", { schema: { tags: ["market"], summary: "Volatilitätsflächen" } }, async () => {
-    const m = ctx.market.get();
-    return { swaption: m.swaptionVols ?? {}, caplet: m.capletVols ?? {}, fx: m.fxVols ?? {} };
-  });
-
-  app.post<{ Body: { valuationDate?: string; spec: Omit<BootstrapSpec, "discountCurve"> & { discountCurveId?: string } } }>(
-    "/api/market/bootstrap",
-    { schema: { tags: ["market"], summary: "Kurve aus Quotes bootstrappen (ohne Speichern)" } },
-    async (req) => {
+export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext) {
+  app.get(
+    "/api/market",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "getMarket",
+        tags: ["market"],
+        summary: "Marktdaten-Übersicht (Bewertungstag, Kurven, Spots, Vol-Flächen, Fixings, Credit)",
+        response: responses({
+          200: {
+            type: "object",
+            properties: {
+              valuationDate: { type: "string" },
+              snapshotId: { type: "string" },
+              meta: objectResponse("Snapshot metadata"),
+              discountCurveId: objectResponse("Discount curve id per currency"),
+              curves: arrayResponse("{ id, currency, nodes }[]"),
+              fxSpots: objectResponse("Spot per pair"),
+              swaptionVols: { type: "array", items: { type: "string" } },
+              capletVols: { type: "array", items: { type: "string" } },
+              fxVols: { type: "array", items: { type: "string" } },
+              fixings: { type: "integer" },
+              credit: objectResponse("Hazard/recovery per counterparty"),
+            },
+            additionalProperties: true,
+          },
+        }),
+      },
+    },
+    async () => {
       const m = ctx.market.get();
-      const val = req.body.valuationDate ? parseISO(req.body.valuationDate) : m.valuationDate;
-      const { discountCurveId, ...rest } = req.body.spec;
-      const disc = discountCurveId ? (m.curves[discountCurveId] as InterpolatedCurve | undefined) : undefined;
-      const res = bootstrapCurve(val, { ...rest, discountCurve: disc });
       return {
-        curve: curveSummary(res.curve, val),
-        residuals: datesToIso(res.residuals.map((r) => ({ ...r, maturity: r.maturity }))),
+        valuationDate: toISO(m.valuationDate),
+        snapshotId: ctx.market.snapshotId(),
+        meta: m.meta,
+        discountCurveId: m.discountCurveId,
+        curves: Object.values(m.curves).map((c) => ({ id: c.id, currency: c.currency, nodes: c.nodeDates.length })),
+        fxSpots: m.fxSpots,
+        swaptionVols: Object.keys(m.swaptionVols ?? {}),
+        capletVols: Object.keys(m.capletVols ?? {}),
+        fxVols: Object.keys(m.fxVols ?? {}),
+        fixings: m.fixings?.length ?? 0,
+        credit: m.credit,
       };
     },
   );
 
-  app.post<{ Body: { valuationDate?: string; spec: Omit<BootstrapSpec, "discountCurve"> & { discountCurveId?: string } } }>(
-    "/api/market/curves",
-    { schema: { tags: ["market"], summary: "Kurve bootstrappen und im Snapshot ersetzen" } },
-    async (req) => {
+  app.get<{ Params: { id: string } }>(
+    "/api/market/curves/:id",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "getCurve",
+        tags: ["market"],
+        summary: "Kurve mit Pillars, Zero-Rates und Forwards",
+        params: curveIdParams,
+        response: responses({ 200: curveSummarySchema }, 400, 404),
+      },
+    },
+    async (req, reply) => {
       const m = ctx.market.get();
-      const val = req.body.valuationDate ? parseISO(req.body.valuationDate) : m.valuationDate;
-      const { discountCurveId, ...rest } = req.body.spec;
-      const disc = discountCurveId ? (m.curves[discountCurveId] as InterpolatedCurve | undefined) : undefined;
-      const res = bootstrapCurve(val, { ...rest, discountCurve: disc });
-      ctx.market.set({ ...m, curves: { ...m.curves, [res.curve.id]: res.curve } });
-      return curveSummary(res.curve, val);
+      const c = m.curves[req.params.id];
+      if (!c) return reply.status(404).send({ error: `Curve ${req.params.id} not found`, statusCode: 404, requestId: req.id });
+      return curveSummary(c, m.valuationDate);
     },
   );
 
-  app.put<{ Body: { fxSpots?: Record<string, number>; fixings?: { index: string; date: string; value: number }[]; valuationDate?: string } }>(
+  app.get(
+    "/api/market/curves",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "listCurves",
+        tags: ["market"],
+        summary: "Alle Kurven",
+        response: responses({ 200: { type: "array", items: curveSummarySchema } }),
+      },
+    },
+    async () => {
+      const m = ctx.market.get();
+      return Object.values(m.curves).map((c) => curveSummary(c, m.valuationDate));
+    },
+  );
+
+  app.get(
+    "/api/market/vols",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "getVols",
+        tags: ["market"],
+        summary: "Volatilitätsflächen",
+        response: responses({
+          200: {
+            type: "object",
+            properties: {
+              swaption: objectResponse("SwaptionVolSurface per id"),
+              caplet: objectResponse("CapletVolSurface per id"),
+              fx: objectResponse("FxVolSurface per id"),
+            },
+            additionalProperties: true,
+          },
+        }),
+      },
+    },
+    async () => {
+      const m = ctx.market.get();
+      return { swaption: m.swaptionVols ?? {}, caplet: m.capletVols ?? {}, fx: m.fxVols ?? {} };
+    },
+  );
+
+  app.post<{ Body: BootstrapBody }>(
+    "/api/market/bootstrap",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "bootstrapCurve",
+        tags: ["market"],
+        summary: "Kurve aus Quotes bootstrappen (ohne Speichern)",
+        body: bootstrapBodySchema,
+        response: responses(
+          {
+            200: {
+              type: "object",
+              properties: {
+                curve: curveSummarySchema,
+                residuals: arrayResponse("Repricing residuals per quote { quote, maturity, residual }"),
+                mergedQuotes: arrayResponse("Quotes dropped by pillarMergeToleranceDays { quote, maturity, mergedInto, residual }"),
+              },
+              additionalProperties: true,
+            },
+          },
+          400,
+          422,
+        ),
+      },
+    },
+    async (req) => {
+      const { valuationDate, spec } = resolveBootstrap(ctx.market.get(), req.body);
+      const res = bootstrapCurve(valuationDate, spec);
+      return {
+        curve: curveSummary(res.curve, valuationDate),
+        residuals: datesToIso(res.residuals),
+        mergedQuotes: datesToIso(res.mergedQuotes ?? []),
+      };
+    },
+  );
+
+  app.post<{ Body: BootstrapBody }>(
+    "/api/market/curves",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "replaceCurve",
+        tags: ["market"],
+        summary: "Kurve bootstrappen und im Snapshot ersetzen",
+        body: bootstrapBodySchema,
+        response: responses(
+          {
+            200: {
+              ...curveSummarySchema,
+              properties: { ...curveSummarySchema.properties, mergedQuotes: arrayResponse("Quotes dropped by pillarMergeToleranceDays") },
+            },
+          },
+          400,
+          422,
+        ),
+      },
+    },
+    async (req) => {
+      const m = ctx.market.get();
+      const { valuationDate, spec } = resolveBootstrap(m, req.body);
+      const res = bootstrapCurve(valuationDate, spec);
+      ctx.market.set({ ...m, curves: { ...m.curves, [res.curve.id]: res.curve } });
+      const tracked = ctx.market.setCurveQuotes(res.curve.id, spec.quotes);
+      ctx.audit.append({
+        actor: "api",
+        action: "curve.replace",
+        subject: res.curve.id,
+        details: { quotes: spec.quotes.length, merged: res.mergedQuotes?.length ?? 0, parRiskTracked: tracked, snapshotId: ctx.market.snapshotId() },
+      });
+      return { ...curveSummary(res.curve, valuationDate), mergedQuotes: datesToIso(res.mergedQuotes ?? []) };
+    },
+  );
+
+  app.put<{
+    Body: {
+      fxSpots?: Record<string, number>;
+      fixings?: { index: string; date: string; value: number }[];
+      valuationDate?: string;
+      fxSpotDates?: Record<string, string>;
+      missingFixingPolicy?: "curve" | "throw";
+    };
+  }>(
     "/api/market",
-    { schema: { tags: ["market"], summary: "Spots/Fixings setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut)" } },
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "updateMarket",
+        tags: ["market"],
+        summary: "Spots/Fixings/Spot-Daten/Fixing-Policy setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut)",
+        body: marketPutSchema,
+        response: responses(
+          {
+            200: {
+              type: "object",
+              properties: {
+                valuationDate: { type: "string" },
+                snapshotId: { type: "string" },
+                fxSpots: objectResponse("Spot per pair"),
+                fixings: arrayResponse("{ index, date, value }[]"),
+                fxSpotDates: objectResponse("ISO spot date per pair"),
+                missingFixingPolicy: { type: "string", enum: ["curve", "throw"] },
+              },
+              additionalProperties: true,
+            },
+          },
+          400,
+          422,
+        ),
+      },
+    },
     async (req) => {
       let m = ctx.market.get();
       if (req.body.valuationDate) m = ctx.market.rebuild(parseISO(req.body.valuationDate));
       if (req.body.fxSpots) m = { ...m, fxSpots: { ...m.fxSpots, ...req.body.fxSpots } };
+      if (req.body.fxSpotDates) {
+        const fxSpotDates = Object.fromEntries(Object.entries(req.body.fxSpotDates).map(([k, v]) => [k, parseISO(v)]));
+        m = { ...m, fxSpotDates: { ...(m.fxSpotDates ?? {}), ...fxSpotDates } };
+      }
+      if (req.body.missingFixingPolicy) m = { ...m, missingFixingPolicy: req.body.missingFixingPolicy };
       if (req.body.fixings) {
         const fixings = datesToSerial(req.body.fixings) as unknown as Fixing[];
         m = { ...m, fixings: [...(m.fixings ?? []), ...fixings] };
       }
       ctx.market.set(m);
-      return { valuationDate: toISO(m.valuationDate), fxSpots: m.fxSpots, fixings: datesToIso(m.fixings) };
+      const snapshotId = ctx.market.snapshotId();
+      ctx.audit.append({
+        actor: "api",
+        action: "market.update",
+        subject: "market",
+        details: { valuationDate: toISO(m.valuationDate), spots: Object.keys(req.body.fxSpots ?? {}), fixings: req.body.fixings?.length ?? 0, snapshotId },
+      });
+      return {
+        valuationDate: toISO(m.valuationDate),
+        snapshotId,
+        fxSpots: m.fxSpots,
+        fixings: datesToIso(m.fixings),
+        fxSpotDates: Object.fromEntries(Object.entries(m.fxSpotDates ?? {}).map(([k, v]) => [k, toISO(v)])),
+        missingFixingPolicy: m.missingFixingPolicy ?? "curve",
+      };
     },
   );
 }

@@ -1,0 +1,38 @@
+{
+  "case": "black76-bachelier",
+  "description": "Closed-form option values: Hull caplet (F 7 %, K 8 %, σ 20 %, T 1, τ 0.25, N 10m, 15M zero 6.5 % cont.) and an ATM Bachelier payer swaption (F = K = 2.5 %, σ_N 80 bp, T 1, annuity 4.5).",
+  "derivation": "Black-76: d1 = (ln(F/K) + σ²T/2)/(σ√T), d2 = d1 − σ√T, C = F·N(d1) − K·N(d2); caplet = N·τ·e^{−0.065·1.25}·C. Bachelier ATM: A·σ√T/√(2π) = 4.5·0.008/√(2π) = 0.014362; the general Bachelier formula (F−K)·N(d) + σ√T·φ(d) is used so the two must agree. Reference values from math.erf.",
+  "inputs": {
+    "black76": {
+      "forward": 0.07,
+      "strike": 0.08,
+      "vol": 0.2,
+      "timeToExpiry": 1.0,
+      "notional": 10000000.0,
+      "accrualFactor": 0.25,
+      "zeroRate15M": 0.065
+    },
+    "bachelier": {
+      "forward": 0.025,
+      "strike": 0.025,
+      "normalVol": 0.008,
+      "timeToExpiry": 1.0,
+      "annuity": 4.5
+    }
+  },
+  "expected": {
+    "black76": {
+      "d1": -0.5676569631226124,
+      "d2": -0.7676569631226124,
+      "undiscountedCall": 0.002251736761716562,
+      "capletValue": 5190.045917440499,
+      "put": 0.012251736761716557
+    },
+    "bachelier": {
+      "atmPayer": 0.014361922094451578,
+      "atmClosedForm": 0.01436192209445158,
+      "delta": 0.5,
+      "vega": 1.7952402618064471
+    }
+  }
+}

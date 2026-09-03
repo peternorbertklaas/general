@@ -1,0 +1,24 @@
+{
+  "case": "swaption-flat-curve",
+  "description": "1Y × 5Y ATM payer swaption (N 10m) on the flat 3 % single curve; underlying annual unadjusted swap 2027-09-03 → 2032-09-03 (fixed 30E/360, float EURIBOR-12M ACT/360); flat normal vol 80 bp.",
+  "derivation": "Forward swap rate F = (DF_1 − DF_6)/Σ_{i=2..6} DF_i, annuity A = Σ_{i=2..6} DF_i (discounted to today); physical and cash 'Collateralised Cash Price' = N·A·Bachelier(F, K=F, σ, T) = N·A·σ√T/√(2π); legacy IRR cash settlement = N·DF(settlement)·Σ_{i=1..5} (1+F)^{−i}·Bachelier(...). Closed form.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "curveId": "EUR-EURIBOR-12M",
+    "flatZeroRate": 0.03,
+    "notional": 10000000.0,
+    "expiryDate": "2027-09-03",
+    "swapStart": "2027-09-03",
+    "swapEnd": "2032-09-03",
+    "strike": 0.030488442992048566,
+    "normalVol": 0.008
+  },
+  "expected": {
+    "forwardSwapRate": 0.030488442992048566,
+    "annuity": 44381608.985448636,
+    "physical": 141645.60237231676,
+    "cashCollateralisedCashPrice": 141645.60237231676,
+    "cashIrr": 141645.73184961968,
+    "expiryYears": 1.0
+  }
+}

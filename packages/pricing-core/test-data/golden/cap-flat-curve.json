@@ -1,0 +1,49 @@
+{
+  "case": "cap-flat-curve",
+  "description": "Forward-starting 3Y cap 2027-09-03 → 2030-09-03 (long, N 10m, K 3 %) on EURIBOR-12M, flat 3 % single curve, annual unadjusted periods, EURIBOR fixing lag 2 TARGET business days, Bachelier with a flat 70 bp normal vol.",
+  "derivation": "Caplet_i = N·τ_i·DF(pay_i)·Bachelier(F_i, K, σ_N, T_i) with F_i = (DF_{i−1}/DF_i − 1)/τ_i (ACT/360) and T_i = ACT/365F time to the fixing date = accrual start − 2 business days (unadjusted accrual starts may fall on weekends; the fixing steps back over them). Closed form.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "curveId": "EUR-EURIBOR-12M",
+    "flatZeroRate": 0.03,
+    "notional": 10000000.0,
+    "strike": 0.03,
+    "normalVol": 0.007,
+    "effectiveDate": "2027-09-03",
+    "terminationDate": "2030-09-03",
+    "index": "EURIBOR-12M",
+    "frequency": "12M",
+    "dayCount": "ACT/360",
+    "calendar": "NONE",
+    "businessDayConvention": "Unadjusted"
+  },
+  "expected": {
+    "caplets": [
+      {
+        "fixingDate": "2027-09-01",
+        "paymentDate": "2028-09-03",
+        "forward": 0.030038589174517436,
+        "accrualFactor": 1.0166666666666666,
+        "expiryYears": 0.9945205479452055,
+        "presentValue": 26847.589615112814
+      },
+      {
+        "fixingDate": "2028-08-31",
+        "paymentDate": "2029-09-03",
+        "forward": 0.0300373485568932,
+        "accrualFactor": 1.0138888888888888,
+        "expiryYears": 1.9945205479452055,
+        "presentValue": 36715.55753578746
+      },
+      {
+        "fixingDate": "2029-08-30",
+        "paymentDate": "2030-09-03",
+        "forward": 0.0300373485568932,
+        "accrualFactor": 1.0138888888888888,
+        "expiryYears": 2.9917808219178084,
+        "presentValue": 43600.36865844015
+      }
+    ],
+    "pv": 107163.51580934043
+  }
+}

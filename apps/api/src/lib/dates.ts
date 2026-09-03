@@ -15,8 +15,16 @@ const DATE_KEYS = new Set([
   "accrualStart",
   "accrualEnd",
   "maturity",
+  "maturityDate",
+  "designationDate",
+  "settlementDate",
+  "valueDate",
   "spotDate",
   "referenceDate",
+  "nearDate",
+  "farDate",
+  "quoteValidUntil",
+  "confirmationDate",
 ]);
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;

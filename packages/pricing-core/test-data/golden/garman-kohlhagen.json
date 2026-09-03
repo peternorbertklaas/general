@@ -1,0 +1,25 @@
+{
+  "case": "garman-kohlhagen",
+  "description": "EUR/USD vanilla: S 1.10, K 1.10, T 1Y, r_USD 4 %, r_EUR 2 % (continuous), σ 8 %; second set with a 5-day delivery lag (discount and forward to T+5d, vol time to expiry).",
+  "derivation": "F = S·e^{(r_d − r_f)·T_del}; C = e^{−r_d T_del}[F·N(d1) − K·N(d2)], P = e^{−r_d T_del}[K·N(−d2) − F·N(−d1)] with d1 = (ln(F/K) + σ²T/2)/(σ√T); put-call parity C − P = e^{−r_d T_del}(F − K). Reference from math.erf (domain briefing T2: C = 0.045795, P = 0.024445, F = 1.122221).",
+  "inputs": {
+    "spot": 1.1,
+    "strike": 1.1,
+    "timeToExpiry": 1.0,
+    "rd": 0.04,
+    "rf": 0.02,
+    "vol": 0.08,
+    "timeToDeliveryLag": 1.0136986301369864
+  },
+  "expected": {
+    "forward": 1.1222214740294314,
+    "call": 0.04579537170414944,
+    "put": 0.024445214134274217,
+    "parity": 0.02135015756987522,
+    "withDeliveryLag": {
+      "forward": 1.1225289740888942,
+      "call": 0.04595180821918368,
+      "put": 0.024318065193698665
+    }
+  }
+}

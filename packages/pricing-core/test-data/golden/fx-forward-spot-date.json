@@ -1,0 +1,21 @@
+{
+  "case": "fx-forward-spot-date",
+  "description": "Buy 1m EUR / sell USD at 1.12 for 2027-09-08; flat EUR 2 % and USD 4 % curves (continuous, ACT/365F), spot 1.10 quoted for the spot date 2026-09-08 (T+2 on the joint TARGET+US calendar; 2026-09-07 is Labor Day).",
+  "derivation": "Covered interest parity anchored at the spot date: F = S·[DF_EUR(T)/DF_EUR(t_s)]/[DF_USD(T)/DF_USD(t_s)] = 1.10·e^{(0.04−0.02)·365/365}; PV_USD = N_EUR·DF_USD(T)·(F − K); today rate S_0 = S·DF_USD(t_s)/DF_EUR(t_s); PV_EUR = PV_USD/S_0. Closed form.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "spot": 1.1,
+    "rEur": 0.02,
+    "rUsd": 0.04,
+    "eurAmount": 1000000.0,
+    "contractRate": 1.12,
+    "deliveryDate": "2027-09-08"
+  },
+  "expected": {
+    "spotDate": "2026-09-08",
+    "fairForward": 1.1222214740294314,
+    "spotAtValuationDate": 1.0996986714167594,
+    "pvUsd": 2133.199590042415,
+    "pvEur": 1939.8037348669156
+  }
+}

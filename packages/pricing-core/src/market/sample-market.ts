@@ -1,4 +1,5 @@
-import { bootstrapCurve, type CurveQuote } from "../curves/bootstrap.js";
+import { type CurveBuildSpec, type CurveQuote, bootstrapCurves } from "../curves/bootstrap.js";
+import { type Curve } from "../curves/curve.js";
 import { type SerialDate, parseISO } from "../dates/date.js";
 import { type MarketContext } from "./market-context.js";
 import { type SwaptionVolSurface, type CapletVolSurface } from "../models/vol-surfaces.js";
@@ -15,8 +16,28 @@ export interface SampleMarketQuotes {
   usdSofr: CurveQuote[];
   gbpSonia: CurveQuote[];
   chfSaron: CurveQuote[];
+  /**
+   * EUR/USD cross-currency basis (€STR + spread vs SOFR) used to build the
+   * USD-collateral EUR discount curve "EUR-ESTR-USDCSA". Optional so older
+   * quote sets keep working (the curve is then omitted).
+   */
+  eurUsdXccy?: CurveQuote[];
+  /** JPY TONA OIS quotes (curve "JPY-TONA", discount curve for JPY). Optional for older quote sets. */
+  jpyTona?: CurveQuote[];
   fxSpots: Record<string, number>;
 }
+
+/** Curve ids produced by `buildSampleMarket`. */
+export const SAMPLE_CURVE_IDS = {
+  eurOis: "EUR-ESTR",
+  eur6m: "EUR-EURIBOR-6M",
+  eur3m: "EUR-EURIBOR-3M",
+  usdSofr: "USD-SOFR",
+  gbpSonia: "GBP-SONIA",
+  chfSaron: "CHF-SARON",
+  eurUsdXccy: "EUR-ESTR-USDCSA",
+  jpyTona: "JPY-TONA",
+} as const;
 
 export const SAMPLE_QUOTES: SampleMarketQuotes = {
   eurOis: [
@@ -60,6 +81,11 @@ export const SAMPLE_QUOTES: SampleMarketQuotes = {
   ],
   eur3m: [
     { type: "Deposit", tenor: "3M", rate: 0.0212 },
+    // 3M EURIBOR futures on the first two quarterly IMM dates after spot+3M / spot+6M
+    // (tenor form keeps the sample valid for any valuation date). Prices are set
+    // consistent with the FRA strip (~2.15% / ~2.18%); 0.5bp convexity.
+    { type: "Future", start: "3M", price: 97.84, convexityBp: 0.5 },
+    { type: "Future", start: "6M", price: 97.81, convexityBp: 0.5 },
     { type: "FRA", start: "3M", end: "6M", rate: 0.0215 },
     { type: "FRA", start: "6M", end: "9M", rate: 0.0218 },
     { type: "FRA", start: "9M", end: "12M", rate: 0.0222 },
@@ -113,6 +139,75 @@ export const SAMPLE_QUOTES: SampleMarketQuotes = {
     { type: "OIS", tenor: "15Y", rate: 0.0101 },
     { type: "OIS", tenor: "20Y", rate: 0.0106 },
     { type: "OIS", tenor: "30Y", rate: 0.0102 },
+  ],
+  // JPY TONA OIS (indicative levels: BoJ normalisation, ~0.5–1.6%).
+  jpyTona: [
+    { type: "OIS", tenor: "1M", rate: 0.0048 },
+    { type: "OIS", tenor: "3M", rate: 0.0052 },
+    { type: "OIS", tenor: "6M", rate: 0.0058 },
+    { type: "OIS", tenor: "1Y", rate: 0.0068 },
+    { type: "OIS", tenor: "2Y", rate: 0.0085 },
+    { type: "OIS", tenor: "3Y", rate: 0.0098 },
+    { type: "OIS", tenor: "5Y", rate: 0.0118 },
+    { type: "OIS", tenor: "7Y", rate: 0.0133 },
+    { type: "OIS", tenor: "10Y", rate: 0.0152 },
+    { type: "OIS", tenor: "15Y", rate: 0.0175 },
+    { type: "OIS", tenor: "20Y", rate: 0.0188 },
+    { type: "OIS", tenor: "30Y", rate: 0.0195 },
+  ],
+  // EUR/USD basis: €STR + spread vs SOFR flat, quarterly, notional exchange.
+  // `fxSpot` is overridden with `fxSpots.EURUSD` when the market is built.
+  eurUsdXccy: [
+    {
+      type: "XccyBasis",
+      tenor: "1Y",
+      spread: -0.0015,
+      foreignCurrency: "USD",
+      foreignDiscountCurveId: "USD-SOFR",
+      foreignProjectionCurveId: "USD-SOFR",
+      domesticProjectionCurveId: "EUR-ESTR",
+      fxSpot: 1.1625,
+    },
+    {
+      type: "XccyBasis",
+      tenor: "2Y",
+      spread: -0.0017,
+      foreignCurrency: "USD",
+      foreignDiscountCurveId: "USD-SOFR",
+      foreignProjectionCurveId: "USD-SOFR",
+      domesticProjectionCurveId: "EUR-ESTR",
+      fxSpot: 1.1625,
+    },
+    {
+      type: "XccyBasis",
+      tenor: "3Y",
+      spread: -0.0019,
+      foreignCurrency: "USD",
+      foreignDiscountCurveId: "USD-SOFR",
+      foreignProjectionCurveId: "USD-SOFR",
+      domesticProjectionCurveId: "EUR-ESTR",
+      fxSpot: 1.1625,
+    },
+    {
+      type: "XccyBasis",
+      tenor: "5Y",
+      spread: -0.0022,
+      foreignCurrency: "USD",
+      foreignDiscountCurveId: "USD-SOFR",
+      foreignProjectionCurveId: "USD-SOFR",
+      domesticProjectionCurveId: "EUR-ESTR",
+      fxSpot: 1.1625,
+    },
+    {
+      type: "XccyBasis",
+      tenor: "10Y",
+      spread: -0.0025,
+      foreignCurrency: "USD",
+      foreignDiscountCurveId: "USD-SOFR",
+      foreignProjectionCurveId: "USD-SOFR",
+      domesticProjectionCurveId: "EUR-ESTR",
+      fxSpot: 1.1625,
+    },
   ],
   fxSpots: {
     EURUSD: 1.1625,
@@ -199,24 +294,55 @@ export const SAMPLE_EURCHF_VOLS: FxVolSurface = {
   bf25: [0.0015, 0.0018, 0.002, 0.0022, 0.0025, 0.0027],
 };
 
+/**
+ * Curve build specifications used by `buildSampleMarket`, keyed by curve id
+ * and in build order. Exposed so the UI / API can run par-rate risk
+ * (`parRisk`) or rebuild single curves without duplicating the quote lists.
+ * The specs themselves are valuation-date independent (futures use tenor
+ * starts); the parameter is accepted for a stable call signature.
+ */
+export function sampleBootstrapSpecs(
+  _valuationDate: SerialDate = parseISO("2026-09-03"),
+  quotes: SampleMarketQuotes = SAMPLE_QUOTES,
+): Record<string, CurveBuildSpec> {
+  const ids = SAMPLE_CURVE_IDS;
+  const specs: Record<string, CurveBuildSpec> = {
+    [ids.eurOis]: { id: ids.eurOis, currency: "EUR", index: "ESTR", quotes: quotes.eurOis },
+    [ids.eur6m]: { id: ids.eur6m, currency: "EUR", index: "EURIBOR-6M", quotes: quotes.eur6m, discountCurveId: ids.eurOis },
+    // FRA 3x6 / 6x9 and the Dec/Mar futures end 8–10 days apart: merge each pair
+    // to one pillar (the future wins) instead of two pillars with a forward kink.
+    [ids.eur3m]: { id: ids.eur3m, currency: "EUR", index: "EURIBOR-3M", quotes: quotes.eur3m, discountCurveId: ids.eurOis, pillarMergeToleranceDays: 10 },
+    [ids.usdSofr]: { id: ids.usdSofr, currency: "USD", index: "SOFR", quotes: quotes.usdSofr },
+    [ids.gbpSonia]: { id: ids.gbpSonia, currency: "GBP", index: "SONIA", quotes: quotes.gbpSonia },
+    [ids.chfSaron]: { id: ids.chfSaron, currency: "CHF", index: "SARON", quotes: quotes.chfSaron },
+  };
+  if (quotes.jpyTona && quotes.jpyTona.length > 0) {
+    specs[ids.jpyTona] = { id: ids.jpyTona, currency: "JPY", index: "TONA", quotes: quotes.jpyTona };
+  }
+  if (quotes.eurUsdXccy && quotes.eurUsdXccy.length > 0) {
+    const fx = quotes.fxSpots.EURUSD;
+    specs[ids.eurUsdXccy] = {
+      id: ids.eurUsdXccy,
+      currency: "EUR",
+      index: "ESTR",
+      quotes: quotes.eurUsdXccy.map((q) => (q.type === "XccyBasis" && fx !== undefined ? { ...q, fxSpot: fx } : q)),
+    };
+  }
+  return specs;
+}
+
 export function buildSampleMarket(valuationDate: SerialDate = parseISO("2026-09-03"), quotes: SampleMarketQuotes = SAMPLE_QUOTES): MarketContext {
-  const eurOis = bootstrapCurve(valuationDate, { id: "EUR-ESTR", currency: "EUR", index: "ESTR", quotes: quotes.eurOis });
-  const eur6m = bootstrapCurve(valuationDate, { id: "EUR-EURIBOR-6M", currency: "EUR", index: "EURIBOR-6M", quotes: quotes.eur6m, discountCurve: eurOis.curve });
-  const eur3m = bootstrapCurve(valuationDate, { id: "EUR-EURIBOR-3M", currency: "EUR", index: "EURIBOR-3M", quotes: quotes.eur3m, discountCurve: eurOis.curve });
-  const usd = bootstrapCurve(valuationDate, { id: "USD-SOFR", currency: "USD", index: "SOFR", quotes: quotes.usdSofr });
-  const gbp = bootstrapCurve(valuationDate, { id: "GBP-SONIA", currency: "GBP", index: "SONIA", quotes: quotes.gbpSonia });
-  const chf = bootstrapCurve(valuationDate, { id: "CHF-SARON", currency: "CHF", index: "SARON", quotes: quotes.chfSaron });
+  const specs = sampleBootstrapSpecs(valuationDate, quotes);
+  const built = bootstrapCurves(valuationDate, Object.values(specs));
+  const curves: Record<string, Curve> = {};
+  for (const id of Object.keys(specs)) curves[id] = built.curves[id]!;
+  const hasXccy = SAMPLE_CURVE_IDS.eurUsdXccy in curves;
+  const hasJpy = SAMPLE_CURVE_IDS.jpyTona in curves;
   return {
     valuationDate,
-    curves: {
-      [eurOis.curve.id]: eurOis.curve,
-      [eur6m.curve.id]: eur6m.curve,
-      [eur3m.curve.id]: eur3m.curve,
-      [usd.curve.id]: usd.curve,
-      [gbp.curve.id]: gbp.curve,
-      [chf.curve.id]: chf.curve,
-    },
-    discountCurveId: { EUR: "EUR-ESTR", USD: "USD-SOFR", GBP: "GBP-SONIA", CHF: "CHF-SARON" },
+    curves,
+    discountCurveId: { EUR: "EUR-ESTR", USD: "USD-SOFR", GBP: "GBP-SONIA", CHF: "CHF-SARON", ...(hasJpy ? { JPY: SAMPLE_CURVE_IDS.jpyTona } : {}) },
+    ...(hasXccy ? { collateralDiscountCurveId: { "EUR|USD": SAMPLE_CURVE_IDS.eurUsdXccy } } : {}),
     fxSpots: { ...quotes.fxSpots },
     fixings: [],
     swaptionVols: { EUR: SAMPLE_EUR_SWAPTION_VOLS },

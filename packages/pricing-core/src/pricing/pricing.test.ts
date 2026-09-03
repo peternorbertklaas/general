@@ -35,7 +35,14 @@ describe("bootstrap", () => {
     const spot = advance(VAL, "2D", cal);
     for (const q of SAMPLE_QUOTES.eur6m) {
       if (q.type !== "Swap") continue;
-      const swap = makeVanillaSwap({ currency: "EUR", notional: 10_000_000, payReceiveFixed: "Receive", fixedRate: q.rate, effectiveDate: spot, maturity: q.tenor });
+      const swap = makeVanillaSwap({
+        currency: "EUR",
+        notional: 10_000_000,
+        payReceiveFixed: "Receive",
+        fixedRate: q.rate,
+        effectiveDate: spot,
+        maturity: q.tenor,
+      });
       const res = priceInterestRateSwap(ctx, swap, "EUR");
       expect(Math.abs(res.pv)).toBeLessThan(1); // < 1 EUR on 10m notional
       expect(res.analytics.parRate).toBeCloseTo(q.rate, 9);
@@ -113,7 +120,15 @@ describe("interest rate swap", () => {
     const flat = flatCurve("EUR-ESTR", "EUR", VAL, 0.02);
     const c2: MarketContext = { ...ctx, curves: { ...ctx.curves, "EUR-ESTR": flat } };
     const spot = advance(VAL, "2D", getCalendar("TARGET"));
-    const ois = makeVanillaSwap({ currency: "EUR", notional: 1e6, payReceiveFixed: "Pay", fixedRate: 0.02, effectiveDate: spot, maturity: "3Y", index: "ESTR" });
+    const ois = makeVanillaSwap({
+      currency: "EUR",
+      notional: 1e6,
+      payReceiveFixed: "Pay",
+      fixedRate: 0.02,
+      effectiveDate: spot,
+      maturity: "3Y",
+      index: "ESTR",
+    });
     const res = priceInterestRateSwap(c2, ois, "EUR");
     // Annual compounded ACT/360 rate equivalent to 2% continuous (ACT/365F): (e^0.02 - 1) / (365/360)
     expect(res.analytics.parRate as number).toBeCloseTo(((Math.exp(0.02) - 1) * 360) / 365, 4);
@@ -126,7 +141,17 @@ describe("FRA", () => {
     const spot = advance(VAL, "2D", cal);
     const start = advance(spot, "6M", cal, "ModifiedFollowing", true);
     const end = advance(spot, "12M", cal, "ModifiedFollowing", true);
-    const fra: ForwardRateAgreement = { id: "fra", type: "FRA", payReceive: "Pay", notional: 1e7, currency: "EUR", index: "EURIBOR-6M", startDate: start, endDate: end, fixedRate: 0.0226 };
+    const fra: ForwardRateAgreement = {
+      id: "fra",
+      type: "FRA",
+      payReceive: "Pay",
+      notional: 1e7,
+      currency: "EUR",
+      index: "EURIBOR-6M",
+      startDate: start,
+      endDate: end,
+      fixedRate: 0.0226,
+    };
     const res = priceTrade(ctx, fra, "EUR");
     expect(Math.abs(res.pv)).toBeLessThan(0.01);
     const fra2 = { ...fra, fixedRate: 0.02 };
@@ -143,7 +168,15 @@ describe("cap / floor / collar", () => {
     const pvCap = priceTrade(ctx, cap, "EUR").pv;
     const pvFloor = priceTrade(ctx, floor, "EUR").pv;
     // Equivalent swap: receive float (6M) pay fixed K with the same schedule (semi-annual fixed, ACT/360)
-    const swap = makeVanillaSwap({ currency: "EUR", notional: 1e7, payReceiveFixed: "Pay", fixedRate: K, effectiveDate: spot, maturity: "5Y", fixedFrequency: "6M" });
+    const swap = makeVanillaSwap({
+      currency: "EUR",
+      notional: 1e7,
+      payReceiveFixed: "Pay",
+      fixedRate: K,
+      effectiveDate: spot,
+      maturity: "5Y",
+      fixedFrequency: "6M",
+    });
     swap.legs[0]!.dayCount = "ACT/360";
     const pvSwap = priceInterestRateSwap(ctx, swap, "EUR").pv;
     expect(pvCap - pvFloor).toBeCloseTo(pvSwap, 0);
@@ -189,7 +222,16 @@ describe("swaption", () => {
     expect(r.analytics.volatility as number).toBeLessThan(0.012);
   });
   it("ATM straddle ≈ annuity × 2 × σ√T/√(2π)", () => {
-    const probe = makeSwaption({ currency: "EUR", notional: 1e7, payerReceiver: "Payer", strike: 0.03, expiry: "1Y", tenor: "10Y", valuationDate: VAL, settlement: "Physical" });
+    const probe = makeSwaption({
+      currency: "EUR",
+      notional: 1e7,
+      payerReceiver: "Payer",
+      strike: 0.03,
+      expiry: "1Y",
+      tenor: "10Y",
+      valuationDate: VAL,
+      settlement: "Physical",
+    });
     const fwd = priceTrade(ctx, probe, "EUR").analytics.forwardSwapRate as number;
     const atm = makeSwaption({ currency: "EUR", notional: 1e7, payerReceiver: "Payer", strike: fwd, expiry: "1Y", tenor: "10Y", valuationDate: VAL });
     const r = priceTrade(ctx, atm, "EUR");
@@ -198,13 +240,25 @@ describe("swaption", () => {
     const annuity = r.analytics.annuity as number;
     expect(r.pv).toBeCloseTo((annuity * vol * Math.sqrt(T)) / Math.sqrt(2 * Math.PI), 0);
   });
-  it("cash settlement differs slightly from physical", () => {
-    const phys = makeSwaption({ currency: "EUR", notional: 1e7, payerReceiver: "Receiver", strike: 0.03, expiry: "5Y", tenor: "10Y", valuationDate: VAL, settlement: "Physical" });
-    const cash = { ...phys, settlement: "Cash" as const };
+  it("cash settlement: CCP convention equals physical, legacy IRR differs slightly", () => {
+    const phys = makeSwaption({
+      currency: "EUR",
+      notional: 1e7,
+      payerReceiver: "Receiver",
+      strike: 0.03,
+      expiry: "5Y",
+      tenor: "10Y",
+      valuationDate: VAL,
+      settlement: "Physical",
+    });
+    const ccp = { ...phys, settlement: "Cash" as const };
+    const irr = { ...phys, settlement: "Cash" as const, cashSettlementConvention: "IRR" as const };
     const a = priceTrade(ctx, phys, "EUR").pv;
-    const b = priceTrade(ctx, cash, "EUR").pv;
-    expect(Math.abs(a - b) / a).toBeLessThan(0.05);
-    expect(a).not.toBeCloseTo(b, 6);
+    const b = priceTrade(ctx, ccp, "EUR").pv;
+    const c = priceTrade(ctx, irr, "EUR").pv;
+    expect(b).toBeCloseTo(a, 6);
+    expect(Math.abs(a - c) / a).toBeLessThan(0.05);
+    expect(a).not.toBeCloseTo(c, 6);
   });
 });
 
@@ -220,9 +274,15 @@ describe("FX", () => {
     // Buying EUR below fair → positive value
     const cheap = makeFxForward({ pair: "EURUSD", baseAmount: 1e6, rate: fair - 0.01, deliveryDate: del });
     expect(priceTrade(ctx, cheap, "USD").pv).toBeGreaterThan(0);
-    // Reporting in EUR consistent
+    // Reporting in EUR consistent: PVs (discounted to today) convert at the spot rate adjusted to the
+    // valuation date (spot settles T+2), not at the raw spot – review finding H5.
+    const inUsd = priceTrade(ctx, cheap, "USD");
     const inEur = priceTrade(ctx, cheap, "EUR").pv;
-    expect(inEur * 1.1625).toBeCloseTo(priceTrade(ctx, cheap, "USD").pv, 6);
+    const todayRate = inUsd.analytics.spotAtValuationDate as number;
+    expect(inEur * todayRate).toBeCloseTo(inUsd.pv, 6);
+    // the difference to a spot conversion is the 2-day rate differential (~1e-4 relative), not zero
+    expect(Math.abs(inEur * 1.1625 - inUsd.pv) / Math.abs(inUsd.pv)).toBeLessThan(5e-4);
+    expect(todayRate).not.toBe(1.1625);
   });
   it("FX swap PV equals sum of legs", () => {
     const near = makeFxForward({ pair: "EURUSD", baseAmount: 1e6, rate: 1.1625, deliveryDate: parseISO("2026-09-07") });
@@ -263,8 +323,31 @@ describe("cross currency swap", () => {
       id: "ccs",
       type: "CrossCurrencySwap",
       legs: [
-        { type: "Float", payReceive: "Receive", notional: 1e7, currency: "EUR", effectiveDate: spot, terminationDate: mat, frequency: "3M", dayCount: "ACT/360", calendar: "TARGET+US", index: "EURIBOR-3M", spread: -0.0015 },
-        { type: "Float", payReceive: "Pay", notional: 1e7 * 1.1625, currency: "USD", effectiveDate: spot, terminationDate: mat, frequency: "3M", dayCount: "ACT/360", calendar: "TARGET+US", index: "SOFR" },
+        {
+          type: "Float",
+          payReceive: "Receive",
+          notional: 1e7,
+          currency: "EUR",
+          effectiveDate: spot,
+          terminationDate: mat,
+          frequency: "3M",
+          dayCount: "ACT/360",
+          calendar: "TARGET+US",
+          index: "EURIBOR-3M",
+          spread: -0.0015,
+        },
+        {
+          type: "Float",
+          payReceive: "Pay",
+          notional: 1e7 * 1.1625,
+          currency: "USD",
+          effectiveDate: spot,
+          terminationDate: mat,
+          frequency: "3M",
+          dayCount: "ACT/360",
+          calendar: "TARGET+US",
+          index: "SOFR",
+        },
       ],
     };
     const r = priceTrade(ctx, ccs, "EUR");
@@ -289,7 +372,10 @@ describe("scenarios & XVA & report", () => {
     expect(dn.pnl).toBeGreaterThan(0);
     const grid = scenarioGrid(ctx, [recv], "EUR", [-100, 0, 100], [-5, 0, 5], "USD");
     expect(grid.pv[1]![1]).toBeCloseTo(grid.base, 6);
-    const steep = applyScenario(ctx, STANDARD_SCENARIOS.find((s) => s.id === "steep")!);
+    const steep = applyScenario(
+      ctx,
+      STANDARD_SCENARIOS.find((s) => s.id === "steep")!,
+    );
     expect(steep.curves["EUR-ESTR"]!.zeroRate(VAL + 365 * 30)).toBeGreaterThan(ctx.curves["EUR-ESTR"]!.zeroRate(VAL + 365 * 30));
   });
   it("CVA is positive and bounded for a swap and an FX forward", () => {
@@ -308,10 +394,19 @@ describe("scenarios & XVA & report", () => {
     const spot = advance(VAL, "2D", getCalendar("TARGET"));
     const swap = makeVanillaSwap({ currency: "EUR", notional: 1e7, payReceiveFixed: "Pay", fixedRate: 0.031, effectiveDate: spot, maturity: "10Y" });
     const pr = priceTrade(ctx, swap, "EUR");
-    const rep = buildValuationReport(ctx, swap, pr, { transactionPrice: 0 });
+    // The swap is booked from the client's side (client pays 3.1% while par is 2.88%) → negative initial market value for the client
+    const rep = buildValuationReport(ctx, swap, pr, { transactionPrice: 0, perspective: "Kunde" });
     expect(rep.costTransparency).toBeDefined();
-    // Client pays 3.1% while par is 2.88% → negative initial market value for client
+    expect(rep.costTransparency!.perspective).toBe("Kunde");
     expect(rep.costTransparency!.initialMarketValue).toBeLessThan(0);
+    expect(rep.costTransparency!.bankMargin).toBeCloseTo(-rep.costTransparency!.initialMarketValue, 8);
+    expect(rep.costTransparency!.marginBp).toBeGreaterThan(0);
+    // Default perspective is the bank's: the same pv is then the bank's (negative) value → bank margin negative
+    const bank = buildValuationReport(ctx, swap, pr, { transactionPrice: 0 });
+    expect(bank.costTransparency!.perspective).toBe("Bank");
+    expect(bank.costTransparency!.bankMargin).toBeCloseTo(pr.pv, 8);
+    expect(bank.costTransparency!.initialMarketValue).toBeCloseTo(-pr.pv, 8);
+    expect(bank.methodology.some((m) => m.startsWith("Kostentransparenz") && m.includes("Perspektive Bank"))).toBe(true);
     expect(rep.fairValue.ifrs13Level).toBe(2);
     const table = cashflowTable(pr);
     expect(table.length).toBeGreaterThan(20);

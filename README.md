@@ -2,10 +2,12 @@
 
 **Keyboard-first. Transparent bis zum Cashflow. Ein Bewertungskern für Browser und Server.**
 
-DERIVA bewertet Zinsswaps (fix/float/OIS/Basis), FRAs, Caps/Floors/Collars, Swaptions, FX-Forwards/-Swaps,
-FX-Optionen (Vanilla, Digital, Barrier) und Cross-Currency-Swaps mit Multi-Curve-Framework (OIS-Diskontierung),
-Bachelier/shifted Black + SABR-Smile, Garman-Kohlhagen mit Delta-Smile, und liefert Sensitivitäten, Szenarien,
-CVA/DVA und prüfungsfähige Bewertungsreports (IFRS 13, MiFID-II-Kostentransparenz).
+DERIVA bewertet Zinsswaps (fix/float/OIS/Basis, amortisierend, IMM, mit embedded Caps/Floors und RFR-Lookback),
+FRAs, Caps/Floors/Collars, Swaptions (physisch, Cash/CCP), FX-Forwards/-Swaps, FX-Optionen (Vanilla, Digital, Barrier)
+und Cross-Currency-Swaps mit Multi-Curve-Framework (OIS-Diskontierung, Collateral-Kurven, Futures/Basis/XCCY-Inputs),
+Bachelier/shifted Black + SABR-Smile, Garman-Kohlhagen mit Delta-Smile, und liefert Sensitivitäten (Zero, Par, Vega-Buckets),
+Szenarien (inkl. EBA-IRRBB), CVA/DVA für alle Instrumente, Hedge Accounting (IFRS 9 / HGB § 254) und prüfungsfähige
+Bewertungsreports mit Hashes (IFRS 13 / IDW RS HFA 35, MiFID-II-Kostentransparenz, EMIR-Refit-Felder, Termsheet, Geeignetheitserklärung).
 
 Entstanden aus einer Markt- und Wettbewerbsanalyse (LPA Captano/Capmatix, Bloomberg SWPM/OVML, Numerix, Quantifi,
 Murex, TMS-Anbieter, QuantLib/ORE) – siehe [`docs/research`](docs/research).
@@ -13,37 +15,42 @@ Murex, TMS-Anbieter, QuantLib/ORE) – siehe [`docs/research`](docs/research).
 ## Repository
 
 ```
-packages/pricing-core   Bewertungsbibliothek (TypeScript, ohne Abhängigkeiten, 63 Tests)
-apps/api                REST-API (Fastify 5, OpenAPI unter /docs)
-apps/web                Workstation-UI (React 19, Vite, Hotkeys, Command Palette)
+packages/pricing-core   Bewertungsbibliothek (TypeScript, ohne Laufzeitabhängigkeiten)
+apps/api                REST-API (Fastify 5, JSON-Schema-Validierung, OpenAPI-Vertrag, ETag, Audit-Trail)
+apps/web                Workstation-UI (React 19, Vite, Hotkeys, Command Palette, Kundenmodus, Vergleich, Hedge Accounting)
+docs/quality            Bewertungsrubrik, Review-Berichte und Scorecards des Orchestrator-Prozesses
 docs/research           Video-Ausgangspunkt, LPA-Analyse, Wettbewerber, Domäne/Methodik/Regulatorik
 docs/product            Vision & Module, Epics & User Stories, UI-Konzept & Hotkeys
 docs/architecture       Architektur (C4), Architecture Decision Records
+docs/compliance         Regulatorik-Mapping: Anforderung → Feature → Evidenz → Status (MiFID II, IFRS 13/IDW RS HFA 35, IFRS 9/HGB, EMIR, BGH, MaRisk, DORA)
 ```
 
 ## Quickstart
 
 ```bash
 pnpm install
-pnpm --filter @deriva/pricing-core run build   # Core bauen (API/Web importieren dist)
-pnpm test                                       # alle Tests (Core, API, Web)
-pnpm dev                                        # API auf :4000, Web auf :5173
+pnpm build      # Core → API → Web (API/Web importieren das Core-dist; vor Tests/Abgabe ausführen)
+pnpm test       # alle Tests (Core, API, Web); baut den Core vorher
+pnpm dev        # Core-Watch + API auf :4000 + Web auf :5173
 ```
 
 - Web-UI: http://localhost:5173 (läuft auch ohne API – der Pricing-Core rechnet im Browser)
-- API-Doku: http://localhost:4000/docs
+- API-Doku: http://localhost:4000/docs (Swagger UI, nur außerhalb `NODE_ENV=production`); OpenAPI-Vertrag: http://localhost:4000/docs/json
+- Produktionsstart: `NODE_ENV=production LOG_LEVEL=info node apps/api/dist/server.js` (nach `pnpm build`)
+
+Weitere Skripte: `pnpm typecheck`, `pnpm lint`, `pnpm format` / `pnpm format:check`, `pnpm audit` (Details in [`CONTRIBUTING.md`](CONTRIBUTING.md)).
 
 ## Die wichtigsten Hotkeys
 
-| Tasten | Aktion |
-|---|---|
-| `Ctrl/⌘+K` oder `/` | Command Palette mit Schnelleingabe, z.B. `irs 10y pay 3.1% 10m`, `collar 7y 3.5/1.5 6m`, `swpt 1y5y payer 3% 10m`, `fxf eurusd -2m 1.1725 2027-03-15`, `fxo eurusd put 1.15 3m 9m` |
-| `g b` `g p` `g c` `g s` `g m` `g r` | Blotter, Pricing, Kurven, Szenarien, Markt, Report |
-| `n s` `n c` `n w` `n f` `n o` | Neu: Swap, Cap/Floor, Swaption, FX-Forward, FX-Option |
-| `j` / `k` / `Enter` | Trade wählen / öffnen |
-| `]` / `[` / `\` | What-if Zinsen +10bp / −10bp / Reset (Portfolio live neu bewertet) |
-| `Shift+P` / `f` / `d` / `Shift+D` | Par übernehmen / Richtung tauschen / duplizieren / löschen |
-| `c` / `t` / `i` / `?` | Reporting-Währung / Theme / Inspector / Hilfe |
+| Tasten                                                  | Aktion                                                                                                                                                                             |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ctrl/⌘+K` oder `/`                                     | Command Palette mit Schnelleingabe, z.B. `irs 10y pay 3.1% 10m`, `collar 7y 3.5/1.5 6m`, `swpt 1y5y payer 3% 10m`, `fxf eurusd -2m 1.1725 2027-03-15`, `fxo eurusd put 1.15 3m 9m` |
+| `g b` `g p` `g c` `g s` `g m` `g r` `g v` `g h`         | Blotter, Pricing, Kurven, Szenarien, Markt, Report, Vergleich, Hedge Accounting (auch `Alt+1` … `Alt+8`)                                                                           |
+| `n s` `n c` `n w` `n f` `n o` / `n b` `n a` `n i` `n x` | Neu: Swap, Cap/Floor, Swaption, FX-Forward, FX-Option / Basis-Swap, amortisierender Swap, IMM-Swap, FX-Swap                                                                        |
+| `j` / `k` / `Enter`                                     | Trade wählen / öffnen                                                                                                                                                              |
+| `]` / `[` / `\`                                         | What-if Zinsen +10bp / −10bp / Reset (Portfolio live neu bewertet)                                                                                                                 |
+| `Shift+P` / `f` / `d` / `Shift+D`                       | Par übernehmen / Richtung tauschen / duplizieren / löschen (mit Undo `⌘Z`)                                                                                                         |
+| `c` / `t` / `i` / `Shift+K` / `?`                       | Reporting-Währung / Theme / Inspector / Kundenmodus / Hilfe                                                                                                                        |
 
 Vollständige Liste: [`docs/product/03-ui-konzept-und-hotkeys.md`](docs/product/03-ui-konzept-und-hotkeys.md).
 
@@ -64,9 +71,18 @@ curl -s localhost:4000/api/price -H 'content-type: application/json' -d '{
 }' | jq '{pv, par: .analytics.parRate, cashflows: (.legs[1].cashflows|length)}'
 ```
 
-Weitere Endpunkte: `POST /api/risk`, `POST /api/scenarios`, `POST /api/scenarios/grid`, `POST /api/xva`,
-`POST /api/report` (`?format=csv` für Cashflows), `GET/POST/PUT/DELETE /api/trades`, `GET /api/market/curves/:id`,
-`POST /api/market/bootstrap`.
+Weitere Endpunkte: `POST /api/risk`, `/api/risk/par`, `/api/risk/par/portfolio`, `/api/risk/vega` (`dimension`), `POST /api/scenarios` (`includeHistorical`), `GET /api/scenarios/standard|historical`,
+`POST /api/scenarios/grid`, `POST /api/xva` (`credit.cptyHazardCurve`), `POST /api/xva/hazard-curve` (CDS-Spreads → Hazard-Kurve),
+`POST /api/hedge/effectiveness`, `/api/hedge/hypothetical` (`designation`, Tilgungspläne), `POST /api/report` (`?format=csv`; `perspective`, `governance`),
+`POST /api/documents/termsheet|suitability|confirmation|kid` (`?format=md`), `GET/POST/PUT/DELETE /api/trades` (+ `/import`, `/from-template` für CrossCurrencySwap/FRA-Builder),
+`GET /api/market/curves/:id`, `POST /api/market/bootstrap` (Quotes inkl. `FxSwapPoints`, `turnOfYear`, `globalSweeps`, `monotoneConvex`), `GET/PUT /api/market/snapshot` (`forwardJumps`),
+`GET /api/emir/valuations?format=csv&asOf=&timestamp=&method=&uti=&transactionPrice=` (inkl. Clearing-Felder), `GET /api/audit`, `GET /api/health/ready`.
+
+**Vertrag:** Alle Bodies (inkl. Snapshot-Import) sind JSON-Schema-validiert; Trades sind eine diskriminierte Union über `type` mit typisierten Enum-Feldern – ein
+`Fixed`-Leg ohne `rate` oder `status: "Bogus"` ergibt 400 statt `pv: null`. Jede Route hat eine `operationId` und dokumentierte Antworten (2xx, 400/404/409/412/422/429).
+Fehler kommen einheitlich als `{ error, code?, statusCode, validation?, requestId }` (Domänenfehler 422 mit `code`, z. B. `MISSING_FIXING`).
+Trades tragen ETags (`If-Match` auf PUT/DELETE → 412, `If-None-Match` auf GET → 304); jede bewertungsbezogene Antwort trägt `X-Market-Snapshot-Id`
+(identisch mit `audit.snapshotId` im Report) und `X-Request-Id` (eine eingehende `x-request-id` wird übernommen).
 
 ## Bibliothek direkt nutzen
 
@@ -76,27 +92,28 @@ import { buildSampleMarket, makeVanillaSwap, priceTrade, computeRisk, parseISO, 
 const ctx = buildSampleMarket(parseISO("2026-09-03"));
 const spot = advance(ctx.valuationDate, "2D", getCalendar("TARGET"));
 const swap = makeVanillaSwap({ currency: "EUR", notional: 1e7, payReceiveFixed: "Pay", fixedRate: 0.031, effectiveDate: spot, maturity: "10Y" });
-const res = priceTrade(ctx, swap, "EUR");      // res.pv, res.analytics.parRate, res.legs[].cashflows
-const risk = computeRisk(ctx, swap, "EUR");    // risk.dv01, risk.bucketed, risk.theta
+const res = priceTrade(ctx, swap, "EUR"); // res.pv, res.analytics.parRate, res.legs[].cashflows
+const risk = computeRisk(ctx, swap, "EUR"); // risk.dv01, risk.bucketed, risk.theta
 ```
 
 ## Methodik (Kurzfassung)
 
-- **Kurven:** sequentielles Bootstrapping (Depo/FRA/Swap/OIS), dual-curve für EURIBOR gegen €STR; log-lineare DF-Interpolation; Kalender TARGET/US/UK/CH/JP/DE; ISDA-Tageszählungen und Stubs.
-- **Zinsoptionen:** Bachelier (Normal-Vol) als Standard, Black-76 / shifted Black wählbar; Swaption-Cube mit SABR-Smile; Cash- und Physical-Settlement.
-- **FX:** Zinsparität für Forwards; Garman-Kohlhagen mit Smile aus ATM/RR/BF (Delta-Raum); Digitals analytisch; Barrieren nach Reiner-Rubinstein.
-- **Risiko:** zentrales Bump-and-Reprice (DV01, Key-Rate je Pillar, FX-Delta, Vega, Theta, Gamma), Standard-Szenarien inkl. BaFin ±200bp, Zinsen×FX-Matrix.
-- **XVA:** CVA/DVA semi-analytisch (Swaption-Replikation für Swaps, GK für FX-Forwards), Hazard aus CDS-Spread.
-- **Report:** Marktsnapshot, Cashflow-Tabelle, Sensitivitäten, IFRS-13-Level, anfänglicher Marktwert/Marge (BGH XI ZR 33/10, XI ZR 378/13), Methodik.
+- **Kurven:** sequentielles Bootstrapping (Depo/FRA/Future/Swap/OIS/Tenor-Basis/XCCY-Basis), dual-curve für EURIBOR gegen €STR, kollateralabhängige Diskontierung; Pillar am letzten Zahlungstag, Residuen auf der finalen Kurve, optionales Pillar-Merging; log-lineare DF-Interpolation mit Flat-Forward-Extrapolation; Kalender TARGET/US/UK/CH/JP/DE; ISDA-Tageszählungen (inkl. ACT/ACT ICMA mit Referenzperiode), Stubs, IMM-Roll, RFR-Lookback/Observation-Shift.
+- **Zinsoptionen:** Bachelier (Normal-Vol) als Standard, Black-76 / shifted Black wählbar; Swaption-Cube mit SABR-Smile; Cash-Settlement (Collateralised Cash Price, IRR) und Physical-Settlement.
+- **FX:** Spot-Datum T+2/T+1 auf dem Paar-Kalender, Forwards spot-verankert über Zinsparität, PV-Umrechnung zum Heute-Kurs; Garman-Kohlhagen mit Smile aus ATM/RR/BF (Delta-Konvention Spot/Forward/Premium-adjusted, Smile-/Broker-Strangle); Digitals (Cash-/Asset-or-Nothing); Barrieren nach Reiner-Rubinstein mit FD-Greeks.
+- **Risiko:** zentrales Bump-and-Reprice (DV01, Key-Rate je Pillar, Par-Risk je Marktquote mit Re-Bootstrapping – auch als Portfolio-Lauf –, FX-Delta, Vega-Buckets je Expiry oder Expiry × Tenor, Theta = Roll + Cashflows im Intervall, Gamma), Standard-Szenarien inkl. BaFin/EBA-IRRBB, Zinsen×FX-Matrix, eigene Szenarien.
+- **XVA:** CVA/DVA semi-analytisch (Swaption-Replikation für Swaps, Basis-Swaption für Tenor-Basis-Swaps, GK für FX-Forwards, Delta-Normal-Exposure mit gerollten Sensitivitäten für Optionen/CCS), Hazard aus CDS-Spread.
+- **Hedge Accounting:** hypothetisches Derivat, Critical Terms, Dollar-Offset, Regression, OCI/GuV-Split (IFRS 9), Einfrierungs-/Durchbuchungsmethode (HGB).
+- **Report & Compliance:** Marktsnapshot mit deterministischen Hashes (Snapshot, Inputs, Report), Cashflow-Tabelle, Sensitivitäten, IFRS-13-Level-Heuristik auf den tatsächlich genutzten Kurven, Bewertungs-Governance (Freigabestatus, Quellen, Modellversion), anfänglicher Marktwert/Marge (BGH XI ZR 33/10, XI ZR 378/13), EMIR-Refit-Felder, Termsheet, Geeignetheitserklärung (§ 64 WpHG), Methodik. Mapping auf die Anforderungen mit Evidenz und offener Liste: [`docs/compliance/01-regulatorik-mapping.md`](docs/compliance/01-regulatorik-mapping.md).
 
 Die Marktdaten im Repository sind **indikative Beispieldaten** (September 2026); produktive Nutzung erfordert
 Marktdaten-Adapter (siehe ADR-005) und Modellvalidierung nach MaRisk.
 
 ## Roadmap
 
-Siehe [`docs/product/02-epics-und-user-stories.md`](docs/product/02-epics-und-user-stories.md) – v1.0: Marktdaten-Adapter,
-Persistenz/Auth, PDF-Reports, EMIR-Felder, Audit-Trail; v1.1: strukturierte Produkte (Hull-White), Netting-CVA,
-Beratungsdokumente, Excel-Add-in; v1.2: SIMM/CRIF, VaR, Validierungs-Suite gegen QuantLib/ORE.
+Siehe [`docs/product/02-epics-und-user-stories.md`](docs/product/02-epics-und-user-stories.md) – v1.0: Marktdaten-Adapter & Kurven-Governance,
+Persistenz/Auth, PDF-Template-Service, EMIR-Vervollständigung; v1.1: strukturierte Produkte (Hull-White), Netting-CVA (Monte-Carlo), Excel-Add-in;
+v1.2: SIMM/CRIF, VaR, Validierungs-Suite gegen QuantLib/ORE. Qualitätsprozess: [`docs/quality`](docs/quality). Sicherheit: [`SECURITY.md`](SECURITY.md).
 
 ## Lizenz
 
