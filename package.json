@@ -1,0 +1,23 @@
+{
+  "name": "deriva-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DERIVA – moderne Plattform zur Bewertung von Zins- und Währungsderivaten (Pricing-Core, API, Web-UI mit Hotkeys)",
+  "license": "MIT",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter ./packages/* run build && pnpm -r --filter ./apps/* run build",
+    "test": "pnpm -r run test",
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "pnpm -r run lint",
+    "dev": "pnpm --parallel -r --filter ./apps/* run dev",
+    "dev:web": "pnpm --filter @deriva/web run dev",
+    "dev:api": "pnpm --filter @deriva/api run dev"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

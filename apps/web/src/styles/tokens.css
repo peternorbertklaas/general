@@ -1,0 +1,76 @@
+/* DERIVA design tokens – keyboard-first trading workstation aesthetics.
+   Dark is the default (trading floor), light is available via [data-theme="light"]. */
+:root {
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --bg-0: #0b0f17;
+  --bg-1: #10161f;
+  --bg-2: #161d28;
+  --bg-3: #1d2634;
+  --bg-hover: #222d3d;
+  --border: #253041;
+  --border-strong: #34425a;
+
+  --fg-0: #e8edf5;
+  --fg-1: #b7c2d3;
+  --fg-2: #7f8ca0;
+  --fg-3: #56627a;
+
+  --accent: #4f8cff;
+  --accent-2: #8b5cf6;
+  --accent-soft: rgba(79, 140, 255, 0.16);
+  --pos: #22c55e;
+  --pos-soft: rgba(34, 197, 94, 0.15);
+  --neg: #ef4444;
+  --neg-soft: rgba(239, 68, 68, 0.15);
+  --warn: #f59e0b;
+  --warn-soft: rgba(245, 158, 11, 0.15);
+  --info: #06b6d4;
+
+  --radius-s: 4px;
+  --radius-m: 8px;
+  --radius-l: 12px;
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 12px 40px rgba(0, 0, 0, 0.55);
+
+  --fs-xs: 11px;
+  --fs-s: 12px;
+  --fs-m: 13px;
+  --fs-l: 15px;
+  --fs-xl: 20px;
+  --fs-xxl: 28px;
+
+  --rail-w: 56px;
+  --inspector-w: 340px;
+  --topbar-h: 44px;
+  --statusbar-h: 26px;
+
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --bg-0: #f4f6fa;
+  --bg-1: #ffffff;
+  --bg-2: #f1f4f9;
+  --bg-3: #e6ebf3;
+  --bg-hover: #dfe6f0;
+  --border: #d7deea;
+  --border-strong: #b9c4d6;
+  --fg-0: #0f172a;
+  --fg-1: #334155;
+  --fg-2: #64748b;
+  --fg-3: #94a3b8;
+  --accent: #2563eb;
+  --accent-2: #7c3aed;
+  --accent-soft: rgba(37, 99, 235, 0.12);
+  --pos: #16a34a;
+  --pos-soft: rgba(22, 163, 74, 0.12);
+  --neg: #dc2626;
+  --neg-soft: rgba(220, 38, 38, 0.12);
+  --warn: #d97706;
+  --warn-soft: rgba(217, 119, 6, 0.14);
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.08);
+  --shadow-2: 0 12px 40px rgba(15, 23, 42, 0.18);
+  color-scheme: light;
+}

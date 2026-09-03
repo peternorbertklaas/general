@@ -1,0 +1,83 @@
+import { type Curve } from "../curves/curve.js";
+import { type SerialDate } from "../dates/date.js";
+import { type SwaptionVolSurface, type CapletVolSurface } from "../models/vol-surfaces.js";
+import { type FxVolSurface } from "../models/fx-vol-surface.js";
+
+export interface FxSpot {
+  /** Pair as "EURUSD" meaning 1 EUR = rate USD. */
+  pair: string;
+  rate: number;
+  /** Spot date (settlement) */
+  spotDate?: SerialDate;
+}
+
+export interface Fixing {
+  index: string;
+  date: SerialDate;
+  value: number;
+}
+
+/**
+ * The full set of market data needed to price a portfolio on a valuation date.
+ * Curves are keyed by id; discount curves per currency (and collateral) are
+ * looked up via `discountCurveId`. Everything is immutable by convention –
+ * scenario engines create shifted copies.
+ */
+export interface MarketContext {
+  valuationDate: SerialDate;
+  curves: Record<string, Curve>;
+  /** Discount curve id per currency, e.g. { EUR: "EUR-ESTR" } */
+  discountCurveId: Record<string, string>;
+  /** Optional collateral-specific overrides: key `${ccy}|${collateralCcy}` */
+  collateralDiscountCurveId?: Record<string, string>;
+  fxSpots: Record<string, number>;
+  fixings?: Fixing[];
+  swaptionVols?: Record<string, SwaptionVolSurface>;
+  capletVols?: Record<string, CapletVolSurface>;
+  fxVols?: Record<string, FxVolSurface>;
+  /** Credit data for CVA (hazard rates per counterparty id). */
+  credit?: Record<string, { hazardRate: number; recovery: number }>;
+  meta?: { source?: string; snapshotTime?: string; label?: string };
+}
+
+export function getCurve(ctx: MarketContext, id: string): Curve {
+  const c = ctx.curves[id];
+  if (!c) throw new Error(`Curve not found in market context: ${id}`);
+  return c;
+}
+
+export function getDiscountCurve(ctx: MarketContext, currency: string, collateralCcy?: string): Curve {
+  if (collateralCcy && ctx.collateralDiscountCurveId) {
+    const key = `${currency}|${collateralCcy}`;
+    const id = ctx.collateralDiscountCurveId[key];
+    if (id) return getCurve(ctx, id);
+  }
+  const id = ctx.discountCurveId[currency];
+  if (!id) throw new Error(`No discount curve configured for ${currency}`);
+  return getCurve(ctx, id);
+}
+
+/** Spot for `pair`, deriving inverse and crosses via USD/EUR when necessary. */
+export function getFxSpot(ctx: MarketContext, base: string, quote: string): number {
+  if (base === quote) return 1;
+  const direct = ctx.fxSpots[`${base}${quote}`];
+  if (direct !== undefined) return direct;
+  const inverse = ctx.fxSpots[`${quote}${base}`];
+  if (inverse !== undefined) return 1 / inverse;
+  // Try triangulation through a pivot.
+  for (const pivot of ["USD", "EUR"]) {
+    if (pivot === base || pivot === quote) continue;
+    const a = ctx.fxSpots[`${base}${pivot}`] ?? (ctx.fxSpots[`${pivot}${base}`] ? 1 / ctx.fxSpots[`${pivot}${base}`]! : undefined);
+    const b = ctx.fxSpots[`${pivot}${quote}`] ?? (ctx.fxSpots[`${quote}${pivot}`] ? 1 / ctx.fxSpots[`${quote}${pivot}`]! : undefined);
+    if (a !== undefined && b !== undefined) return a * b;
+  }
+  throw new Error(`FX spot not available for ${base}${quote}`);
+}
+
+export function getFixing(ctx: MarketContext, index: string, date: SerialDate): number | undefined {
+  return ctx.fixings?.find((f) => f.index.toUpperCase() === index.toUpperCase() && f.date === date)?.value;
+}
+
+export function withCurves(ctx: MarketContext, curves: Record<string, Curve>): MarketContext {
+  return { ...ctx, curves: { ...ctx.curves, ...curves } };
+}
