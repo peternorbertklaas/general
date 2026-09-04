@@ -22,7 +22,7 @@ import { keysText, HOTKEYS } from "../hotkeys/keymap.js";
 import { fmtDate, fmtMoney, fmtMs, fmtNum, fmtPct, signClass } from "../lib/format.js";
 import { CASHFLOW_KIND_DE, legTypeLabel, t, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { copyText, indicationText } from "../lib/indication.js";
-import { analyticsRows } from "../lib/metrics.js";
+import { analyticsRows, detailRows } from "../lib/metrics.js";
 import { downloadText } from "../lib/portfolio-io.js";
 import { applyParSolve, flipTrade, isBasisSwap, isOption, keyMetric, keyMetricLabel, tradeTypeBadge } from "../lib/trade-ops.js";
 import { LS_KEYS, deleteWithUndo, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
@@ -73,17 +73,22 @@ export function PricingWorkspace() {
   const [par, setPar] = useState<{ tradeId: string; key: string; report: ParRiskReport; ms: number } | null>(null);
   const [curveSel, setCurveSel] = useState<string | null>(null);
   const [vegaDim, setVegaDim] = useState<VegaDim>(() => (readLocal(LS_KEYS.vegaDimension) === "expiry-tenor" ? "expiry-tenor" : "expiry"));
+  /** FX options: also bump the 25Δ risk reversal / butterfly of every expiry row (smile buckets). */
+  const [fxSmile, setFxSmile] = useState(false);
   const cfNav = useTableNav({ onCopied: () => act().showToast("Cashflow-Zeile kopiert") });
   const krNav = useTableNav({ onCopied: () => act().showToast("Zeile kopiert") });
 
   const vegaB = useMemo<VegaBucketReport[]>(() => {
     if (!trade || !isOption(trade) || customer || r?.error) return [];
     try {
-      return vegaBuckets(s.market, trade, s.reportingCurrency, { dimension: trade.type === "Swaption" ? vegaDim : "expiry" });
+      return vegaBuckets(s.market, trade, s.reportingCurrency, {
+        dimension: trade.type === "Swaption" ? vegaDim : "expiry",
+        smile: trade.type === "FxOption" && fxSmile,
+      });
     } catch {
       return [];
     }
-  }, [trade, s.market, s.reportingCurrency, customer, vegaDim, r?.error]);
+  }, [trade, s.market, s.reportingCurrency, customer, vegaDim, fxSmile, r?.error]);
 
   if (!trade) {
     return (
@@ -119,6 +124,14 @@ export function PricingWorkspace() {
   const parKey = `${trade.id}|${s.valuationDate}|${s.reportingCurrency}|${JSON.stringify(s.whatIf)}|${JSON.stringify(trade)}`;
   const parStale = par !== null && par.key !== parKey;
   const isFx = trade.type.startsWith("Fx");
+  const details = detailRows(res?.details);
+  const keyTermId = isBasisSwap(trade)
+    ? trade.type === "CrossCurrencySwap"
+      ? "fairBasisSpread"
+      : "fairSpread"
+    : trade.type === "InterestRateSwap"
+      ? "parRate"
+      : undefined;
 
   const computePar = () => {
     const t0 = performance.now();
@@ -261,7 +274,7 @@ export function PricingWorkspace() {
               </div>
               <div className="kpi">
                 <span className="label">
-                  <Term id={isBasisSwap(trade) ? "fairSpread" : trade.type === "InterestRateSwap" ? "parRate" : undefined}>{keyMetricLabel(trade)}</Term>
+                  <Term id={keyTermId}>{keyMetricLabel(trade)}</Term>
                 </span>
                 <span className="value">{keyMetric(trade, res?.analytics)}</span>
               </div>
@@ -283,6 +296,16 @@ export function PricingWorkspace() {
                 </div>
               )}
             </div>
+            {details.length > 0 && (
+              <div className="muted xs row wrap" style={{ marginTop: 8, gap: 10 }} data-testid="pricing-details">
+                <span>Termine:</span>
+                {details.map((d) => (
+                  <span key={d.k}>
+                    {d.label} <b className="mono">{d.v}</b>
+                  </span>
+                ))}
+              </div>
+            )}
             {r?.error && (
               <div className="warning error" style={{ marginTop: 10 }} role="alert" data-testid="pricing-error">
                 {translateCoreMessage(r.error)}
@@ -491,34 +514,71 @@ export function PricingWorkspace() {
                       </button>
                     </div>
                   )}
-                  <span>+1 bp Normal-Vol je Bucket</span>
+                  {trade.type === "FxOption" && (
+                    <label
+                      className="check"
+                      title="Zusätzlich 25Δ Risk Reversal und Butterfly je Verfall um +1 Vol-Punkt bumpen (Smile-Buckets, nicht Teil der Summe)"
+                    >
+                      <input type="checkbox" checked={fxSmile} data-testid="vega-smile" onChange={(e) => setFxSmile(e.target.checked)} /> Smile (RR/BF)
+                    </label>
+                  )}
+                  <span>{trade.type === "FxOption" ? "+1 Vol-Punkt je Verfall" : "+1 bp Normal-Vol je Bucket"}</span>
                 </span>
               </h3>
               <div className="grid cols-2">
-                {vegaB.map((vb) => (
-                  <div key={vb.key} style={vb.dimension === "expiry-tenor" ? { gridColumn: "1 / -1" } : undefined}>
-                    <div className="muted xs" style={{ marginBottom: 4 }}>
-                      {vb.kind === "swaption" ? "Swaption-Cube" : "Caplet-Fläche"} {vb.key} · Σ {fmtMoney(vb.total, s.reportingCurrency)}
+                {vegaB.map((vb) => {
+                  const atm = vb.kind === "fx" ? vb.buckets.filter((b) => !b.component || b.component === "atm") : vb.buckets;
+                  const smile = vb.kind === "fx" ? vb.buckets.filter((b) => b.component === "rr25" || b.component === "bf25") : [];
+                  return (
+                    <div key={vb.key} style={vb.dimension === "expiry-tenor" ? { gridColumn: "1 / -1" } : undefined}>
+                      <div className="muted xs" style={{ marginBottom: 4 }}>
+                        {vb.kind === "swaption" ? "Swaption-Cube" : vb.kind === "fx" ? "FX-Fläche" : "Caplet-Fläche"} {vb.key} · Σ{" "}
+                        {fmtMoney(vb.total, s.reportingCurrency)}
+                      </div>
+                      {vb.dimension === "expiry-tenor" ? (
+                        <VegaHeatmap report={vb} ccy={s.reportingCurrency} />
+                      ) : (
+                        <EChart
+                          className="chart mini"
+                          ariaLabel={`Vega je Verfall ${vb.key}`}
+                          option={{
+                            grid: { left: 52, right: 8, top: 6, bottom: 22 },
+                            xAxis: { type: "category", data: atm.map((b) => b.label), axisLabel: { hideOverlap: true } },
+                            yAxis: { type: "value", axisLabel: { formatter: (v: number) => fmtNum(v, 0) } },
+                            tooltip: { trigger: "axis", valueFormatter: (v) => fmtMoney(v as number, s.reportingCurrency) },
+                            series: [{ type: "bar", data: atm.map((b) => ({ value: b.vega, itemStyle: { color: b.vega >= 0 ? posColor() : negColor() } })) }],
+                          }}
+                        />
+                      )}
+                      {smile.length > 0 && (
+                        <div className="table-scroll" style={{ maxHeight: 180, marginTop: 6 }} data-testid="vega-smile-table">
+                          <table className="grid-table compact">
+                            <thead>
+                              <tr>
+                                <th>Verfall</th>
+                                <th className="num">RR 25Δ (+1 Pkt)</th>
+                                <th className="num">BF 25Δ (+1 Pkt)</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {[...new Set(smile.map((b) => b.expiry))].map((e) => {
+                                const rr = smile.find((b) => b.expiry === e && b.component === "rr25");
+                                const bf = smile.find((b) => b.expiry === e && b.component === "bf25");
+                                return (
+                                  <tr key={e} style={{ cursor: "default" }}>
+                                    <td className="mono">{(rr ?? bf)?.label.replace(/ (RR|BF)25$/, "") ?? ""}</td>
+                                    <td className={`num ${signClass(rr?.vega)}`}>{fmtMoney(rr?.vega)}</td>
+                                    <td className={`num ${signClass(bf?.vega)}`}>{fmtMoney(bf?.vega)}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
                     </div>
-                    {vb.dimension === "expiry-tenor" ? (
-                      <VegaHeatmap report={vb} ccy={s.reportingCurrency} />
-                    ) : (
-                      <EChart
-                        className="chart mini"
-                        ariaLabel={`Vega je Verfall ${vb.key}`}
-                        option={{
-                          grid: { left: 52, right: 8, top: 6, bottom: 22 },
-                          xAxis: { type: "category", data: vb.buckets.map((b) => b.label), axisLabel: { hideOverlap: true } },
-                          yAxis: { type: "value", axisLabel: { formatter: (v: number) => fmtNum(v, 0) } },
-                          tooltip: { trigger: "axis", valueFormatter: (v) => fmtMoney(v as number, s.reportingCurrency) },
-                          series: [
-                            { type: "bar", data: vb.buckets.map((b) => ({ value: b.vega, itemStyle: { color: b.vega >= 0 ? posColor() : negColor() } })) },
-                          ],
-                        }}
-                      />
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

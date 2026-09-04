@@ -174,9 +174,9 @@ describe("F-26 – deterministic German formatting without Intl", () => {
     expect(formatPctDe(0.0312, 2)).toBe("3,12 %");
     expect(formatDateTimeDe("2026-09-03T18:05:00Z")).toBe("03.09.2026, 18:05 UTC");
     expect(formatDateTimeDe("nonsense")).toBe("nonsense");
-    // builders use it for names
+    // builders use it for names (German display form, decimal comma)
     expect(makeFxOption({ pair: "EURUSD", optionType: "Call", notional: 1e6, strike: 1.18, expiryDate: parseISO("2027-09-03") }).name).toBe(
-      "Call EURUSD 1.000.000 @ 1.18",
+      "Call EUR/USD 1.000.000 @ 1,1800",
     );
   });
 });

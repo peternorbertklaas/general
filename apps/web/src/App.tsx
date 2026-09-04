@@ -11,6 +11,7 @@ import { isTextEntry, useHotkeys } from "./hotkeys/useHotkeys.js";
 import { blotterCsv, buildBlotterRows, readBlotterColumns } from "./lib/blotter-export.js";
 import { fmtDate, fmtMs } from "./lib/format.js";
 import { copyText, indicationText } from "./lib/indication.js";
+import { downloadPortfolioReport } from "./lib/portfolio-export.js";
 import { downloadText } from "./lib/portfolio-io.js";
 import { deleteWithUndo, marketModified, selectedTrade, setToastHover, useStore, whatIfActive, whatIfLabel } from "./state/store.js";
 import { Blotter } from "./views/Blotter.js";
@@ -53,7 +54,7 @@ function statusHintIds(view: ViewId): string[] {
     case "curves":
       return ["palette", "valdate", "bump.up", "undo"];
     case "report":
-      return ["palette", "report.generate", "doc.termsheet", "customer"];
+      return ["palette", "report.generate", "doc.termsheet", "doc.kid", "customer"];
     case "hedge":
       return ["palette", "go.pricing", "go.blotter", "help"];
     default:
@@ -231,13 +232,18 @@ export function App() {
         case "new.basis":
         case "new.amort":
         case "new.imm":
-        case "new.fxs": {
+        case "new.fxs":
+        case "new.ccs":
+        case "new.fra": {
           const kind = def.id.replace("new.", "");
           if (!isTemplateId(kind)) break;
           const nt = st.addTrade(newTradeTemplate(kind, st.valuationDate), { goToPricing: true, autoId: true });
           st.showToast(`Neu: ${nt.id} · ${nt.name ?? ""}`);
           break;
         }
+        case "export.portfolio":
+          downloadPortfolioReport("json");
+          break;
         case "duplicate": {
           if (!needTrade()) break;
           const c = st.duplicateSelected();
@@ -331,12 +337,17 @@ export function App() {
           break;
         case "doc.termsheet":
         case "doc.suitability":
+        case "doc.kid":
+        case "doc.confirmation": {
           // Documents need a generated report: generate implicitly, then open the dialog in the report view (N-22).
           if (!needTrade()) break;
           if (!st.reportStamp) st.generateReport();
-          st.setDoc(def.id === "doc.termsheet" ? "Termsheet" : "Geeignetheitserklaerung");
+          const kind =
+            def.id === "doc.termsheet" ? "Termsheet" : def.id === "doc.suitability" ? "Geeignetheitserklaerung" : def.id === "doc.kid" ? "KID" : "Confirmation";
+          st.setDoc(kind);
           if (st.view !== "report") go("report");
           break;
+        }
       }
     },
     [exportCsv, exportBlotter],

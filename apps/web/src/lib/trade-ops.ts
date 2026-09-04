@@ -9,8 +9,9 @@ export function isBasisSwap(t: Trade): boolean {
 /** Label of the instrument's headline quote (par rate, forward, premium ...). */
 export function keyMetricLabel(t: Trade): string {
   switch (t.type) {
-    case "InterestRateSwap":
     case "CrossCurrencySwap":
+      return isBasisSwap(t) ? "Fairer Basis-Spread" : "Par-Satz";
+    case "InterestRateSwap":
       return isBasisSwap(t) ? "Fairer Spread" : "Par-Satz";
     case "Swaption":
       return "Forward-Swapsatz";
@@ -77,6 +78,40 @@ export function flipTrade(t: Trade): Trade {
   }
 }
 
+/**
+ * Coupon / spread of the first outstanding period of a leg (the `r_0` of the
+ * core's par solver): the rate of the first interest cashflow whose accrual end
+ * lies after the valuation date, from the pricing result.
+ */
+function firstOutstandingRate(r: PricingResult, legIndex: number): number | undefined {
+  const leg = r.legs.find((l) => l.legIndex === legIndex);
+  const cf = leg?.cashflows.find((c) => c.kind === "Interest" && (c.accrualEnd ?? c.paymentDate) > r.valuationDate && c.rate !== undefined);
+  return cf?.rate;
+}
+
+/** Accrual start of the first outstanding interest period of a leg. */
+function firstOutstandingStart(r: PricingResult, legIndex: number): number | undefined {
+  const leg = r.legs.find((l) => l.legIndex === legIndex);
+  const cf = leg?.cashflows.find((c) => c.kind === "Interest" && (c.accrualEnd ?? c.paymentDate) > r.valuationDate);
+  return cf?.accrualStart;
+}
+
+/** Schedule value in force at `date` (last entry dated on/before it), `base` before the first entry. */
+export function scheduleValueAt<K extends string>(schedule: ({ date: number } & Record<K, number>)[] | undefined, key: K, date: number, base: number): number {
+  let v = base;
+  for (const e of schedule ?? []) if (e.date <= date) v = e[key];
+  return v;
+}
+
+/**
+ * Apply a coupon schedule shift: the base rate and every schedule entry move
+ * by the same amount so the step differences stay constant (core semantics of
+ * `parRateBase` / `fairSpread` with schedules).
+ */
+function shiftSchedule<T extends { date: number }>(schedule: T[] | undefined, key: "rate" | "spread", shift: number): T[] | undefined {
+  return schedule?.map((e) => ({ ...e, [key]: (e as unknown as Record<string, number>)[key]! + shift }));
+}
+
 /** Set the fixed rate / strike / contract rate / spread to the fair (par) level from the latest pricing. */
 export function applyParSolve(t: Trade, r: PricingResult | undefined): Trade | undefined {
   if (!r) return undefined;
@@ -89,16 +124,33 @@ export function applyParSolve(t: Trade, r: PricingResult | undefined): Trade | u
         let done = false;
         return {
           ...t,
-          legs: t.legs.map((l) => {
+          legs: t.legs.map((l, i) => {
             if (done || l.type !== "Float") return l;
             done = true;
+            if (l.spreadSchedule && l.spreadSchedule.length > 0) {
+              // fairSpread is the spread of the first outstanding period with the schedule steps kept constant.
+              const start = firstOutstandingStart(r, i) ?? l.effectiveDate;
+              const shift = fair - scheduleValueAt(l.spreadSchedule, "spread", start, l.spread ?? 0);
+              return { ...l, spread: (l.spread ?? 0) + shift, spreadSchedule: shiftSchedule(l.spreadSchedule, "spread", shift) };
+            }
             return { ...l, spread: fair };
           }),
         } as Trade;
       }
-      const par = r.analytics.parRate as number | undefined;
+      const hasSchedule = t.legs.some((l) => l.type === "Fixed" && (l.rateSchedule?.length ?? 0) > 0);
+      const par = (hasSchedule ? (r.analytics.parRateBase as number | undefined) : undefined) ?? (r.analytics.parRate as number | undefined);
       if (par === undefined) return undefined;
-      return { ...t, legs: t.legs.map((l) => (l.type === "Fixed" ? { ...l, rate: par } : l)) } as Trade;
+      return {
+        ...t,
+        legs: t.legs.map((l, i) => {
+          if (l.type !== "Fixed") return l;
+          if (!l.rateSchedule || l.rateSchedule.length === 0) return { ...l, rate: par };
+          // Step-up: move the whole staircase so the first outstanding coupon equals parRateBase.
+          const r0 = firstOutstandingRate(r, i) ?? l.rate;
+          const shift = par - r0;
+          return { ...l, rate: l.rate + shift, rateSchedule: shiftSchedule(l.rateSchedule, "rate", shift) };
+        }),
+      } as Trade;
     }
     case "Swaption": {
       const fwd = r.analytics.forwardSwapRate as number | undefined;
@@ -199,6 +251,17 @@ export function tradeMaturity(t: Trade): number {
 /** Option-like trades that carry vega. */
 export function isOption(t: Trade): boolean {
   return t.type === "CapFloor" || t.type === "Swaption" || t.type === "FxOption";
+}
+
+/** A firm quote ("Quoted") whose validity date lies before the valuation date. */
+export function quoteExpired(t: Pick<Trade, "status" | "quoteValidUntil">, valuationDate: number): boolean {
+  return t.status === "Quoted" && t.quoteValidUntil !== undefined && t.quoteValidUntil < valuationDate;
+}
+
+/** Whether a swap / CCS carries a coupon or spread schedule (step-up). */
+export function hasCouponSchedule(t: Trade): boolean {
+  if (t.type !== "InterestRateSwap" && t.type !== "CrossCurrencySwap") return false;
+  return t.legs.some((l) => (l.type === "Fixed" ? (l.rateSchedule?.length ?? 0) > 0 : (l.spreadSchedule?.length ?? 0) > 0));
 }
 
 /**

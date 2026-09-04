@@ -1,12 +1,14 @@
 import { useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { STANDARD_SCENARIOS, runScenarios, scenarioGrid } from "@deriva/pricing-core";
+import { HISTORICAL_SCENARIOS, STANDARD_SCENARIOS, runScenarios, scenarioGrid } from "@deriva/pricing-core";
 import { EChart, negColor, posColor } from "../components/EChart.js";
 import { NumInput } from "../components/NumInput.js";
 import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
 import { fmtCompact, fmtMoney, fmtNum, fmtSigned, signClass } from "../lib/format.js";
 import { EMPTY_SCENARIO_FORM, buildCustomScenario, describeScenario, type CustomScenarioForm } from "../lib/scenarios.js";
-import { useStore } from "../state/store.js";
+import { LS_KEYS, readLocal, useStore, writeLocal } from "../state/store.js";
+
+const HISTORICAL_IDS = new Set(HISTORICAL_SCENARIOS.map((s) => s.id));
 import { heatBg, heatGridKeyNav } from "./MarketView.js";
 
 const RATES = [-200, -100, -50, -25, 0, 25, 50, 100, 200];
@@ -112,14 +114,23 @@ export function ScenariosView() {
   const act = useStore.getState;
   const [scope, setScope] = useState<"portfolio" | "selected">("portfolio");
   const [fxCcy, setFxCcy] = useState("USD");
+  // Historical stress episodes (core `HISTORICAL_SCENARIOS`) are opt-in and remembered locally.
+  const [historical, setHistorical] = useState(() => readLocal(LS_KEYS.scenariosHistorical) === "1");
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const toggleHistorical = () => {
+    const next = !historical;
+    setHistorical(next);
+    writeLocal(LS_KEYS.scenariosHistorical, next ? "1" : "0");
+  };
   const trades = useMemo(() => (scope === "portfolio" ? s.trades : s.trades.filter((t) => t.id === s.selectedId)), [scope, s.trades, s.selectedId]);
-  const scenarios = useMemo(() => [...STANDARD_SCENARIOS, ...s.customScenarios], [s.customScenarios]);
+  const scenarios = useMemo(() => [...STANDARD_SCENARIOS, ...(historical ? HISTORICAL_SCENARIOS : []), ...s.customScenarios], [s.customScenarios, historical]);
 
   const out = useMemo(() => runScenarios(s.market, trades, scenarios, s.reportingCurrency), [s.market, trades, scenarios, s.reportingCurrency]);
   const grid = useMemo(() => scenarioGrid(s.market, trades, s.reportingCurrency, RATES, FX, fxCcy), [s.market, trades, s.reportingCurrency, fxCcy]);
   const maxAbs = Math.max(1, ...grid.pv.flat().map((v) => Math.abs(v - grid.base)));
   const nonBase = out.results.filter((r) => r.scenario.id !== "base");
   const isCustom = (id: string) => s.customScenarios.some((c) => c.id === id);
+  const isHist = (id: string) => HISTORICAL_IDS.has(id);
   const tableNav = useTableNav({ onCopied: () => act().showToast("Zeile kopiert") });
   const tradeNav = useTableNav({
     onCopied: () => act().showToast("Zeile kopiert"),
@@ -178,6 +189,15 @@ export function ScenariosView() {
             </button>
           ))}
         </div>
+        <button
+          className={`chip ${historical ? "active" : ""}`}
+          aria-pressed={historical}
+          onClick={toggleHistorical}
+          data-testid="historical-toggle"
+          title="Historische Stress-Episoden (Lehman 2008, Euro-Krise 2011, Covid 2020, Zinswende 2022, SNB 2015, Brexit 2016) als Szenarien ergänzen"
+        >
+          {historical ? "✓ " : ""}historische Stress-Tage ({HISTORICAL_SCENARIOS.length})
+        </button>
         <div className="grow" />
         <span className="muted xs">Basis-PV {fmtMoney(out.base, s.reportingCurrency)}</span>
       </div>
@@ -215,16 +235,49 @@ export function ScenariosView() {
                 </tr>
               </thead>
               <tbody onKeyDown={tableNav.onKeyDown}>
-                {out.results.map((r) => (
-                  <tr key={r.scenario.id} {...navRowProps()} style={{ cursor: "default" }}>
-                    <td>
-                      {r.scenario.name} {isCustom(r.scenario.id) && <span className="badge">eigen</span>}
-                    </td>
-                    <td className={`num ${signClass(r.total)}`}>{fmtMoney(r.total)}</td>
-                    <td className={`num ${signClass(r.pnl)}`}>{fmtMoney(r.pnl)}</td>
-                    <td className="num muted">{out.base !== 0 ? `${fmtNum((r.pnl / Math.abs(out.base)) * 100, 1)} %` : "–"}</td>
-                  </tr>
-                ))}
+                {out.results.flatMap((r) => {
+                  const hist = isHist(r.scenario.id);
+                  const open = expanded === r.scenario.id;
+                  const rows = [
+                    <tr key={r.scenario.id} {...navRowProps()} style={{ cursor: "default" }} title={r.scenario.description} data-hist={hist || undefined}>
+                      <td>
+                        {hist && r.scenario.description && (
+                          <button
+                            type="button"
+                            className="btn ghost xs"
+                            aria-expanded={open}
+                            aria-label={`Beschreibung ${r.scenario.name} ${open ? "ausblenden" : "anzeigen"}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpanded(open ? null : r.scenario.id);
+                            }}
+                            style={{ marginRight: 4 }}
+                          >
+                            {open ? "▾" : "▸"}
+                          </button>
+                        )}
+                        {r.scenario.name} {isCustom(r.scenario.id) && <span className="badge">eigen</span>}
+                        {hist && (
+                          <span className="badge warn" title={r.scenario.description}>
+                            historisch
+                          </span>
+                        )}
+                      </td>
+                      <td className={`num ${signClass(r.total)}`}>{fmtMoney(r.total)}</td>
+                      <td className={`num ${signClass(r.pnl)}`}>{fmtMoney(r.pnl)}</td>
+                      <td className="num muted">{out.base !== 0 ? `${fmtNum((r.pnl / Math.abs(out.base)) * 100, 1)} %` : "–"}</td>
+                    </tr>,
+                  ];
+                  if (open && r.scenario.description)
+                    rows.push(
+                      <tr key={`${r.scenario.id}-desc`} className="scenario-desc" style={{ cursor: "default" }} data-testid="scenario-description">
+                        <td colSpan={4} className="muted xs">
+                          {r.scenario.description}
+                        </td>
+                      </tr>,
+                    );
+                  return rows;
+                })}
               </tbody>
             </table>
           </div>

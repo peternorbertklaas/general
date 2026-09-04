@@ -239,6 +239,11 @@ export const capFloorSchema = {
     calendar,
     strike: rate,
     floorStrike: rate,
+    notionalSchedule: {
+      ...legBaseProperties.notionalSchedule,
+      description:
+        "Amortisation: outstanding notional per period – the last entry with `date` ≤ the period's accrual start applies, earlier periods use `notional` (same rule as a swap leg's `notionalSchedule`)",
+    },
     businessDayConvention: { type: "string", enum: [...BUSINESS_DAY_CONVENTIONS] },
     stub: { type: "string", enum: [...STUB_TYPES] },
     model: { type: "string", enum: [...IR_MODELS] },
@@ -546,6 +551,31 @@ export const portfolioBodySchema = {
     trades: { type: "array", items: tradeRef, maxItems: 5000 },
     reportingCurrency: currency,
     useStore: { type: "boolean" },
+  },
+  additionalProperties: false,
+} as const;
+
+/** Aggregations of the portfolio report (`byCounterparty`, `byBook`, `byType`). */
+export const PORTFOLIO_GROUPINGS = ["counterparty", "book", "type"] as const;
+export type PortfolioGrouping = (typeof PORTFOLIO_GROUPINGS)[number];
+
+export const portfolioReportBodySchema = {
+  type: "object",
+  properties: {
+    trades: { type: "array", items: tradeRef, maxItems: 5000, description: "Trades to report on (default: the trade store)" },
+    reportingCurrency: currency,
+    groupBy: {
+      type: "array",
+      items: { type: "string", enum: [...PORTFOLIO_GROUPINGS] },
+      minItems: 1,
+      maxItems: 3,
+      uniqueItems: true,
+      description:
+        "Aggregations to include (default: all three – `byCounterparty`, `byBook`, `byType`); the others are returned as empty arrays and left out of the Markdown. `audit.reportHash` always covers the full report and is independent of `groupBy`.",
+    },
+    theta: { type: "boolean", description: "Compute the 1-day theta per trade (default true; two extra valuations per trade)" },
+    fxDelta: { type: "boolean", description: "Compute the FX delta per foreign currency (default true)" },
+    preparedBy: { ...shortText, description: "Recorded in `audit.preparedBy`" },
   },
   additionalProperties: false,
 } as const;
@@ -1046,7 +1076,7 @@ export const pricingResultSchema = {
     pv: num("PV in reporting currency, positive = asset to us"),
     legs: anyArray("LegResult[] (pv, pvReporting, annuity, cashflows[] with paymentDate/discountFactor/presentValue)"),
     analytics: anyObject(
-      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks; FX: `deltaAmount` = PV change in reporting currency for +1 % spot, `deltaPct` = delta as fraction of the notional). Dates live in `details`.",
+      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1). Dates live in `details`.",
     ),
     details: anyObject(
       "Non-numeric details complementing `analytics`: ISO dates such as `spotDate` (FX), `fixingDate`/`settlementDate` (FRA), `maturity` (swaps)",
@@ -1107,6 +1137,69 @@ export const valuationReportSchema = {
     audit: anyObject("{ snapshotId, inputsHash, reportHash, engineVersion, preparedBy? }"),
     governance: anyObject("Valuation governance (snapshot status, input sources, model version, validatedBy)"),
     whatIf: anyObject("Set when produced under a what-if shift (stress valuation, not an audit valuation)"),
+  },
+  additionalProperties: true,
+} as const;
+
+const portfolioAggregateSchema = {
+  type: "object",
+  description: "PortfolioAggregate: sums over the trades of one group (failed valuations excluded).",
+  properties: {
+    key: { type: "string", description: 'Group key (counterparty, book or trade type; "–" when the trade has none)' },
+    trades: { type: "integer" },
+    pv: num("PV in reporting currency"),
+    dv01: num("Parallel DV01 (+1bp all rate curves)"),
+    theta: num("1-day theta"),
+    fxDelta: anyObject(
+      'FX delta keyed by pair "<ccy><reporting>" (e.g. "USDEUR"): PV change per +1 % appreciation of the first currency vs the reporting currency',
+    ),
+    warnings: { type: "integer", description: "Number of pricing warnings in the group" },
+  },
+  additionalProperties: true,
+} as const;
+
+export const portfolioReportSchema = {
+  type: "object",
+  description:
+    "PortfolioReport (book level): PV, parallel DV01, 1-day theta and FX delta per trade, aggregated by counterparty, book and trade type, with totals, warning counts and the audit anchors of the single-trade report (snapshot id, inputs hash, report hash, engine version). Header `X-Market-Snapshot-Id` = `audit.snapshotId`.",
+  properties: {
+    generatedAt: isoDateTime,
+    valuationDate: isoDate,
+    reportingCurrency: currency,
+    market: anyObject("{ label?, source? } of the market snapshot"),
+    lines: {
+      type: "array",
+      description: "One line per trade, in input order; a failed valuation carries `error` and null measures and is excluded from the aggregates",
+      items: {
+        type: "object",
+        properties: {
+          tradeId: { type: "string" },
+          name: { type: "string" },
+          type: { type: "string", enum: [...TRADE_TYPES] },
+          counterparty: { type: "string" },
+          book: { type: "string" },
+          pv: num("PV in reporting currency (null when the valuation failed)"),
+          dv01: num("Parallel DV01 (+1bp)"),
+          theta: num("1-day theta (null when not computable or `theta: false`)"),
+          fxDelta: anyObject('FX delta keyed by pair "<ccy><reporting>" (+1 % appreciation of the foreign currency); empty with `fxDelta: false`'),
+          warnings: { type: "array", items: { type: "string" }, description: "Pricer warnings (English), e.g. MISSING_FIXING" },
+          error: { type: "string", description: "Set when the valuation threw" },
+        },
+        additionalProperties: true,
+      },
+    },
+    totals: portfolioAggregateSchema,
+    byCounterparty: { type: "array", items: portfolioAggregateSchema },
+    byBook: { type: "array", items: portfolioAggregateSchema },
+    byType: { type: "array", items: portfolioAggregateSchema },
+    failed: { type: "integer", description: "Number of trades whose valuation failed" },
+    warningsCount: { type: "integer", description: "Total number of pricing warnings" },
+    groupBy: {
+      type: "array",
+      items: { type: "string", enum: [...PORTFOLIO_GROUPINGS] },
+      description: "Echo of the request's `groupBy` (absent when all aggregations are returned)",
+    },
+    audit: anyObject("{ snapshotId, inputsHash, reportHash, engineVersion, preparedBy? } – deterministic for the same trades on the same snapshot"),
   },
   additionalProperties: true,
 } as const;

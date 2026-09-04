@@ -71,9 +71,10 @@ curl -s localhost:4000/api/price -H 'content-type: application/json' -d '{
 }' | jq '{pv, par: .analytics.parRate, cashflows: (.legs[1].cashflows|length)}'
 ```
 
-Weitere Endpunkte: `POST /api/risk`, `/api/risk/par`, `/api/risk/par/portfolio`, `/api/risk/vega` (`dimension`), `POST /api/scenarios` (`includeHistorical`), `GET /api/scenarios/standard|historical`,
+Weitere Endpunkte: `POST /api/risk`, `/api/risk/par`, `/api/risk/par/portfolio`, `/api/risk/vega` (`dimension`, `smile`; Swaption-Cube, Caplet- und FX-Vol-Fläche), `POST /api/scenarios` (`includeHistorical`), `GET /api/scenarios/standard|historical`,
 `POST /api/scenarios/grid`, `POST /api/xva` (`credit.cptyHazardCurve`), `POST /api/xva/hazard-curve` (CDS-Spreads → Hazard-Kurve),
-`POST /api/hedge/effectiveness`, `/api/hedge/hypothetical` (`designation`, Tilgungspläne), `POST /api/report` (`?format=csv`; `perspective`, `governance`),
+`POST /api/hedge/effectiveness` (`designationSnapshot`, `freezeDesignationVol`), `/api/hedge/hypothetical` (`designation`, Tilgungspläne), `POST /api/report` (`?format=csv`; `perspective`, `governance`),
+`POST /api/report/portfolio` (Buchebene: PV/DV01/Theta/FX-Delta je Trade und nach Kontrahent/Buch/Produktart; `groupBy`, `?format=md`),
 `POST /api/documents/termsheet|suitability|confirmation|kid` (`?format=md`), `GET/POST/PUT/DELETE /api/trades` (+ `/import`, `/from-template` für CrossCurrencySwap/FRA-Builder),
 `GET /api/market/curves/:id`, `POST /api/market/bootstrap` (Quotes inkl. `FxSwapPoints`, `turnOfYear`, `globalSweeps`, `monotoneConvex`), `GET/PUT /api/market/snapshot` (`forwardJumps`),
 `GET /api/emir/valuations?format=csv&asOf=&timestamp=&method=&uti=&transactionPrice=` (inkl. Clearing-Felder), `GET /api/audit`, `GET /api/health/ready`.

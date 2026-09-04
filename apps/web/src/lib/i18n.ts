@@ -3,7 +3,7 @@
  * core warnings/errors (regex templates), `PricingError` codes, leg / cashflow /
  * option labels, builder trade names, hedge summaries and select options.
  */
-import { isPricingError } from "@deriva/pricing-core";
+import { TRADE_TYPE_LABELS_DE, isPricingError } from "@deriva/pricing-core";
 
 type Rule = { re: RegExp; to: (m: RegExpMatchArray) => string };
 
@@ -151,16 +151,8 @@ export function translatePricingError(e: unknown): string {
   return translateCoreMessage(String(e));
 }
 
-export const TRADE_TYPE_DE: Record<string, string> = {
-  InterestRateSwap: "Zinsswap",
-  CrossCurrencySwap: "Cross-Currency-Swap",
-  FRA: "FRA",
-  CapFloor: "Cap/Floor",
-  Swaption: "Swaption",
-  FxForward: "FX-Forward",
-  FxSwap: "FX-Swap",
-  FxOption: "FX-Option",
-};
+/** German trade-type labels – single source is the core (`TRADE_TYPE_LABELS_DE`), re-exported as a string map for free-text lookups. */
+export const TRADE_TYPE_DE: Record<string, string> = { ...TRADE_TYPE_LABELS_DE };
 
 /** Leg type badges in cashflow tables ("Fixed" → "Fest"). */
 export const LEG_TYPE_DE: Record<string, string> = {
@@ -273,6 +265,12 @@ export function germanTradeName(name: string | undefined): string | undefined {
   if (m) return `Basis-Swap ${m[1]} +${deDecimal(m[2]!)} bp vs ${m[3]} ${m[4]}`;
   m = /^FX-Swap ([A-Z]{6}) ([\d.]+) ([+-]?[\d.]+) Pkt$/.exec(name);
   if (m) return `FX-Swap ${pairDe(m[1]!)} ${m[2]} ${deDecimal(m[3]!)} Pkt`;
+  // "FRA EUR 3x6 Pay @ 2.200%" (core `makeFra`)
+  m = /^FRA ([A-Z]{3}) (\S+) (Pay|Receive) @ ([-\d.]+)%$/.exec(name);
+  if (m) return `FRA ${m[1]} ${m[2]} ${m[3] === "Pay" ? "Zahler" : "Empfänger"} @ ${deDecimal(m[4]!)} %`;
+  // "CCS EURUSD 5Y ESTR -20.0bp vs SOFR" (core `makeCrossCurrencySwap`)
+  m = /^CCS ([A-Z]{6}) (\S+) (\S+) ([+-]?[\d.]+)bp vs (\S+)$/.exec(name);
+  if (m) return `CCS ${pairDe(m[1]!)} ${m[2]} ${m[3]} ${deDecimal(m[4]!).replace(/^-/, "−")} bp vs ${m[5]}`;
   return name;
 }
 

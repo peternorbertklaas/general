@@ -5,6 +5,8 @@ import {
   makeAmortisingSwap,
   makeBasisSwap,
   makeCapFloor,
+  makeCrossCurrencySwap,
+  makeFra,
   makeFxForward,
   makeFxOption,
   makeFxSwap,
@@ -16,7 +18,7 @@ import { TEMPLATE_LABELS } from "../hotkeys/keymap.js";
 
 export type TemplateId = keyof typeof TEMPLATE_LABELS;
 
-export const TEMPLATE_IDS: TemplateId[] = ["irs", "cap", "swpt", "fxf", "fxo", "basis", "amort", "imm", "fxs"];
+export const TEMPLATE_IDS: TemplateId[] = ["irs", "cap", "swpt", "fxf", "fxo", "basis", "amort", "imm", "fxs", "ccs", "fra"];
 
 export { TEMPLATE_LABELS };
 
@@ -103,5 +105,25 @@ export function newTradeTemplate(kind: TemplateId, valuationDate: number): Trade
         }),
         name: "FX-Swap EUR/USD 1Y",
       };
+    case "ccs":
+      return makeCrossCurrencySwap({
+        name: "CCS EUR/USD 5Y €STR −20 bp vs SOFR",
+        pair: "EURUSD",
+        domesticNotional: 10_000_000,
+        fxSpot: 1.17,
+        spread: -0.002,
+        effectiveDate: spot,
+        tenor: "5Y",
+      });
+    case "fra":
+      return makeFra({
+        name: "FRA EUR 3x6 Zahler",
+        currency: "EUR",
+        notional: 10_000_000,
+        payReceive: "Pay",
+        start: "3x6",
+        rate: 0.022,
+        valuationDate,
+      });
   }
 }

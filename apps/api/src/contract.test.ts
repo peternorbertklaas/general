@@ -302,6 +302,7 @@ describe("N-08 OpenAPI contract", () => {
         "listTrades",
         "parRisk",
         "parRiskPortfolio",
+        "portfolioReport",
         "priceTrade",
         "pricePortfolio",
         "replaceCurve",
@@ -830,5 +831,253 @@ describe("R-03 core surface round 3", () => {
     expect(doc).toContain("always the bank");
     expect(doc).toContain("monotoneConvex");
     expect(doc).toContain("FxSwapPoints");
+  });
+});
+
+describe("R-04 core surface round 4", () => {
+  const post = (url: string, payload: Record<string, unknown>) => app.inject({ method: "POST", url, payload });
+  const trade = async (id: string) => (await app.inject({ method: "GET", url: `/api/trades/${id}` })).json().trade;
+
+  it("portfolio report: store or body trades, aggregates, audit anchors, groupBy trimming, Markdown download, audit entry", async () => {
+    const app2 = await buildApp({ logger: false });
+    const post2 = (url: string, payload: Record<string, unknown>) => app2.inject({ method: "POST", url, payload });
+    const url = "/api/report/portfolio";
+    const r = await post2(url, {});
+    expect(r.statusCode, r.body).toBe(200);
+    const rep = r.json();
+    expect(rep.lines).toHaveLength(10);
+    expect(rep.totals.trades).toBe(10);
+    expect(rep.failed).toBe(0);
+    expect(rep.reportingCurrency).toBe("EUR");
+    expect(rep.valuationDate).toBe("2026-09-03");
+    expect(rep.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(rep.byCounterparty.map((a: { key: string }) => a.key).sort()).toEqual(["CPTY-A", "CPTY-B"]);
+    expect(rep.byBook).toHaveLength(1);
+    expect(rep.byType.length).toBeGreaterThanOrEqual(4);
+    expect(rep.byCounterparty.reduce((s: number, a: { pv: number }) => s + a.pv, 0)).toBeCloseTo(rep.totals.pv, 4);
+    expect(typeof rep.totals.dv01).toBe("number");
+    expect(typeof rep.totals.theta).toBe("number");
+    expect(typeof rep.totals.fxDelta.USDEUR).toBe("number");
+    expect(rep.totals.fxDelta.EURUSD).toBeUndefined();
+    expect(rep.lines.find((l: { tradeId: string }) => l.tradeId === "FXO-0002").fxDelta.CHFEUR).not.toBe(0);
+    expect(rep.audit.snapshotId).toBe(r.headers["x-market-snapshot-id"]);
+    expect(rep.audit.reportHash).toMatch(/^[0-9a-f]{8,}$/);
+    expect(rep.audit.inputsHash).toMatch(/^[0-9a-f]{8,}$/);
+    expect(rep.groupBy).toBeUndefined();
+    // Deterministic: same trades on the same snapshot → same hashes.
+    const again = (await post2(url, {})).json();
+    expect(again.audit.reportHash).toBe(rep.audit.reportHash);
+    expect(again.audit.inputsHash).toBe(rep.audit.inputsHash);
+    // groupBy trims the aggregations but not the hash; options reach the core.
+    const grouped = await post2(url, { groupBy: ["type"], reportingCurrency: "USD", theta: false, fxDelta: false, preparedBy: "Marktfolge" });
+    expect(grouped.statusCode, grouped.body).toBe(200);
+    expect(grouped.json().byCounterparty).toEqual([]);
+    expect(grouped.json().byBook).toEqual([]);
+    expect(grouped.json().byType.length).toBe(rep.byType.length);
+    expect(grouped.json().groupBy).toEqual(["type"]);
+    expect(grouped.json().reportingCurrency).toBe("USD");
+    expect(grouped.json().totals.fxDelta).toEqual({});
+    expect(grouped.json().lines[0].theta).toBeNull();
+    expect(grouped.json().audit.preparedBy).toBe("Marktfolge");
+    const sameTrim = await post2(url, { groupBy: ["type"] });
+    expect(sameTrim.json().audit.reportHash).toBe(rep.audit.reportHash);
+    // Body trades: a failed valuation stays as a line with `error`, excluded from the totals.
+    const t = (await app2.inject({ method: "GET", url: "/api/trades/IRS-0002" })).json().trade;
+    const bad = { ...t, id: "BAD", legs: [t.legs[0], { ...t.legs[1], index: "NOPE-6M" }] };
+    const own = await post2(url, { trades: [t, bad] });
+    expect(own.statusCode, own.body).toBe(200);
+    expect(own.json().lines).toHaveLength(2);
+    expect(own.json().failed).toBe(1);
+    // The failed trade is counted but contributes nothing to the measures.
+    expect(own.json().totals.trades).toBe(2);
+    expect(own.json().totals.pv).toBeCloseTo(own.json().lines[0].pv, 6);
+    expect(own.json().totals.dv01).toBeCloseTo(own.json().lines[0].dv01, 6);
+    const badLine = own.json().lines.find((l: { tradeId: string }) => l.tradeId === "BAD");
+    expect(typeof badLine.error).toBe("string");
+    expect(badLine.pv).toBeNull();
+    expect(badLine.dv01).toBeNull();
+    expect(own.json().lines[0].pv).toBeCloseTo(rep.lines.find((l: { tradeId: string }) => l.tradeId === "IRS-0002").pv, 6);
+    // Markdown: German rendering, trimmed to the requested groupings.
+    const md = await app2.inject({ method: "POST", url: `${url}?format=md`, payload: { groupBy: ["counterparty"] } });
+    expect(md.statusCode, md.body).toBe(200);
+    expect(md.headers["content-type"]).toContain("text/markdown");
+    expect(String(md.headers["content-disposition"])).toContain(`portfolio-${rep.audit.snapshotId}-report.md`);
+    expect(md.headers["x-market-snapshot-id"]).toBe(rep.audit.snapshotId);
+    expect(md.body).toContain("# Portfolio-Bewertungsreport");
+    expect(md.body).toContain("03.09.2026");
+    expect(md.body).toContain("## Nach Kontrahent");
+    expect(md.body).not.toContain("## Nach Buch");
+    expect(md.body).not.toContain("## Nach Produktart");
+    expect(md.body).toContain("## Einzelgeschäfte");
+    expect(md.body).toContain(rep.audit.reportHash);
+    const fullMd = await app2.inject({ method: "POST", url: `${url}?format=md`, payload: {} });
+    for (const h of ["## Nach Kontrahent", "## Nach Buch", "## Nach Produktart", "## Audit"]) expect(fullMd.body).toContain(h);
+    // Validation.
+    expect((await post2(url, { groupBy: ["desk"] })).statusCode).toBe(400);
+    expect((await post2(url, { groupBy: [] })).statusCode).toBe(400);
+    expect((await post2(url, { groupBy: ["type", "type"] })).statusCode).toBe(400);
+    expect((await post2(url, { reportingCurrency: "eur" })).statusCode).toBe(400);
+    expect((await post2(url, { foo: 1 })).statusCode).toBe(400);
+    expect((await post2(url, { trades: [{ id: "x", type: "FRA" }] })).statusCode).toBe(400);
+    expect((await app2.inject({ method: "POST", url: `${url}?format=pdf`, payload: {} })).statusCode).toBe(400);
+    // Audit trail.
+    const audit = (await app2.inject({ method: "GET", url: "/api/audit" })).json();
+    expect(audit.chainValid).toBe(true);
+    const entries = audit.entries.filter((e: { action: string }) => e.action === "report.portfolio");
+    expect(entries).toHaveLength(7);
+    expect(entries[0]).toMatchObject({
+      subject: "portfolio",
+      details: { trades: 10, failed: 0, reportHash: rep.audit.reportHash, snapshotId: rep.audit.snapshotId },
+    });
+    expect(entries[2].details.groupBy).toEqual(["type"]);
+    expect(entries[4].details.failed).toBe(1);
+    // Empty store → empty but well-formed report.
+    const empty = await buildApp({ logger: false, seedPortfolio: false });
+    const e = await empty.inject({ method: "POST", url, payload: {} });
+    expect(e.statusCode, e.body).toBe(200);
+    expect(e.json().lines).toEqual([]);
+    expect(e.json().totals.trades).toBe(0);
+    await empty.close();
+    await app2.close();
+  }, 120000);
+
+  it("vega buckets: FX option reports the pair's surface as kind fx; `smile` adds RR25/BF25 buckets outside the total", async () => {
+    const fxo = await trade("FXO-0001");
+    const atm = await post("/api/risk/vega", { trade: fxo });
+    expect(atm.statusCode, atm.body).toBe(200);
+    expect(atm.json()).toHaveLength(1);
+    const surface = atm.json()[0];
+    expect(surface.kind).toBe("fx");
+    expect(surface.key).toMatch(/^(EURUSD|USDEUR)$/);
+    expect(surface.dimension).toBe("expiry");
+    expect(surface.buckets.length).toBeGreaterThan(2);
+    expect(surface.buckets.every((b: { component?: string }) => b.component === "atm")).toBe(true);
+    expect(surface.buckets.every((b: { tenor?: number }) => b.tenor === undefined)).toBe(true);
+    const sum = surface.buckets.reduce((s: number, b: { vega: number }) => s + b.vega, 0);
+    expect(sum).toBeCloseTo(surface.total, 6);
+    const smile = await app.inject({ method: "POST", url: "/api/risk/vega?smile=true", payload: { trade: fxo } });
+    expect(smile.statusCode, smile.body).toBe(200);
+    const buckets = smile.json()[0].buckets as { label: string; vega: number; component: string }[];
+    expect(new Set(buckets.map((b) => b.component))).toEqual(new Set(["atm", "rr25", "bf25"]));
+    expect(buckets.length).toBe(3 * surface.buckets.length);
+    expect(buckets.some((b) => / RR25$/.test(b.label))).toBe(true);
+    expect(buckets.some((b) => / BF25$/.test(b.label))).toBe(true);
+    expect(buckets.filter((b) => b.component === "atm").reduce((s, b) => s + b.vega, 0)).toBeCloseTo(smile.json()[0].total, 6);
+    expect(smile.json()[0].total).toBeCloseTo(surface.total, 6);
+    expect(buckets.every((b) => Number.isFinite(b.vega))).toBe(true);
+    // Body beats query; non-boolean is rejected; IR surfaces ignore the flag.
+    const body = await post("/api/risk/vega", { trade: fxo, smile: true });
+    expect(body.json()[0].buckets).toHaveLength(buckets.length);
+    const bodyWins = await app.inject({ method: "POST", url: "/api/risk/vega?smile=true", payload: { trade: fxo, smile: false } });
+    expect(bodyWins.json()[0].buckets).toHaveLength(surface.buckets.length);
+    expect((await post("/api/risk/vega", { trade: fxo, smile: "yes" })).statusCode).toBe(400);
+    const sw = await post("/api/risk/vega", { trade: await trade("SWPT-0001"), smile: true });
+    expect(sw.statusCode).toBe(200);
+    expect(sw.json()[0].kind).toBe("swaption");
+    expect(sw.json()[0].buckets.every((b: { component?: string }) => b.component === undefined)).toBe(true);
+    const doc = JSON.stringify(app.swagger());
+    expect(doc).toContain('"swaption","caplet","fx"');
+    expect(doc).toContain('"atm","rr25","bf25"');
+    expect(doc).toContain("FX-Vol-Fläche");
+  }, 60000);
+
+  it("hedge: freezeDesignationVol freezes the hypothetical cap's vol at designation and reports frozenVol", async () => {
+    const app2 = await buildApp({ logger: false });
+    const url = "/api/hedge/effectiveness";
+    const snap = (await app2.inject({ method: "GET", url: "/api/market/snapshot" })).json();
+    const rel = {
+      id: "HR-FREEZE",
+      name: "Cap auf variablen Kredit (Vol eingefroren)",
+      type: "CashFlowHedge",
+      hedgedItem: {
+        description: "Variabler Kredit",
+        currency: "EUR",
+        notional: 8000000,
+        kind: "FloatingRateLoan",
+        index: "EURIBOR-6M",
+        effectiveDate: "2026-09-07",
+        maturityDate: "2031-09-07",
+      },
+      hedgingInstrumentId: "CAP-0001",
+      designationDate: "2026-09-03",
+      method: "DollarOffset",
+      accountingFramework: "IFRS9",
+    };
+    const frozen = await app2.inject({ method: "POST", url, payload: { relationship: rel, designationSnapshot: snap, freezeDesignationVol: true } });
+    expect(frozen.statusCode, frozen.body).toBe(200);
+    const hypo = frozen.json().hypotheticalDerivative;
+    expect(typeof hypo.frozenVol).toBe("number");
+    expect(hypo.frozenVol).toBeGreaterThan(0);
+    expect(hypo.trade.type).toBe("CapFloor");
+    expect(hypo.trade.volOverride).toBeCloseTo(hypo.frozenVol, 12);
+    expect(typeof hypo.pv).toBe("number");
+    expect(frozen.json().dollarOffsetCumulative).toBeDefined();
+    const live = await app2.inject({ method: "POST", url, payload: { relationship: rel, designationSnapshot: snap } });
+    expect(live.statusCode, live.body).toBe(200);
+    expect(live.json().hypotheticalDerivative.frozenVol).toBeUndefined();
+    expect(live.json().hypotheticalDerivative.trade.volOverride).toBeUndefined();
+    // Without a designation snapshot the flag has nothing to freeze from.
+    const noDesignation = await app2.inject({ method: "POST", url, payload: { relationship: rel, freezeDesignationVol: true } });
+    expect(noDesignation.statusCode, noDesignation.body).toBe(200);
+    expect(noDesignation.json().hypotheticalDerivative.frozenVol).toBeUndefined();
+    expect((await app2.inject({ method: "POST", url, payload: { relationship: rel, freezeDesignationVol: "yes" } })).statusCode).toBe(400);
+    const audit = (await app2.inject({ method: "GET", url: "/api/audit" })).json();
+    const tests = audit.entries.filter((e: { action: string; subject: string }) => e.action === "hedge.test" && e.subject === "HR-FREEZE");
+    expect(tests).toHaveLength(3);
+    expect(tests[0].details.frozenVol).toBeCloseTo(hypo.frozenVol, 12);
+    expect(tests[1].details.frozenVol).toBeUndefined();
+    const doc = JSON.stringify(app.swagger());
+    expect(doc).toContain("frozenVol");
+    expect(doc).toContain("freezeDesignationVol");
+    await app2.close();
+  }, 120000);
+
+  it("trade schema: CapFloor.notionalSchedule prices an amortising cap, rejects malformed entries and round-trips through the store", async () => {
+    const cap = await trade("CAP-0001");
+    const full = (await price(cap)).json();
+    const amortising = {
+      ...cap,
+      notionalSchedule: [
+        { date: cap.effectiveDate, notional: 8000000 },
+        { date: "2029-09-07", notional: 4000000 },
+      ],
+    };
+    const am = await price(amortising);
+    expect(am.statusCode, am.body).toBe(200);
+    expect(Math.abs(am.json().pv)).toBeLessThan(Math.abs(full.pv));
+    expect(Math.sign(am.json().pv)).toBe(Math.sign(full.pv));
+    expect((await price({ ...cap, notionalSchedule: [{ date: "2029-09-07" }] })).statusCode).toBe(400);
+    expect((await price({ ...cap, notionalSchedule: [{ date: "07.09.2029", notional: 4000000 }] })).statusCode).toBe(400);
+    expect((await price({ ...cap, notionalSchedule: [{ date: "2029-09-07", notional: -1 }] })).statusCode).toBe(400);
+    expect((await price({ ...cap, notionalSchedule: [{ date: "2029-09-07", notional: 4000000, foo: 1 }] })).statusCode).toBe(400);
+    const app2 = await buildApp({ logger: false });
+    const created = await app2.inject({ method: "POST", url: "/api/trades", payload: { ...amortising, id: "CAP-AM" } });
+    expect(created.statusCode, created.body).toBe(201);
+    const stored = (await app2.inject({ method: "GET", url: "/api/trades/CAP-AM" })).json().trade;
+    expect(stored.notionalSchedule).toEqual(amortising.notionalSchedule);
+    await app2.close();
+  });
+
+  it("pricing analytics: FX forwards / swaps carry `deltaAmount` only, FX options additionally `deltaPct` as a fraction", async () => {
+    const fwd = (await price(await trade("FXF-0001"))).json();
+    expect(typeof fwd.analytics.deltaAmount).toBe("number");
+    expect(fwd.analytics.deltaPct).toBeUndefined();
+    const fxSwap = {
+      id: "fxs-d",
+      type: "FxSwap",
+      nearLeg: { buyCurrency: "USD", buyAmount: 1170000, sellCurrency: "EUR", sellAmount: 1000000, deliveryDate: "2026-09-07" },
+      farLeg: { buyCurrency: "EUR", buyAmount: 1000000, sellCurrency: "USD", sellAmount: 1175000, deliveryDate: "2027-03-15" },
+    };
+    const swp = await price(fxSwap);
+    expect(swp.statusCode, swp.body).toBe(200);
+    expect(typeof swp.json().analytics.deltaAmount).toBe("number");
+    expect(swp.json().analytics.deltaPct).toBeUndefined();
+    const opt = (await price(await trade("FXO-0002"))).json();
+    expect(typeof opt.analytics.deltaAmount).toBe("number");
+    expect(Math.abs(opt.analytics.deltaPct)).toBeLessThanOrEqual(1);
+    expect(Math.abs(opt.analytics.deltaPct)).toBeGreaterThan(0);
+    const doc = JSON.stringify(app.swagger());
+    expect(doc).toContain("FX forwards and FX swaps: `deltaAmount`");
+    expect(doc).toContain("`deltaPct` = signed spot delta as a fraction of the notional");
   });
 });

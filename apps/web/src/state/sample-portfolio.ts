@@ -1,4 +1,16 @@
-import { type Trade, advance, getCalendar, makeCapFloor, makeFxForward, makeFxOption, makeSwaption, makeVanillaSwap, parseISO } from "@deriva/pricing-core";
+import {
+  type Trade,
+  advance,
+  getCalendar,
+  makeCapFloor,
+  makeCrossCurrencySwap,
+  makeFra,
+  makeFxForward,
+  makeFxOption,
+  makeSwaption,
+  makeVanillaSwap,
+  parseISO,
+} from "@deriva/pricing-core";
 
 /** Demo book: a Mittelstand treasury hedging loans and FX exposures. All booked trades are "Live". */
 export function samplePortfolio(valuationDate: number): Trade[] {
@@ -152,6 +164,40 @@ function sampleTrades(valuationDate: number): Trade[] {
       }),
       name: "EUR-Call/CHF-Put 2 Mio @ 0,9500",
       book: "Vertrieb CH",
+    },
+    {
+      ...makeCrossCurrencySwap({
+        id: "CCS-0001",
+        pair: "EURUSD",
+        domesticNotional: 10_000_000,
+        fxSpot: 1.17,
+        spread: -0.002,
+        effectiveDate: spot,
+        tenor: "5Y",
+        counterparty: "Commerzbank",
+        collateralCurrency: "EUR",
+      }),
+      name: "CCS EUR/USD 5Y €STR −20 bp vs SOFR",
+      book: "USD-Finanzierung",
+      uti: "529900T8BM49AURSDO55CCS0001",
+      cleared: false,
+    },
+    {
+      ...makeFra({
+        id: "FRA-0001",
+        currency: "EUR",
+        notional: 10_000_000,
+        payReceive: "Pay",
+        start: "3x6",
+        rate: 0.022,
+        valuationDate,
+        counterparty: "DZ BANK",
+      }),
+      name: "FRA EUR 3x6 Zahler @ 2,200 %",
+      book: "Liquidität",
+      uti: "529900T8BM49AURSDO55FRA0001",
+      cleared: true,
+      clearingMember: "Eurex Clearing AG",
     },
   ];
 }

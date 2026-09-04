@@ -6,6 +6,8 @@ import {
   makeAmortisingSwap,
   makeBasisSwap,
   makeCapFloor,
+  makeCrossCurrencySwap,
+  makeFra,
   makeFxForward,
   makeFxOption,
   makeFxSwap,
@@ -24,6 +26,9 @@ import { fmtNum } from "./format.js";
  *   "swpt 1y5y payer 3% 10m" | "swaption 2y10y rec 2.8 5m"
  *   "fxf eurusd 2m 1.1725 2027-03-15"  (positive = buy EUR, "-2m" = sell)
  *   "fxo eurusd put 1.15 3m 2027-06-15" | "fxo eurchf call 0.95 2m 6m"
+ *   "ccs eurusd 5y -20bp 10m [mtm]"    → cross-currency basis swap (€STR −20bp vs SOFR), optional MtM reset
+ *   "fra 3x6 pay 2.2% 10m"             → forward rate agreement (period from the spot date)
+ *   "irs 5y pay 2.5% 10m step 2.5/3.0/3.5" → step-up coupon: one rate per year from the start
  *   "@Landesbank" anywhere sets the counterparty ("irs 10y pay 3.1% 10m @Landesbank")
  */
 export interface ParseResult {
@@ -54,6 +59,10 @@ function parseRate(s: string): number | undefined {
 
 const TENOR = /^\d+(?:d|w|m|y)$/i;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
+/** FRA period "3x6" (months from the spot date). */
+const FRA_PERIOD = /^(\d{1,2})x(\d{1,2})$/i;
+/** Step-up coupon list "2.5/3.0/3.5" (percent, one rate per year). */
+const STEP_LIST = /^-?\d+(?:[.,]\d+)?(?:\/-?\d+(?:[.,]\d+)?)+$/;
 
 function parseDateOrTenor(tok: string, from: number): number | undefined {
   if (DATE.test(tok)) return parseISO(tok);
@@ -63,6 +72,8 @@ function parseDateOrTenor(tok: string, from: number): number | undefined {
 
 const CCYS = new Set(["eur", "usd", "gbp", "chf", "jpy"]);
 const DIRECTION = new Set(["pay", "payer", "p", "rec", "receive", "receiver", "r", "call", "put", "c"]);
+/** Modifier words of the grammar ("mtm" = MtM reset, "step" introduces the coupon list). */
+const MODIFIERS = new Set(["mtm", "step"]);
 const COMMANDS = new Set([
   "irs",
   "swap",
@@ -84,6 +95,9 @@ const COMMANDS = new Set([
   "tenorbasis",
   "fxs",
   "fxswap",
+  "ccs",
+  "xccy",
+  "fra",
   "stichtag",
 ]);
 
@@ -96,7 +110,8 @@ export function isGrammarToken(t: string): boolean {
   const tl = t.toLowerCase();
   if (/^[-+\d.,]/.test(t)) return true; // numbers, rates, amounts, dates, "1y5y"
   if (TENOR.test(t) || DATE.test(t)) return true;
-  if (CCYS.has(tl) || DIRECTION.has(tl) || COMMANDS.has(tl)) return true;
+  if (CCYS.has(tl) || DIRECTION.has(tl) || COMMANDS.has(tl) || MODIFIERS.has(tl)) return true;
+  if (FRA_PERIOD.test(t) || STEP_LIST.test(t)) return true;
   if (/^[a-z]{6}$/i.test(t) && CCYS.has(tl.slice(0, 3)) && CCYS.has(tl.slice(3))) return true; // currency pair
   if (/^(euribor|estr|sofr|sonia|saron|tona)/i.test(t)) return true;
   if (/^\d+m\/\d+m$/i.test(t) || /%$/.test(t) || /bp$/i.test(t)) return true;
@@ -141,12 +156,17 @@ export function extractCounterparty(toks: string[]): { toks: string[]; counterpa
   return { toks: out, counterparty: cp.length ? cp.join(" ") : undefined };
 }
 
-export function parseQuickEntry(input: string, valuationDate: number): ParseResult {
+export interface QuickEntryOptions {
+  /** Market FX spots ("EURUSD" → 1.17) – fix the foreign notional of a cross-currency swap when no rate is typed. */
+  fxSpots?: Record<string, number>;
+}
+
+export function parseQuickEntry(input: string, valuationDate: number, opts: QuickEntryOptions = {}): ParseResult {
   const raw = input.trim().split(/\s+/).filter(Boolean);
   if (raw.length === 0) return { ok: false };
   const { toks, counterparty } = extractCounterparty(raw);
   if (toks.length === 0) return { ok: false };
-  const r = parseCore(toks, valuationDate);
+  const r = parseCore(toks, valuationDate, opts);
   if (r.ok && r.trade && counterparty) {
     r.trade = { ...r.trade, counterparty };
     r.description = `${r.description} · @${counterparty}`;
@@ -154,7 +174,7 @@ export function parseQuickEntry(input: string, valuationDate: number): ParseResu
   return r;
 }
 
-function parseCore(toks: string[], valuationDate: number): ParseResult {
+function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOptions): ParseResult {
   const cmd = toks[0]!.toLowerCase();
   const rest = toks.slice(1);
   const cal = getCalendar("TARGET");
@@ -215,6 +235,98 @@ function parseCore(toks: string[], valuationDate: number): ParseResult {
       };
       return { ok: true, trade, description: `FX-Swap ${pair} ${amtTok} @ ${fmtNum(nearRate, 4)}/${fmtNum(farRate, 4)} · Far ${dateTok}` };
     }
+    if (["ccs", "xccy"].includes(cmd)) {
+      // ccs <pair> <tenor> [spreadbp] [notional] [mtm] [fixed <rate%>]   e.g. "ccs eurusd 5y -20bp 10m mtm"
+      let pair: string | undefined;
+      let tenor: string | undefined;
+      let spread = 0;
+      let notional = 10_000_000;
+      let mtm = false;
+      let fxSpot: number | undefined;
+      let pr: "Pay" | "Receive" = "Receive";
+      for (const t of rest) {
+        const tl = t.toLowerCase();
+        if (/^[a-z]{6}$/i.test(t) && CCYS.has(tl.slice(0, 3)) && CCYS.has(tl.slice(3))) pair = t.toUpperCase();
+        else if (TENOR.test(t) && !tenor) tenor = t.toUpperCase();
+        else if (/bp$/i.test(t)) spread = parseRate(t) ?? 0;
+        else if (tl === "mtm") mtm = true;
+        else if (["pay", "payer", "p"].includes(tl)) pr = "Pay";
+        else if (["rec", "receive", "receiver", "r"].includes(tl)) pr = "Receive";
+        else if (/^\d+[.,]\d{2,}$/.test(t)) fxSpot = Number(t.replace(",", "."));
+        else {
+          const amt = parseAmount(t);
+          if (amt !== undefined) notional = amt;
+        }
+      }
+      if (!pair || !tenor) return { ok: false, error: "Format: ccs eurusd 5y -20bp 10m [mtm]" };
+      const dom = pair.slice(0, 3);
+      const forCcy = pair.slice(3);
+      // Foreign notional = domestic × spot: typed rate first, then the market spot (direct or inverse quotation).
+      const spots = opts.fxSpots ?? {};
+      const inverse = spots[`${forCcy}${dom}`];
+      const rate = fxSpot ?? spots[pair] ?? (inverse ? 1 / inverse : undefined);
+      if (rate === undefined)
+        return { ok: false, error: `FX-Spot für ${dom}/${forCcy} fehlt – Kurs angeben (z.B. ccs ${pair.toLowerCase()} 5y -20bp 10m 1.17)` };
+      const trade = makeCrossCurrencySwap({
+        name: `Cross-Currency-Swap ${dom}/${forCcy} ${tenor} ${fmtNum(spread * 1e4, 1)} bp${mtm ? " MtM" : ""}`,
+        pair,
+        domesticNotional: notional,
+        fxSpot: rate,
+        spread,
+        effectiveDate: spot,
+        tenor,
+        mtmReset: mtm,
+        domesticPayReceive: pr,
+      });
+      return {
+        ok: true,
+        trade,
+        description: `Cross-Currency-Swap ${dom}/${forCcy} ${tenor} · ${pr === "Receive" ? "Erhalte" : "Zahle"} ${dom} ${spread >= 0 ? "+" : ""}${fmtNum(spread * 1e4, 1)} bp · Nominal ${fmtNum(notional, 0)} ${dom} @ ${fmtNum(rate, 4)}${mtm ? " · MtM-Reset" : ""}`,
+      };
+    }
+    if (cmd === "fra") {
+      // fra [ccy] <NxM> pay|rec <rate%> [notional] [index]   e.g. "fra 3x6 pay 2.2% 10m"
+      let ccy = "EUR";
+      let period: string | undefined;
+      let pr: "Pay" | "Receive" = "Pay";
+      let rate: number | undefined;
+      let notional = 10_000_000;
+      let index: string | undefined;
+      for (const t of rest) {
+        const tl = t.toLowerCase();
+        if (/^[a-z]{3}$/i.test(t) && CCYS.has(tl)) ccy = t.toUpperCase();
+        else if (FRA_PERIOD.test(t) && !period) period = t.toLowerCase();
+        else if (["pay", "payer", "p"].includes(tl)) pr = "Pay";
+        else if (["rec", "receive", "receiver", "r"].includes(tl)) pr = "Receive";
+        else if (/%$/.test(t) || /bp$/i.test(t) || (rate === undefined && /^\d+(?:[.,]\d+)?$/.test(t) && Number(t.replace(",", ".")) < 20 && !/[km]$/i.test(t)))
+          rate = parseRate(t);
+        else if (/^(euribor|estr|sofr|sonia|saron|tona)/i.test(t)) index = t.toUpperCase().replace("EURIBOR", "EURIBOR-").replace("--", "-");
+        else {
+          const amt = parseAmount(t);
+          if (amt !== undefined) notional = amt;
+        }
+      }
+      if (!period) return { ok: false, error: "Periode fehlt (z.B. fra 3x6 pay 2.2% 10m)" };
+      const m = FRA_PERIOD.exec(period)!;
+      if (Number(m[2]) <= Number(m[1])) return { ok: false, error: "FRA-Periode: Ende muss nach dem Start liegen (z.B. 3x6)" };
+      if (rate === undefined) return { ok: false, error: "Festsatz fehlt (z.B. 2.2%)" };
+      if (!index && ccy === "EUR") index = `EURIBOR-${Number(m[2]) - Number(m[1])}M`;
+      const trade = makeFra({
+        name: `FRA ${ccy} ${period} ${pr === "Pay" ? "Zahler" : "Empfänger"}`,
+        currency: ccy,
+        notional,
+        payReceive: pr,
+        start: period,
+        rate,
+        index,
+        valuationDate,
+      });
+      return {
+        ok: true,
+        trade,
+        description: `FRA ${ccy} ${period} · Fest ${pr === "Pay" ? "zahlen" : "erhalten"} @ ${fmtNum(rate * 100, 3)} % · Nominal ${fmtNum(notional, 0)}${index ? ` · ${index}` : ""}`,
+      };
+    }
     if (["irs", "swap", "ois", "amort", "amortising"].includes(cmd)) {
       let ccy = "EUR";
       let tenor: string | undefined;
@@ -222,9 +334,19 @@ function parseCore(toks: string[], valuationDate: number): ParseResult {
       let rate: number | undefined;
       let notional = 10_000_000;
       let index: string | undefined;
+      let steps: number[] | undefined;
+      let expectSteps = false;
       for (const t of rest) {
         const tl = t.toLowerCase();
-        if (/^[a-z]{3}$/i.test(t) && ["eur", "usd", "gbp", "chf", "jpy"].includes(tl)) ccy = t.toUpperCase();
+        if (expectSteps) {
+          expectSteps = false;
+          if (STEP_LIST.test(t) || /^-?\d+(?:[.,]\d+)?%?$/.test(t)) {
+            steps = t.split("/").map((x) => parseRate(x.endsWith("%") ? x : `${x}%`)!);
+            continue;
+          }
+        }
+        if (tl === "step" || tl === "staffel") expectSteps = true;
+        else if (/^[a-z]{3}$/i.test(t) && ["eur", "usd", "gbp", "chf", "jpy"].includes(tl)) ccy = t.toUpperCase();
         else if (TENOR.test(t) && tenor === undefined) tenor = t.toUpperCase();
         else if (["pay", "payer", "p"].includes(tl)) pr = "Pay";
         else if (["rec", "receive", "receiver", "r"].includes(tl)) pr = "Receive";
@@ -246,13 +368,16 @@ function parseCore(toks: string[], valuationDate: number): ParseResult {
       }
       if (cmd === "ois" && !index) index = ccy === "EUR" ? "ESTR" : ccy === "USD" ? "SOFR" : ccy === "GBP" ? "SONIA" : ccy === "CHF" ? "SARON" : "TONA";
       const isAmort = cmd.startsWith("amort");
-      const name = `${isAmort ? "Amortisierender " : ""}${pr === "Pay" ? "Payer" : "Receiver"}-Swap ${ccy} ${tenor}${cmd === "ois" ? " OIS" : ""}`;
-      const params = { name, currency: ccy, notional, payReceiveFixed: pr, fixedRate: rate, effectiveDate: spot, maturity: tenor, index };
+      // Step-up coupon: the first list entry is the initial coupon, every further entry starts one year later.
+      if (steps && steps.length > 0) rate = steps[0]!;
+      const stepUp = steps && steps.length > 1 ? steps.slice(1).map((r, i) => ({ date: addTenor(spot, `${i + 1}Y`), rate: r })) : undefined;
+      const name = `${isAmort ? "Amortisierender " : ""}${pr === "Pay" ? "Payer" : "Receiver"}-Swap ${ccy} ${tenor}${cmd === "ois" ? " OIS" : ""}${stepUp ? " Staffel" : ""}`;
+      const params = { name, currency: ccy, notional, payReceiveFixed: pr, fixedRate: rate, effectiveDate: spot, maturity: tenor, index, stepUp };
       const trade = isAmort ? makeAmortisingSwap(params) : makeVanillaSwap(params);
       return {
         ok: true,
         trade,
-        description: `${pr === "Pay" ? "Payer" : "Receiver"}-Swap ${ccy} ${tenor} @ ${fmtNum(rate * 100, 3)} % · Nominal ${fmtNum(notional, 0)}${index ? ` · ${index}` : ""}${isAmort ? " · linear amortisierend" : ""}`,
+        description: `${pr === "Pay" ? "Payer" : "Receiver"}-Swap ${ccy} ${tenor} @ ${fmtNum(rate * 100, 3)} %${stepUp ? ` → ${steps!.map((r) => fmtNum(r * 100, 2)).join(" / ")} % Staffel` : ""} · Nominal ${fmtNum(notional, 0)}${index ? ` · ${index}` : ""}${isAmort ? " · linear amortisierend" : ""}`,
       };
     }
     if (["cap", "floor", "collar"].includes(cmd)) {
@@ -375,6 +500,9 @@ export const QUICK_ENTRY_EXAMPLES = [
   "basis 5y 3m/6m 5bp 10m",
   "amort 10y pay 3.1% 10m",
   "fxs eurusd 1m 1.1625 1.18 1y",
+  "ccs eurusd 5y -20bp 10m mtm",
+  "fra 3x6 pay 2.2% 10m",
+  "irs 5y pay 2.5% 10m step 2.5/3.0/3.5",
   "irs 5y rec 2.4% 5m @Landesbank",
 ];
 

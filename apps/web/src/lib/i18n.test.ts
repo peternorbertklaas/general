@@ -91,6 +91,8 @@ describe("i18n core message mapping (F-25)", () => {
     expect(germanTradeName("Payer EUR 10Y @ 3.100%")).toBe("Payer-Swap EUR 10Y @ 3,100 %");
     expect(germanTradeName("Cap EUR 5Y @ 3.00%")).toBe("Cap EUR 5Y @ 3,00 %");
     expect(germanTradeName("Put EURUSD 3.000.000 @ 1.15")).toBe("Put EUR/USD 3.000.000 @ 1,15");
+    expect(germanTradeName("FRA EUR 3x6 Pay @ 2.200%")).toBe("FRA EUR 3x6 Zahler @ 2,200 %");
+    expect(germanTradeName("CCS EURUSD 5Y ESTR -20.0bp vs SOFR")).toBe("CCS EUR/USD 5Y ESTR −20,0 bp vs SOFR");
     expect(germanTradeName("Mein eigener Name")).toBe("Mein eigener Name");
     expect(germanizeText("designiert am 2026-09-30 (InterestRateSwap)")).toBe("designiert am 30.09.2026 (Zinsswap)");
     expect(germanizeDocValue("1.216 %")).toBe("1,216 %");

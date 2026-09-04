@@ -1,11 +1,16 @@
 import { useMemo, useState } from "react";
 import {
+  type ConfirmationParties,
   type GeneratedDocument,
+  type KidOptions,
+  type MasterAgreementRef,
   type PricingResult,
   type SuitabilityInputs,
   type Trade,
   type ValuationReport,
   STANDARD_SCENARIOS,
+  generateConfirmation,
+  generateKid,
   generateSuitabilityStatement,
   generateTermsheet,
   parseISO,
@@ -15,16 +20,18 @@ import {
 import { fmtDate, fmtMoney } from "../lib/format.js";
 import { germanizeDocValue, germanizeParagraph, translatePricingError } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
-import { type DocKind, useStore } from "../state/store.js";
+import { tradeMaturity } from "../lib/trade-ops.js";
+import { type DocKind, reportInputsFor, useStore } from "../state/store.js";
+import { DateInput } from "./DateInput.js";
 import { Modal } from "./Modal.js";
 import { NumInput } from "./NumInput.js";
 
 export type { DocKind };
 
 const INTERNAL_ROW = /marge|margin|ertrag der bank|bankmarge|deckungsbeitrag|interne/i;
-const REQUIRED_ROW = /anfänglicher (negativer )?marktwert|initial market value/i;
+const REQUIRED_ROW = /anfänglicher (negativer )?marktwert|initial market value|kosten|einstiegskosten/i;
 
-/** Customer mode: drop internal margin lines but keep the legally required initial market value. */
+/** Customer mode: drop internal margin lines but keep the legally required initial market value / cost figures. */
 export function filterForCustomer(doc: GeneratedDocument, customer: boolean): GeneratedDocument {
   if (!customer) return doc;
   const sections = doc.sections
@@ -81,6 +88,42 @@ const DEFAULT_INPUTS: SuitabilityInputs = {
   alternativesConsidered: ["Cap", "Festzinskredit"],
 };
 
+/** Form model of the confirmation dialog (parties, master agreement, reference). */
+export interface ConfirmationForm {
+  bankName: string;
+  bankLei: string;
+  clientName: string;
+  clientLei: string;
+  masterAgreement: MasterAgreementRef["type"];
+  masterAgreementDate: number;
+  masterAgreementRef: string;
+  csaRef: string;
+  confirmationDate: number;
+  reference: string;
+}
+
+/** Form model of the KID dialog. */
+export interface KidForm {
+  manufacturer: string;
+  holdingPeriodYears: number;
+  contact: string;
+}
+
+export const DOC_TITLES: Record<DocKind, string> = {
+  Termsheet: "Termsheet",
+  Geeignetheitserklaerung: "Geeignetheitserklärung (§ 64 Abs. 4 WpHG)",
+  Confirmation: "Confirmation (Geschäftsbestätigung unter Rahmenvertrag)",
+  KID: "Basisinformationsblatt (PRIIPs-KID)",
+};
+
+const LEI_RE = /^[A-Z0-9]{18}[0-9]{2}$/;
+
+/** Years from the valuation date to the trade's maturity, at least one month, rounded to two decimals. */
+export function defaultHoldingPeriod(trade: Trade, valuationDate: number): number {
+  const years = (tradeMaturity(trade) - valuationDate) / 365.25;
+  return Math.max(1 / 12, Math.round(years * 100) / 100);
+}
+
 interface Props {
   kind: DocKind;
   trade: Trade;
@@ -93,11 +136,33 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
   const market = useStore((s) => s.market);
   const customer = useStore((s) => s.customerMode);
   const reportingCurrency = useStore((s) => s.reportingCurrency);
+  const valuationDate = useStore((s) => s.valuationDate);
+  const perspective = useStore((s) => reportInputsFor(s, trade.id).perspective);
   const [inputs, setInputs] = useState<SuitabilityInputs>({ ...DEFAULT_INPUTS, transactionPrice: report.costTransparency?.transactionPrice ?? 0 });
   const [generated, setGenerated] = useState<{ doc: GeneratedDocument | null; error: string | null }>({ doc: null, error: null });
   const set = (patch: Partial<SuitabilityInputs>) => setInputs((i) => ({ ...i, ...patch }));
+  // Confirmation: under the client perspective the counterparty is the bank (Partei A), otherwise the client (Partei B).
+  const [conf, setConf] = useState<ConfirmationForm>({
+    bankName: perspective === "Kunde" ? (trade.counterparty ?? "") : "",
+    bankLei: "",
+    clientName: perspective === "Kunde" ? "" : (trade.counterparty ?? ""),
+    clientLei: "",
+    masterAgreement: "DRV",
+    masterAgreementDate: trade.tradeDate ?? valuationDate,
+    masterAgreementRef: "",
+    csaRef: "",
+    confirmationDate: valuationDate,
+    reference: `CONF-${trade.id}`,
+  });
+  const setC = (patch: Partial<ConfirmationForm>) => setConf((c) => ({ ...c, ...patch }));
+  const [kid, setKid] = useState<KidForm>({
+    manufacturer: perspective === "Kunde" ? (trade.counterparty ?? "") : "",
+    holdingPeriodYears: defaultHoldingPeriod(trade, valuationDate),
+    contact: "",
+  });
+  const setK = (patch: Partial<KidForm>) => setKid((k) => ({ ...k, ...patch }));
 
-  // Pure derivation – errors are part of the memo result, no setState during render (N-26).
+  // Pure derivations – errors are part of the memo result, no setState during render (N-26).
   const termsheet = useMemo<{ doc: GeneratedDocument | null; error: string | null }>(() => {
     if (kind !== "Termsheet") return { doc: null, error: null };
     try {
@@ -107,8 +172,52 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
     }
   }, [kind, market, trade, pricing, report, customer]);
 
-  const doc = kind === "Termsheet" ? termsheet.doc : generated.doc;
-  const error = kind === "Termsheet" ? termsheet.error : generated.error;
+  const confirmation = useMemo<{ doc: GeneratedDocument | null; error: string | null }>(() => {
+    if (kind !== "Confirmation") return { doc: null, error: null };
+    try {
+      const parties: ConfirmationParties = {
+        bank: { name: conf.bankName.trim() || "Bank (Partei A)", lei: conf.bankLei.trim() || undefined },
+        client: { name: conf.clientName.trim() || "Kunde (Partei B)", lei: conf.clientLei.trim() || undefined },
+      };
+      const ma: MasterAgreementRef = {
+        type: conf.masterAgreement,
+        date: conf.masterAgreementDate,
+        reference: conf.masterAgreementRef.trim() || undefined,
+        csaReference: conf.csaRef.trim() || undefined,
+      };
+      const doc = generateConfirmation(trade, parties, ma, market, pricing, {
+        tradeDate: trade.tradeDate,
+        confirmationDate: conf.confirmationDate,
+        reference: conf.reference.trim() || undefined,
+      });
+      return { doc: polishDocument(filterForCustomer(doc, customer), kind, report), error: null };
+    } catch (e) {
+      return { doc: null, error: translatePricingError(e) };
+    }
+  }, [kind, conf, market, trade, pricing, report, customer]);
+
+  const kidDoc = useMemo<{ doc: GeneratedDocument | null; error: string | null }>(() => {
+    if (kind !== "KID") return { doc: null, error: null };
+    try {
+      const scen = runScenarios(market, [trade], STANDARD_SCENARIOS, reportingCurrency).results;
+      const opts: KidOptions = {
+        manufacturer: kid.manufacturer.trim() || "Hersteller (Bank)",
+        holdingPeriodYears: kid.holdingPeriodYears > 0 ? kid.holdingPeriodYears : undefined,
+        contact: kid.contact.trim() || undefined,
+        report,
+        transactionPrice: report.costTransparency?.transactionPrice,
+        perspective: report.costTransparency?.perspective ?? perspective,
+        scenarioSet: STANDARD_SCENARIOS,
+      };
+      return { doc: polishDocument(filterForCustomer(generateKid(market, trade, pricing, scen, opts), customer), kind, report), error: null };
+    } catch (e) {
+      return { doc: null, error: translatePricingError(e) };
+    }
+  }, [kind, kid, market, trade, pricing, report, reportingCurrency, customer, perspective]);
+
+  const current = kind === "Termsheet" ? termsheet : kind === "Confirmation" ? confirmation : kind === "KID" ? kidDoc : generated;
+  const doc = current.doc;
+  const error = current.error;
 
   const generate = () => {
     try {
@@ -131,7 +240,8 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
     window.print();
     window.setTimeout(done, 2000);
   };
-  const title = kind === "Termsheet" ? "Termsheet" : "Geeignetheitserklärung (§ 64 Abs. 4 WpHG)";
+  const title = DOC_TITLES[kind];
+  const leiIssue = (lei: string) => (lei.trim() && !LEI_RE.test(lei.trim()) ? "LEI hat 20 Zeichen (ISO 17442)" : undefined);
 
   return (
     <Modal
@@ -248,6 +358,113 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
           </div>
         </div>
       )}
+      {kind === "Confirmation" && (
+        <div className="card" style={{ marginBottom: 12 }} data-testid="confirmation-form">
+          <h3>Parteien und Rahmenvertrag</h3>
+          <div className="form">
+            <div className="field">
+              <label htmlFor="cf-bank">Bank (Partei A)</label>
+              <input id="cf-bank" value={conf.bankName} placeholder="Firma" onChange={(e) => setC({ bankName: e.target.value })} />
+            </div>
+            <div className={`field ${leiIssue(conf.bankLei) ? "invalid" : ""}`}>
+              <label htmlFor="cf-bank-lei">LEI Bank</label>
+              <input
+                id="cf-bank-lei"
+                className="mono"
+                value={conf.bankLei}
+                placeholder="20 Zeichen"
+                spellCheck={false}
+                onChange={(e) => setC({ bankLei: e.target.value.toUpperCase() })}
+              />
+              {leiIssue(conf.bankLei) && <span className="field-msg error">{leiIssue(conf.bankLei)}</span>}
+            </div>
+            <div className="field">
+              <label htmlFor="cf-client">Kunde (Partei B)</label>
+              <input id="cf-client" value={conf.clientName} placeholder="Firma / Name" onChange={(e) => setC({ clientName: e.target.value })} />
+            </div>
+            <div className={`field ${leiIssue(conf.clientLei) ? "invalid" : ""}`}>
+              <label htmlFor="cf-client-lei">LEI Kunde</label>
+              <input
+                id="cf-client-lei"
+                className="mono"
+                value={conf.clientLei}
+                placeholder="20 Zeichen"
+                spellCheck={false}
+                onChange={(e) => setC({ clientLei: e.target.value.toUpperCase() })}
+              />
+              {leiIssue(conf.clientLei) && <span className="field-msg error">{leiIssue(conf.clientLei)}</span>}
+            </div>
+            <div className="field">
+              <label htmlFor="cf-ma">Rahmenvertrag</label>
+              <select id="cf-ma" value={conf.masterAgreement} onChange={(e) => setC({ masterAgreement: e.target.value as MasterAgreementRef["type"] })}>
+                <option value="DRV">DRV (Deutscher Rahmenvertrag für Finanztermingeschäfte)</option>
+                <option value="ISDA">ISDA Master Agreement</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Datum Rahmenvertrag</label>
+              <DateInput value={conf.masterAgreementDate} ariaLabel="Datum Rahmenvertrag" onChange={(v) => setC({ masterAgreementDate: v })} />
+            </div>
+            <div className="field">
+              <label htmlFor="cf-ma-ref">Referenz Rahmenvertrag</label>
+              <input
+                id="cf-ma-ref"
+                value={conf.masterAgreementRef}
+                placeholder="Vertragsnummer"
+                onChange={(e) => setC({ masterAgreementRef: e.target.value })}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="cf-csa">Besicherungsanhang / CSA</label>
+              <input id="cf-csa" value={conf.csaRef} placeholder="optional" onChange={(e) => setC({ csaRef: e.target.value })} />
+            </div>
+            <div className="field">
+              <label>Datum der Bestätigung</label>
+              <DateInput value={conf.confirmationDate} ariaLabel="Datum der Bestätigung" onChange={(v) => setC({ confirmationDate: v })} />
+            </div>
+            <div className="field">
+              <label htmlFor="cf-ref">Referenz der Bestätigung</label>
+              <input id="cf-ref" className="mono" value={conf.reference} onChange={(e) => setC({ reference: e.target.value })} />
+            </div>
+          </div>
+          <div className="muted xs" style={{ marginTop: 6 }}>
+            Variable Beträge im Zahlungsplan sind indikativ (Forwards am Bewertungstag). Die Bestätigung wird live aus den Eingaben erzeugt.
+          </div>
+        </div>
+      )}
+      {kind === "KID" && (
+        <div className="card" style={{ marginBottom: 12 }} data-testid="kid-form">
+          <h3>Angaben zum Basisinformationsblatt</h3>
+          <div className="form">
+            <div className="field span-2">
+              <label htmlFor="kid-man">Hersteller (PRIIP-Hersteller)</label>
+              <input id="kid-man" value={kid.manufacturer} placeholder="Bank" onChange={(e) => setK({ manufacturer: e.target.value })} />
+            </div>
+            <div className="field">
+              <label>Empfohlene Haltedauer</label>
+              <NumInput
+                value={kid.holdingPeriodYears}
+                step={0.5}
+                min={1 / 12}
+                max={50}
+                digits={2}
+                unit="Jahre"
+                ariaLabel="Empfohlene Haltedauer"
+                testId="kid-holding-period"
+                onChange={(v) => setK({ holdingPeriodYears: v })}
+              />
+            </div>
+            <div className="field span-2">
+              <label htmlFor="kid-contact">Kontakt für Beschwerden</label>
+              <input id="kid-contact" value={kid.contact} placeholder="Website / E-Mail" onChange={(e) => setK({ contact: e.target.value })} />
+            </div>
+          </div>
+          <div className="muted xs" style={{ marginTop: 6 }}>
+            Performance-Szenarien (ungünstig / moderat / günstig / Stress) und Gesamtrisikoindikator aus dem Standard-Szenarioset; Kosten aus der
+            Kostentransparenz des Reports (Transaktionspreis {fmtMoney(report.costTransparency?.transactionPrice ?? 0, report.reportingCurrency)}).
+          </div>
+        </div>
+      )}
       {error && (
         <div className="warning error" role="alert">
           {error}
@@ -278,8 +495,8 @@ export function DocumentBody({ doc }: { doc: GeneratedDocument }) {
           {sec.rows && sec.rows.length > 0 && (
             <table className="grid-table">
               <tbody>
-                {sec.rows.map(([k, v]) => (
-                  <tr key={k} style={{ cursor: "default" }}>
+                {sec.rows.map(([k, v], i) => (
+                  <tr key={`${k}-${i}`} style={{ cursor: "default" }}>
                     <td className="muted">{k}</td>
                     <td className="num">{v}</td>
                   </tr>
@@ -293,7 +510,7 @@ export function DocumentBody({ doc }: { doc: GeneratedDocument }) {
                 <thead>
                   <tr>
                     {sec.table.header.map((h, i) => (
-                      <th key={h} className={i > 0 ? "num" : ""}>
+                      <th key={`${h}-${i}`} className={i > 0 ? "num" : ""}>
                         {h}
                       </th>
                     ))}

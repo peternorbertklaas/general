@@ -84,6 +84,23 @@ function forwardLeg(
 }
 
 /**
+ * Linear FX delta amount of forward legs: PV change (reporting currency) when
+ * `ccyUp` appreciates by 1 % against every other currency. A leg denominated
+ * in `ccyUp` moves by +1 % of its reporting PV; when `ccyUp` is the reporting
+ * currency itself every foreign leg moves by −1 % of its reporting PV (linear
+ * approximation of 1/1.01). Same convention as `RiskReport.fxDelta` and the
+ * FX option's `deltaAmount` (base currency +1 %).
+ */
+export function linearFxDeltaAmount(legs: LegResult[], ccyUp: string, reporting: string): number {
+  let d = 0;
+  for (const l of legs) {
+    if (ccyUp !== reporting && l.currency === ccyUp) d += l.pvReporting * 0.01;
+    else if (ccyUp === reporting && l.currency !== reporting) d -= l.pvReporting * 0.01;
+  }
+  return d;
+}
+
+/**
  * FX delta convention (analytics `fxDelta`, `fxDeltaSellCurrency`): PV change
  * in reporting currency when the named currency appreciates by 1% against the
  * reporting currency (positive = we gain when that currency strengthens).
@@ -119,6 +136,12 @@ export function priceFxForward(ctx: MarketContext, trade: FxForward, reportingCu
       fxDeltaCurrency: primaryCcy,
       /** Set when both currencies differ from the reporting currency: delta of the sold currency. */
       fxDeltaSellCurrency: buyIsForeign && sellIsForeign ? deltaSell : undefined,
+      /**
+       * PV change (reporting ccy) for +1 % spot of the buy currency against the
+       * sell currency – linear: ±(reporting PV of the leg in the moving currency) × 1 %.
+       * Same contract as the FX option's `deltaAmount` (see `PricingResult.analytics`).
+       */
+      deltaAmount: linearFxDeltaAmount(r.legs, trade.buyCurrency, reporting),
       ndf: trade.ndf ? "yes" : "no",
     },
     /** Spot settlement date (T+2 / T+1 on the pair calendar), ISO. */
@@ -146,6 +169,8 @@ export function priceFxSwap(ctx: MarketContext, trade: FxSwap, reportingCurrency
       swapPoints: (farFair - near.fair) * pipFactor(trade.nearLeg.buyCurrency, trade.nearLeg.sellCurrency),
       nearPv: near.pv,
       farPv: far.pv,
+      /** PV change (reporting ccy) for +1 % spot of the near-leg buy currency, both legs (linear, see `PricingResult.analytics`). */
+      deltaAmount: linearFxDeltaAmount([...near.legs, ...far.legs], trade.nearLeg.buyCurrency, reporting),
     },
     details: { spotDate: toISO(fxSpotDate(ctx, trade.nearLeg.buyCurrency, trade.nearLeg.sellCurrency)) },
     warnings: [],

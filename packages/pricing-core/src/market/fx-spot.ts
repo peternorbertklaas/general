@@ -80,7 +80,6 @@ export function fxRateAtValuationDate(ctx: MarketContext, base: string, quote: s
 }
 
 /** Pip size denominator for a pair: 100 for JPY-style quotes, 10,000 otherwise. */
-export function pipFactor(base: string, quote: string): number {
-  void base;
+export function pipFactor(_base: string, quote: string): number {
   return HUNDREDTH_PIP_CURRENCIES.has(quote.toUpperCase()) ? 100 : 10_000;
 }

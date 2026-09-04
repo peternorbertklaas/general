@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useRisk } from "../hooks/useRisk.js";
 import { fmtDate, fmtMoney, signClass } from "../lib/format.js";
 import { translateCoreMessage } from "../lib/i18n.js";
-import { analyticsRows, bucketLabel, type AnalyticsRow } from "../lib/metrics.js";
+import { analyticsRows, bucketLabel, detailRows, type AnalyticsRow } from "../lib/metrics.js";
 import { tradeMaturity, tradeNotional, tradeTypeBadge } from "../lib/trade-ops.js";
 import { STATUS_LABELS, selectedTrade, useStore } from "../state/store.js";
 import { Term } from "./InfoTip.js";
@@ -83,6 +83,7 @@ export function Inspector() {
   const status = trade.status ?? "Indication";
   const rows = r?.result ? analyticsRows(r.result.analytics, { tradeType: trade.type, reportingCurrency: ccy }) : [];
   const price = rows.filter((x) => x.section === "price");
+  const details = detailRows(r?.result?.details);
   const vegaEntries = Object.entries(rk?.vega ?? {});
   const fxEntries = Object.entries(rk?.fxDelta ?? {});
   return (
@@ -103,6 +104,11 @@ export function Inspector() {
           {!customer && (trade.counterparty ? `· ${trade.counterparty}` : "· ohne Kontrahent")}
           {trade.book && ` · Buch ${trade.book}`}
         </div>
+        {details.length > 0 && (
+          <div className="muted xs" data-testid="inspector-details">
+            {details.map((d) => `${d.label} ${d.v}`).join(" · ")}
+          </div>
+        )}
       </div>
       <div className="kpi big">
         <span className="label">

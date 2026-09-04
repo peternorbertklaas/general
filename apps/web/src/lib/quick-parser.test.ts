@@ -87,6 +87,62 @@ describe("quick entry parser", () => {
     expect(f.ok).toBe(true);
     expect(f.trade?.type).toBe("FxSwap");
   });
+  it("parses cross-currency swaps (spread, notional, MtM reset) and FRAs (period, direction, rate)", () => {
+    const SPOTS = { fxSpots: { EURUSD: 1.17 } };
+    const c = parseQuickEntry("ccs eurusd 5y -20bp 10m mtm", VAL, SPOTS);
+    expect(c.ok).toBe(true);
+    expect(c.trade?.type).toBe("CrossCurrencySwap");
+    if (c.trade?.type === "CrossCurrencySwap") {
+      expect(c.trade.legs[0]!.currency).toBe("EUR");
+      expect(c.trade.legs[0]!.notional).toBe(10_000_000);
+      expect((c.trade.legs[0] as { spread: number }).spread).toBeCloseTo(-0.002, 10);
+      expect(c.trade.legs[1]!.currency).toBe("USD");
+      expect(c.trade.legs[1]!.notional).toBeCloseTo(11_700_000, 3);
+      expect(c.trade.mtmReset).toBeDefined();
+      expect(c.trade.legs[0]!.notionalExchange?.initial).toBe(true);
+    }
+    expect(c.description).toMatch(/Cross-Currency-Swap EUR\/USD 5Y/);
+    expect(c.description).toMatch(/MtM-Reset/);
+    const c2 = parseQuickEntry("ccs eurusd 5y -20bp 10m 1.20", VAL); // explicit spot instead of market spot
+    expect(c2.ok).toBe(true);
+    expect(c2.trade?.type === "CrossCurrencySwap" && c2.trade.mtmReset).toBeUndefined();
+    expect(c2.trade?.type === "CrossCurrencySwap" && c2.trade.legs[1]!.notional).toBeCloseTo(12_000_000, 3);
+    expect(parseQuickEntry("ccs eurusd 5y -20bp 10m", VAL).error).toMatch(/FX-Spot für EUR\/USD fehlt/);
+    expect(parseQuickEntry("ccs 5y -20bp", VAL, SPOTS).ok).toBe(false);
+
+    const f = parseQuickEntry("fra 3x6 pay 2.2% 10m", VAL);
+    expect(f.ok).toBe(true);
+    expect(f.trade?.type).toBe("FRA");
+    if (f.trade?.type === "FRA") {
+      expect(f.trade.payReceive).toBe("Pay");
+      expect(f.trade.fixedRate).toBeCloseTo(0.022, 10);
+      expect(f.trade.notional).toBe(10_000_000);
+      expect(f.trade.index).toBe("EURIBOR-3M");
+      expect(f.trade.startDate).toBeGreaterThan(VAL + 80);
+      expect(f.trade.endDate).toBeGreaterThan(f.trade.startDate + 80);
+    }
+    const f2 = parseQuickEntry("fra 6x12 rec 2.5 5m @DZ BANK", VAL);
+    expect(f2.trade?.type === "FRA" && f2.trade.payReceive).toBe("Receive");
+    expect(f2.trade?.type === "FRA" && f2.trade.index).toBe("EURIBOR-6M");
+    expect(f2.trade?.counterparty).toBe("DZ BANK");
+    expect(parseQuickEntry("fra pay 2.2%", VAL).ok).toBe(false);
+    expect(parseQuickEntry("fra 6x3 pay 2.2%", VAL).ok).toBe(false);
+    for (const tok of ["3x6", "mtm", "step", "2.5/3.0/3.5"]) expect(isGrammarToken(tok), tok).toBe(true);
+  });
+  it("step token builds a step-up coupon schedule (one rate per year, first rate = base coupon)", () => {
+    const r = parseQuickEntry("irs 5y pay 2.5% 10m step 2.5/3.0/3.5", VAL);
+    expect(r.ok).toBe(true);
+    if (r.trade?.type === "InterestRateSwap") {
+      const fixed = r.trade.legs.find((l): l is Extract<typeof l, { type: "Fixed" }> => l.type === "Fixed")!;
+      expect(fixed.rate).toBeCloseTo(0.025, 10);
+      const sched = fixed.rateSchedule!;
+      expect(sched.length).toBe(3);
+      expect(sched[sched.length - 1]!.rate).toBeCloseTo(0.035, 10);
+      expect(sched[1]!.date - sched[0]!.date).toBeGreaterThan(360);
+    }
+    expect(r.description).toMatch(/Staffel/);
+    expect(parseQuickEntry("irs 5y pay 10m step 2,0/2,5", VAL).trade?.type === "InterestRateSwap").toBe(true);
+  });
   it("reports errors for incomplete input", () => {
     expect(parseQuickEntry("irs pay 3%", VAL).ok).toBe(false);
     expect(parseQuickEntry("cap 5y", VAL).ok).toBe(false);

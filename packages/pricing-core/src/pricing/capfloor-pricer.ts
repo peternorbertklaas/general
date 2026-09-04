@@ -17,6 +17,15 @@ function optionValue(model: CapFloorModel, type: OptionType, fwd: number, strike
   return black76Greeks(type, fwd, strike, vol, t);
 }
 
+/** Notional of a period: last `notionalSchedule` entry with date ≤ accrual start, else `notional` (same rule as swap legs). */
+function capNotionalAt(trade: CapFloor, accrualStart: number): number {
+  const s = trade.notionalSchedule;
+  if (!s || s.length === 0) return trade.notional;
+  let n = trade.notional;
+  for (const e of s) if (e.date <= accrualStart) n = e.notional;
+  return n;
+}
+
 /**
  * Cap / floor / collar as a strip of caplets / floorlets on the index
  * forward. Model: explicit `trade.model`, else derived from the caplet
@@ -27,7 +36,9 @@ function optionValue(model: CapFloorModel, type: OptionType, fwd: number, strike
  * end; the first caplet of a spot-starting cap is included (its fixing is
  * usually known – load it as a fixing to value it intrinsically). For RFR
  * indices the default 3M frequency values a compounded-RFR caplet with the
- * model on the 3M forward (market-standard approximation).
+ * model on the 3M forward (market-standard approximation). An optional
+ * `notionalSchedule` (amortising cap) is applied per period like on swap legs;
+ * `analytics.premiumPct` then refers to the initial notional.
  */
 export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurrency?: string): PricingResult {
   const reporting = reportingCurrency ?? trade.currency;
@@ -84,6 +95,7 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
     } else {
       fwd = proj.forwardRate(p.accrualStart, p.accrualEnd, idx.dayCount);
     }
+    const notional = capNotionalAt(trade, p.accrualStart);
     let amount = 0;
     for (const c of components) {
       const vol = trade.volOverride ?? (surface ? capletVol(surface, tExp, c.strike) : 0.006);
@@ -95,7 +107,7 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
       const g = isFixed
         ? { price: Math.max((c.type === "Call" ? 1 : -1) * (fwd - c.strike), 0), delta: 0, gamma: 0, vega: 0, theta: 0 }
         : optionValue(model, c.type, fwd, c.strike, vol, tExp, shift);
-      const scale = longShort * c.sign * trade.notional * tau;
+      const scale = longShort * c.sign * notional * tau;
       amount += scale * g.price;
       delta += scale * g.delta * df;
       gamma += scale * g.gamma * df;
@@ -109,7 +121,7 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
       accrualEnd: p.accrualEnd,
       paymentDate: p.paymentDate,
       fixingDate: p.fixingDate,
-      notional: trade.notional,
+      notional,
       rate: fwd,
       accrualFactor: tau,
       amount,

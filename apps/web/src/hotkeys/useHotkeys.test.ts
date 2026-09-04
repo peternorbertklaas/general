@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { TEMPLATE_IDS } from "../lib/templates.js";
 import { enterAllowed, eventMatches, isEditable, isTextEntry, parseCombo } from "./useHotkeys.js";
-import { HOTKEYS, VIEW_HOTKEYS, VISIBLE_HOTKEYS, isMac, keyList, keyTokens, keysText } from "./keymap.js";
+import { HOTKEYS, TEMPLATE_LABELS, VIEW_HOTKEYS, VISIBLE_HOTKEYS, isMac, keyList, keyTokens, keysText } from "./keymap.js";
 
 function ev(key: string, mods: Partial<KeyboardEvent> = {}): KeyboardEvent {
   return { key, code: "", ctrlKey: false, metaKey: false, shiftKey: false, altKey: false, ...mods } as KeyboardEvent;
@@ -52,6 +53,35 @@ describe("hotkey matching", () => {
     expect(VIEW_HOTKEYS.map((v) => v.view)).toContain("hedge");
     expect(VISIBLE_HOTKEYS.some((h) => h.id === "escape")).toBe(false);
     expect(VISIBLE_HOTKEYS.some((h) => h.id.startsWith("view."))).toBe(false);
+  });
+  it("every trade template has exactly one visible 'new.<id>' hotkey with its label (CCS = n z, FRA = n r)", () => {
+    for (const id of TEMPLATE_IDS) {
+      const defs = VISIBLE_HOTKEYS.filter((h) => h.id === `new.${id}`);
+      expect(defs.length, id).toBe(1);
+      expect(defs[0]!.label).toBe(TEMPLATE_LABELS[id]);
+      expect(defs[0]!.group).toBe("Aktionen");
+    }
+    expect(HOTKEYS.filter((h) => keyList(h).includes("n z")).map((h) => h.id)).toEqual(["new.ccs"]);
+    expect(HOTKEYS.filter((h) => keyList(h).includes("n r")).map((h) => h.id)).toEqual(["new.fra"]);
+    // every "new." hotkey points at an existing template
+    for (const h of HOTKEYS.filter((x) => x.id.startsWith("new."))) expect(TEMPLATE_IDS as string[], h.id).toContain(h.id.slice(4));
+  });
+  it("document / export hotkeys are registered once and free of collisions (KID = mod+shift+k)", () => {
+    expect(HOTKEYS.filter((h) => keyList(h).includes("mod+shift+k")).map((h) => h.id)).toEqual(["doc.kid"]);
+    expect(HOTKEYS.filter((h) => keyList(h).includes("mod+shift+f")).map((h) => h.id)).toEqual(["doc.confirmation"]);
+    expect(HOTKEYS.filter((h) => keyList(h).includes("mod+shift+l")).map((h) => h.id)).toEqual(["export.portfolio"]);
+    // shift+k (customer mode) and mod+k (palette) stay distinct from mod+shift+k
+    const kid = parseCombo("mod+shift+k");
+    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), kid)).toBe(true);
+    expect(eventMatches(ev("K", { shiftKey: true }), kid)).toBe(false);
+    expect(eventMatches(ev("k", { ctrlKey: true }), kid)).toBe(false);
+    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), parseCombo("shift+k"))).toBe(false);
+    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), parseCombo("mod+k"))).toBe(false);
+    for (const id of ["doc.kid", "doc.confirmation", "export.portfolio"])
+      expect(
+        VISIBLE_HOTKEYS.some((h) => h.id === id),
+        id,
+      ).toBe(true);
   });
   it("renders key tokens and alias text", () => {
     expect(keyTokens("g p")).toEqual([["G"], ["P"]]);

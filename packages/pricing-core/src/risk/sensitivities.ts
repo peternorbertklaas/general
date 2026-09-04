@@ -5,7 +5,7 @@ import { toISO } from "../dates/date.js";
 import { embeddedOptionLegs, tradeIndexNames } from "../instruments/trade-dates.js";
 import { type PricingResult, type Trade } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve, withCurves } from "../market/market-context.js";
-import { shiftFxSurface } from "../models/fx-vol-surface.js";
+import { type FxSmileComponent, shiftFxSurface, shiftFxSurfaceRow } from "../models/fx-vol-surface.js";
 import { type CapletVolSurface, type SwaptionVolSurface, shiftCapletSurface, shiftSwaptionSurface } from "../models/vol-surfaces.js";
 import { splitPair } from "../pricing/fx-pricer.js";
 import { fxToReporting } from "../pricing/leg-pricer.js";
@@ -436,20 +436,30 @@ export interface VegaBucket {
   expiry: number;
   /** Underlying swap tenor in years – only set for `dimension: "expiry-tenor"` swaption buckets. */
   tenor?: number;
-  /** "2Y" (expiry rows) or "2Yx5Y" (expiry × tenor cells). */
+  /** "2Y" (expiry rows), "2Yx5Y" (expiry × tenor cells) or "1Y RR25" / "1Y BF25" (FX smile buckets). */
   label: string;
-  /** PV change for +1bp normal vol (+1 vol point for lognormal surfaces) on this expiry row / cell. */
+  /**
+   * PV change for +1bp normal vol (+1 vol point for lognormal surfaces) on this
+   * expiry row / cell; FX: +1 vol point on the row's ATM (or RR/BF for smile buckets).
+   */
   vega: number;
+  /** FX surfaces only: the bumped quote of the row ("atm" for the ATM row buckets, "rr25" / "bf25" for smile buckets). */
+  component?: FxSmileComponent;
 }
 
 export interface VegaBucketReport {
-  /** Key of the surface in the market context (e.g. "EUR" or "EUR-EURIBOR-6M"). */
+  /** Key of the surface in the market context (e.g. "EUR", "EUR-EURIBOR-6M" or the FX pair "EURUSD"). */
   key: string;
   surfaceId: string;
-  kind: "swaption" | "caplet";
+  kind: "swaption" | "caplet" | "fx";
   /** Bucket layout: expiry rows (default) or expiry × tenor cells (swaption cubes only). */
   dimension: "expiry" | "expiry-tenor";
   buckets: VegaBucket[];
+  /**
+   * Sum of the buckets. For FX surfaces only the ATM buckets are summed
+   * (≈ parallel vega `computeRisk().vega["fx:<pair>"]`); smile buckets are
+   * reported separately and excluded from the total.
+   */
   total: number;
 }
 
@@ -461,9 +471,16 @@ export interface VegaBucketOptions {
    * surfaces have no tenor dimension and always report expiry rows.
    */
   dimension?: "expiry" | "expiry-tenor";
+  /**
+   * FX surfaces: also report smile buckets – the 25Δ risk reversal and
+   * butterfly of every expiry row bumped by +1 vol point (`component`
+   * "rr25" / "bf25"). Default false (ATM rows only).
+   */
+  smile?: boolean;
 }
 
 function expiryLabel(years: number): string {
+  if (years < 1 / 12 - 1e-9) return `${Math.max(1, Math.round(years * 52))}W`;
   if (years < 1) return `${Math.round(years * 12)}M`;
   return Number.isInteger(years) ? `${years}Y` : `${years.toFixed(2)}Y`;
 }
@@ -480,19 +497,35 @@ function shiftCapletRow(s: CapletVolSurface, row: number, shift: number): Caplet
   return { ...s, vols: s.vols.map((r, i) => (i === row ? r.map((v) => Math.max(1e-6, v + shift)) : r)) };
 }
 
+/** Keys of the FX vol surfaces an FX option's valuation reads (the pair, in either quotation). */
+export function fxSurfaceKeysFor(ctx: MarketContext, trade: Trade): string[] {
+  if (trade.type !== "FxOption" || !ctx.fxVols || trade.volOverride !== undefined) return [];
+  const { base, quote } = splitPair(trade.pair);
+  return Object.keys(ctx.fxVols).filter((k) => {
+    const key = k.toUpperCase();
+    return key === `${base}${quote}` || key === `${quote}${base}`;
+  });
+}
+
 /**
  * Vega per bucket for swaptions (swaption cube rows, or expiry × tenor cells
  * with `dimension: "expiry-tenor"`), caps/floors and swaps with embedded
  * caps/floors (caplet surface rows): each row / cell is bumped by +1bp normal
- * vol (or +1 vol point for lognormal surfaces) and the trade repriced. The
- * buckets sum to the parallel vega up to smile (SABR) non-linearity. Trades
- * without optionality return an empty list.
+ * vol (or +1 vol point for lognormal surfaces) and the trade repriced. FX
+ * options: every expiry row of the pair's `FxVolSurface` has its ATM vol
+ * bumped by +1 vol point (`kind: "fx"`, keyed by pair); with `opts.smile` the
+ * 25Δ risk reversal and butterfly of each row are bumped as separate smile
+ * buckets (`component` "rr25" / "bf25", not part of `total`). The buckets sum
+ * to the parallel vega up to smile (SABR / delta-space) non-linearity and the
+ * variance interpolation between FX expiries. Trades without optionality
+ * return an empty list.
  */
 export function vegaBuckets(ctx: MarketContext, trade: Trade, reportingCurrency: string, opts: VegaBucketOptions = {}): VegaBucketReport[] {
   const out: VegaBucketReport[] = [];
   const dimension = opts.dimension ?? "expiry";
   const capletKeys = capletSurfaceKeysFor(ctx, trade);
-  if (trade.type !== "Swaption" && capletKeys.length === 0) return out;
+  const fxKeys = fxSurfaceKeysFor(ctx, trade);
+  if (trade.type !== "Swaption" && capletKeys.length === 0 && fxKeys.length === 0) return out;
   const base = priceTrade(ctx, trade, reportingCurrency).pv;
   if (trade.type === "Swaption" && ctx.swaptionVols) {
     for (const [k, s] of Object.entries(ctx.swaptionVols)) {
@@ -526,6 +559,23 @@ export function vegaBuckets(ctx: MarketContext, trade: Trade, reportingCurrency:
         return { expiry: e, label: expiryLabel(e), vega: pv - base };
       });
       out.push({ key: k, surfaceId: s.id, kind: "caplet", dimension: "expiry", buckets, total: buckets.reduce((a, b) => a + b.vega, 0) });
+    }
+  }
+  if (ctx.fxVols) {
+    for (const k of fxKeys) {
+      const s = ctx.fxVols[k]!;
+      const reprice = (row: number, component: FxSmileComponent) =>
+        priceTrade({ ...ctx, fxVols: { ...ctx.fxVols, [k]: shiftFxSurfaceRow(s, row, 0.01, component) } }, trade, reportingCurrency).pv - base;
+      const buckets: VegaBucket[] = s.expiries.map((e, i): VegaBucket => ({ expiry: e, label: expiryLabel(e), vega: reprice(i, "atm"), component: "atm" }));
+      const total = buckets.reduce((a, b) => a + b.vega, 0);
+      if (opts.smile) {
+        for (const component of ["rr25", "bf25"] as const) {
+          s.expiries.forEach((e, i) => {
+            buckets.push({ expiry: e, label: `${expiryLabel(e)} ${component.toUpperCase()}`, vega: reprice(i, component), component });
+          });
+        }
+      }
+      out.push({ key: k, surfaceId: s.id, kind: "fx", dimension: "expiry", buckets, total });
     }
   }
   return out;

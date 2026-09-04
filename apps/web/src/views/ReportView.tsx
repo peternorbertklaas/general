@@ -1,19 +1,31 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { type ReportPerspective, buildValuationReport, cashflowTable, computeRisk, computeXva, hazardFromSpread, toCsv, toISO } from "@deriva/pricing-core";
+import {
+  type ReportPerspective,
+  buildValuationReport,
+  cashflowTable,
+  computeRisk,
+  computeXva,
+  getDiscountCurve,
+  hazardFromSpread,
+  toCsv,
+  toISO,
+} from "@deriva/pricing-core";
 import { DocumentsModal } from "../components/DocumentsModal.js";
 import { EChart, cssVar } from "../components/EChart.js";
 import { Term } from "../components/InfoTip.js";
 import { NumInput } from "../components/NumInput.js";
 import { keysText, HOTKEYS } from "../hotkeys/keymap.js";
+import { hazardCurveFor } from "../lib/credit.js";
 import { fmtBp, fmtDate, fmtMoney, fmtNum, fmtPct, signClass } from "../lib/format.js";
 import { PERSPECTIVE_DE, SNAPSHOT_STATUS_DE, t as tr, translateCoreMessage } from "../lib/i18n.js";
-import { bucketLabel } from "../lib/metrics.js";
+import { bucketLabel, detailRows } from "../lib/metrics.js";
 import { downloadText } from "../lib/portfolio-io.js";
 import { tradeNotional, tradeTypeBadge } from "../lib/trade-ops.js";
 import { DEFAULT_REPORT_INPUTS, marketModified, quotesHash, reportInputsFor, selectedTrade, useStore, whatIfActive, whatIfLabel } from "../state/store.js";
 
 const genKeys = keysText(HOTKEYS.find((h) => h.id === "report.generate")!);
+const hk = (id: string) => keysText(HOTKEYS.find((h) => h.id === id) ?? { keys: "" });
 
 export function ReportView() {
   const s = useStore(
@@ -31,6 +43,8 @@ export function ReportView() {
       customerMode: st.customerMode,
       reportInputs: st.reportInputs,
       docKind: st.docKind,
+      turnOfYear: st.turnOfYear,
+      cdsCurves: st.cdsCurves,
     })),
   );
   const act = useStore.getState;
@@ -42,10 +56,22 @@ export function ReportView() {
   const inputs = trade ? reportInputsFor(s, trade.id) : DEFAULT_REPORT_INPUTS;
   const setInputs = (patch: Partial<typeof inputs>) => trade && act().setReportInputs(trade.id, patch);
   const isDefault = trade ? s.reportInputs[trade.id] === undefined : true;
+  /** CDS term structure of the counterparty (market view) → hazard curve for the XVA; flat hazard from the spread otherwise. */
+  const cdsQuotes = trade?.counterparty ? s.cdsCurves[trade.counterparty] : undefined;
+  const cptyHazardCurve = useMemo(() => {
+    if (!trade || !cdsQuotes) return undefined;
+    let discount;
+    try {
+      discount = getDiscountCurve(s.market, s.reportingCurrency);
+    } catch {
+      discount = undefined;
+    }
+    return hazardCurveFor(s.cdsCurves, trade.counterparty, inputs.recovery / 100, s.valuationDate, discount);
+  }, [trade, cdsQuotes, s.cdsCurves, s.market, s.reportingCurrency, inputs.recovery, s.valuationDate]);
 
   /** Everything the report depends on – a stable hash of the quotes instead of a string length (N-18). */
   const inputsKey = trade
-    ? `${trade.id}|${JSON.stringify(trade)}|${s.baseMarket.meta?.label}|${toISO(s.valuationDate)}|${JSON.stringify(s.whatIf)}|${s.reportingCurrency}|${JSON.stringify(inputs)}|${quotesHash(s.quotes)}|${JSON.stringify(s.interpolation)}`
+    ? `${trade.id}|${JSON.stringify(trade)}|${s.baseMarket.meta?.label}|${toISO(s.valuationDate)}|${JSON.stringify(s.whatIf)}|${s.reportingCurrency}|${JSON.stringify(inputs)}|${quotesHash(s.quotes)}|${JSON.stringify(s.interpolation)}|${JSON.stringify(s.turnOfYear)}|${JSON.stringify(cdsQuotes ?? null)}`
     : "";
   // The inputs key is captured once per stamp and kept in the store, so it survives view switches (N-18).
   const keyRef = useRef(inputsKey);
@@ -75,6 +101,7 @@ export function ReportView() {
           cptyRecovery: inputs.recovery / 100,
           ownHazard: hazardFromSpread(inputs.ownSpreadBp / 1e4, inputs.recovery / 100),
           ownRecovery: inputs.recovery / 100,
+          cptyHazardCurve,
         },
         s.reportingCurrency,
       );
@@ -89,7 +116,7 @@ export function ReportView() {
     } catch {
       return null;
     }
-  }, [trade, s.results, reportMarket, s.reportingCurrency, inputs, s.reportStamp, s.whatIf, wiActive]);
+  }, [trade, s.results, reportMarket, s.reportingCurrency, inputs, s.reportStamp, s.whatIf, wiActive, cptyHazardCurve]);
 
   if (!trade) {
     return (
@@ -209,6 +236,17 @@ export function ReportView() {
             >
               Geeignetheitserklärung
             </button>
+            <button
+              className="btn"
+              onClick={() => act().setDoc("Confirmation")}
+              data-testid="open-confirmation"
+              title={`Confirmation – Einzelabschluss unter DRV / ISDA (${hk("doc.confirmation")})`}
+            >
+              Confirmation
+            </button>
+            <button className="btn" onClick={() => act().setDoc("KID")} data-testid="open-kid" title={`Basisinformationsblatt PRIIPs-KID (${hk("doc.kid")})`}>
+              Basisinformationsblatt (KID)
+            </button>
             <button className="btn" onClick={reportJson}>
               ⤓ JSON
             </button>
@@ -233,6 +271,7 @@ export function ReportView() {
           {trade.name} · Nominal {fmtMoney(n.amount, n.currency)} · Bewertungstag {fmtDate(s.valuationDate)} · Reporting {report.reportingCurrency} · Snapshot{" "}
           {report.market.label}
           {report.whatIf && ` · What-if ${report.whatIf.label}`} · erstellt {new Date(report.generatedAt).toLocaleString("de-DE")}
+          {detailRows(report.pricing.details).map((d) => ` · ${d.label} ${d.v}`)}
         </div>
         <div className="muted xs mono audit" style={{ marginTop: 6 }} data-testid="audit-hashes">
           Engine {report.audit.engineVersion} · Snapshot {report.audit.snapshotId} · Report-Hash {report.audit.reportHash.slice(0, 16)}…
@@ -261,8 +300,11 @@ export function ReportView() {
               <Term id="cva">CVA</Term>
             </span>
             <span className={`value ${signClass(-report.fairValue.cva)}`}>{xvaOk ? fmtMoney(-report.fairValue.cva) : "n/a"}</span>
-            <span className="sub">
-              Kontrahent {fmtNum(inputs.cptySpreadBp, 0)} bp · LGD {fmtNum(100 - inputs.recovery, 0)} %
+            <span className="sub" data-testid="cva-sub">
+              {cptyHazardCurve
+                ? `CDS-Termstruktur ${trade.counterparty} (${cptyHazardCurve.times.length} Pillars)`
+                : `Kontrahent ${fmtNum(inputs.cptySpreadBp, 0)} bp`}{" "}
+              · LGD {fmtNum(100 - inputs.recovery, 0)} %
             </span>
           </div>
         )}
@@ -337,16 +379,22 @@ export function ReportView() {
             {!customer && (
               <>
                 <div className="field">
-                  <label>Kontrahenten-Spread</label>
+                  <label>Kontrahenten-Spread{cptyHazardCurve ? " (flach, überschrieben)" : ""}</label>
                   <NumInput
                     value={inputs.cptySpreadBp}
                     step={5}
                     min={0}
                     unit="bp"
                     ariaLabel="Kontrahenten-Spread"
+                    disabled={!!cptyHazardCurve}
                     onChange={(v) => setInputs({ cptySpreadBp: v })}
                   />
                   <span className="print-only">{fmtNum(inputs.cptySpreadBp, 0)} bp</span>
+                  {cptyHazardCurve && (
+                    <span className="field-msg muted">
+                      CDS-Termstruktur aus der Marktansicht ({cptyHazardCurve.times.length} Pillars) ersetzt den flachen Spread.
+                    </span>
+                  )}
                 </div>
                 <div className="field">
                   <label>Eigener Spread</label>

@@ -4,9 +4,11 @@ import {
   type AccountingFramework,
   type DollarOffsetResult,
   type EffectivenessMethod,
+  type HedgeDesignation,
   type HedgeEffectivenessReport,
   type HedgeRelationship,
   type HedgeType,
+  type HedgedItemAmortisation,
   type HedgedItemKind,
   type Trade,
   addTenor,
@@ -21,7 +23,7 @@ import { fmtDate, fmtMoney, fmtNum, fmtPct, signClass } from "../lib/format.js";
 import { hedgeDocMarkdown } from "../lib/hedge-doc.js";
 import { TRADE_TYPE_DE, germanizeText, translatePricingError } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
-import { tradeMaturity, tradeNotional, tradeTypeBadge } from "../lib/trade-ops.js";
+import { isOption, tradeMaturity, tradeNotional, tradeTypeBadge } from "../lib/trade-ops.js";
 import { buildMarket, selectedTrade, useStore } from "../state/store.js";
 
 const KINDS: { v: HedgedItemKind; l: string }[] = [
@@ -43,9 +45,34 @@ const FRAMEWORKS: { v: AccountingFramework; l: string }[] = [
   { v: "IFRS9", l: "IFRS 9" },
   { v: "HGB", l: "HGB § 254" },
 ];
-const CCYS = ["EUR", "USD", "GBP", "CHF"];
-const INDICES = ["EURIBOR-3M", "EURIBOR-6M", "ESTR", "SOFR", "SONIA", "SARON"];
-const TERM_DE: Record<string, string> = { notional: "Nominal", currency: "Währung", effectiveDate: "Startdatum", maturityDate: "Fälligkeit", index: "Index" };
+const DESIGNATIONS: { v: HedgeDesignation; l: string }[] = [
+  { v: "FullFairValue", l: "Voller Fair Value" },
+  { v: "IntrinsicValue", l: "Innerer Wert (Zeitwert → OCI, Cost of Hedging)" },
+];
+type AmortSel = "none" | HedgedItemAmortisation["type"];
+const AMORTISATIONS: { v: AmortSel; l: string }[] = [
+  { v: "none", l: "endfällig (kein Tilgungsplan)" },
+  { v: "Linear", l: "Linear" },
+  { v: "Annuity", l: "Annuität" },
+  { v: "Custom", l: "Custom (Nominalverlauf)" },
+];
+const CCYS = ["EUR", "USD", "GBP", "CHF", "JPY"];
+const INDICES = ["EURIBOR-3M", "EURIBOR-6M", "ESTR", "SOFR", "SONIA", "SARON", "TONA"];
+const TERM_DE: Record<string, string> = {
+  notional: "Nominal",
+  currency: "Währung",
+  effectiveDate: "Startdatum",
+  maturityDate: "Fälligkeit",
+  index: "Index",
+  notionalSchedule: "Nominalverlauf",
+};
+
+/** Notional schedule of the hedging instrument's first leg (amortising swaps / CCS), undefined for bullet instruments. */
+export function instrumentNotionalSchedule(t: Trade): { date: number; notional: number }[] | undefined {
+  if (t.type !== "InterestRateSwap" && t.type !== "CrossCurrencySwap") return undefined;
+  const s = t.legs[0]?.notionalSchedule;
+  return s && s.length > 0 ? s : undefined;
+}
 
 /**
  * Default designation date: the instrument's effective date when it lies in
@@ -253,6 +280,7 @@ export function HedgeView() {
       baseMarket: st.baseMarket,
       quotes: st.quotes,
       interpolation: st.interpolation,
+      turnOfYear: st.turnOfYear,
       customerMode: st.customerMode,
     })),
   );
@@ -261,12 +289,16 @@ export function HedgeView() {
   const stored = trade ? s.hedgeRelationships[trade.id] : undefined;
   const rel = useMemo(() => (trade ? (stored ?? defaultRelationship(trade, s.valuationDate)) : null), [trade, stored, s.valuationDate]);
   const [simulateDesignation, setSimulateDesignation] = useState(true);
+  /** Freeze the option vol of the hypothetical at designation (IFRS 9 B6.5.5 – vol changes are not hedged-risk ineffectiveness). */
+  const [freezeVol, setFreezeVol] = useState(false);
   const [hypo, setHypo] = useState<{ tradeId: string; trade: Trade } | null>(null);
   const [report, setReport] = useState<{ tradeId: string; key: string; r: HedgeEffectivenessReport } | null>(null);
   const [error, setError] = useState<string | null>(null);
   /** Everything the effectiveness test depends on – shown as "veraltet" when it changes after the test (N-20). */
   const testKey =
-    trade && rel ? `${trade.id}|${JSON.stringify(rel)}|${JSON.stringify(trade)}|${s.baseMarket.meta?.label}|${s.valuationDate}|${simulateDesignation}` : "";
+    trade && rel
+      ? `${trade.id}|${JSON.stringify(rel)}|${JSON.stringify(trade)}|${s.baseMarket.meta?.label}|${s.valuationDate}|${simulateDesignation}|${freezeVol}`
+      : "";
 
   if (!trade || !rel) {
     return (
@@ -284,6 +316,28 @@ export function HedgeView() {
   const updItem = (patch: Partial<HedgeRelationship["hedgedItem"]>) => upd({ hedgedItem: { ...rel.hedgedItem, ...patch } });
   const isFx = rel.hedgedItem.kind === "ForecastFxCashflow" || rel.hedgedItem.kind === "FxReceivable";
   const ccy = trade.type.startsWith("Fx") ? "EUR" : rel.hedgedItem.currency;
+  const item = rel.hedgedItem;
+  const amortSel: AmortSel = item.notionalSchedule?.length ? "Custom" : (item.amortisation?.type ?? "none");
+  const instrSchedule = instrumentNotionalSchedule(trade);
+  const setAmortisation = (v: AmortSel) => {
+    const finalNotional = item.amortisation?.finalNotional ?? 0;
+    if (v === "none") updItem({ amortisation: undefined, notionalSchedule: undefined });
+    else if (v === "Linear") updItem({ amortisation: { type: "Linear", finalNotional }, notionalSchedule: undefined });
+    else if (v === "Annuity")
+      updItem({
+        amortisation: { type: "Annuity", finalNotional, loanRate: item.amortisation?.loanRate ?? item.fixedRate ?? 0.03 },
+        notionalSchedule: undefined,
+      });
+    else {
+      const schedule = item.notionalSchedule ?? instrSchedule ?? [{ date: item.effectiveDate, notional: item.notional }];
+      updItem({ amortisation: { type: "Custom", schedule }, notionalSchedule: schedule });
+    }
+  };
+  const takeInstrumentSchedule = () => {
+    if (!instrSchedule) return;
+    updItem({ notionalSchedule: instrSchedule, amortisation: { type: "Custom", schedule: instrSchedule }, notional: instrSchedule[0]!.notional });
+    act().showToast(`Tilgungsplan übernommen (${instrSchedule.length} Perioden)`);
+  };
 
   const buildHypo = () => {
     try {
@@ -296,8 +350,12 @@ export function HedgeView() {
   };
   const runTest = () => {
     try {
-      const designationCtx = simulateDesignation ? buildMarket(rel.designationDate, s.quotes, s.interpolation) : undefined;
-      const r = hedgeEffectivenessReport(s.market, rel, trade, { designationCtx, reportingCurrency: ccy });
+      const designationCtx = simulateDesignation ? buildMarket(rel.designationDate, s.quotes, s.interpolation, s.turnOfYear) : undefined;
+      const r = hedgeEffectivenessReport(s.market, rel, trade, {
+        designationCtx,
+        reportingCurrency: ccy,
+        freezeDesignationVol: freezeVol && isOption(trade) && !!designationCtx,
+      });
       setReport({ tradeId: trade.id, key: testKey, r });
       setHypo({ tradeId: trade.id, trade: r.hypotheticalDerivative.trade });
       setError(null);
@@ -415,6 +473,23 @@ export function HedgeView() {
               ))}
             </select>
           </div>
+          {isOption(trade) && (
+            <div className="field span-2">
+              <label>Designation der Option (IFRS 9 6.5.15)</label>
+              <select
+                value={rel.designation ?? "FullFairValue"}
+                aria-label="Designation"
+                data-testid="hedge-designation"
+                onChange={(e) => upd({ designation: e.target.value as HedgeDesignation })}
+              >
+                {DESIGNATIONS.map((o) => (
+                  <option key={o.v} value={o.v}>
+                    {o.l}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <DateField label="Designationsdatum" value={rel.designationDate} onChange={(v) => upd({ designationDate: v })} />
           <div className="field">
             <label>
@@ -438,6 +513,21 @@ export function HedgeView() {
               <input type="checkbox" checked={simulateDesignation} onChange={(e) => setSimulateDesignation(e.target.checked)} /> Designationsmarkt simulieren
               (Sample-Markt am Designationsdatum {fmtDate(rel.designationDate)})
             </label>
+            {isOption(trade) && (
+              <label
+                className="check"
+                title="Das hypothetische Derivat behält die Volatilität des Designationsmarkts (Vol-Override); Vol-Änderungen zählen dann nicht als Ineffektivität (IFRS 9 B6.5.5)"
+              >
+                <input
+                  type="checkbox"
+                  checked={freezeVol}
+                  disabled={!simulateDesignation}
+                  data-testid="hedge-freeze-vol"
+                  onChange={(e) => setFreezeVol(e.target.checked)}
+                />{" "}
+                Vol bei Designation einfrieren
+              </label>
+            )}
           </div>
         </div>
         <h3 style={{ marginTop: 14 }}>Grundgeschäft</h3>
@@ -523,6 +613,76 @@ export function HedgeView() {
           )}
           <DateField label="Beginn" value={rel.hedgedItem.effectiveDate} onChange={(v) => updItem({ effectiveDate: v })} />
           <DateField label={isFx ? "Zahlungstermin" : "Fälligkeit"} value={rel.hedgedItem.maturityDate} onChange={(v) => updItem({ maturityDate: v })} />
+          {!isFx && (
+            <>
+              <div className="field">
+                <label>Tilgung</label>
+                <select
+                  value={amortSel}
+                  aria-label="Tilgungsplan Grundgeschäft"
+                  data-testid="hedge-amortisation"
+                  onChange={(e) => setAmortisation(e.target.value as AmortSel)}
+                >
+                  {AMORTISATIONS.map((o) => (
+                    <option key={o.v} value={o.v}>
+                      {o.l}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {(amortSel === "Linear" || amortSel === "Annuity") && (
+                <div className="field">
+                  <label>Restschuld</label>
+                  <NumInput
+                    value={item.amortisation?.finalNotional ?? 0}
+                    step={100000}
+                    min={0}
+                    unit={item.currency}
+                    ariaLabel="Restschuld Grundgeschäft"
+                    onChange={(v) => updItem({ amortisation: { ...(item.amortisation ?? { type: amortSel }), finalNotional: v } })}
+                  />
+                </div>
+              )}
+              {amortSel === "Annuity" && (
+                <div className="field">
+                  <label>Kreditzins (Annuität)</label>
+                  <NumInput
+                    value={item.amortisation?.loanRate ?? item.fixedRate ?? 0.03}
+                    scale={100}
+                    step={0.05}
+                    unit="%"
+                    ariaLabel="Kreditzins Grundgeschäft"
+                    onChange={(v) => updItem({ amortisation: { ...(item.amortisation ?? { type: "Annuity" }), loanRate: v } })}
+                  />
+                </div>
+              )}
+              <div className="field span-2">
+                <label>Nominalverlauf</label>
+                <div className="row wrap" style={{ gap: 8 }}>
+                  <button
+                    className="btn ghost"
+                    onClick={takeInstrumentSchedule}
+                    disabled={!instrSchedule}
+                    data-testid="hedge-take-schedule"
+                    title={
+                      instrSchedule
+                        ? `${instrSchedule.length} Perioden aus Leg 1 des Sicherungsinstruments`
+                        : "Das Sicherungsinstrument hat keinen Tilgungsplan"
+                    }
+                  >
+                    Tilgungsplan vom Sicherungsinstrument übernehmen
+                  </button>
+                  <span className="muted xs">
+                    {item.notionalSchedule?.length
+                      ? `${item.notionalSchedule.length} Perioden · ${fmtMoney(item.notionalSchedule[0]!.notional, item.currency)} → ${fmtMoney(item.notionalSchedule[item.notionalSchedule.length - 1]!.notional, item.currency)}`
+                      : amortSel === "none"
+                        ? "konstantes Nominal"
+                        : "aus dem Tilgungsprofil erzeugt"}
+                  </span>
+                </div>
+              </div>
+            </>
+          )}
         </div>
         <div className="muted xs" style={{ marginTop: 8 }}>
           Sicherungsinstrument: {trade.name ?? trade.id} · Nominal {fmtMoney(tradeNotional(trade).amount, tradeNotional(trade).currency)} · bis{" "}
@@ -542,6 +702,11 @@ export function HedgeView() {
             <span className="right row">
               <span className="muted xs">
                 perfekte Absicherung des Grundgeschäfts · PV am Bewertungstag {rep ? fmtMoney(rep.hypotheticalDerivative.pv, ccy) : "–"}
+                {rep?.hypotheticalDerivative.frozenVol !== undefined && (
+                  <span className="badge" style={{ marginLeft: 6 }} data-testid="hedge-frozen-vol">
+                    Vol eingefroren {fmtPct(rep.hypotheticalDerivative.frozenVol, 2)}
+                  </span>
+                )}
               </span>
               <button
                 className="btn ghost"
@@ -622,11 +787,22 @@ export function HedgeView() {
                 <li key={l}>{germanizeText(l)}</li>
               ))}
             </ul>
-            {rep.warnings.map((w) => (
-              <div key={w} className="warning" style={{ marginTop: 6 }}>
-                {germanizeText(w)}
+            {rep.basisScenarioIds.length > 0 && (
+              <div className="muted xs" style={{ marginTop: 6 }} data-testid="hedge-basis-info">
+                Basis-Szenarien in der Regression ({rep.basisScenarioIds.length}): {rep.basisScenarioIds.join(", ")} – Einzelkurven-Schocks der Projektions- und
+                Diskontkurven legen Tenor- und OIS-Basis-Ineffektivität offen.
               </div>
-            ))}
+            )}
+            {rep.warnings.length > 0 && (
+              <div className="warning" style={{ marginTop: 8 }} data-testid="hedge-warnings">
+                <b className="small">Hinweise ({rep.warnings.length})</b>
+                <ul className="small" style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {rep.warnings.map((w) => (
+                    <li key={w}>{germanizeText(w)}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {!s.customerMode &&
               rep.pricingWarnings.map((w) => (
                 <div key={w} className="muted xs" style={{ marginTop: 4 }}>
@@ -672,6 +848,47 @@ export function HedgeView() {
               </div>
             </div>
             <DollarOffsetCard title="Prospektiv (+100 bp / +10 % Spot)" r={rep.dollarOffsetProspective} ccy={ccy} />
+            {rep.dollarOffsetBasis && <DollarOffsetCard title="Basis (+25 bp Projektionskurve Grundgeschäft)" r={rep.dollarOffsetBasis} ccy={ccy} />}
+            {rep.costOfHedging && (
+              <div className="card" data-testid="hedge-coh">
+                <h3>
+                  Cost of Hedging
+                  <span className="right muted xs">IFRS 9 6.5.15 · Zeitwert der Option</span>
+                </h3>
+                <div className="table-scroll">
+                  <table className="grid-table compact">
+                    <tbody>
+                      <tr style={{ cursor: "default" }}>
+                        <td className="muted">Zeitwert am Bewertungstag</td>
+                        <td className={`num ${signClass(rep.costOfHedging.timeValue)}`}>{fmtMoney(rep.costOfHedging.timeValue, rep.costOfHedging.currency)}</td>
+                      </tr>
+                      <tr style={{ cursor: "default" }}>
+                        <td className="muted">Zeitwert bei Designation</td>
+                        <td className="num">
+                          {rep.costOfHedging.timeValueAtDesignation !== undefined
+                            ? fmtMoney(rep.costOfHedging.timeValueAtDesignation, rep.costOfHedging.currency)
+                            : "– (Designationsmarkt fehlt)"}
+                        </td>
+                      </tr>
+                      <tr style={{ cursor: "default" }}>
+                        <td>
+                          <b>Δ Zeitwert → OCI (Cost-of-Hedging-Rücklage)</b>
+                        </td>
+                        <td className={`num ${signClass(rep.costOfHedging.change)}`}>
+                          {rep.costOfHedging.change !== undefined ? fmtMoney(rep.costOfHedging.change, rep.costOfHedging.currency) : "–"}
+                        </td>
+                      </tr>
+                      <tr style={{ cursor: "default" }}>
+                        <td className="muted">Innerer Wert (Effektivitätsmessung)</td>
+                        <td className={`num ${signClass(rep.costOfHedging.intrinsicValue)}`}>
+                          {fmtMoney(rep.costOfHedging.intrinsicValue, rep.costOfHedging.currency)}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
             {rep.dollarOffsetCumulative ? (
               <DollarOffsetCard title="Kumulativ (seit Designation)" r={rep.dollarOffsetCumulative} ccy={ccy} />
             ) : (

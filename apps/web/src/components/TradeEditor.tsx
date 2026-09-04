@@ -4,19 +4,19 @@ import {
   type CrossCurrencySwap,
   type FixedLeg,
   type FloatLeg,
-  type InterestRateSwap,
   type StubType,
   type SwapLeg,
   type Trade,
+  addTenor,
   buildSchedule,
   getIndex,
   linearAmortisation,
 } from "@deriva/pricing-core";
 import { parseDateInput } from "../lib/date-parse.js";
-import { fmtDate, fmtMoney } from "../lib/format.js";
+import { fmtBp, fmtDate, fmtMoney, fmtPct } from "../lib/format.js";
 import { BARRIER_DE, CAPFLOOR_DE, CASH_CONVENTION_DE, MODEL_DE, OPTION_TYPE_DE, PAYER_RECEIVER_DE, SETTLEMENT_DE, optionsFrom } from "../lib/i18n.js";
 import { parseNumberInput } from "../lib/num-parse.js";
-import { annuityAmortisation, frequencyMonths, parseSchedulePaste } from "../lib/trade-ops.js";
+import { annuityAmortisation, frequencyMonths, parseSchedulePaste, scheduleValueAt } from "../lib/trade-ops.js";
 import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
 import { LS_KEYS, STATUS_LABELS, TRADE_STATUSES, readLocal, useStore, writeLocal } from "../state/store.js";
 import { DateInput } from "./DateInput.js";
@@ -122,8 +122,8 @@ function marketRate(
 
 const DAYCOUNTS = ["ACT/360", "ACT/365F", "30E/360", "30/360", "ACT/ACT ISDA"] as const;
 const FREQS = ["1M", "3M", "6M", "1Y", "ZC"] as const;
-const INDICES = ["EURIBOR-3M", "EURIBOR-6M", "ESTR", "SOFR", "SONIA", "SARON"] as const;
-const CCYS = ["EUR", "USD", "GBP", "CHF"] as const;
+const INDICES = ["EURIBOR-3M", "EURIBOR-6M", "ESTR", "SOFR", "SONIA", "SARON", "TONA"] as const;
+const CCYS = ["EUR", "USD", "GBP", "CHF", "JPY"] as const;
 const PAIRS = ["EURUSD", "EURGBP", "EURCHF", "EURJPY", "USDJPY"] as const;
 const STUBS: { v: StubType; l: string }[] = [
   { v: "ShortFront", l: "Short Front" },
@@ -153,7 +153,154 @@ export function isOisIndex(index: string): boolean {
   }
 }
 
-type LegPatch = Partial<Omit<FloatLeg, "type">> & Partial<Pick<FixedLeg, "rate">>;
+type LegPatch = Partial<Omit<FloatLeg, "type">> & Partial<Pick<FixedLeg, "rate" | "rateSchedule">>;
+
+/** Period starts of a leg schedule (empty when the schedule cannot be built). */
+function legPeriodStarts(leg: SwapLeg): number[] {
+  try {
+    return buildSchedule({
+      effectiveDate: leg.effectiveDate,
+      terminationDate: leg.terminationDate,
+      frequency: leg.frequency,
+      calendar: leg.calendar,
+      businessDayConvention: leg.businessDayConvention,
+      stub: leg.stub,
+      endOfMonth: leg.endOfMonth,
+      paymentLag: leg.paymentLag,
+    }).periods.map((p) => p.accrualStart);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Step-up / step-down coupon editor ("Kuponverlauf"): `FixedLeg.rateSchedule`
+ * or `FloatLeg.spreadSchedule` as rows of date + rate/spread. The last entry
+ * dated on/before a period start applies (core rule); periods before the first
+ * entry use the leg's base rate / spread.
+ */
+function CouponScheduleEditor({ leg, legIndex, onChange }: { leg: SwapLeg; legIndex: number; onChange: (patch: LegPatch) => void }) {
+  const isFixed = leg.type === "Fixed";
+  const base = isFixed ? leg.rate : (leg.spread ?? 0);
+  const entries: { date: number; value: number }[] = isFixed
+    ? (leg.rateSchedule ?? []).map((e) => ({ date: e.date, value: e.rate }))
+    : (leg.spreadSchedule ?? []).map((e) => ({ date: e.date, value: e.spread }));
+  const on = entries.length > 0;
+  const commit = (list: { date: number; value: number }[]) => {
+    const sorted = [...list].sort((a, b) => a.date - b.date);
+    if (isFixed) onChange({ rateSchedule: sorted.length ? sorted.map((e) => ({ date: e.date, rate: e.value })) : undefined });
+    else onChange({ spreadSchedule: sorted.length ? sorted.map((e) => ({ date: e.date, spread: e.value })) : undefined });
+  };
+  const valueAt = (d: number) => scheduleValueAt(entries, "value", d, base);
+  const addRow = () => {
+    const last = entries[entries.length - 1];
+    const date = last ? addTenor(last.date, "1Y") : addTenor(leg.effectiveDate, "1Y");
+    commit([...entries, { date, value: last ? last.value : base }]);
+  };
+  const fromAmortisation = () => {
+    const dates = (leg.notionalSchedule?.length ? leg.notionalSchedule.map((e) => e.date) : legPeriodStarts(leg)).filter((d) => d > leg.effectiveDate);
+    if (dates.length === 0) return;
+    commit(dates.map((d) => ({ date: d, value: valueAt(d) })));
+  };
+  const setRow = (i: number, patch: Partial<{ date: number; value: number }>) => commit(entries.map((e, j) => (j === i ? { ...e, ...patch } : e)));
+  const remove = (i: number) => commit(entries.filter((_, j) => j !== i));
+  const fmt = (v: number) => (isFixed ? fmtPct(v, 3) : fmtBp(v, 1));
+  return (
+    <div className="collapsible coupon-schedule" data-testid={`coupon-schedule-${legIndex}`}>
+      <div className="row wrap" style={{ gap: 8, padding: "6px 0" }}>
+        <b className="small">Kuponverlauf {isFixed ? "(Zinsstaffel)" : "(Spread-Staffel)"}</b>
+        {on ? (
+          <span className="badge" title="Stufen der Staffel">
+            {entries.length} {entries.length === 1 ? "Stufe" : "Stufen"}
+          </span>
+        ) : (
+          <span className="muted xs">konstant {fmt(base)}</span>
+        )}
+        <span className="grow" />
+        <button type="button" className="btn ghost xs" onClick={addRow} data-testid={`coupon-add-${legIndex}`} title="Stufe ein Jahr nach der letzten anfügen">
+          + Stufe
+        </button>
+        <button
+          type="button"
+          className="btn ghost xs"
+          onClick={fromAmortisation}
+          title={
+            leg.notionalSchedule?.length
+              ? "Eine Stufe je Datum des Tilgungsplans anlegen (Werte aus der bestehenden Staffel bzw. Basiskupon)"
+              : "Eine Stufe je Periodenstart anlegen (kein Tilgungsplan vorhanden)"
+          }
+        >
+          vom Amortisationsplan übernehmen
+        </button>
+        {on && (
+          <button type="button" className="btn ghost xs" onClick={() => commit([])} title="Staffel entfernen – konstanter Kupon">
+            Entfernen
+          </button>
+        )}
+      </div>
+      {on && (
+        <div className="table-scroll" style={{ maxHeight: 220 }}>
+          <table className="grid-table compact">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>ab Datum</th>
+                <th className="num">{isFixed ? "Kupon" : "Spread"}</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              <tr style={{ cursor: "default" }}>
+                <td className="muted">0</td>
+                <td className="mono muted xs">bis {fmtDate(entries[0]!.date)}</td>
+                <td className="num muted xs">{fmt(base)} (Basis)</td>
+                <td />
+              </tr>
+              {entries.map((e, i) => (
+                <tr key={i} style={{ cursor: "default" }}>
+                  <td className="muted">{i + 1}</td>
+                  <td>
+                    <DateInput
+                      inline
+                      value={e.date}
+                      base={leg.effectiveDate}
+                      ariaLabel={`Stufe ${i + 1} Datum Leg ${legIndex + 1}`}
+                      onChange={(v) => setRow(i, { date: v })}
+                    />
+                  </td>
+                  <td className="num">
+                    <span style={{ display: "inline-block", width: 130 }}>
+                      <NumInput
+                        inline
+                        value={e.value}
+                        scale={isFixed ? 100 : 1e4}
+                        step={isFixed ? 0.05 : 1}
+                        unit={isFixed ? "%" : "bp"}
+                        ariaLabel={`Stufe ${i + 1} ${isFixed ? "Kupon" : "Spread"} Leg ${legIndex + 1}`}
+                        onChange={(v) => setRow(i, { value: v })}
+                      />
+                    </span>
+                  </td>
+                  <td className="num">
+                    <button
+                      type="button"
+                      className="btn ghost danger xs"
+                      aria-label={`Stufe ${i + 1} entfernen`}
+                      title="Stufe entfernen"
+                      onClick={() => remove(i)}
+                    >
+                      ✕
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
 
 /** Schedule conventions of a swap leg (stub, BDC, EOM, lags, RFR conventions, embedded cap/floor). */
 function LegConventions({ leg, onChange, open, onToggle }: { leg: SwapLeg; onChange: (patch: LegPatch) => void; open: boolean; onToggle: () => void }) {
@@ -221,17 +368,40 @@ type AmortKind = "linear" | "annuity" | "custom";
  * leg schedule). Profiles: "Linear" to a target residual, "Annuität" (constant
  * instalment from the loan rate), "Custom" (edit / paste a Datum;Nominal table).
  */
-function AmortisationEditor({ trade, onChange }: { trade: InterestRateSwap | CrossCurrencySwap; onChange: (t: Trade) => void }) {
+/** Schedule owner of the amortisation editor: a swap leg or a cap/floor (same `notionalSchedule` rule in the core). */
+interface AmortLeg {
+  label: string;
+  notional: number;
+  currency: string;
+  effectiveDate: number;
+  terminationDate: number;
+  frequency: string;
+  calendar: SwapLeg["calendar"];
+  businessDayConvention?: BusinessDayConvention;
+  stub?: StubType;
+  endOfMonth?: boolean;
+  paymentLag?: number;
+  notionalSchedule?: { date: number; notional: number }[];
+}
+
+function AmortisationEditor({
+  legs,
+  onSchedule,
+}: {
+  legs: AmortLeg[];
+  /** Write `schedule` (undefined = constant notional) to the legs at `targets`. */
+  onSchedule: (targets: number[], schedule: { date: number; notional: number }[] | undefined) => void;
+}) {
   const valuationDate = useStore((s) => s.valuationDate);
   const showToast = useStore((s) => s.showToast);
-  const [applyAll, setApplyAll] = useState(trade.type === "InterestRateSwap");
+  const [applyAll, setApplyAll] = useState(legs.every((l) => l.currency === legs[0]!.currency));
   const [legIdx, setLegIdx] = useState(0);
   const [kind, setKind] = useState<AmortKind>("linear");
   const [residual, setResidual] = useState(0);
   const [loanRate, setLoanRate] = useState(0.04);
-  const sameDates = trade.legs.every((l) => l.effectiveDate === trade.legs[0]!.effectiveDate && l.terminationDate === trade.legs[0]!.terminationDate);
+  const sameDates = legs.every((l) => l.effectiveDate === legs[0]!.effectiveDate && l.terminationDate === legs[0]!.terminationDate);
   const all = applyAll && sameDates;
-  const ref = trade.legs[all ? 0 : Math.min(legIdx, trade.legs.length - 1)]!;
+  const ref = legs[all ? 0 : Math.min(legIdx, legs.length - 1)]!;
   const on = (ref.notionalSchedule?.length ?? 0) > 0;
 
   const periodStarts = useMemo(() => {
@@ -259,8 +429,8 @@ function AmortisationEditor({ trade, onChange }: { trade: InterestRateSwap | Cro
   };
 
   const setSchedule = (schedule: { date: number; notional: number }[] | undefined) => {
-    const targets = all ? trade.legs.map((_, i) => i) : [trade.legs.indexOf(ref)];
-    onChange({ ...trade, legs: trade.legs.map((l, i) => (targets.includes(i) ? { ...l, notionalSchedule: schedule } : l)) } as Trade);
+    const targets = all ? legs.map((_, i) => i) : [legs.indexOf(ref)];
+    onSchedule(targets, schedule);
   };
   const toggle = (enabled: boolean) => setSchedule(enabled ? periodStarts.map((d) => ({ date: d, notional: ref.notional })) : undefined);
   const setRow = (i: number, notional: number) => {
@@ -296,14 +466,14 @@ function AmortisationEditor({ trade, onChange }: { trade: InterestRateSwap | Cro
       <h3>
         Amortisation
         <span className="right row" style={{ gap: 12 }}>
-          {trade.legs.length > 1 && (
+          {legs.length > 1 && (
             <Checkbox checked={all} onChange={setApplyAll} label={sameDates ? "auf alle Legs anwenden" : "auf alle Legs anwenden (Laufzeiten abweichend)"} />
           )}
-          {!all && trade.legs.length > 1 && (
+          {!all && legs.length > 1 && (
             <select className="inline" value={legIdx} onChange={(e) => setLegIdx(Number(e.target.value))} aria-label="Leg für Amortisation">
-              {trade.legs.map((l, i) => (
+              {legs.map((l, i) => (
                 <option key={i} value={i}>
-                  Leg {i + 1} ({l.type === "Fixed" ? "Fest" : l.index})
+                  Leg {i + 1} ({l.label})
                 </option>
               ))}
             </select>
@@ -435,6 +605,56 @@ export function TradeEditor({ trade, onChange }: Props) {
               ? trade.underlying.legs[0]!.currency
               : trade.legs[0]!.currency;
   const upfrontOn = trade.upfront !== undefined;
+  const regulatory = !customerMode && (
+    <>
+      <div className="form-section" role="heading" aria-level={4}>
+        Regulatorik (EMIR Refit)
+      </div>
+      <Field label="UTI" span2 hint="Unique Transaction Identifier (ISO 23897) – Pflichtfeld im EMIR-Bewertungsexport">
+        <input
+          className="mono"
+          value={trade.uti ?? ""}
+          placeholder="z. B. 529900T8BM49AURSDO55…"
+          onChange={(e) => upd({ uti: e.target.value.trim() || undefined })}
+          aria-label="UTI"
+          spellCheck={false}
+        />
+      </Field>
+      <Field label="Clearing">
+        <Checkbox
+          checked={trade.cleared ?? false}
+          onChange={(v) => upd({ cleared: v, clearingMember: v ? trade.clearingMember : undefined })}
+          label="zentral gecleart (Art. 4 EMIR)"
+        />
+      </Field>
+      {trade.cleared && (
+        <Field label="Clearing-Member">
+          <input
+            value={trade.clearingMember ?? ""}
+            placeholder="z. B. Eurex Clearing AG"
+            onChange={(e) => upd({ clearingMember: e.target.value || undefined })}
+            aria-label="Clearing-Member"
+          />
+        </Field>
+      )}
+      {trade.status === "Quoted" && (
+        <Field
+          label="Angebot gültig bis"
+          issue={
+            trade.quoteValidUntil !== undefined && trade.quoteValidUntil < valuationDate
+              ? { field: "quoteValidUntil", level: "warn", msg: "Angebot ist abgelaufen (vor dem Bewertungstag)" }
+              : undefined
+          }
+        >
+          <DateInput
+            value={trade.quoteValidUntil ?? addTenor(valuationDate, "1W")}
+            ariaLabel="Angebot gültig bis"
+            onChange={(v) => upd({ quoteValidUntil: v })}
+          />
+        </Field>
+      )}
+    </>
+  );
   const common = (
     <>
       <Field label="Bezeichnung" span2>
@@ -457,7 +677,14 @@ export function TradeEditor({ trade, onChange }: Props) {
         </Field>
       )}
       <Field label="Status">
-        <Select value={trade.status ?? "Indication"} options={TRADE_STATUSES.map((v) => ({ v, l: STATUS_LABELS[v] }))} onChange={(v) => upd({ status: v })} />
+        <Select
+          value={trade.status ?? "Indication"}
+          options={TRADE_STATUSES.map((v) => ({ v, l: STATUS_LABELS[v] }))}
+          ariaLabel="Status"
+          onChange={(v) =>
+            upd({ status: v, quoteValidUntil: v === "Quoted" ? (trade.quoteValidUntil ?? addTenor(valuationDate, "1W")) : trade.quoteValidUntil })
+          }
+        />
       </Field>
       <Field label="Collateral (CSA)" hint="Diskontkurve nach Besicherung">
         <Select
@@ -496,6 +723,7 @@ export function TradeEditor({ trade, onChange }: Props) {
           </Field>
         </>
       )}
+      {regulatory}
     </>
   );
 
@@ -558,12 +786,24 @@ export function TradeEditor({ trade, onChange }: Props) {
                       }
                       label="Ende"
                     />
+                    <Checkbox
+                      checked={leg0.notionalExchange?.interim ?? false}
+                      onChange={(v) =>
+                        setBoth({
+                          notionalExchange: { initial: leg0.notionalExchange?.initial ?? false, final: leg0.notionalExchange?.final ?? false, interim: v },
+                        })
+                      }
+                      label="Interim (bei Nominaländerung)"
+                    />
                   </span>
                 </Field>
-                <Field label="MtM-Reset">
+                <Field label="MtM-Reset" hint="Nominal des Reset-Legs wird je Periode am Forward-Kurs neu fixiert">
                   <Select
                     value={trade.mtmReset ? String(trade.mtmReset.resettingLegIndex) : ""}
-                    options={[{ v: "", l: "kein Reset" }, ...trade.legs.map((_, i) => ({ v: String(i), l: `Leg ${i + 1}` }))]}
+                    options={[
+                      { v: "", l: "kein Reset (konstantes Nominal)" },
+                      ...trade.legs.map((l, i) => ({ v: String(i), l: `Leg ${i + 1} (${l.currency})` })),
+                    ]}
                     ariaLabel="MtM-Reset"
                     onChange={(v) => upd({ mtmReset: v === "" ? undefined : { resettingLegIndex: Number(v) } } as Partial<CrossCurrencySwap>)}
                   />
@@ -571,7 +811,12 @@ export function TradeEditor({ trade, onChange }: Props) {
               </>
             )}
           </div>
-          <AmortisationEditor trade={trade} onChange={onChange} />
+          <AmortisationEditor
+            legs={trade.legs.map((l) => ({ ...l, label: l.type === "Fixed" ? "Fest" : l.index }))}
+            onSchedule={(targets, schedule) =>
+              onChange({ ...trade, legs: trade.legs.map((l, i) => (targets.includes(i) ? { ...l, notionalSchedule: schedule } : l)) } as Trade)
+            }
+          />
           {trade.legs.map((leg, i) => (
             <div key={i} className="card" style={{ padding: 10 }}>
               <h3>
@@ -650,6 +895,7 @@ export function TradeEditor({ trade, onChange }: Props) {
                   <Select value={leg.dayCount} options={DAYCOUNTS} onChange={(v) => setLeg(i, { dayCount: v })} />
                 </Field>
               </div>
+              <CouponScheduleEditor leg={leg} legIndex={i} onChange={(patch) => setLeg(i, patch)} />
               <LegConventions leg={leg} onChange={(patch) => setLeg(i, patch)} open={convOpen} onToggle={toggleConv} />
             </div>
           ))}
@@ -753,6 +999,7 @@ export function TradeEditor({ trade, onChange }: Props) {
               />
             </Field>
           </div>
+          <AmortisationEditor legs={[{ ...trade, label: trade.index }]} onSchedule={(_targets, schedule) => upd({ notionalSchedule: schedule })} />
           <Collapsible title="Konventionen" open={convOpen} onToggle={toggleConv}>
             <Field label="Stub">
               <Select value={trade.stub ?? "ShortFront"} options={STUBS} onChange={(v) => upd({ stub: v })} />
@@ -1120,6 +1367,12 @@ export function TradeEditor({ trade, onChange }: Props) {
               onChange={(v) => upd({ payReceive: v })}
             />
           </Field>
+          <Field label="Währung">
+            <Select value={trade.currency} options={CCYS} ariaLabel="Währung" onChange={(v) => upd({ currency: v })} />
+          </Field>
+          <Field label="Index" hint="Referenzzins der FRA-Periode">
+            <Select value={trade.index} options={[...new Set([...INDICES, trade.index])]} ariaLabel="Index" onChange={(v) => upd({ index: v })} />
+          </Field>
           <Field label="Nominal">
             <NumInput
               value={trade.notional}
@@ -1143,11 +1396,14 @@ export function TradeEditor({ trade, onChange }: Props) {
               onChange={(v) => upd({ fixedRate: v })}
             />
           </Field>
-          <Field label="Start">
+          <Field label="Start (Fixing-Periode)">
             <DateInput value={trade.startDate} ariaLabel="Start" onChange={(v) => upd({ startDate: v })} />
           </Field>
           <Field label="Ende" issue={iss("endDate")}>
             <DateInput value={trade.endDate} ariaLabel="Ende" invalid={!!iss("endDate")} base={trade.startDate} onChange={(v) => upd({ endDate: v })} />
+          </Field>
+          <Field label="Tageszählung">
+            <Select value={trade.dayCount ?? "ACT/360"} options={DAYCOUNTS} ariaLabel="Tageszählung" onChange={(v) => upd({ dayCount: v })} />
           </Field>
         </div>
       );

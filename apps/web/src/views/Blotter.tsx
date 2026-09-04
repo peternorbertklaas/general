@@ -21,8 +21,9 @@ import {
 } from "../lib/blotter-export.js";
 import { fmtCompact, fmtDate, fmtMoney, signClass } from "../lib/format.js";
 import { translateCoreMessage, translatePricingError } from "../lib/i18n.js";
+import { downloadPortfolioReport } from "../lib/portfolio-export.js";
 import { CSV_IMPORT_TEMPLATES, type CsvTradeType, csvTemplateText, downloadText, tradesFromCsv, tradesFromJson, tradesToJson } from "../lib/portfolio-io.js";
-import { tradeTypeBadge } from "../lib/trade-ops.js";
+import { quoteExpired, tradeTypeBadge } from "../lib/trade-ops.js";
 import { type DuplicateStrategy, LS_KEYS, STATUS_LABELS, deleteWithUndo, readLocal, useStore, writeLocal, type TradeStatus } from "../state/store.js";
 
 type SortKey = "id" | "type" | "notional" | "maturity" | "pv" | "dv01" | "cpty" | "book" | "status";
@@ -30,9 +31,19 @@ const SORT_KEYS: SortKey[] = ["id", "type", "notional", "maturity", "pv", "dv01"
 
 export const ONBOARDING_EXAMPLES = ["irs 10y pay 3.1% 10m", "cap 5y 3% 8m", "fxf eurusd -2m 1.1725 2027-03-15"];
 
-export function StatusBadge({ status }: { status: Trade["status"] }) {
+/** Status badge; a firm quote past its validity date carries an extra "abgelaufen" badge. */
+export function StatusBadge({ status, expired }: { status: Trade["status"]; expired?: boolean }) {
   const st: TradeStatus = status ?? "Indication";
-  return <span className={`badge st-${st.toLowerCase()}`}>{STATUS_LABELS[st]}</span>;
+  return (
+    <>
+      <span className={`badge st-${st.toLowerCase()}`}>{STATUS_LABELS[st]}</span>
+      {expired && (
+        <span className="badge warn" title="Angebot vor dem Bewertungstag abgelaufen" data-testid="quote-expired">
+          abgelaufen
+        </span>
+      )}
+    </>
+  );
 }
 
 /** First-launch hint card (dismissible, remembered in localStorage). */
@@ -111,9 +122,11 @@ interface BlotterPrefs {
   filter: TypeFilter;
   hideIndications: boolean;
   noCpty: boolean;
+  /** Only trades without a UTI (EMIR reporting gap). */
+  noUti: boolean;
   group: GroupKey;
 }
-const DEFAULT_PREFS: BlotterPrefs = { sort: { key: "id", dir: 1 }, filter: "all", hideIndications: false, noCpty: false, group: "none" };
+const DEFAULT_PREFS: BlotterPrefs = { sort: { key: "id", dir: 1 }, filter: "all", hideIndications: false, noCpty: false, noUti: false, group: "none" };
 
 /** Sort / filter / grouping are persisted (N-24). */
 function readPrefs(): BlotterPrefs {
@@ -124,7 +137,7 @@ function readPrefs(): BlotterPrefs {
     const sort = p.sort && SORT_KEYS.includes(p.sort.key) && (p.sort.dir === 1 || p.sort.dir === -1) ? p.sort : DEFAULT_PREFS.sort;
     const filter = TYPE_FILTERS.some((f) => f.id === p.filter) ? (p.filter as TypeFilter) : "all";
     const group = GROUP_OPTIONS.some((g) => g.key === p.group) ? (p.group as GroupKey) : "none";
-    return { sort, filter, hideIndications: !!p.hideIndications, noCpty: !!p.noCpty, group };
+    return { sort, filter, hideIndications: !!p.hideIndications, noCpty: !!p.noCpty, noUti: !!p.noUti, group };
   } catch {
     return DEFAULT_PREFS;
   }
@@ -163,12 +176,13 @@ export function Blotter() {
       selectedId: st.selectedId,
       compareIds: st.compareIds,
       valuationDate: st.valuationDate,
+      reportInputs: st.reportInputs,
     })),
   );
   const act = useStore.getState;
   const customer = s.customerMode;
   const [prefs, setPrefs] = useState<BlotterPrefs>(() => readPrefs());
-  const { sort, filter, hideIndications, noCpty, group } = prefs;
+  const { sort, filter, hideIndications, noCpty, noUti, group } = prefs;
   const updPrefs = (patch: Partial<BlotterPrefs>) =>
     setPrefs((p) => {
       const next = { ...p, ...patch };
@@ -198,15 +212,20 @@ export function Blotter() {
         })
         .filter((r) => !hideIndications || (r.t.status ?? "Indication") !== "Indication")
         .filter((r) => !noCpty || !r.t.counterparty?.trim())
+        .filter((r) => !noUti || !r.t.uti?.trim())
         .filter(
-          (r) => !q || `${r.t.id} ${r.t.name ?? ""} ${customer ? "" : `${r.t.counterparty ?? ""} ${r.t.book ?? ""}`}`.toLowerCase().includes(q.toLowerCase()),
+          (r) =>
+            !q ||
+            `${r.t.id} ${r.t.name ?? ""} ${customer ? "" : `${r.t.counterparty ?? ""} ${r.t.book ?? ""} ${r.t.uti ?? ""}`}`
+              .toLowerCase()
+              .includes(q.toLowerCase()),
         )
         .sort((a, b) => {
           const va = sortVal(a, sort.key);
           const vb = sortVal(b, sort.key);
           return (va < vb ? -1 : va > vb ? 1 : 0) * sort.dir;
         }),
-    [rows, filter, hideIndications, noCpty, q, sort, customer],
+    [rows, filter, hideIndications, noCpty, noUti, q, sort, customer],
   );
   const groups = useMemo(() => groupBlotterRows(filtered, customer && group !== "type" ? "none" : group), [filtered, group, customer]);
   const orderedRows = useMemo(() => groups.flatMap((g) => g.rows), [groups]);
@@ -255,6 +274,8 @@ export function Blotter() {
     return [...m.entries()];
   }, [rows]);
   const withoutCpty = rows.filter((r) => !r.t.counterparty?.trim()).length;
+  const withoutUti = rows.filter((r) => !r.t.uti?.trim()).length;
+  const expiredQuotes = rows.filter((r) => quoteExpired(r.t, s.valuationDate)).length;
   const warnCount = rows.filter((r) => r.warnings.length > 0 || r.error).length;
   const errorCount = rows.filter((r) => r.error).length;
 
@@ -278,15 +299,21 @@ export function Blotter() {
     downloadText(`portfolio-${toISO(s.valuationDate)}.json`, tradesToJson(s.trades), "application/json");
     act().showToast(`Portfolio als JSON exportiert (${s.trades.length} Trades)`);
   };
+  /** EMIR Refit valuation export: UTI / clearing fields come from the trade, the transaction price (→ MTMA) from the report inputs when set. */
   const exportEmir = () => {
     const records = s.trades
       .map((t) => {
         const r = s.results[t.id]?.result;
-        return r && !s.results[t.id]?.error ? emirValuationRecord(s.market, t, r) : null;
+        if (!r || s.results[t.id]?.error) return null;
+        const ri = s.reportInputs[t.id];
+        return emirValuationRecord(s.market, t, r, ri && Number.isFinite(ri.offerPv) ? { transactionPrice: ri.offerPv } : undefined);
       })
       .filter((x): x is NonNullable<typeof x> => x !== null);
+    const missingUti = records.filter((r) => !r.uti).length;
     downloadText(`emir-valuations-${toISO(s.valuationDate)}.csv`, emirCsv(records), "text/csv;charset=utf-8");
-    act().showToast(`EMIR-Bewertungen exportiert (${records.length}${errorCount ? `, ${errorCount} fehlerhafte Trades ausgelassen` : ""})`);
+    act().showToast(
+      `EMIR-Bewertungen exportiert (${records.length}${errorCount ? `, ${errorCount} fehlerhafte Trades ausgelassen` : ""}${missingUti ? `, ${missingUti} ohne UTI` : ""})`,
+    );
   };
   /** Import with duplicate handling: ask when ids collide, otherwise import directly. */
   const stageImport = (trades: Trade[], source: string) => {
@@ -329,7 +356,7 @@ export function Blotter() {
     }
   };
   const resetFilters = () => {
-    updPrefs({ filter: "all", hideIndications: false, noCpty: false, group: "none" });
+    updPrefs({ filter: "all", hideIndications: false, noCpty: false, noUti: false, group: "none" });
     setQ("");
   };
   const openTrade = (id: string) => {
@@ -443,7 +470,7 @@ export function Blotter() {
         {show("dv01") && <td className={`num ${signClass(r.dv01)}`}>{fmtMoney(r.dv01)}</td>}
         {show("status") && (
           <td>
-            <StatusBadge status={r.t.status} />
+            <StatusBadge status={r.t.status} expired={quoteExpired(r.t, s.valuationDate)} />
           </td>
         )}
         {show("valuation") && (
@@ -515,6 +542,7 @@ export function Blotter() {
             {rows.length} Trades{!customer && ` · ${byCpty.length} Kontrahenten`}
             {warnCount > 0 && !customer && ` · ${warnCount} mit Hinweisen`}
             {errorCount > 0 && ` · ${errorCount} nicht bewertet`}
+            {expiredQuotes > 0 && ` · ${expiredQuotes} Angebot${expiredQuotes === 1 ? "" : "e"} abgelaufen`}
           </span>
         </div>
         {!customer && (
@@ -600,6 +628,17 @@ export function Blotter() {
                 {noCpty ? "✓ " : ""}ohne Kontrahent ({withoutCpty})
               </button>
             )}
+            {!customer && withoutUti > 0 && (
+              <button
+                className={`chip ${noUti ? "active" : ""}`}
+                onClick={() => updPrefs({ noUti: !noUti })}
+                aria-pressed={noUti}
+                title="Trades ohne UTI (EMIR-Meldelücke)"
+                data-testid="filter-no-uti"
+              >
+                {noUti ? "✓ " : ""}ohne UTI ({withoutUti})
+              </button>
+            )}
             <label className="row" style={{ gap: 4 }}>
               <span className="muted xs">Gruppieren</span>
               <select
@@ -683,11 +722,36 @@ export function Blotter() {
                         exportEmir();
                         setExportOpen(false);
                       }}
-                      title="EMIR-Refit-Bewertungsfelder (Valuation amount/currency/timestamp/method) als CSV"
+                      title="EMIR-Refit-Bewertungsfelder (UTI, Valuation amount/currency/timestamp/method, Clearing) als CSV – Transaktionspreis aus den Report-Eingaben"
                     >
                       ⤓ EMIR-Bewertungen (CSV)
                     </button>
                   )}
+                  <div className="sep" role="separator" />
+                  <button
+                    role="menuitem"
+                    className="item"
+                    data-testid="export-portfolio-json"
+                    onClick={() => {
+                      downloadPortfolioReport("json");
+                      setExportOpen(false);
+                    }}
+                    title={`Portfolio-Report: PV/DV01 je Kontrahent, Buch und Typ mit Snapshot-ID und Hashes (${keysOf("export.portfolio")})`}
+                  >
+                    ⤓ Portfolio-Report (JSON)
+                  </button>
+                  <button
+                    role="menuitem"
+                    className="item"
+                    data-testid="export-portfolio-md"
+                    onClick={() => {
+                      downloadPortfolioReport("md");
+                      setExportOpen(false);
+                    }}
+                    title="Portfolio-Report als Markdown (druckbar)"
+                  >
+                    ⤓ Portfolio-Report (Markdown)
+                  </button>
                   <div className="sep" role="separator" />
                   <label
                     role="menuitem"

@@ -373,12 +373,55 @@ try {
   await page.locator('[data-testid="vega-dimension"] button', { hasText: "Tenor" }).click();
   await wait(800);
   check((await page.locator('[data-testid="vega-heatmap"]').count()) === 1, "expiry × tenor vega heatmap renders");
+  // FX option vega buckets: FX surface with optional smile buckets (core round 3)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("FXO-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(800);
+  check((await page.locator('[data-testid="vega-buckets"]').innerText()).includes("FX-Fläche"), "FX option vega buckets are labelled FX-Fläche");
+  await page.locator('[data-testid="vega-smile"]').check();
+  await wait(800);
+  check((await page.locator('[data-testid="vega-smile-table"]').count()) === 1, "smile toggle adds the RR/BF bucket table");
+  await page.locator('[data-testid="vega-smile"]').uncheck();
+
+  // CCS via palette quick entry: fair basis spread as key metric, interim exchange and MtM reset in the editor
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("ccs eurusd 5y -20bp 10m mtm");
+  await wait(200);
+  check((await page.locator(".palette .item").first().innerText()).includes("Cross-Currency-Swap EUR/USD 5Y"), "palette previews the CCS quick entry");
+  await page.keyboard.press("Enter");
+  await wait(600);
+  const ccsId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
+  check(/^CCS-\d{4}$/.test(ccsId), `CCS created via palette with readable id (${ccsId})`);
+  check((await page.locator(".kpi .label", { hasText: "Fairer Basis-Spread" }).count()) === 1, "CCS key metric is the fair basis spread");
+  check((await page.locator("label.check", { hasText: "Interim" }).count()) === 1, "CCS editor offers the interim notional exchange");
+  check((await page.locator('select[aria-label="MtM-Reset"]').inputValue()) === "1", "quick entry 'mtm' selects the resetting leg");
+  check((await page.locator('input[aria-label="UTI"]').count()) === 1, "Regulatorik section with UTI field in the editor");
+  // FRA via chord n r: editor with index select, settlement / fixing dates in the header
+  await page.keyboard.press("n");
+  await page.keyboard.press("r");
+  await wait(600);
+  const fraId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
+  check(/^FRA-\d{4}$/.test(fraId), `n r creates an FRA (${fraId})`);
+  check((await page.locator('select[aria-label="Index"]').count()) === 1, "FRA editor has an index select");
+  check(/Fixing-Datum \d{2}\.\d{2}\.\d{4}/.test(await page.locator('[data-testid="pricing-details"]').innerText()), "FRA header shows the fixing date");
   // back to the new IRS
   await page.keyboard.press("Control+k");
   await page.keyboard.type(newId);
   await wait(200);
   await page.keyboard.press("Enter");
   await wait(400);
+  // Step-up coupon table (Kuponverlauf): a step writes rateSchedule and both par rates appear
+  await page.locator('[data-testid="coupon-add-0"]').click();
+  await wait(500);
+  check((await page.locator('[data-testid="coupon-schedule-0"] table').count()) === 1, "step-up table renders after adding a step");
+  check((await page.locator('input[aria-label="Stufe 1 Kupon Leg 1"]').count()) === 1, "step row has a NumInput for the coupon");
+  const stepAnalytics = await page.locator('[data-testid="analytics-table"]').innerText();
+  check(stepAnalytics.includes("Par-Satz (Basis, Staffel konstant)") && stepAnalytics.includes("Par-Satz (flach)"), "analytics show base and flat par rates");
+  await page.locator('button[aria-label="Stufe 1 entfernen"]').click();
+  await wait(300);
+  check((await page.locator('[data-testid="coupon-schedule-0"] table').count()) === 0, "removing the step drops the table");
 
   // Report: generate, audit line, governance, perspective, what-if badge, documents
   await chord(page, "r");
@@ -473,6 +516,26 @@ try {
   check((await page.locator('[data-testid="document-body"]').count()) === 1, "suitability statement generated");
   await page.keyboard.press("Escape");
   await wait(200);
+  // KID (Basisinformationsblatt) via hotkey and Confirmation via button
+  await page.keyboard.press("Control+Shift+K");
+  await wait(600);
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "Ctrl+Shift+K opens the KID modal");
+  check((await page.locator('[data-testid="kid-form"]').count()) === 1, "KID form with manufacturer / holding period");
+  const kidText = await page.locator('[data-testid="document-body"]').innerText();
+  check(kidText.includes("Basisinformationsblatt"), "KID document rendered");
+  check(!/\d{4}-\d{2}-\d{2}/.test(kidText), "KID uses German dates");
+  await page.locator('[data-testid="kid-holding-period"]').fill("3");
+  await page.keyboard.press("Enter");
+  await wait(400);
+  check((await page.locator('[data-testid="document-body"]').count()) === 1, "KID regenerates live after changing the holding period");
+  await page.keyboard.press("Escape");
+  await wait(300);
+  await page.locator('[data-testid="open-confirmation"]').click();
+  await wait(500);
+  check((await page.locator('[data-testid="confirmation-form"]').count()) === 1, "confirmation form (parties, master agreement)");
+  check((await page.locator('[data-testid="document-body"]').innerText()).includes("Rahmenvertrag"), "confirmation document rendered");
+  await page.keyboard.press("Escape");
+  await wait(300);
   await page.screenshot({ path: join(outDir, "view-Report.png") });
   // Print emulation of the report
   await page.emulateMedia({ media: "print" });
@@ -511,6 +574,23 @@ try {
   await wait(300);
   check((await page.locator('[data-testid="hedge-stale"]').count()) === 1, "changed hedge ratio flags the result as stale (N-20)");
   check((await page.locator('[data-testid="hedge-export"]').count()) === 1, "hedge documentation export button");
+  check((await page.locator('[data-testid="hedge-amortisation"]').count()) === 1, "hedged item offers the amortisation select");
+  check((await page.locator('[data-testid="hedge-designation"]').count()) === 0, "designation select hidden for linear instruments");
+  // option instrument: designation select, freeze-vol checkbox, cost of hedging card
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("CAP-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(300);
+  await chord(page, "h");
+  check((await page.locator('[data-testid="hedge-designation"]').count()) === 1, "cap offers the option designation");
+  check((await page.locator('[data-testid="hedge-freeze-vol"]').count()) === 1, "freeze designation vol checkbox");
+  await page.locator('[data-testid="hedge-designation"]').selectOption("IntrinsicValue");
+  await page.locator('[data-testid="hedge-freeze-vol"]').check();
+  await page.locator('[data-testid="hedge-test"]').click();
+  await wait(3000);
+  check((await page.locator('[data-testid="hedge-coh"]').count()) === 1, "cost-of-hedging card for the intrinsic-value designation");
+  check((await page.locator('[data-testid="hedge-frozen-vol"]').count()) === 1, "frozen designation vol shown on the hypothetical");
   await page.screenshot({ path: join(outDir, "view-Hedge.png") });
 
   // Views render without errors (dark)
@@ -536,19 +616,66 @@ try {
   );
   await page.locator('[data-testid="interp-select"]').selectOption("logLinear");
   await wait(400);
+  check(
+    (await page.locator('[data-testid="interp-select"] option', { hasText: "monoton-konvex" }).count()) === 1,
+    "interpolation select offers monoton-konvex (Hagan–West)",
+  );
   await page.locator("button.btn", { hasText: "Quotes +10 bp" }).click();
   await wait(500);
   check((await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"), "chip shows modifiziert after quote edit");
   check((await page.locator("tr.edited").count()) >= 1, "edited quote rows highlighted");
   await page.locator("button.btn", { hasText: "Zurücksetzen" }).click();
   await wait(400);
+  // JPY-TONA curve tab and turn-of-year jump
+  await page.locator('[aria-label="Kurve"] button', { hasText: "TONA" }).click();
+  await wait(400);
+  check((await page.locator(".card h3", { hasText: "JPY-TONA" }).count()) >= 1, "JPY-TONA curve selectable");
+  check((await page.locator('[data-testid="pillar-table"] tbody tr').count()) >= 5, "JPY-TONA pillars rendered");
+  await page.locator('[aria-label="Kurve"] button', { hasText: "€STR" }).click();
+  await wait(300);
+  await page.locator('[data-testid="toy-bp"]').fill("20");
+  await page.keyboard.press("Enter");
+  await wait(200);
+  await page.locator('[data-testid="toy-apply"]').click();
+  await wait(800);
+  check((await page.locator('[data-testid="toy-badge"]').count()) === 1, "turn-of-year badge after applying the jump");
+  check((await page.locator('[data-testid="market-modified-chip"]').innerText()).includes("Turn-of-Year"), "turn-of-year counts as modified market");
+  await page.locator("button.btn", { hasText: "Zurücksetzen" }).click();
+  await wait(500);
+  check((await page.locator('[data-testid="toy-badge"]').count()) === 0, "reset removes the turn-of-year jump");
+  // Reporting currency cycles through JPY (discount curve present)
+  await page.keyboard.press("c");
+  await page.keyboard.press("c");
+  await page.keyboard.press("c");
+  await page.keyboard.press("c");
+  await wait(600);
+  check((await page.locator('button[aria-label^="Reporting-Währung JPY"]').count()) === 1, "currency cycle reaches JPY");
+  await page.keyboard.press("c");
+  await wait(600);
 
-  // Scenario heatmap click sets the what-if
+  // Scenario heatmap click sets the what-if; historical stress episodes toggle
   await chord(page, "s");
   await page.locator(".heat button.cell").nth(1).click();
   await wait(400);
   check((await page.locator('[data-testid="market-chip"]').innerText()).includes("What-if"), "heatmap cell sets what-if");
   await page.keyboard.press("0");
+  await wait(200);
+  await page.locator('[data-testid="historical-toggle"]').click();
+  await wait(1500);
+  check((await page.locator('[data-testid="scenario-table"]').innerText()).includes("Lehman"), "historical toggle adds the stress episodes");
+  await page.locator('button[aria-label^="Beschreibung Lehman"]').click();
+  await wait(200);
+  check((await page.locator('[data-testid="scenario-description"]').count()) === 1, "scenario description row expands");
+  await page.locator('[data-testid="historical-toggle"]').click();
+  await wait(800);
+
+  // Market: CDS term structure editor bootstraps a hazard curve
+  await chord(page, "m");
+  await page.locator('[data-testid="cds-add"]').click();
+  await wait(300);
+  check((await page.locator('[data-testid="cds-table"] tbody tr').count()) === 1, "CDS quote row added");
+  check((await page.locator('[data-testid="hazard-pillars"]').count()) === 1, "hazard pillars shown for the CDS term structure");
+  await page.locator('[data-testid="cds-table"] button[aria-label^="CDS-Quote 1 entfernen"]').click();
   await wait(200);
 
   // Toast stack is capped at four (N-09)
@@ -560,6 +687,20 @@ try {
   await wait(200);
   check((await page.locator(".toast").count()) <= 4, `toast stack capped (${await page.locator(".toast").count()})`);
   await wait(3500);
+  // Blotter: portfolio report export entries, 'ohne UTI' chip, quote expiry badge
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
+  check((await page.locator('[data-testid="export-portfolio-json"]').count()) === 1, "portfolio report (JSON) download button present");
+  check((await page.locator('[data-testid="export-portfolio-md"]').count()) === 1, "portfolio report (Markdown) download button present");
+  await page.keyboard.press("Escape");
+  await page.locator("body").click({ position: { x: 5, y: 5 } });
+  await wait(200);
+  check((await page.locator('[data-testid="filter-no-uti"]').count()) === 1, "'ohne UTI' filter chip present");
+  await page.locator('[data-testid="filter-no-uti"]').click();
+  await wait(200);
+  check((await page.locator("td.id-cell", { hasText: "FRA-0001" }).count()) === 0, "'ohne UTI' hides trades carrying a UTI");
+  await page.locator('[data-testid="filter-no-uti"]').click();
+  await wait(200);
 
   // Light theme – all views
   await page.keyboard.press("t");
@@ -627,10 +768,11 @@ try {
   await wait(200);
 
   // Persistence: reload keeps the book and shows the restore toast
+  const beforeReload = (await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1];
   await page.reload({ waitUntil: "networkidle" });
   await wait(600);
   const afterReload = (await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1];
-  check(afterReload === before, `trades persisted across reload (${before} → ${afterReload})`);
+  check(afterReload === beforeReload, `trades persisted across reload (${beforeReload} → ${afterReload})`);
   check((await page.locator(".toast", { hasText: "lokalem Speicher" }).count()) === 1, "restore toast");
   check((await page.locator(".toast button", { hasText: "Zurücksetzen" }).count()) === 1, "restore toast offers reset");
 

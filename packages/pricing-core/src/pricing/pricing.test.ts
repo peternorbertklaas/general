@@ -30,7 +30,6 @@ describe("bootstrap", () => {
     for (let i = 1; i < dfs.length; i++) expect(dfs[i]!).toBeLessThan(dfs[i - 1]!);
   });
   it("dual-curve EURIBOR-6M reprices par swaps", () => {
-    const ois = ctx.curves["EUR-ESTR"]!;
     const cal = getCalendar("TARGET");
     const spot = advance(VAL, "2D", cal);
     for (const q of SAMPLE_QUOTES.eur6m) {
@@ -47,7 +46,6 @@ describe("bootstrap", () => {
       expect(Math.abs(res.pv)).toBeLessThan(1); // < 1 EUR on 10m notional
       expect(res.analytics.parRate).toBeCloseTo(q.rate, 9);
     }
-    void ois;
   });
   it("deposit and FRA forwards are reproduced", () => {
     const c = ctx.curves["EUR-EURIBOR-6M"]!;

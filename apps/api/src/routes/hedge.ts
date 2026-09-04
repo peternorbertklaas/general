@@ -92,6 +92,8 @@ interface HedgeBody {
   /** Market snapshot at designation (enables retrospective test and accounting split). */
   designationSnapshot?: MarketSnapshotJson;
   reportingCurrency?: string;
+  /** Freeze the hypothetical option's vol at designation (`HedgeReportOptions.freezeDesignationVol`); needs `designationSnapshot`. */
+  freezeDesignationVol?: boolean;
 }
 
 export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext) {
@@ -111,6 +113,11 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
             hedgingInstrument: tradeRef,
             designationSnapshot: marketSnapshotRef,
             reportingCurrency: { type: "string", pattern: "^[A-Z]{3}$" },
+            freezeDesignationVol: {
+              type: "boolean",
+              description:
+                "Freeze the volatility of a hypothetical option (cap/floor, swaption, FX option) at designation: with `designationSnapshot` the hypothetical gets a `volOverride` from the designation market's surface (FX option / swaption: smile vol at strike and expiry; cap/floor: the implied flat cap vol at the strike), so vol moves of the surface no longer create ineffectiveness (IFRS 9 B6.5.5). Default false (hypothetical revalued on the current surface); ignored without `designationSnapshot` or when the hypothetical already carries a `volOverride`. The applied vol is reported as `hypotheticalDerivative.frozenVol`.",
+            },
           },
           additionalProperties: false,
         },
@@ -129,7 +136,18 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
                   "Time value of an option designated at intrinsic value (IFRS 9 6.5.15): { currency, timeValue, intrinsicValue, timeValueAtDesignation?, change? }; absent otherwise",
                 ),
                 hedgingInstrument: objectResponse("{ id, name?, type, pv }"),
-                hypotheticalDerivative: objectResponse("{ trade, pv } – amortising items carry the notional path on both legs"),
+                hypotheticalDerivative: {
+                  type: "object",
+                  description: "The hypothetical derivative and its PV at the valuation date – amortising items carry the notional path on both legs",
+                  properties: {
+                    trade: objectResponse("Hypothetical derivative as Trade (with `volOverride` when the vol was frozen)"),
+                    pv: { description: "PV in reporting currency" },
+                    frozenVol: {
+                      description: "Decimal vol taken from the designation market when `freezeDesignationVol` applied a `volOverride`; absent otherwise",
+                    },
+                  },
+                  additionalProperties: true,
+                },
                 criticalTerms: objectResponse("Critical-terms match (incl. `notionalSchedule` check for amortising items)"),
                 dollarOffsetProspective: objectResponse("Prospective dollar offset (current vs. +100bp / +10 % spot)"),
                 dollarOffsetBasis: objectResponse(
@@ -163,12 +181,23 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
       const instrument = req.body.hedgingInstrument ? datesToSerial(req.body.hedgingInstrument) : ctx.trades.get(rel.hedgingInstrumentId)?.trade;
       if (!instrument) return reply.status(404).send({ error: `Hedging instrument ${rel.hedgingInstrumentId} not found`, statusCode: 404, requestId: req.id });
       const designationCtx = req.body.designationSnapshot ? deserializeMarket(req.body.designationSnapshot) : undefined;
-      const report = hedgeEffectivenessReport(ctx.market.get(), rel, instrument, { designationCtx, reportingCurrency: req.body.reportingCurrency });
+      const report = hedgeEffectivenessReport(ctx.market.get(), rel, instrument, {
+        designationCtx,
+        reportingCurrency: req.body.reportingCurrency,
+        freezeDesignationVol: req.body.freezeDesignationVol,
+      });
+      const frozenVol = report.hypotheticalDerivative.frozenVol;
       ctx.audit.append({
         actor: "api",
         action: "hedge.test",
         subject: rel.id,
-        details: { effective: report.effective, method: rel.method, designation: report.designation, basisScenarios: report.basisScenarioIds.length },
+        details: {
+          effective: report.effective,
+          method: rel.method,
+          designation: report.designation,
+          basisScenarios: report.basisScenarioIds.length,
+          ...(frozenVol !== undefined ? { frozenVol } : {}),
+        },
       });
       return datesToIso(report);
     },

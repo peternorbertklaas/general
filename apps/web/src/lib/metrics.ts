@@ -31,8 +31,8 @@ const vol: MetricDef["fmt"] = (v, c) => (isFx(c) || Math.abs(v) >= 0.05 ? fmtPct
 export const METRICS: Record<string, MetricDef> = {
   // swaps / FRAs
   parRate: { label: "Par-Satz", fmt: pct4 },
-  parRateBase: { label: "Par-Satz Basiskupon", unit: "Staffel parallel verschoben", fmt: pct4 },
-  parRateFlat: { label: "Par-Satz konstant", unit: "ersetzt die Kuponstaffel", fmt: pct4 },
+  parRateBase: { label: "Par-Satz (Basis, Staffel konstant)", fmt: pct4 },
+  parRateFlat: { label: "Par-Satz (flach)", fmt: pct4 },
   fairSpread: { label: "Fairer Spread", fmt: (v) => fmtBp(v, 1) },
   fixedRate: { label: "Festsatz", fmt: pct4 },
   annuity: { label: "Annuität", unit: "Σ DF·τ·Nominal", fmt: money },
@@ -76,9 +76,10 @@ export const METRICS: Record<string, MetricDef> = {
   rhoForeign: { label: "Rho Basis-Ccy", unit: "je 1 bp", fmt: money, section: "risk" },
   // FX
   deltaBase: { label: "Spot-Delta", unit: "Basis-Ccy", fmt: money, section: "risk" },
-  /** Core: PV change (reporting ccy) for +1 % spot – a money amount, not a percentage (N-01). */
-  deltaPct: { label: "FX-Delta", unit: "je +1 % Spot", fmt: money, section: "risk" },
-  deltaAmount: { label: "FX-Delta", unit: "je +1 % Spot", fmt: money, section: "risk" },
+  /** Core: signed spot delta as a fraction of the base notional (−1 … +1), shown in % (N-01). */
+  deltaPct: { label: "Delta (Spot)", unit: "Anteil Basis-Nominal", fmt: (v) => fmtPct(v, 2), section: "risk" },
+  /** Core: PV change (reporting ccy) for +1 % spot – a money amount. */
+  deltaAmount: { label: "Delta-Betrag je +1 % Spot", fmt: money, section: "risk" },
   fxDelta: { label: "FX-Delta", unit: "je +1 % Spot", fmt: money, section: "risk" },
   fxDeltaSellCurrency: { label: "FX-Delta Verkaufswährung", unit: "je +1 % Spot", fmt: money, section: "risk" },
   contractRate: { label: "Kontraktkurs", fmt: num4 },
@@ -196,6 +197,38 @@ export function analyticsRows(analytics: Record<string, number | string | undefi
   return rows;
 }
 
+/** German labels of `PricingResult.details` (ISO date strings and identifiers). */
+const DETAIL_LABELS: Record<string, string> = {
+  spotDate: "Spot-Datum",
+  fixingDate: "Fixing-Datum",
+  settlementDate: "Settlement-Datum",
+  maturity: "Fälligkeit",
+  expiryDate: "Verfall",
+  deliveryDate: "Lieferung",
+  paymentDate: "Zahlung",
+};
+
+export interface DetailRow {
+  k: string;
+  label: string;
+  v: string;
+}
+
+/**
+ * Rows for `result.details`: ISO dates are rendered as dd.mm.yyyy, other
+ * strings pass through; unknown keys get a humanised label.
+ */
+export function detailRows(details: Record<string, string | undefined> | undefined): DetailRow[] {
+  if (!details) return [];
+  const out: DetailRow[] = [];
+  for (const [k, v] of Object.entries(details)) {
+    if (!v) continue;
+    const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+    out.push({ k, label: DETAIL_LABELS[k] ?? humanize(k), v: iso ? `${iso[3]}.${iso[2]}.${iso[1]}` : v });
+  }
+  return out;
+}
+
 /** Label of a bucketed risk key such as "EUR:1Y" or "EURUSD" → "EUR 1Y". */
 export function bucketLabel(key: string): string {
   return key.replace(/:/g, " ");
@@ -216,7 +249,12 @@ export const METRIC_DEFINITIONS: Record<string, string> = {
   ifrs13:
     "IFRS 13 Fair-Value-Hierarchie: Level 1 = notierte Preise, Level 2 = beobachtbare Inputs (OTC-Vanillas auf Kurven/Vols), Level 3 = wesentliche nicht beobachtbare Inputs (z. B. Vol-Override, Extrapolation).",
   parRate: "Par-Satz: Festsatz, bei dem der Swap einen Barwert von null hat.",
+  parRateBase:
+    "Par-Satz (Basis): Kupon der ersten offenen Periode, der den Barwert auf null bringt, wobei alle Stufen der Kuponstaffel (r_i − r_0) konstant bleiben.",
+  parRateFlat: "Par-Satz (flach): der einheitliche Kupon, der die gesamte Kuponstaffel ersetzt und den Barwert auf null bringt.",
   fairSpread: "Fairer Spread: Aufschlag auf das erste variable Leg, der den Basis-Swap auf Barwert null bringt.",
+  fairBasisSpread:
+    "Fairer Basis-Spread: Aufschlag auf das Spread-Leg (Leg 1) des Cross-Currency-Swaps, der beide Legs inkl. Nominalaustausch auf Barwert null bringt.",
   keyRate: "Key-Rate-Delta: Barwertänderung bei +1 bp auf einem einzelnen Kurvenpillar (Summe ≈ DV01).",
   parRisk: "Par-Sensitivität: Barwertänderung bei +1 bp auf einer Marktquote (Deposit, FRA, Future, Swap) mit Neu-Bootstrapping aller abhängigen Kurven.",
   hedgeRatio: "Hedge Ratio: Anteil des Grundgeschäfts, der durch das Sicherungsinstrument abgesichert wird (IFRS 9 6.3.7).",

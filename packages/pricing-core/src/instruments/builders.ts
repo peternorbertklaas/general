@@ -2,7 +2,7 @@ import { getIndex, getSwapConventions } from "../curves/index-definitions.js";
 import { type CalendarId, addBusinessDays, advance, getCalendar } from "../dates/calendar.js";
 import { type SerialDate, addTenor, immDate, nextImmDate, today, toYMD } from "../dates/date.js";
 import { buildSchedule, frequencyPerYear } from "../dates/schedule.js";
-import { formatDe } from "../format.js";
+import { formatDe, formatPctDe } from "../format.js";
 import { fxSpotDateFrom, pipFactor } from "../market/fx-spot.js";
 import {
   type CapFloor,
@@ -22,6 +22,28 @@ let counter = 0;
 export function nextTradeId(prefix = "T"): string {
   counter += 1;
   return `${prefix}-${Date.now().toString(36)}-${counter}`;
+}
+
+/**
+ * Default trade names are German display strings (decimal comma, "EUR/USD"
+ * pair notation, German product words) – the same form the UI shows, so no
+ * client-side translation of core names is needed.
+ */
+function pairDe(pair: string): string {
+  const p = pair.replace("/", "").toUpperCase();
+  return `${p.slice(0, 3)}/${p.slice(3, 6)}`;
+}
+
+/** Rate quote for names: decimal comma, `digits` decimals, e.g. rateDe(0.031, 3) → "3,100 %". */
+function rateDe(rate: number, digits = 3): string {
+  return formatPctDe(rate, digits);
+}
+
+/** FX rate / strike for names: decimal comma, trailing zeros trimmed to at least 4 decimals (1.18 → "1,1800"). */
+function fxRateDe(rate: number): string {
+  const s = String(rate);
+  const decimals = s.includes(".") ? s.split(".")[1]!.length : 0;
+  return formatDe(rate, Math.max(4, Math.min(decimals, 6)));
 }
 
 export interface VanillaSwapParams {
@@ -67,7 +89,10 @@ export function makeVanillaSwap(p: VanillaSwapParams): InterestRateSwap {
     id: p.id ?? nextTradeId("IRS"),
     name:
       p.name ??
-      `${p.payReceiveFixed === "Pay" ? "Payer" : "Receiver"} ${p.currency} ${typeof p.maturity === "string" ? p.maturity : ""} @ ${(p.fixedRate * 100).toFixed(3)}%${rateSchedule ? " (Step-up)" : ""}`,
+      `${p.payReceiveFixed === "Pay" ? "Payer" : "Receiver"}-Swap ${p.currency} ${typeof p.maturity === "string" ? p.maturity : ""} @ ${rateDe(p.fixedRate)}${rateSchedule ? " (Step-up)" : ""}`.replace(
+        /\s+/g,
+        " ",
+      ),
     type: "InterestRateSwap",
     counterparty: p.counterparty,
     collateralCurrency: p.collateralCurrency,
@@ -127,7 +152,7 @@ export function makeCapFloor(p: {
   const maturity = typeof p.maturity === "string" ? addTenor(p.effectiveDate, p.maturity) : p.maturity;
   return {
     id: p.id ?? nextTradeId("CAP"),
-    name: `${p.capFloor} ${p.currency} ${typeof p.maturity === "string" ? p.maturity : ""} @ ${(p.strike * 100).toFixed(2)}%`,
+    name: `${p.capFloor} ${p.currency} ${typeof p.maturity === "string" ? p.maturity : ""} @ ${rateDe(p.strike, 2)}`.replace(/\s+/g, " "),
     type: "CapFloor",
     capFloor: p.capFloor,
     payReceive: (p.longShort ?? "Long") === "Long" ? "Receive" : "Pay",
@@ -173,7 +198,7 @@ export function makeSwaption(p: {
   });
   return {
     id: p.id ?? nextTradeId("SWPT"),
-    name: `${p.payerReceiver} swaption ${typeof p.expiry === "string" ? p.expiry : ""}x${p.tenor} @ ${(p.strike * 100).toFixed(3)}%`,
+    name: `${p.payerReceiver}-Swaption ${typeof p.expiry === "string" ? p.expiry : ""}×${p.tenor} @ ${rateDe(p.strike)}`,
     type: "Swaption",
     payReceive: (p.longShort ?? "Long") === "Long" ? "Receive" : "Pay",
     payerReceiver: p.payerReceiver,
@@ -199,7 +224,7 @@ export function makeFxForward(p: {
   const abs = Math.abs(p.baseAmount);
   return {
     id: p.id ?? nextTradeId("FXF"),
-    name: `${buyBase ? "Buy" : "Sell"} ${base}${quote} ${formatDe(abs, 0)} @ ${p.rate}`,
+    name: `${buyBase ? "Kauf" : "Verkauf"} ${pairDe(p.pair)} ${formatDe(abs, 0)} @ ${fxRateDe(p.rate)}`,
     type: "FxForward",
     buyCurrency: buyBase ? base : quote,
     buyAmount: buyBase ? abs : abs * p.rate,
@@ -230,7 +255,7 @@ export function makeFxOption(p: {
   const quote = p.pair.slice(3, 6).toUpperCase();
   return {
     id: p.id ?? nextTradeId("FXO"),
-    name: `${p.optionType} ${p.pair.toUpperCase()} ${formatDe(p.notional, 0)} @ ${p.strike}`,
+    name: `${p.optionType} ${pairDe(p.pair)} ${formatDe(p.notional, 0)} @ ${fxRateDe(p.strike)}`,
     type: "FxOption",
     payReceive: (p.longShort ?? "Long") === "Long" ? "Receive" : "Pay",
     optionType: p.optionType,
@@ -282,7 +307,9 @@ export function makeBasisSwap(p: {
   };
   return {
     id: p.id ?? nextTradeId("BASIS"),
-    name: p.name ?? `Basis ${p.receiveIndex} +${(p.spread * 1e4).toFixed(1)}bp vs ${p.payIndex} ${typeof p.maturity === "string" ? p.maturity : ""}`,
+    name:
+      p.name ??
+      `Basis-Swap ${p.receiveIndex} ${p.spread >= 0 ? "+" : ""}${formatDe(p.spread * 1e4, 1)} bp vs ${p.payIndex} ${typeof p.maturity === "string" ? p.maturity : ""}`.trim(),
     type: "InterestRateSwap",
     counterparty: p.counterparty,
     legs: [mk(p.receiveIndex, "Receive", p.spread), mk(p.payIndex, "Pay", 0)],
@@ -384,7 +411,7 @@ export function makeImmSwap(p: Omit<VanillaSwapParams, "effectiveDate" | "maturi
     ...p,
     effectiveDate: start,
     maturity: end,
-    name: p.name ?? `IMM ${p.currency} ${p.tenor} @ ${(p.fixedRate * 100).toFixed(3)}%`,
+    name: p.name ?? `IMM-Swap ${p.currency} ${p.tenor} @ ${rateDe(p.fixedRate)}`,
   });
   return { ...swap, legs: swap.legs.map((l) => ({ ...l, roll: "IMM" as const })) };
 }
@@ -497,15 +524,13 @@ export function makeCrossCurrencySwap(p: CrossCurrencySwapParams): CrossCurrency
   const legs: SwapLeg[] = spreadOn === "domestic" && p.fixedRate === undefined ? [domestic, foreign] : [foreign, domestic];
   const resetLeg = p.mtmResetLeg ?? "foreign";
   const resettingLegIndex = legs.indexOf(resetLeg === "foreign" ? foreign : domestic);
-  const bp = (p.spread * 1e4).toFixed(1);
+  const bp = formatDe(p.spread * 1e4, 1);
   const tenorLabel = typeof p.tenor === "string" ? p.tenor : "";
   const desc =
-    p.fixedRate !== undefined
-      ? `${(p.fixedRate * 100).toFixed(3)}% ${dom} vs ${frnIdx.name}`
-      : `${domIdx.name} ${p.spread >= 0 ? "+" : ""}${bp}bp vs ${frnIdx.name}`;
+    p.fixedRate !== undefined ? `${rateDe(p.fixedRate)} ${dom} vs ${frnIdx.name}` : `${domIdx.name} ${p.spread >= 0 ? "+" : ""}${bp} bp vs ${frnIdx.name}`;
   return {
     id: p.id ?? nextTradeId("CCS"),
-    name: p.name ?? `CCS ${dom}${frn} ${tenorLabel} ${desc}${p.mtmReset ? " (MtM-Reset)" : ""}`.replace(/\s+/g, " ").trim(),
+    name: p.name ?? `Cross-Currency-Swap ${dom}/${frn} ${tenorLabel} ${desc}${p.mtmReset ? " (MtM-Reset)" : ""}`.replace(/\s+/g, " ").trim(),
     type: "CrossCurrencySwap",
     counterparty: p.counterparty,
     collateralCurrency: p.collateralCurrency,
@@ -557,7 +582,7 @@ export function makeFra(p: {
   if (endDate <= startDate) throw new Error("makeFra: end must be after start");
   return {
     id: p.id ?? nextTradeId("FRA"),
-    name: p.name ?? `FRA ${p.currency} ${label} ${p.payReceive === "Pay" ? "Pay" : "Receive"} @ ${(p.rate * 100).toFixed(3)}%`.replace(/\s+/g, " "),
+    name: p.name ?? `FRA ${p.currency} ${label} ${p.payReceive === "Pay" ? "Zahler" : "Empfänger"} @ ${rateDe(p.rate)}`.replace(/\s+/g, " "),
     type: "FRA",
     payReceive: p.payReceive,
     notional: p.notional,
@@ -590,7 +615,7 @@ export function makeFxSwap(p: {
   const pips = (p.farRate - p.nearRate) * pipFactor(p.pair.slice(0, 3), p.pair.slice(3, 6));
   return {
     id: p.id ?? nextTradeId("FXS"),
-    name: `FX-Swap ${p.pair.toUpperCase()} ${formatDe(Math.abs(p.baseAmount), 0)} ${pips >= 0 ? "+" : ""}${pips.toFixed(1)} Pkt`,
+    name: `FX-Swap ${pairDe(p.pair)} ${formatDe(Math.abs(p.baseAmount), 0)} ${pips >= 0 ? "+" : ""}${formatDe(pips, 1)} Pkt`,
     type: "FxSwap",
     nearLeg,
     farLeg,

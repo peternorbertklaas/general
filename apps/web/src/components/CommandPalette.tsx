@@ -52,6 +52,7 @@ export function CommandPalette({ onHotkey }: Props) {
       compareIds: st.compareIds,
       trades: st.trades,
       results: st.results,
+      fxSpots: st.market.fxSpots,
     })),
   );
   const act = useStore.getState;
@@ -70,7 +71,7 @@ export function CommandPalette({ onHotkey }: Props) {
     return () => restoreFocus(prevFocus.current);
   }, []);
 
-  const parsed = useMemo(() => parseQuickEntry(q, s.valuationDate), [q, s.valuationDate]);
+  const parsed = useMemo(() => parseQuickEntry(q, s.valuationDate, { fxSpots: s.fxSpots }), [q, s.valuationDate, s.fxSpots]);
   const valDateCmd = useMemo(() => parseValuationDateCommand(q), [q]);
 
   const items = useMemo<Item[]>(() => {
@@ -87,6 +88,9 @@ export function CommandPalette({ onHotkey }: Props) {
       else if (h.id === "valdate") desc = fmtDate(s.valuationDate);
       else if (h.id === "doc.termsheet") desc = "Report wird bei Bedarf erzeugt";
       else if (h.id === "doc.suitability") desc = "§ 64 Abs. 4 WpHG";
+      else if (h.id === "doc.kid") desc = "PRIIPs-KID, VO (EU) 1286/2014";
+      else if (h.id === "doc.confirmation") desc = "Einzelabschluss unter DRV / ISDA";
+      else if (h.id === "export.portfolio") desc = `${s.trades.length} Trades · PV/DV01 je Kontrahent, Buch, Typ`;
       return {
         id: h.id,
         group: h.group,

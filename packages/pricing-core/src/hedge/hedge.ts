@@ -1,8 +1,10 @@
 import { getIndex, getSwapConventions } from "../curves/index-definitions.js";
 import { type SerialDate, toISO } from "../dates/date.js";
+import { yearFraction } from "../dates/daycount.js";
 import { buildSchedule } from "../dates/schedule.js";
-import { formatDe } from "../format.js";
+import { formatDateDe, formatDe } from "../format.js";
 import { annuityAmortisationSchedule, linearAmortisation, makeCapFloor, makeVanillaSwap } from "../instruments/builders.js";
+import { tradeTypeLabelDe } from "../instruments/labels.js";
 import {
   type CapFloor,
   type FixedLeg,
@@ -16,10 +18,13 @@ import {
   type TradeType,
 } from "../instruments/types.js";
 import { type MarketContext } from "../market/market-context.js";
+import { solveBracketed } from "../math/rootfind.js";
+import { capletVol } from "../models/vol-surfaces.js";
 import { fxForwardRate, splitPair } from "../pricing/fx-pricer.js";
 import { fxToReporting } from "../pricing/leg-pricer.js";
 import { priceTrade, tradeCurrencies } from "../pricing/price.js";
 import { STANDARD_SCENARIOS, type ScenarioDefinition, applyScenario } from "../risk/scenarios.js";
+import { capletSurfaceKeysFor } from "../risk/sensitivities.js";
 
 /**
  * Hedge accounting (Bilanzierung von Sicherungsbeziehungen) for IFRS 9 and
@@ -261,7 +266,12 @@ export interface HedgeEffectivenessReport {
   reportingCurrency: string;
   hedgeRatio: number;
   hedgingInstrument: { id: string; name?: string; type: TradeType; pv: number };
-  hypotheticalDerivative: { trade: Trade; pv: number };
+  /**
+   * The hypothetical derivative and its PV at the valuation date. `frozenVol`
+   * is set when `HedgeReportOptions.freezeDesignationVol` applied a
+   * `volOverride` taken from the designation market (decimal vol).
+   */
+  hypotheticalDerivative: { trade: Trade; pv: number; frozenVol?: number };
   criticalTerms: CriticalTermsResult;
   /** Prospective test: current market vs. shocked market (+100bp, or +10 % spot for FX hedges). */
   dollarOffsetProspective: DollarOffsetResult;
@@ -324,6 +334,20 @@ export interface HedgeReportOptions {
    * issued if that set contains parallel shocks only).
    */
   basisScenarios?: boolean;
+  /**
+   * Freeze the volatility of a hypothetical option (cap/floor, swaption, FX
+   * option) at designation: when true and `designationCtx` is given, the
+   * hypothetical gets a `volOverride` taken from the designation market's
+   * surface (FX option / swaption: smile vol at strike and expiry; cap/floor:
+   * the flat vol that reproduces the strip's designation-date PV, i.e. the
+   * implied flat cap vol at the strike). Subsequent PV changes of the
+   * hypothetical then stem from rates (and spot) only – the hedged item has no
+   * volatility exposure, so vol moves of the surface should not create
+   * ineffectiveness (IFRS 9 B6.5.5). Default false (the hypothetical is
+   * revalued on the current surface). Ignored when the hypothetical already
+   * carries a `volOverride`.
+   */
+  freezeDesignationVol?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +632,42 @@ function instrumentLegs(trade: Trade): SwapLeg[] {
   return [];
 }
 
+/** Schedule parameters of the leg / strip whose period starts define the notional path comparison. */
+interface PeriodSource {
+  effectiveDate: SerialDate;
+  terminationDate: SerialDate;
+  frequency: string;
+  calendar: SwapLeg["calendar"];
+  businessDayConvention?: SwapLeg["businessDayConvention"];
+  stub?: SwapLeg["stub"];
+  endOfMonth?: boolean;
+  roll?: SwapLeg["roll"];
+}
+
+/**
+ * Notional path of an IR hedging instrument in the hedged currency: the leg in
+ * that currency (swaps, swaption underlying) or the cap/floor strip itself,
+ * with its `notionalSchedule` when it amortises.
+ */
+function instrumentNotionalPath(trade: Trade, hedgedCcy: string): { periods?: PeriodSource; schedule?: { date: SerialDate; notional: number }[] } {
+  if (trade.type === "CapFloor") {
+    return {
+      periods: {
+        effectiveDate: trade.effectiveDate,
+        terminationDate: trade.terminationDate,
+        frequency: trade.frequency,
+        calendar: trade.calendar,
+        businessDayConvention: trade.businessDayConvention,
+        stub: trade.stub,
+      },
+      schedule: trade.notionalSchedule,
+    };
+  }
+  const legs = instrumentLegs(trade);
+  const leg = legs.find((l) => l.currency.toUpperCase() === hedgedCcy) ?? legs[0];
+  return leg ? { periods: leg, schedule: leg.notionalSchedule } : {};
+}
+
 // ---------------------------------------------------------------------------
 // Hypothetical derivative
 // ---------------------------------------------------------------------------
@@ -627,13 +687,15 @@ function instrumentLegs(trade: Trade): SwapLeg[] {
  *   `maturityDate`, in the direction of the hedging instrument (default: sell
  *   the foreign currency for an inflow, buy for an outflow).
  * - Amortising items (`notionalSchedule` / `amortisation`): the notional path
- *   is transferred to both legs of the hypothetical swap.
+ *   is transferred to both legs of the hypothetical swap (or to the
+ *   hypothetical cap's `notionalSchedule`).
  * - Cap/floor as hedging instrument (IFRS 9 B6.5.29, IDW RS HFA 35 Tz. 60):
- *   a hypothetical cap/floor with the hedged item's currency, notional, dates
- *   and index, the instrument's strike(s), direction and model; volatility
- *   from the market the hypothetical is valued in (the designation market when
- *   given). FX option as hedging instrument: a hypothetical option with the
- *   same strike, expiry, delivery and type on the hedged amount.
+ *   a hypothetical cap/floor with the hedged item's currency, notional (path),
+ *   dates and index, the instrument's strike(s), direction and model;
+ *   volatility from the market the hypothetical is valued in (the designation
+ *   market when given; frozen with `freezeDesignationVol`). FX option as
+ *   hedging instrument: a hypothetical option with the same strike, expiry,
+ *   delivery and type on the hedged amount.
  *
  * @throws when terms are insufficient (unknown counter currency, matured item, no par rate).
  */
@@ -720,6 +782,7 @@ export function hypotheticalDerivative(ctx: MarketContext, rel: HedgeRelationshi
       shift: hedgingInstrument.shift,
       volOverride: hedgingInstrument.volOverride,
       frequency: hedgingInstrument.frequency,
+      ...(schedule ? { notionalSchedule: schedule } : {}),
     };
   }
 
@@ -764,8 +827,8 @@ export function criticalTermsMatch(
   const instNotional = terms.notional !== undefined ? Math.abs(terms.notional) : undefined;
   checks.push({
     term: "notional",
-    hedgedItem: hedgedNotional.toFixed(2),
-    hedgingInstrument: instNotional !== undefined ? instNotional.toFixed(2) : "n/a",
+    hedgedItem: formatDe(hedgedNotional, 2),
+    hedgingInstrument: instNotional !== undefined ? formatDe(instNotional, 2) : "n/a",
     applicable: instNotional !== undefined,
     match:
       instNotional !== undefined && Math.abs(instNotional - hedgedNotional) <= notionalTolerance * Math.max(Math.abs(instNotional), Math.abs(hedgedNotional)),
@@ -783,8 +846,8 @@ export function criticalTermsMatch(
   const effApplicable = !fx && terms.effectiveDate !== undefined;
   checks.push({
     term: "effectiveDate",
-    hedgedItem: toISO(item.effectiveDate),
-    hedgingInstrument: terms.effectiveDate !== undefined ? toISO(terms.effectiveDate) : "n/a",
+    hedgedItem: formatDateDe(item.effectiveDate),
+    hedgingInstrument: terms.effectiveDate !== undefined ? formatDateDe(terms.effectiveDate) : "n/a",
     applicable: effApplicable,
     match: effApplicable && Math.abs(terms.effectiveDate! - item.effectiveDate) <= toleranceDays,
   });
@@ -792,8 +855,8 @@ export function criticalTermsMatch(
   const matApplicable = terms.maturityDate !== undefined;
   checks.push({
     term: "maturityDate",
-    hedgedItem: toISO(item.maturityDate),
-    hedgingInstrument: terms.maturityDate !== undefined ? toISO(terms.maturityDate) : "n/a",
+    hedgedItem: formatDateDe(item.maturityDate),
+    hedgingInstrument: terms.maturityDate !== undefined ? formatDateDe(terms.maturityDate) : "n/a",
     applicable: matApplicable,
     match: matApplicable && Math.abs(terms.maturityDate! - item.maturityDate) <= toleranceDays,
   });
@@ -807,24 +870,23 @@ export function criticalTermsMatch(
     match: idxApplicable && item.index!.toUpperCase() === terms.index!.toUpperCase(),
   });
 
-  // Notional path (Tilgungsplan): compare the outstanding notional period-wise when either side amortises.
+  // Notional path (Tilgungsplan): compare the outstanding notional period-wise when either side amortises
+  // (swap legs, swaption underlying or an amortising cap/floor strip).
   if (!fx) {
     const itemSchedule = hedgedItemNotionalSchedule(rel);
-    const legs = instrumentLegs(hedgingInstrument);
-    const instLeg = legs.find((l) => l.currency.toUpperCase() === hedgedCcy) ?? legs[0];
-    const instSchedule = instLeg?.notionalSchedule;
+    const { periods: instPeriods, schedule: instSchedule } = instrumentNotionalPath(hedgingInstrument, hedgedCcy);
     const applicable = (itemSchedule !== undefined && itemSchedule.length > 0) || (instSchedule !== undefined && instSchedule.length > 0);
     if (applicable) {
-      const periodStarts = instLeg
+      const periodStarts = instPeriods
         ? buildSchedule({
-            effectiveDate: instLeg.effectiveDate,
-            terminationDate: instLeg.terminationDate,
-            frequency: instLeg.frequency,
-            calendar: instLeg.calendar,
-            businessDayConvention: instLeg.businessDayConvention ?? "ModifiedFollowing",
-            stub: instLeg.stub ?? "ShortFront",
-            endOfMonth: instLeg.endOfMonth ?? false,
-            roll: instLeg.roll,
+            effectiveDate: instPeriods.effectiveDate,
+            terminationDate: instPeriods.terminationDate,
+            frequency: instPeriods.frequency,
+            calendar: instPeriods.calendar,
+            businessDayConvention: instPeriods.businessDayConvention ?? "ModifiedFollowing",
+            stub: instPeriods.stub ?? "ShortFront",
+            endOfMonth: instPeriods.endOfMonth ?? false,
+            roll: instPeriods.roll,
           }).periods.map((p) => p.accrualStart)
         : buildSchedule({ ...itemScheduleLeg(item) }).periods.map((p) => p.accrualStart);
       const instBase = instNotional ?? hedgedNotional;
@@ -832,11 +894,11 @@ export function criticalTermsMatch(
       const instPath = periodStarts.map((d) => scheduleValueAt(instSchedule, d, (e) => Math.abs(e.notional), instBase));
       const mismatches = periodStarts.filter((_, i) => Math.abs(instPath[i]! - itemPath[i]!) > notionalTolerance * Math.max(itemPath[i]!, instPath[i]!, 1e-12));
       const describe = (path: number[]) =>
-        `${path[0]!.toFixed(0)} → ${path[path.length - 1]!.toFixed(0)} (${path.length} Perioden${path.some((n) => Math.abs(n - path[0]!) > 1e-9) ? ", amortisierend" : ", konstant"})`;
+        `${formatDe(path[0]!, 0)} → ${formatDe(path[path.length - 1]!, 0)} (${path.length} Perioden${path.some((n) => Math.abs(n - path[0]!) > 1e-9) ? ", amortisierend" : ", konstant"})`;
       checks.push({
         term: "notionalSchedule",
         hedgedItem: describe(itemPath),
-        hedgingInstrument: `${describe(instPath)}${mismatches.length ? `; Abweichung in ${mismatches.length} Periode(n), erste ${toISO(mismatches[0]!)}` : ""}`,
+        hedgingInstrument: `${describe(instPath)}${mismatches.length ? `; Abweichung in ${mismatches.length} Periode(n), erste ${formatDateDe(mismatches[0]!)}` : ""}`,
         applicable: true,
         match: mismatches.length === 0,
       });
@@ -1166,6 +1228,45 @@ export function hgbSplit(deltaHedge: number, deltaHypothetical: number, assessab
 }
 
 // ---------------------------------------------------------------------------
+// Volatility at designation (frozen hypothetical option vol)
+// ---------------------------------------------------------------------------
+
+/**
+ * Volatility (decimal, in the hypothetical's model units) the designation
+ * market implies for a hypothetical option, to be frozen as `volOverride`:
+ * - FX option / swaption: the surface vol at the option's strike and expiry
+ *   (`analytics.volatility` of the designation-date valuation).
+ * - Cap/floor/collar: the flat vol that reproduces the strip's PV on the
+ *   designation market (implied flat cap vol); falls back to the caplet
+ *   surface vol at the strike and the last caplet expiry when no root exists
+ *   (e.g. zero PV of a deep out-of-the-money strip).
+ * Returns undefined when the option already carries a `volOverride` or no
+ * volatility can be determined.
+ */
+export function designationVol(designationCtx: MarketContext, hypothetical: Trade, reportingCurrency: string): number | undefined {
+  if (!isOptionTrade(hypothetical) || hypothetical.volOverride !== undefined) return undefined;
+  const priced = priceTrade(designationCtx, hypothetical, reportingCurrency);
+  if (hypothetical.type !== "CapFloor") {
+    const v = priced.analytics.volatility;
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+  }
+  // Cap/floor: implied flat vol of the strip on the designation market.
+  const key = capletSurfaceKeysFor(designationCtx, hypothetical)[0];
+  const surface = key ? designationCtx.capletVols?.[key] : undefined;
+  const tLast = Math.max(1e-6, yearFraction(designationCtx.valuationDate, hypothetical.terminationDate, "ACT/365F"));
+  const fallback = surface ? capletVol(surface, tLast, hypothetical.strike) : undefined;
+  const target = priced.pv;
+  const pvAt = (vol: number) => priceTrade(designationCtx, { ...hypothetical, volOverride: vol }, reportingCurrency).pv - target;
+  const guess = fallback ?? (priced.analytics.model === "Bachelier" ? 0.006 : 0.2);
+  try {
+    const vol = solveBracketed(pvAt, guess, guess * 0.25, { minX: 1e-6, maxX: 10, tolerance: 1e-12 });
+    return Number.isFinite(vol) && vol > 0 ? vol : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
 
@@ -1200,7 +1301,7 @@ export function hedgeEffectivenessReport(
   const designationCtx = opts.designationCtx;
   if (designationCtx && designationCtx.valuationDate !== rel.designationDate) {
     warnings.push(
-      `Stichtag der Designationsmarktdaten (${toISO(designationCtx.valuationDate)}) weicht vom Designationsdatum (${toISO(rel.designationDate)}) ab.`,
+      `Stichtag der Designationsmarktdaten (${formatDateDe(designationCtx.valuationDate)}) weicht vom Designationsdatum (${formatDateDe(rel.designationDate)}) ab.`,
     );
   }
   if (!designationCtx) {
@@ -1214,10 +1315,10 @@ export function hedgeEffectivenessReport(
 
   const terms = instrumentTerms(hedgingInstrument, hedgedCcy);
   if (terms.maturityDate !== undefined && terms.maturityDate <= ctx.valuationDate) {
-    warnings.push(`Sicherungsinstrument ist am Bewertungsstichtag bereits fällig (${toISO(terms.maturityDate)}).`);
+    warnings.push(`Sicherungsinstrument ist am Bewertungsstichtag bereits fällig (${formatDateDe(terms.maturityDate)}).`);
   }
   if (item.maturityDate <= ctx.valuationDate) {
-    warnings.push(`Grundgeschäft ist am Bewertungsstichtag bereits fällig (${toISO(item.maturityDate)}).`);
+    warnings.push(`Grundgeschäft ist am Bewertungsstichtag bereits fällig (${formatDateDe(item.maturityDate)}).`);
   }
   const portion = hedgedPortionNotional(rel);
   if (terms.notional !== undefined && portion > 0) {
@@ -1231,7 +1332,22 @@ export function hedgeEffectivenessReport(
 
   // Hypothetical derivative at designation (or current market as proxy).
   const hypoCtx = designationCtx ?? ctx;
-  const hypothetical = opts.hypothetical ?? hypotheticalDerivative(hypoCtx, rel, hedgingInstrument);
+  let hypothetical = opts.hypothetical ?? hypotheticalDerivative(hypoCtx, rel, hedgingInstrument);
+  let frozenVol: number | undefined;
+  if (opts.freezeDesignationVol) {
+    if (!designationCtx) {
+      warnings.push(
+        "Volatilität zum Designationszeitpunkt kann ohne Designationsmarktdaten nicht eingefroren werden – hypothetisches Derivat wird auf der aktuellen Fläche bewertet.",
+      );
+    } else if (isOptionTrade(hypothetical) && hypothetical.volOverride === undefined) {
+      frozenVol = designationVol(designationCtx, hypothetical, ccy);
+      if (frozenVol !== undefined) hypothetical = { ...hypothetical, volOverride: frozenVol };
+      else
+        warnings.push(
+          "Volatilität des hypothetischen Derivats konnte aus den Designationsmarktdaten nicht bestimmt werden – Bewertung auf der aktuellen Fläche.",
+        );
+    }
+  }
   const pvHedge = pv(ctx, hedgingInstrument, ccy, pricingWarnings);
   const pvHypo = pv(ctx, hypothetical, ccy, pricingWarnings);
 
@@ -1383,6 +1499,7 @@ export function hedgeEffectivenessReport(
     designation,
     costOfHedging,
     hypothetical,
+    frozenVol,
   });
 
   return {
@@ -1398,7 +1515,7 @@ export function hedgeEffectivenessReport(
     reportingCurrency: ccy,
     hedgeRatio: ratio,
     hedgingInstrument: { id: hedgingInstrument.id, name: hedgingInstrument.name, type: hedgingInstrument.type, pv: pvHedge },
-    hypotheticalDerivative: { trade: hypothetical, pv: pvHypo },
+    hypotheticalDerivative: { trade: hypothetical, pv: pvHypo, ...(frozenVol !== undefined ? { frozenVol } : {}) },
     criticalTerms,
     dollarOffsetProspective,
     dollarOffsetBasis,
@@ -1489,6 +1606,7 @@ interface SummaryInput {
   designation: HedgeDesignation;
   costOfHedging?: CostOfHedging;
   hypothetical: Trade;
+  frozenVol?: number;
 }
 
 const AMORTISATION_LABELS: Record<HedgedItemAmortisation["type"], string> = {
@@ -1504,7 +1622,7 @@ function buildSummary(s: SummaryInput): string[] {
   const frameworkLabel = rel.accountingFramework === "IFRS9" ? "IFRS 9" : "HGB § 254 (BilMoG, IDW RS HFA 35)";
   const out: string[] = [];
   out.push(
-    `Sicherungsbeziehung „${rel.name}“ (${rel.id}): ${typeLabel} nach ${frameworkLabel}, designiert am ${toISO(rel.designationDate)}, Bewertungsstichtag ${toISO(s.valuationDate)}.`,
+    `Sicherungsbeziehung „${rel.name}“ (${rel.id}): ${typeLabel} nach ${frameworkLabel}, designiert am ${formatDateDe(rel.designationDate)}, Bewertungsstichtag ${formatDateDe(s.valuationDate)}.`,
   );
   const amort = item.notionalSchedule?.length
     ? `, Tilgungsplan (${item.notionalSchedule.length} Stufen)`
@@ -1512,11 +1630,16 @@ function buildSummary(s: SummaryInput): string[] {
       ? `, ${AMORTISATION_LABELS[item.amortisation.type]}`
       : "";
   out.push(
-    `Grundgeschäft: ${item.description} (${KIND_LABELS[item.kind]}, ${fmtAmount(Math.abs(item.amount ?? item.notional), item.currency)}${item.index ? `, ${item.index}` : ""}${item.fixedRate !== undefined ? `, Kupon ${fmtPct(item.fixedRate, 3)}` : ""}${amort}, ${toISO(item.effectiveDate)} – ${toISO(item.maturityDate)}); gesicherter Anteil ${fmtPct(s.ratio, 1)} = ${fmtAmount(s.portion, item.currency)}.`,
+    `Grundgeschäft: ${item.description} (${KIND_LABELS[item.kind]}, ${fmtAmount(Math.abs(item.amount ?? item.notional), item.currency)}${item.index ? `, ${item.index}` : ""}${item.fixedRate !== undefined ? `, Kupon ${fmtPct(item.fixedRate, 3)}` : ""}${amort}, ${formatDateDe(item.effectiveDate)} – ${formatDateDe(item.maturityDate)}); gesicherter Anteil ${fmtPct(s.ratio, 1)} = ${fmtAmount(s.portion, item.currency)}.`,
   );
   out.push(
-    `Sicherungsinstrument: ${s.hedgingInstrument.name ?? s.hedgingInstrument.id} (${s.hedgingInstrument.type}), Barwert ${fmtAmount(s.pvHedge, ccy)}; hypothetisches Derivat (${s.hypothetical.type}) Barwert ${fmtAmount(s.pvHypo, ccy)}.`,
+    `Sicherungsinstrument: ${s.hedgingInstrument.name ?? s.hedgingInstrument.id} (${tradeTypeLabelDe(s.hedgingInstrument.type)}), Barwert ${fmtAmount(s.pvHedge, ccy)}; hypothetisches Derivat (${tradeTypeLabelDe(s.hypothetical.type)}) Barwert ${fmtAmount(s.pvHypo, ccy)}.`,
   );
+  if (s.frozenVol !== undefined) {
+    out.push(
+      `Volatilität des hypothetischen Derivats zum Designationszeitpunkt eingefroren (${s.hypothetical.type === "CapFloor" && (s.hypothetical.model ?? "Bachelier") === "Bachelier" ? `${fmtNum(s.frozenVol * 1e4, 2)} bp Normal-Vol` : fmtPct(s.frozenVol, 3)}) – Wertänderungen des hypothetischen Derivats resultieren nur aus Zins-/Kursänderungen, nicht aus Volatilitätsbewegungen.`,
+    );
+  }
   if (isOptionTrade(s.hedgingInstrument)) {
     if (s.designation === "IntrinsicValue" && s.costOfHedging) {
       const c = s.costOfHedging;

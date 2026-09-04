@@ -8,16 +8,22 @@ import {
   type InterpolationMethod,
   type SampleMarketQuotes,
   bootstrapCurves,
+  bumpQuote,
+  parseISO,
   quoteDates,
   quoteLabel,
   sampleBootstrapSpecs,
+  toISO,
 } from "@deriva/pricing-core";
+import { DateInput } from "../components/DateInput.js";
 import { EChart, cssVar } from "../components/EChart.js";
 import { NumInput } from "../components/NumInput.js";
 import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
 import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { translatePricingError } from "../lib/i18n.js";
 import { marketModified, useStore } from "../state/store.js";
+
+export { bumpQuote };
 
 const QUOTE_SETS: { key: keyof Omit<SampleMarketQuotes, "fxSpots">; curveId: string; label: string; title: string }[] = [
   { key: "eurOis", curveId: "EUR-ESTR", label: "€STR", title: "EUR €STR OIS" },
@@ -26,6 +32,7 @@ const QUOTE_SETS: { key: keyof Omit<SampleMarketQuotes, "fxSpots">; curveId: str
   { key: "usdSofr", curveId: "USD-SOFR", label: "SOFR", title: "USD SOFR OIS" },
   { key: "gbpSonia", curveId: "GBP-SONIA", label: "SONIA", title: "GBP SONIA OIS" },
   { key: "chfSaron", curveId: "CHF-SARON", label: "SARON", title: "CHF SARON OIS" },
+  { key: "jpyTona", curveId: "JPY-TONA", label: "TONA", title: "JPY TONA OIS" },
   { key: "eurUsdXccy", curveId: "EUR-ESTR-USDCSA", label: "EUR/USD CSA", title: "EUR Diskont unter USD-CSA (Xccy-Basis)" },
 ];
 
@@ -34,8 +41,15 @@ const INTERPOLATIONS: { v: InterpolationMethod; l: string }[] = [
   { v: "linearZero", l: "linear (Zero)" },
   { v: "cubicSplineZero", l: "kubischer Spline (Zero)" },
   { v: "flatForward", l: "flat forward" },
-  { v: "monotoneConvex" as InterpolationMethod, l: "Monotone Convex (Hagan–West)" },
+  { v: "monotoneConvex", l: "monoton-konvex (Hagan–West)" },
 ];
+
+/** Next 31 December after the valuation date (default turn-of-year window start). */
+export function nextYearEnd(valuationDate: number): number {
+  const year = Number(toISO(valuationDate).slice(0, 4));
+  const ye = parseISO(`${year}-12-31`);
+  return ye > valuationDate ? ye : parseISO(`${year + 1}-12-31`);
+}
 
 /** Editable numeric value of a quote (rate, futures price, basis spread or swap points) with unit handling. */
 export function quoteValue(q: CurveQuote): { value: number; unit: "%" | "Preis" | "bp" | "Pkt"; step: number; digits: number } {
@@ -77,21 +91,6 @@ export function withQuoteValue(q: CurveQuote, v: number): CurveQuote {
   }
 }
 
-/** Bump one quote by `bp` basis points in its own unit (futures price moves inversely; swap points are left untouched). */
-export function bumpQuote(q: CurveQuote, bp: number): CurveQuote {
-  switch (q.type) {
-    case "Future":
-      return { ...q, price: q.price - bp / 100 };
-    case "BasisSwap":
-    case "XccyBasis":
-      return { ...q, spread: q.spread + bp * 1e-4 };
-    case "FxSwapPoints":
-      return q;
-    default:
-      return { ...q, rate: q.rate + bp * 1e-4 };
-  }
-}
-
 const INTERP_ALLOWED = new Set<string>(INTERPOLATIONS.map((i) => i.v));
 
 export function CurvesView() {
@@ -99,6 +98,7 @@ export function CurvesView() {
     useShallow((st) => ({
       quotes: st.quotes,
       interpolation: st.interpolation,
+      turnOfYear: st.turnOfYear,
       baseMarket: st.baseMarket,
       valuationDate: st.valuationDate,
     })),
@@ -113,6 +113,14 @@ export function CurvesView() {
   const cmp = cmpId ? (s.baseMarket.curves[cmpId] as InterpolatedCurve | undefined) : undefined;
   const modified = marketModified(s);
   const override = s.interpolation[set.curveId];
+  const storedToy = s.turnOfYear[set.curveId];
+  // Turn-of-year inputs: local draft per curve, seeded from the stored jump (or the next 31 Dec / 0 bp).
+  const [toyDraft, setToyDraft] = useState<{ curveId: string; date: number; bp: number } | null>(null);
+  const toy =
+    toyDraft && toyDraft.curveId === set.curveId
+      ? toyDraft
+      : { curveId: set.curveId, date: storedToy?.date ?? nextYearEnd(s.valuationDate), bp: storedToy?.bp ?? 0 };
+  const toyDirty = storedToy ? storedToy.date !== toy.date || storedToy.bp !== toy.bp : toy.bp !== 0;
   const pillarNav = useTableNav({ onCopied: () => useStore.getState().showToast("Pillar kopiert") });
 
   const series = useMemo(() => {
@@ -143,7 +151,9 @@ export function CurvesView() {
     try {
       const spec = specs[set.curveId];
       if (!spec) return null;
-      const result = bootstrapCurves(s.valuationDate, [{ ...spec, interpolation: override ?? spec.interpolation }], s.baseMarket.curves).results[set.curveId];
+      const toyList = storedToy && storedToy.date > s.valuationDate && storedToy.bp !== 0 ? [{ date: storedToy.date, bp: storedToy.bp }] : undefined;
+      const result = bootstrapCurves(s.valuationDate, [{ ...spec, interpolation: override ?? spec.interpolation, turnOfYear: toyList }], s.baseMarket.curves)
+        .results[set.curveId];
       const dates = spec.quotes.map((q) => {
         try {
           return quoteDates(s.valuationDate, spec, q);
@@ -155,7 +165,7 @@ export function CurvesView() {
     } catch {
       return null;
     }
-  }, [specs, s.valuationDate, set.curveId, s.baseMarket.curves, override]);
+  }, [specs, s.valuationDate, set.curveId, s.baseMarket.curves, override, storedToy]);
 
   const applyQuotes = (next: SampleMarketQuotes, label: string) => {
     if (!useStore.getState().setQuotes(next, label)) useStore.getState().showToast("Bootstrap fehlgeschlagen – Quote nicht übernommen");
@@ -183,6 +193,22 @@ export function CurvesView() {
       st.showToast(`Bootstrap fehlgeschlagen: ${translatePricingError(e)}`);
     }
   };
+  const applyToy = () => {
+    const st = useStore.getState();
+    const ok = st.setTurnOfYear(set.curveId, toy.bp === 0 ? undefined : { date: toy.date, bp: toy.bp });
+    if (!ok) st.showToast("Bootstrap mit Turn-of-Year fehlgeschlagen");
+    else
+      st.showToast(
+        toy.bp === 0
+          ? `Turn-of-Year ${set.curveId} entfernt`
+          : `Turn-of-Year ${set.curveId}: ${fmtDate(toy.date)} ${toy.bp > 0 ? "+" : ""}${fmtNum(toy.bp, 1)} bp`,
+      );
+    setToyDraft(null);
+  };
+  const removeToy = () => {
+    useStore.getState().setTurnOfYear(set.curveId, undefined);
+    setToyDraft(null);
+  };
   const original = (i: number): CurveQuote | undefined => SAMPLE_QUOTES[set.key]?.[i];
   const isEdited = (i: number, q: CurveQuote) => JSON.stringify(original(i)) !== JSON.stringify(q);
   const interpValue = override ?? curve?.interpolation ?? "logLinear";
@@ -204,6 +230,7 @@ export function CurvesView() {
             >
               {q.label}
               {s.interpolation[q.curveId] && <span className="dot warn" aria-label="Interpolation überschrieben" />}
+              {s.turnOfYear[q.curveId] && <span className="dot warn" aria-label="Turn-of-Year gesetzt" />}
             </button>
           ))}
         </div>
@@ -239,10 +266,40 @@ export function CurvesView() {
             </span>
           )}
         </label>
+        <label
+          className="row"
+          style={{ gap: 6 }}
+          title="Turn-of-Year: Sprung des Instantan-Forwards über den Jahreswechsel (Fenster ab Datum, 1 Tag) in bp – Pillars werden neu gelöst"
+        >
+          <span className="muted small">Turn-of-Year</span>
+          <DateInput inline value={toy.date} ariaLabel="Turn-of-Year Datum" onChange={(v) => setToyDraft({ curveId: set.curveId, date: v, bp: toy.bp })} />
+          <span style={{ display: "inline-block", width: 96 }}>
+            <NumInput
+              inline
+              value={toy.bp}
+              step={5}
+              digits={1}
+              unit="bp"
+              ariaLabel="Turn-of-Year bp"
+              testId="toy-bp"
+              onChange={(v) => setToyDraft({ curveId: set.curveId, date: toy.date, bp: v })}
+              onCommit={() => undefined}
+            />
+          </span>
+          <button className="btn xs" onClick={applyToy} disabled={!toyDirty} data-testid="toy-apply" title="Turn-of-Year auf die Kurve anwenden (Bootstrap)">
+            Anwenden
+          </button>
+          {storedToy && (
+            <button className="btn ghost xs" onClick={removeToy} title="Turn-of-Year entfernen">
+              ✕
+            </button>
+          )}
+        </label>
         <div className="grow" />
         {modified && (
-          <span className="chip warn" title="Quotes, Spots oder Interpolation weichen vom Sample-Markt ab" data-testid="market-modified-chip">
+          <span className="chip warn" title="Quotes, Spots, Interpolation oder Turn-of-Year weichen vom Sample-Markt ab" data-testid="market-modified-chip">
             <span className="dot" /> Markt modifiziert{overrideCount > 0 ? ` · ${overrideCount} Interpolation` : ""}
+            {Object.keys(s.turnOfYear).length > 0 ? ` · ${Object.keys(s.turnOfYear).length} Turn-of-Year` : ""}
           </span>
         )}
         <button className="btn" onClick={() => bumpAll(10)}>
@@ -257,6 +314,8 @@ export function CurvesView() {
             const st = useStore.getState();
             st.resetQuotes();
             for (const id of Object.keys(st.interpolation)) st.setInterpolation(id, undefined);
+            for (const id of Object.keys(st.turnOfYear)) st.setTurnOfYear(id, undefined);
+            setToyDraft(null);
           }}
           disabled={!modified}
         >
@@ -271,6 +330,11 @@ export function CurvesView() {
             <span className="right muted xs">
               {INTERPOLATIONS.find((x) => x.v === curve?.interpolation)?.l ?? curve?.interpolation} · {curve?.dayCount} · Referenz{" "}
               {curve && fmtDate(curve.referenceDate)}
+              {curve && curve.forwardJumps.length > 0 && (
+                <span className="badge warn" style={{ marginLeft: 6 }} data-testid="toy-badge">
+                  Turn-of-Year {curve.forwardJumps.map((j) => `${fmtDate(j.date)} ${j.bp > 0 ? "+" : ""}${fmtNum(j.bp, 1)} bp`).join(", ")}
+                </span>
+              )}
             </span>
           </h3>
           {series && (
@@ -291,9 +355,10 @@ export function CurvesView() {
             />
           )}
           <div className="muted xs" style={{ marginTop: 6 }}>
-            Multi-Curve: Diskontierung über OIS ({s.baseMarket.discountCurveId.EUR}), Projektion der EURIBOR-Forwards über die Tenor-Kurve
-            (Dual-Curve-Bootstrapping); Xccy-Basis liefert die USD-CSA-Diskontkurve. Interpolation je Kurve wählbar (Standard log-linear in Diskontfaktoren) –
-            ein Override wird gespeichert, überlebt den Stichtagswechsel und bootstrappt abhängige Kurven neu.
+            Multi-Curve: Diskontierung über OIS ({s.baseMarket.discountCurveId.EUR}; JPY über {s.baseMarket.discountCurveId.JPY ?? "–"}), Projektion der
+            EURIBOR-Forwards über die Tenor-Kurve (Dual-Curve-Bootstrapping); Xccy-Basis liefert die USD-CSA-Diskontkurve, FX-Swap-Punkte das kurze Ende
+            impliziter Kurven. Interpolation je Kurve wählbar (Standard log-linear in Diskontfaktoren, monoton-konvex nach Hagan–West für glatte Forwards) –
+            Override und Turn-of-Year werden gespeichert, überleben den Stichtagswechsel und bootstrappen abhängige Kurven neu.
           </div>
         </div>
         <div className="card">

@@ -125,6 +125,13 @@ export interface CapFloor extends TradeBase {
   strike: number;
   /** Floor strike for collars (long cap, short floor when payReceive=Receive). */
   floorStrike?: number;
+  /**
+   * Amortisation: outstanding notional per period (the last entry with `date`
+   * ≤ the period's accrual start applies, periods before the first entry use
+   * `notional`) – same rule as `LegBase.notionalSchedule`, so the hypothetical
+   * cap of an amortising hedged item carries the loan's notional path.
+   */
+  notionalSchedule?: { date: SerialDate; notional: number }[];
   businessDayConvention?: BusinessDayConvention;
   stub?: StubType;
   /** Model override: "Bachelier" (default) or "Black" / "ShiftedBlack". */
@@ -256,6 +263,16 @@ export interface PricingResult {
    * here – they live in `details` as ISO strings. The only legacy exception is
    * the swap `maturity` (serial date, kept for backward compatibility and
    * mirrored as `details.maturity`).
+   *
+   * FX delta contract (FxOption, FxForward, FxSwap):
+   * - `deltaAmount` – money amount in the reporting currency: PV change for a
+   *   +1 % spot move of the base currency (FX option: pair base; forward / FX
+   *   swap: the (near-leg) buy currency) against the other currency. Linear
+   *   instruments: ±(reporting-currency PV of the leg in the moving currency) × 1 %.
+   * - `deltaPct` – FX options only: the signed spot delta as a fraction of
+   *   the notional (long call ≈ +0,5 ATM, long put ≈ −0,5), i.e.
+   *   deltaAmount / (1 % of the notional in reporting currency); in [−1, 1]
+   *   for vanillas. Linear FX trades do not report it (their delta is ±1).
    */
   analytics: Record<string, number | string | undefined>;
   /**

@@ -27,6 +27,7 @@ export * from "./models/fx-vol-surface.js";
 // Instruments & pricing
 export * from "./instruments/types.js";
 export * from "./instruments/builders.js";
+export * from "./instruments/labels.js";
 export * from "./instruments/trade-dates.js";
 export * from "./pricing/leg-pricer.js";
 export * from "./pricing/swap-pricer.js";
@@ -44,4 +45,5 @@ export * from "./reporting/valuation-report.js";
 export * from "./market/snapshot.js";
 export * from "./reporting/emir.js";
 export * from "./reporting/documents.js";
+export * from "./reporting/portfolio-report.js";
 export * from "./hedge/hedge.js";

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App.js";
+import { newTradeTemplate } from "./lib/templates.js";
 import { useStore } from "./state/store.js";
 
 describe("App", () => {
@@ -278,6 +279,166 @@ describe("App", () => {
     click.mockRestore();
     act(() => useStore.getState().removeHedgeRelationship("IRS-0001"));
   }, 15000);
+  it("palette lists CCS / FRA templates from the keymap; n r creates an FRA, n z a CCS with the basis-spread key metric", async () => {
+    render(<App />);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const input = screen.getByRole("combobox", { name: "Befehl oder Schnelleingabe" }) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "Cross-Currency" } });
+    expect(screen.getByText("Neuer Cross-Currency-Swap")).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "Neues FRA" } });
+    expect(screen.getByText("Neues FRA")).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "ccs eurusd 5y -20bp 10m mtm" } });
+    expect(screen.getByText(/Trade anlegen: Cross-Currency-Swap EUR\/USD 5Y/)).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "Escape" });
+    const n = useStore.getState().trades.length;
+    fireEvent.keyDown(window, { key: "n" });
+    fireEvent.keyDown(window, { key: "r" });
+    expect(useStore.getState().trades.length).toBe(n + 1);
+    const fra = useStore.getState().trades[n]!;
+    expect(fra.type).toBe("FRA");
+    expect(fra.id).toMatch(/^FRA-\d{4}$/);
+    expect(useStore.getState().view).toBe("pricing");
+    await waitFor(() => expect(screen.getByLabelText("Index")).toBeInTheDocument());
+    expect(screen.getByTestId("pricing-details").textContent).toMatch(/Fixing-Datum \d{2}\.\d{2}\.\d{4}/);
+    fireEvent.keyDown(window, { key: "n" });
+    fireEvent.keyDown(window, { key: "z" });
+    const ccs = useStore.getState().trades[n + 1]!;
+    expect(ccs.type).toBe("CrossCurrencySwap");
+    await waitFor(() => expect(screen.getAllByText("Fairer Basis-Spread").length).toBeGreaterThan(0));
+    expect(screen.getByText("Interim (bei Nominaländerung)")).toBeInTheDocument();
+    expect(screen.getByLabelText("MtM-Reset")).toBeInTheDocument();
+    act(() => useStore.getState().removeTrade(ccs.id));
+    act(() => useStore.getState().removeTrade(fra.id));
+  });
+  it("step-up table: adding a coupon step writes rateSchedule and the analytics show both par rates", async () => {
+    render(<App />);
+    act(() => useStore.getState().select("IRS-0002"));
+    act(() => useStore.getState().setView("pricing"));
+    const before = useStore.getState().trades.find((t) => t.id === "IRS-0002")!;
+    fireEvent.click(screen.getByTestId("coupon-add-0"));
+    const after = useStore.getState().trades.find((t) => t.id === "IRS-0002")!;
+    expect(after.type === "InterestRateSwap" && (after.legs[0] as { rateSchedule?: unknown[] }).rateSchedule?.length).toBe(1);
+    await waitFor(() => expect(screen.getByTestId("analytics-table").textContent).toMatch(/Par-Satz \(Basis, Staffel konstant\)/));
+    expect(screen.getByTestId("analytics-table").textContent).toMatch(/Par-Satz \(flach\)/);
+    expect(screen.getByLabelText("Stufe 1 Kupon Leg 1")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Stufe 1 entfernen"));
+    expect(useStore.getState().trades.find((t) => t.id === "IRS-0002")).toEqual({
+      ...before,
+      legs: before.type === "InterestRateSwap" ? before.legs.map((l) => ({ ...l, ...(l.type === "Fixed" ? { rateSchedule: undefined } : {}) })) : [],
+    });
+    act(() => useStore.getState().updateTrade(before));
+  });
+  it("regulatory fields: an expired quote shows 'abgelaufen', the 'ohne UTI' chip filters, the KID / Confirmation dialogs open", async () => {
+    render(<App />);
+    const fra = useStore.getState().trades.find((t) => t.id === "FRA-0001")!;
+    act(() => useStore.getState().updateTrade({ ...fra, status: "Quoted", quoteValidUntil: useStore.getState().valuationDate - 3 }));
+    expect(screen.getAllByTestId("quote-expired").length).toBeGreaterThan(0);
+    const withoutUti = useStore.getState().trades.filter((t) => !t.uti).length;
+    const chip = screen.getByTestId("filter-no-uti");
+    expect(chip.textContent).toContain(`(${withoutUti})`);
+    fireEvent.click(chip);
+    expect(document.querySelectorAll('tr[data-nav="trade"]').length).toBe(withoutUti);
+    fireEvent.click(chip);
+    act(() => useStore.getState().updateTrade(fra));
+    // KID via hotkey (report generated implicitly), Confirmation via button
+    act(() => useStore.getState().select("IRS-0001"));
+    fireEvent.keyDown(window, { key: "K", ctrlKey: true, shiftKey: true });
+    expect(useStore.getState().docKind).toBe("KID");
+    expect(useStore.getState().view).toBe("report");
+    const modal = await screen.findByTestId("documents-modal");
+    expect(modal).toBeInTheDocument();
+    expect(screen.getByTestId("kid-form")).toBeInTheDocument();
+    expect(screen.getByTestId("document-body").textContent).toMatch(/Basisinformationsblatt/);
+    expect(screen.getByTestId("document-body").textContent).toMatch(/Gesamtrisikoindikator|Risiko/);
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(useStore.getState().docKind).toBeNull());
+    fireEvent.click(screen.getByTestId("open-confirmation"));
+    await screen.findByTestId("confirmation-form");
+    expect(screen.getByTestId("document-body").textContent).toMatch(/Rahmenvertrag/);
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(useStore.getState().modalDepth).toBe(0));
+    expect(screen.getByTestId("open-kid")).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 20));
+  });
+  it("scenarios: the historical toggle adds the core stress episodes with an expandable description", () => {
+    render(<App />);
+    act(() => useStore.getState().setView("scenarios"));
+    const table = () => screen.getByTestId("scenario-table").textContent ?? "";
+    expect(table()).not.toMatch(/Lehman/);
+    fireEvent.click(screen.getByTestId("historical-toggle"));
+    expect(table()).toMatch(/Lehman Okt 2008/);
+    expect(screen.getAllByText("historisch").length).toBeGreaterThan(3);
+    fireEvent.click(screen.getByRole("button", { name: /Beschreibung Lehman Okt 2008 anzeigen/ }));
+    expect(screen.getByTestId("scenario-description").textContent).toMatch(/Lehman/);
+    fireEvent.click(screen.getByTestId("historical-toggle"));
+    expect(table()).not.toMatch(/Lehman/);
+  });
+  it("curves: JPY-TONA is selectable, turn-of-year applies a forward jump; market: CDS term structure feeds the report's CVA", async () => {
+    render(<App />);
+    act(() => useStore.getState().setView("curves"));
+    fireEvent.click(screen.getByRole("button", { name: "TONA" }));
+    expect(screen.getAllByText(/JPY-TONA/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: "€STR" }));
+    const bp = screen.getByTestId("toy-bp") as HTMLInputElement;
+    fireEvent.change(bp, { target: { value: "20" } });
+    fireEvent.click(screen.getByTestId("toy-apply"));
+    expect(useStore.getState().turnOfYear["EUR-ESTR"]?.bp).toBe(20);
+    expect(screen.getByTestId("toy-badge")).toBeInTheDocument();
+    act(() => useStore.getState().setTurnOfYear("EUR-ESTR", undefined));
+    // CDS term structure for the counterparty of IRS-0001 → report uses the bootstrapped hazard curve
+    act(() => useStore.getState().setView("market"));
+    fireEvent.change(screen.getByTestId("cds-cpty"), { target: { value: "Landesbank A" } });
+    fireEvent.click(screen.getByTestId("cds-add"));
+    fireEvent.click(screen.getByTestId("cds-add"));
+    expect(useStore.getState().cdsCurves["Landesbank A"]?.length).toBe(2);
+    expect(screen.getByTestId("hazard-pillars").textContent).toMatch(/Hazard-Kurve/);
+    act(() => useStore.getState().select("IRS-0001"));
+    act(() => useStore.getState().setView("report"));
+    fireEvent.keyDown(window, { key: "R", ctrlKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("cva-sub").textContent).toMatch(/CDS-Termstruktur Landesbank A \(2 Pillars\)/));
+    act(() => useStore.getState().setCdsCurve("Landesbank A", undefined));
+    await waitFor(() => expect(screen.getByTestId("cva-sub").textContent).toMatch(/Kontrahent \d+ bp/));
+  });
+  it("hedge: the hedged item takes the amortisation plan of the instrument; option instruments offer the designation", async () => {
+    render(<App />);
+    const amort = { ...newTradeTemplate("amort", useStore.getState().valuationDate), id: "AMORT-T1" };
+    act(() => useStore.getState().addTrade(amort, { select: true }));
+    act(() => useStore.getState().setView("hedge"));
+    expect(screen.queryByTestId("hedge-designation")).toBeNull();
+    fireEvent.click(screen.getByTestId("hedge-take-schedule"));
+    const rel = useStore.getState().hedgeRelationships["AMORT-T1"]!;
+    expect(rel.hedgedItem.notionalSchedule?.length).toBeGreaterThan(5);
+    expect(rel.hedgedItem.amortisation?.type).toBe("Custom");
+    fireEvent.change(screen.getByTestId("hedge-amortisation"), { target: { value: "Annuity" } });
+    expect(useStore.getState().hedgeRelationships["AMORT-T1"]!.hedgedItem.amortisation?.type).toBe("Annuity");
+    expect(screen.getByLabelText("Kreditzins Grundgeschäft")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("hedge-test"));
+    await screen.findByTestId("hedge-verdict-badge");
+    expect(screen.getAllByText("Nominalverlauf").length).toBeGreaterThan(1); // form label + critical-terms row
+    act(() => useStore.getState().select("CAP-0001"));
+    expect(screen.getByTestId("hedge-designation")).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("hedge-designation"), { target: { value: "IntrinsicValue" } });
+    expect(useStore.getState().hedgeRelationships["CAP-0001"]!.designation).toBe("IntrinsicValue");
+    fireEvent.click(screen.getByTestId("hedge-test"));
+    await screen.findByTestId("hedge-coh");
+    act(() => useStore.getState().removeHedgeRelationship("CAP-0001"));
+    act(() => useStore.getState().removeHedgeRelationship("AMORT-T1"));
+    act(() => useStore.getState().removeTrade("AMORT-T1"));
+  }, 20000);
+  it("portfolio report: the export menu offers JSON and Markdown and the hotkey downloads the JSON", () => {
+    render(<App />);
+    const spy = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:x");
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    fireEvent.click(screen.getByTestId("export-menu-btn"));
+    expect(screen.getByTestId("export-portfolio-json")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("export-portfolio-md"));
+    expect(click).toHaveBeenCalledTimes(1);
+    expect(useStore.getState().toasts.some((t) => t.msg.includes("Portfolio-Report als Markdown"))).toBe(true);
+    fireEvent.keyDown(window, { key: "L", ctrlKey: true, shiftKey: true });
+    expect(click).toHaveBeenCalledTimes(2);
+    spy.mockRestore();
+    click.mockRestore();
+  });
   it("no store writes during render: risk is filled by effects and views render without React warnings (N-26)", async () => {
     render(<App />);
     act(() => useStore.setState({ compareIds: ["IRS-0001", "CAP-0001"] }));

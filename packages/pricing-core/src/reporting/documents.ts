@@ -1,6 +1,5 @@
-import { toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
-import { formatDateTimeDe, formatDe, formatPctDe } from "../format.js";
+import { formatDateDe, formatDateTimeDe, formatDe, formatPctDe } from "../format.js";
 import { tradeMaturityDate } from "../instruments/trade-dates.js";
 import { type FixedLeg, type FloatLeg, type PricingResult, type SwapLeg, type Trade } from "../instruments/types.js";
 import { type MarketContext } from "../market/market-context.js";
@@ -38,10 +37,13 @@ export interface GeneratedDocument {
   markdown: string;
 }
 
-// Deterministic German formatting (no Intl / ICU dependency in the core).
+// Deterministic German formatting (no Intl / ICU dependency in the core): no
+// ISO dates, no decimal points and no English trade-type identifiers in the text.
 const money = (v: number, ccy?: string) => `${formatDe(v, 0)}${ccy ? " " + ccy : ""}`;
 const pct = (v: number, d = 3) => formatPctDe(v, d);
-const date = (d: number) => toISO(d).split("-").reverse().join(".");
+const date = (d: number) => formatDateDe(d);
+const bp = (decimal: number, d = 1) => `${decimal >= 0 ? "+" : ""}${formatDe(decimal * 1e4, d)} bp`;
+const fxRate = (v: number) => formatDe(v, 4);
 
 function productName(t: Trade): string {
   switch (t.type) {
@@ -83,12 +85,12 @@ function termsRows(t: Trade): [string, string][] {
           l.type === "Fixed" && l.rateSchedule?.length ? ` (Staffel: ${l.rateSchedule.map((s) => `${pct(s.rate, 2)} ab ${date(s.date)}`).join(", ")})` : "";
         const spreadSteps =
           l.type === "Float" && l.spreadSchedule?.length
-            ? ` (Spread-Staffel: ${l.spreadSchedule.map((s) => `${(s.spread * 1e4).toFixed(1)} bp ab ${date(s.date)}`).join(", ")})`
+            ? ` (Spread-Staffel: ${l.spreadSchedule.map((s) => `${bp(s.spread)} ab ${date(s.date)}`).join(", ")})`
             : "";
         const rate =
           l.type === "Fixed"
             ? `Festsatz ${pct(l.rate)}${steps}`
-            : `${l.index}${l.spread ? ` ${l.spread >= 0 ? "+" : ""}${(l.spread * 1e4).toFixed(1)} bp` : ""}${spreadSteps}${l.capRate !== undefined ? `, Cap ${pct(l.capRate, 2)}` : ""}${l.floorRate !== undefined ? `, Floor ${pct(l.floorRate, 2)}` : ""}`;
+            : `${l.index}${l.spread ? ` ${bp(l.spread)}` : ""}${spreadSteps}${l.capRate !== undefined ? `, Cap ${pct(l.capRate, 2)}` : ""}${l.floorRate !== undefined ? `, Floor ${pct(l.floorRate, 2)}` : ""}`;
         rows.push([
           `Leg ${i + 1}`,
           `${dir} ${rate}, ${l.frequency}, ${l.dayCount}, Nominal ${money(l.notional, l.currency)}${l.notionalSchedule ? " (amortisierend)" : ""}${l.notionalExchange?.initial || l.notionalExchange?.final ? ", Nominalaustausch" : ""}`,
@@ -113,6 +115,7 @@ function termsRows(t: Trade): [string, string][] {
         ["Strike", pct(t.strike, 2)],
       );
       if (t.floorStrike !== undefined) rows.push(["Floor-Strike", pct(t.floorStrike, 2)]);
+      if (t.notionalSchedule?.length) rows.push(["Nominalverlauf", `amortisierend (${t.notionalSchedule.length} Stufen)`]);
       rows.push(["Position", t.payReceive === "Receive" ? "Kunde ist Käufer" : "Kunde ist Verkäufer"]);
       break;
     case "Swaption": {
@@ -122,7 +125,7 @@ function termsRows(t: Trade): [string, string][] {
         ["Ausübung", date(t.expiryDate)],
         ["Zugrunde liegender Swap", `${date(fixed.effectiveDate)} – ${date(fixed.terminationDate)}`],
         ["Strike", pct(fixed.rate)],
-        ["Settlement", t.settlement],
+        ["Settlement", t.settlement === "Physical" ? "physische Lieferung des Swaps" : "Barausgleich (Cash Settlement)"],
         ["Position", t.payReceive === "Receive" ? "Kunde ist Käufer" : "Kunde ist Verkäufer"],
       );
       break;
@@ -131,7 +134,7 @@ function termsRows(t: Trade): [string, string][] {
       rows.push(
         ["Kunde kauft", money(t.buyAmount, t.buyCurrency)],
         ["Kunde verkauft", money(t.sellAmount, t.sellCurrency)],
-        ["Terminkurs", (t.sellAmount / t.buyAmount).toFixed(4)],
+        ["Terminkurs", fxRate(t.sellAmount / t.buyAmount)],
         ["Valuta", date(t.deliveryDate)],
       );
       break;
@@ -152,11 +155,11 @@ function termsRows(t: Trade): [string, string][] {
         ["Währungspaar", t.pair],
         ["Typ", `${t.optionType} auf ${t.pair.slice(0, 3)}`],
         ["Nominal", money(t.notional, t.pair.slice(0, 3))],
-        ["Strike", t.strike.toFixed(4)],
+        ["Strike", fxRate(t.strike)],
         ["Verfall / Lieferung", `${date(t.expiryDate)} / ${date(t.deliveryDate)}`],
         ["Position", t.payReceive === "Receive" ? "Kunde ist Käufer" : "Kunde ist Verkäufer"],
       );
-      if (t.barrier) rows.push(["Barriere", `${t.barrier.type} bei ${t.barrier.level.toFixed(4)}`]);
+      if (t.barrier) rows.push(["Barriere", `${t.barrier.type} bei ${fxRate(t.barrier.level)}`]);
       break;
   }
   return rows;
@@ -226,7 +229,7 @@ export function generateTermsheet(ctx: MarketContext, trade: Trade, pricing: Pri
                       : k === "fairSpread"
                         ? "Fairer Spread"
                         : "Prämie in %",
-                typeof v === "number" ? (k.startsWith("premium") ? `${v.toFixed(3)} %` : k === "fairForward" ? v.toFixed(4) : pct(v)) : String(v),
+                typeof v === "number" ? (k.startsWith("premium") ? `${formatDe(v, 3)} %` : k === "fairForward" ? fxRate(v) : pct(v)) : String(v),
               ] as [string, string],
           ),
       ],
@@ -287,7 +290,8 @@ function defaultTargetMarket(inputs: SuitabilityInputs): string {
 export function generateSuitabilityStatement(
   ctx: MarketContext,
   trade: Trade,
-  pricing: PricingResult,
+  // Kept in the signature for API stability; the statement reads fair value and costs from `report`.
+  _pricing: PricingResult,
   report: ValuationReport,
   inputs: SuitabilityInputs,
   scenarios?: ScenarioResult[],
@@ -406,7 +410,7 @@ function describe(t: Trade): string {
     case "FxSwap":
       return "Kombination aus Kassa- und Termingeschäft in entgegengesetzter Richtung zur Liquiditäts- bzw. Laufzeitsteuerung von Fremdwährungspositionen.";
     case "FxOption":
-      return `Recht (keine Pflicht), ${money(t.notional, t.pair.slice(0, 3))} zum Kurs ${t.strike.toFixed(4)} am ${date(t.expiryDate)} zu ${t.optionType === "Call" ? "kaufen" : "verkaufen"}; Absicherung eines Worst-Case-Kurses bei Partizipation an günstigen Kursen.`;
+      return `Recht (keine Pflicht), ${money(t.notional, t.pair.slice(0, 3))} zum Kurs ${fxRate(t.strike)} am ${date(t.expiryDate)} zu ${t.optionType === "Call" ? "kaufen" : "verkaufen"}; Absicherung eines Worst-Case-Kurses bei Partizipation an günstigen Kursen.`;
   }
 }
 
@@ -641,13 +645,19 @@ export interface KidOptions {
 }
 
 /**
- * Summary risk indicator (1–7) from the VaR-equivalent volatility proxy of
- * the scenario P&L: worst-case loss of the scenario set relative to the
- * notional (PRIIPs MRM classes, DelVO 2017/653 Annex II: < 0.5 % → 1,
- * 0.5–5 % → 2, 5–12 % → 3, 12–20 % → 4, 20–30 % → 5, 30–80 % → 6, > 80 % → 7).
- * Bought options are capped at the premium (max loss = premium), sold options
- * and linear derivatives use the scenario loss; a floor of class 2 applies
- * to OTC derivatives (credit risk class of a bank counterparty).
+ * Summary risk indicator (1–7) – **heuristic**, not the DelVO (EU) 2017/653
+ * Annex II calculation. The market risk measure is approximated by the
+ * worst-case loss of the deterministic scenario set relative to the notional
+ * (used in place of the VaR-equivalent volatility, VEV) and mapped to the
+ * MRM classes with the Annex II VEV thresholds: < 0.5 % → 1, 0.5–5 % → 2,
+ * 5–12 % → 3, 12–20 % → 4, 20–30 % → 5, 30–80 % → 6, > 80 % → 7. Bought
+ * options are capped at the premium (max loss = premium, MRM ≤ 6), sold
+ * options and linear derivatives use the scenario loss; a floor of class 2
+ * applies to OTC derivatives (credit risk class of a bank counterparty, CRM).
+ * The prescribed Annex II method for category-3 PRIIPs – bootstrapped /
+ * Cornish-Fisher VaR at 97.5 % over the recommended holding period from
+ * simulated (Monte-Carlo) price paths and the CRM from the manufacturer's
+ * credit assessment – is roadmap; see `generateKid` ("Herleitung").
  */
 export function summaryRiskIndicator(lossFraction: number, opts: { isBoughtOption?: boolean } = {}): { sri: 1 | 2 | 3 | 4 | 5 | 6 | 7; vevProxy: number } {
   const vev = Math.max(0, lossFraction);
@@ -782,7 +792,7 @@ export function generateKid(
         ["Gesamtrisikoindikator (SRI)", `${sri} von 7 (1 = niedrigstes, 7 = höchstes Risiko)`],
         [
           "Herleitung",
-          `Marktrisiko-Näherung: maximaler Szenarioverlust ${formatPctDe(vevProxy, 2)} des Nominals über ${results.length} Szenarien${isBought ? ", begrenzt auf die gezahlte Prämie" : ""}; Kreditrisiko des Kontrahenten (Bank) berücksichtigt (mind. Klasse 2). Heuristik, keine Monte-Carlo-Simulation nach Anhang II DelVO 2017/653.`,
+          `Heuristik (keine Berechnung nach Anhang II DelVO (EU) 2017/653): Marktrisikomaß = maximaler Szenarioverlust ${formatPctDe(vevProxy, 2)} des Nominals über ${results.length} Szenarien (deterministische Marktszenarien des Bewertungskerns)${isBought ? ", begrenzt auf die gezahlte Prämie (Klasse höchstens 6)" : ""}, eingeordnet nach den VEV-Klassengrenzen des Anhangs II (unter 0,5 % Klasse 1; 0,5–5 % Klasse 2; 5–12 % Klasse 3; 12–20 % Klasse 4; 20–30 % Klasse 5; 30–80 % Klasse 6; über 80 % Klasse 7); Kreditrisikomaß pauschal als Bankkontrahent (mind. Klasse 2). Die vorgeschriebene Monte-Carlo-/Cornish-Fisher-VaR-Simulation über die empfohlene Haltedauer (Kategorie 3, Anhang II Nr. 19 ff.) ist als Weiterentwicklung vorgesehen.`,
         ],
         ["Empfohlene Haltedauer", `${formatDe(holding, 1)} Jahre (bis Fälligkeit)`],
       ],

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { SAMPLE_QUOTES, buildSampleMarket, parseISO, priceTrade } from "@deriva/pricing-core";
+import { SAMPLE_QUOTES, addTenor, buildSampleMarket, makeVanillaSwap, parseISO, priceTrade } from "@deriva/pricing-core";
 import { samplePortfolio } from "../state/sample-portfolio.js";
 import { TEMPLATE_IDS, newTradeTemplate } from "./templates.js";
-import { METRICS, analyticsRows, isKnownMetric } from "./metrics.js";
+import { METRICS, analyticsRows, detailRows, isKnownMetric } from "./metrics.js";
 
 const VAL = parseISO("2026-09-03");
 const market = buildSampleMarket(VAL, SAMPLE_QUOTES);
@@ -33,26 +33,62 @@ describe("analytics whitelist (N-01, F-14)", () => {
     expect(rows.map((r) => r.label)).toEqual(["Some new thing", "Another flag"]);
   });
 
-  it("FX option: FX-Delta is a money amount per +1 % spot, spot date (when emitted) is a date, strike is a price", () => {
+  it("FX option: deltaPct is the signed spot delta in %, deltaAmount the money amount per +1 % spot, details carry ISO dates", () => {
     const fxo = samplePortfolio(VAL).find((t) => t.type === "FxOption")!;
     const r = priceTrade(market, fxo, "EUR");
     const rows = analyticsRows(r.analytics, { tradeType: "FxOption", reportingCurrency: "EUR" });
     const by = Object.fromEntries(rows.map((x) => [x.k, x]));
-    const delta = by.deltaAmount ?? by.deltaPct!;
-    expect(delta.label).toBe("FX-Delta");
-    expect(delta.unit).toBe("je +1 % Spot");
-    expect(delta.v).not.toContain("%");
-    expect(Math.abs(Number(delta.v.replace(/\./g, "").replace(",", ".")))).toBeLessThan(1e6); // ≈ −10.818, not −1.079.785,95 %
-    // the legacy key is still mapped as money should an older core emit it
-    const legacy = analyticsRows({ deltaPct: -10818.15, spotDate: 20704 }, { tradeType: "FxOption", reportingCurrency: "EUR" });
-    expect(legacy.find((x) => x.k === "deltaPct")!.v).toBe("-10.818");
-    expect(legacy.find((x) => x.k === "spotDate")!.label).toBe("Spot-Datum");
-    expect(legacy.find((x) => x.k === "spotDate")!.v).toBe("08.09.2026");
+    // signed fraction of the base notional → percentage with two decimals (put: negative, |Δ| < 100 %)
+    expect(by.deltaPct!.label).toBe("Delta (Spot)");
+    expect(by.deltaPct!.v).toMatch(/^-\d{1,2},\d{2} %$/);
+    expect(Math.abs(r.analytics.deltaPct as number)).toBeLessThan(1);
+    // money amount per +1 % spot, no percent sign, plausible magnitude (≈ −10.818 EUR on 3 Mio)
+    expect(by.deltaAmount!.label).toBe("Delta-Betrag je +1 % Spot");
+    expect(by.deltaAmount!.v).not.toContain("%");
+    expect(Math.abs(Number(by.deltaAmount!.v.replace(/\./g, "").replace(",", ".")))).toBeLessThan(1e6);
+    // dates live in `details` as ISO strings and are rendered dd.mm.yyyy
+    const det = detailRows(r.details);
+    expect(det.find((d) => d.k === "spotDate")).toEqual({ k: "spotDate", label: "Spot-Datum", v: "08.09.2026" });
+    expect(detailRows(undefined)).toEqual([]);
+    expect(detailRows({ fixingDate: "2026-12-03", settlementDate: "2026-12-07", maturity: undefined }).map((d) => d.label)).toEqual([
+      "Fixing-Datum",
+      "Settlement-Datum",
+    ]);
     expect(by.strike!.v).toBe("1,1500");
     expect(by.greeksMethod!.label).toBe("Greeks");
     expect(by.greeksMethod!.v).toBe("analytisch");
     expect(by.spotAtValuationDate!.label).toBe("Spot (Bewertungstag)");
     expect(rows.some((x) => x.k === "d1" || x.k === "d2")).toBe(false);
+  });
+
+  it("step-up swap: parRateBase and parRateFlat carry the agreed German labels; CCS and FRA keys are whitelisted", () => {
+    const spot = parseISO("2026-09-07");
+    const swap = makeVanillaSwap({
+      currency: "EUR",
+      notional: 10_000_000,
+      payReceiveFixed: "Pay",
+      fixedRate: 0.025,
+      effectiveDate: spot,
+      maturity: "5Y",
+      stepUp: [
+        { date: addTenor(spot, "1Y"), rate: 0.03 },
+        { date: addTenor(spot, "2Y"), rate: 0.035 },
+      ],
+    });
+    const rows = analyticsRows(priceTrade(market, swap, "EUR").analytics, { tradeType: "InterestRateSwap", reportingCurrency: "EUR" });
+    const by = Object.fromEntries(rows.map((x) => [x.k, x]));
+    expect(by.parRateBase!.label).toBe("Par-Satz (Basis, Staffel konstant)");
+    expect(by.parRateFlat!.label).toBe("Par-Satz (flach)");
+    expect(by.parRateBase!.v).toMatch(/%$/);
+    const ccs = samplePortfolio(VAL).find((t) => t.type === "CrossCurrencySwap")!;
+    const ccsRows = analyticsRows(priceTrade(market, ccs, "EUR").analytics, { tradeType: "CrossCurrencySwap", reportingCurrency: "EUR" });
+    expect(ccsRows.find((x) => x.k === "fairSpread")!.v).toMatch(/bp$/);
+    expect(ccsRows.find((x) => x.k === "mtmReset")!.v).toBe("nein");
+    const fra = samplePortfolio(VAL).find((t) => t.type === "FRA")!;
+    const fraRes = priceTrade(market, fra, "EUR");
+    const fraRows = analyticsRows(fraRes.analytics, { tradeType: "FRA", reportingCurrency: "EUR" });
+    expect(fraRows.find((x) => x.k === "forwardRate")!.label).toBe("Forward-Satz");
+    expect(detailRows(fraRes.details).map((d) => d.label)).toEqual(["Fixing-Datum", "Settlement-Datum"]);
   });
 
   it("FX forward: fxDeltaCurrency / fxDeltaSellCurrency / ndf are labelled; swaption / cap greeks per bp are money", () => {

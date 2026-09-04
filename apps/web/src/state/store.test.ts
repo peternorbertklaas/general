@@ -10,12 +10,14 @@ import {
   TOAST_MAX,
   TOAST_MS,
   UNDO_DEPTH,
+  buildMarket,
   compareTrades,
   deleteWithUndo,
   marketModified,
   quotesHash,
   quotesModified,
   reportInputsFor,
+  reportingCurrencies,
   useStore,
 } from "./store.js";
 
@@ -354,6 +356,66 @@ describe("store", () => {
     st.setInterpolation("EUR-ESTR", undefined);
     expect(marketModified(useStore.getState())).toBe(false);
     useStore.getState().setValuationDate("2026-09-03");
+  });
+
+  it("sample book carries CCS-0001 and FRA-0001 with regulatory fields; reporting currency cycles through JPY only with a JPY discount curve", () => {
+    const s = useStore.getState();
+    const ccs = s.trades.find((t) => t.id === "CCS-0001")!;
+    const fra = s.trades.find((t) => t.id === "FRA-0001")!;
+    expect(ccs.type).toBe("CrossCurrencySwap");
+    expect(fra.type).toBe("FRA");
+    expect(fra.cleared).toBe(true);
+    expect(fra.clearingMember).toBe("Eurex Clearing AG");
+    expect(ccs.uti).toMatch(/CCS0001$/);
+    expect(s.results["CCS-0001"]?.result?.analytics.fairSpread).toBeDefined();
+    expect(s.results["FRA-0001"]?.result?.analytics.forwardRate).toBeDefined();
+    expect(reportingCurrencies(s.baseMarket)).toEqual(["EUR", "USD", "GBP", "CHF", "JPY"]);
+    expect(reportingCurrencies({ discountCurveId: { EUR: "EUR-ESTR" } })).toEqual(["EUR", "USD", "GBP", "CHF"]);
+    s.setReportingCurrency("CHF");
+    useStore.getState().cycleReportingCurrency();
+    expect(useStore.getState().reportingCurrency).toBe("JPY");
+    expect(useStore.getState().results["IRS-0001"]?.result?.currency).toBe("JPY");
+    useStore.getState().cycleReportingCurrency();
+    expect(useStore.getState().reportingCurrency).toBe("EUR");
+  });
+
+  it("turn-of-year jumps live in the store, re-bootstrap the curve, count as modified and persist (Kurven)", () => {
+    const s = useStore.getState();
+    expect(marketModified(s)).toBe(false);
+    const toy = { date: parseISO("2026-12-31"), bp: 15 };
+    expect(s.setTurnOfYear("EUR-ESTR", toy)).toBe(true);
+    let st = useStore.getState();
+    expect(st.turnOfYear["EUR-ESTR"]).toEqual(toy);
+    expect(marketModified(st)).toBe(true);
+    const curve = st.baseMarket.curves["EUR-ESTR"] as { forwardJumps?: readonly { bp: number }[] };
+    expect(curve.forwardJumps?.length).toBe(1);
+    expect(curve.forwardJumps?.[0]?.bp).toBe(15);
+    // the jump raises the forward over the year end against the unshifted curve
+    const plain = buildMarket(st.valuationDate, st.quotes, {}).curves["EUR-ESTR"]!;
+    const d = parseISO("2026-12-31");
+    expect(st.baseMarket.curves["EUR-ESTR"]!.forwardRate(d, d + 1, "ACT/360")).toBeGreaterThan(plain.forwardRate(d, d + 1, "ACT/360") + 0.001);
+    const saved = JSON.parse(localStorage.getItem(PERSIST_KEY)!) as { state: { turnOfYear: Record<string, unknown> } };
+    expect(saved.state.turnOfYear["EUR-ESTR"]).toEqual(toy);
+    // a jump in the past is ignored by the bootstrap but still stored
+    expect(useStore.getState().setValuationDate("2027-01-15")).toBe(true);
+    st = useStore.getState();
+    expect((st.baseMarket.curves["EUR-ESTR"] as { forwardJumps?: readonly unknown[] }).forwardJumps?.length ?? 0).toBe(0);
+    useStore.getState().setValuationDate("2026-09-03");
+    useStore.getState().setTurnOfYear("EUR-ESTR", undefined);
+    expect(marketModified(useStore.getState())).toBe(false);
+  });
+
+  it("CDS term structures are stored per counterparty and persisted (Markt)", () => {
+    const s = useStore.getState();
+    s.setCdsCurve("Landesbank A", [
+      { tenor: "1Y", spread: 0.008 },
+      { tenor: "5Y", spread: 0.012 },
+    ]);
+    expect(useStore.getState().cdsCurves["Landesbank A"]?.length).toBe(2);
+    const saved = JSON.parse(localStorage.getItem(PERSIST_KEY)!) as { state: { cdsCurves: Record<string, unknown[]> } };
+    expect(saved.state.cdsCurves["Landesbank A"]?.length).toBe(2);
+    useStore.getState().setCdsCurve("Landesbank A", []);
+    expect(useStore.getState().cdsCurves["Landesbank A"]).toBeUndefined();
   });
 
   it("germanises English builder names on add (N-07)", () => {

@@ -15,6 +15,7 @@ import { registerHedgeRoutes } from "./routes/hedge.js";
 import { registerDocumentRoutes } from "./routes/documents.js";
 import { registerExtendedRiskRoutes } from "./routes/risk-extended.js";
 import { registerMarketRoutes } from "./routes/market.js";
+import { registerPortfolioReportRoutes } from "./routes/portfolio-report.js";
 import { registerPricingRoutes } from "./routes/pricing.js";
 import { registerSnapshotRoutes } from "./routes/snapshot.js";
 import { registerTradeRoutes } from "./routes/trades.js";
@@ -191,6 +192,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
 
   await registerMarketRoutes(app, ctx);
   await registerPricingRoutes(app, ctx);
+  await registerPortfolioReportRoutes(app, ctx);
   await registerTradeRoutes(app, ctx);
   await registerSnapshotRoutes(app, ctx);
   await registerAuditRoutes(app, ctx);

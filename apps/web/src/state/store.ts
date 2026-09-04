@@ -111,7 +111,19 @@ export interface ReportInputs {
 }
 export const DEFAULT_REPORT_INPUTS: ReportInputs = { offerPv: 0, cptySpreadBp: 120, ownSpreadBp: 60, recovery: 40, perspective: "Kunde" };
 
-export type DocKind = "Termsheet" | "Geeignetheitserklaerung";
+export type DocKind = "Termsheet" | "Geeignetheitserklaerung" | "Confirmation" | "KID";
+
+/** Turn-of-year forward jump on a bootstrapped curve (see core `BootstrapSpec.turnOfYear`). */
+export interface TurnOfYear {
+  date: number;
+  bp: number;
+}
+
+/** CDS par-spread term structure of a counterparty (tenor like "5Y", spread decimal). */
+export interface CdsQuote {
+  tenor: string;
+  spread: number;
+}
 
 interface AppState {
   valuationDate: number;
@@ -119,6 +131,10 @@ interface AppState {
   quotes: SampleMarketQuotes;
   /** Interpolation overrides per curve id (persisted, survive valuation-date changes – N-23). */
   interpolation: Record<string, InterpolationMethod>;
+  /** Turn-of-year jumps per curve id (persisted, applied to the curve's bootstrap spec). */
+  turnOfYear: Record<string, TurnOfYear>;
+  /** CDS term structures per counterparty (persisted) – bootstrapped to hazard curves for the XVA panel. */
+  cdsCurves: Record<string, CdsQuote[]>;
   baseMarket: MarketContext;
   market: MarketContext;
   whatIf: WhatIf;
@@ -199,6 +215,8 @@ interface AppState {
   setQuotes(q: SampleMarketQuotes, label?: string): boolean;
   resetQuotes(): void;
   setInterpolation(curveId: string, method: InterpolationMethod | undefined): boolean;
+  setTurnOfYear(curveId: string, toy: TurnOfYear | undefined): boolean;
+  setCdsCurve(counterparty: string, quotes: CdsQuote[] | undefined): void;
   repriceAll(): void;
   /**
    * Risk report from the cache, computed on demand *without* writing to the
@@ -281,9 +299,9 @@ export function quotesModified(q: SampleMarketQuotes): boolean {
   return JSON.stringify(q) !== JSON.stringify(SAMPLE_QUOTES);
 }
 
-/** Quotes, spots or interpolation overrides differ from the sample market (N-23). */
-export function marketModified(s: Pick<AppState, "quotes" | "interpolation">): boolean {
-  return quotesModified(s.quotes) || Object.keys(s.interpolation).length > 0;
+/** Quotes, spots, interpolation overrides or turn-of-year jumps differ from the sample market (N-23). */
+export function marketModified(s: Pick<AppState, "quotes" | "interpolation"> & { turnOfYear?: Record<string, TurnOfYear> }): boolean {
+  return quotesModified(s.quotes) || Object.keys(s.interpolation).length > 0 || Object.keys(s.turnOfYear ?? {}).length > 0;
 }
 
 /** Stable short hash of the quote set (report staleness key, N-18). */
@@ -296,14 +314,33 @@ export function quotesHash(q: SampleMarketQuotes): string {
  * overrides; curves are re-bootstrapped in dependency order so dependent
  * curves see the overridden discount curve (N-23).
  */
-export function buildMarket(date: number, quotes: SampleMarketQuotes, interpolation: Record<string, InterpolationMethod>): MarketContext {
+export function buildMarket(
+  date: number,
+  quotes: SampleMarketQuotes,
+  interpolation: Record<string, InterpolationMethod>,
+  turnOfYear: Record<string, TurnOfYear> = {},
+): MarketContext {
   const built = buildSampleMarket(date, quotes);
-  const overrides = Object.entries(interpolation).filter(([id]) => id in built.curves);
-  if (overrides.length === 0) return built;
+  const overrides = Object.keys(interpolation).filter((id) => id in built.curves);
+  // A turn-of-year jump only makes sense while the date lies ahead of the valuation date.
+  const toys = Object.entries(turnOfYear).filter(([id, t]) => id in built.curves && t.date > date && t.bp !== 0);
+  if (overrides.length === 0 && toys.length === 0) return built;
   const specs = sampleBootstrapSpecs(date, quotes);
-  const list = Object.values(specs).map((sp) => (interpolation[sp.id] ? { ...sp, interpolation: interpolation[sp.id] } : sp));
+  const list = Object.values(specs).map((sp) => {
+    let out = sp;
+    if (interpolation[sp.id]) out = { ...out, interpolation: interpolation[sp.id] };
+    const toy = turnOfYear[sp.id];
+    if (toy && toy.date > date && toy.bp !== 0) out = { ...out, turnOfYear: [{ date: toy.date, bp: toy.bp }] };
+    return out;
+  });
   const { curves } = bootstrapCurves(date, list);
   return { ...built, curves: { ...built.curves, ...curves } };
+}
+
+/** Reporting currencies offered by `c`: the majors plus JPY when the market carries a JPY discount curve. */
+export function reportingCurrencies(m: Pick<MarketContext, "discountCurveId">): string[] {
+  const base = ["EUR", "USD", "GBP", "CHF"];
+  return m.discountCurveId.JPY ? [...base, "JPY"] : base;
 }
 
 /** localStorage keys outside the persisted slice (theme etc. are read before hydration). */
@@ -319,6 +356,7 @@ export const LS_KEYS = {
   blotterGroup: "deriva.blotter.group",
   parRiskOpen: "deriva.pricing.parRiskOpen",
   vegaDimension: "deriva.pricing.vegaDimension",
+  scenariosHistorical: "deriva.scenarios.historical",
 } as const;
 
 export function readLocal(key: string): string | null {
@@ -389,11 +427,23 @@ function isPlausibleReportInputs(v: unknown): v is ReportInputs {
   );
 }
 
+function isPlausibleTurnOfYear(v: unknown): v is TurnOfYear {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return typeof o.date === "number" && Number.isFinite(o.date) && typeof o.bp === "number" && Number.isFinite(o.bp);
+}
+
+function isPlausibleCdsCurve(v: unknown): v is CdsQuote[] {
+  return Array.isArray(v) && v.every((q) => q && typeof q === "object" && typeof (q as CdsQuote).tenor === "string" && Number.isFinite((q as CdsQuote).spread));
+}
+
 /** Slice of the state written to localStorage. */
 export interface PersistedSlice {
   trades: Trade[];
   quotes: SampleMarketQuotes;
   interpolation: Record<string, InterpolationMethod>;
+  turnOfYear?: Record<string, TurnOfYear>;
+  cdsCurves?: Record<string, CdsQuote[]>;
   valuationDate: number;
   reportingCurrency: string;
   view: ViewId;
@@ -431,8 +481,13 @@ export const useStore = create<AppState>()(
         const entry: UndoEntry = { kind: "quotes", quotes: cloneQuotes(quotes), label, at: now };
         set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
       };
-      const rebuildMarket = (date: number, quotes: SampleMarketQuotes, interpolation = get().interpolation): MarketContext => {
-        const built = buildMarket(date, quotes, interpolation);
+      const rebuildMarket = (
+        date: number,
+        quotes: SampleMarketQuotes,
+        interpolation = get().interpolation,
+        turnOfYear: Record<string, TurnOfYear> = get().turnOfYear,
+      ): MarketContext => {
+        const built = buildMarket(date, quotes, interpolation, turnOfYear);
         const fixings = get().baseMarket.fixings;
         return fixings && fixings.length > 0 ? { ...built, fixings } : built;
       };
@@ -440,6 +495,8 @@ export const useStore = create<AppState>()(
         valuationDate: initialDate,
         quotes: initialQuotes,
         interpolation: {},
+        turnOfYear: {},
+        cdsCurves: {},
         baseMarket: initialMarket,
         market: initialMarket,
         whatIf: { ratesBp: 0, fxPct: 0, volBp: 0 },
@@ -637,7 +694,7 @@ export const useStore = create<AppState>()(
           set({ reportingCurrency: c, results, lastPricingMs: ms, riskCache: {} });
         },
         cycleReportingCurrency: () => {
-          const order = ["EUR", "USD", "GBP", "CHF"];
+          const order = reportingCurrencies(get().baseMarket);
           const cur = get().reportingCurrency;
           get().setReportingCurrency(order[(order.indexOf(cur) + 1) % order.length]!);
         },
@@ -733,6 +790,25 @@ export const useStore = create<AppState>()(
             return false;
           }
         },
+        setTurnOfYear: (curveId, toy) => {
+          const turnOfYear = { ...get().turnOfYear };
+          if (toy === undefined) delete turnOfYear[curveId];
+          else turnOfYear[curveId] = toy;
+          try {
+            const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, turnOfYear);
+            set({ turnOfYear });
+            get().setMarket(base);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        setCdsCurve: (counterparty, quotes) => {
+          const cdsCurves = { ...get().cdsCurves };
+          if (quotes === undefined || quotes.length === 0) delete cdsCurves[counterparty];
+          else cdsCurves[counterparty] = quotes;
+          set({ cdsCurves });
+        },
         repriceAll: () => {
           const { results, ms } = priceAll(get().market, get().trades, get().reportingCurrency);
           set({ results, lastPricingMs: ms, riskCache: {} });
@@ -799,6 +875,8 @@ export const useStore = create<AppState>()(
             valuationDate,
             quotes,
             interpolation: {},
+            turnOfYear: {},
+            cdsCurves: {},
             trades,
             baseMarket,
             market,
@@ -826,6 +904,8 @@ export const useStore = create<AppState>()(
         trades: s.trades,
         quotes: s.quotes,
         interpolation: s.interpolation,
+        turnOfYear: s.turnOfYear,
+        cdsCurves: s.cdsCurves,
         valuationDate: s.valuationDate,
         reportingCurrency: s.reportingCurrency,
         view: s.view,
@@ -846,13 +926,21 @@ export const useStore = create<AppState>()(
             for (const [k, v] of Object.entries(p.interpolation))
               if (typeof v === "string" && INTERPOLATIONS.has(v)) interpolation[k] = v as InterpolationMethod;
           }
+          const turnOfYear: Record<string, TurnOfYear> = {};
+          if (p.turnOfYear && typeof p.turnOfYear === "object") {
+            for (const [k, v] of Object.entries(p.turnOfYear)) if (isPlausibleTurnOfYear(v)) turnOfYear[k] = v;
+          }
+          const cdsCurves: Record<string, CdsQuote[]> = {};
+          if (p.cdsCurves && typeof p.cdsCurves === "object") {
+            for (const [k, v] of Object.entries(p.cdsCurves)) if (isPlausibleCdsCurve(v) && v.length > 0) cdsCurves[k] = v;
+          }
           const valuationDate = typeof p.valuationDate === "number" && Number.isFinite(p.valuationDate) ? p.valuationDate : current.valuationDate;
+          const view = VIEW_IDS.includes(p.view as ViewId) ? (p.view as ViewId) : current.view;
+          const baseMarket = buildMarket(valuationDate, quotes, interpolation, turnOfYear);
           const reportingCurrency =
-            typeof p.reportingCurrency === "string" && ["EUR", "USD", "GBP", "CHF"].includes(p.reportingCurrency)
+            typeof p.reportingCurrency === "string" && reportingCurrencies(baseMarket).includes(p.reportingCurrency)
               ? p.reportingCurrency
               : current.reportingCurrency;
-          const view = VIEW_IDS.includes(p.view as ViewId) ? (p.view as ViewId) : current.view;
-          const baseMarket = buildMarket(valuationDate, quotes, interpolation);
           const { results, ms } = priceAll(baseMarket, trades, reportingCurrency);
           const selectedId = trades.some((t) => t.id === p.selectedId) ? p.selectedId! : (trades[0]?.id ?? null);
           const reportInputs: Record<string, ReportInputs> = {};
@@ -864,6 +952,8 @@ export const useStore = create<AppState>()(
             trades,
             quotes,
             interpolation,
+            turnOfYear,
+            cdsCurves,
             valuationDate,
             reportingCurrency,
             view,
@@ -876,7 +966,7 @@ export const useStore = create<AppState>()(
             results,
             lastPricingMs: ms,
             selectedId,
-            restored: { trades: trades.length, quotesModified: quotesModified(quotes) || Object.keys(interpolation).length > 0 },
+            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear }) },
           };
         } catch {
           return current;

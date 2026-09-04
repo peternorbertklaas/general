@@ -35,6 +35,8 @@ export const TEMPLATE_LABELS = {
   amort: "Neuer amortisierender Swap",
   imm: "Neuer IMM-Swap",
   fxs: "Neuer FX-Swap",
+  ccs: "Neuer Cross-Currency-Swap",
+  fra: "Neues FRA",
 } as const;
 
 export const HOTKEYS: HotkeyDef[] = [
@@ -67,6 +69,8 @@ export const HOTKEYS: HotkeyDef[] = [
   { id: "new.amort", keys: "n a", label: TEMPLATE_LABELS.amort, group: "Aktionen" },
   { id: "new.imm", keys: "n i", label: TEMPLATE_LABELS.imm, group: "Aktionen" },
   { id: "new.fxs", keys: "n x", label: TEMPLATE_LABELS.fxs, group: "Aktionen" },
+  { id: "new.ccs", keys: "n z", label: TEMPLATE_LABELS.ccs, group: "Aktionen" },
+  { id: "new.fra", keys: "n r", label: TEMPLATE_LABELS.fra, group: "Aktionen" },
   { id: "undo", keys: "mod+z", label: "Rückgängig (Trades, Quotes)", group: "Aktionen", global: true },
   { id: "export.csv", keys: "mod+e", label: "Cashflows als CSV exportieren", group: "Aktionen", global: true },
   { id: "export.blotter", keys: "mod+shift+e", label: "Blotter als CSV exportieren", group: "Aktionen", global: true },
@@ -74,6 +78,9 @@ export const HOTKEYS: HotkeyDef[] = [
   { id: "report.generate", keys: "mod+shift+r", label: "Report erzeugen (Zeitstempel fixieren)", group: "Aktionen", global: true },
   { id: "doc.termsheet", keys: "mod+shift+t", label: "Termsheet öffnen", group: "Aktionen", global: true },
   { id: "doc.suitability", keys: "mod+shift+g", label: "Geeignetheitserklärung öffnen", group: "Aktionen", global: true },
+  { id: "doc.kid", keys: "mod+shift+k", label: "Basisinformationsblatt (KID) öffnen", group: "Aktionen", global: true },
+  { id: "doc.confirmation", keys: "mod+shift+f", label: "Confirmation (Geschäftsbestätigung) öffnen", group: "Aktionen", global: true },
+  { id: "export.portfolio", keys: "mod+shift+l", label: "Portfolio-Report exportieren (JSON + Markdown)", group: "Aktionen", global: true },
   { id: "duplicate", keys: "d", label: "Trade duplizieren", group: "Blotter" },
   { id: "delete", keys: ["shift+d", "delete"], label: "Trade löschen (mit Rückgängig)", group: "Blotter" },
   { id: "down", keys: "j", label: "Nächster Trade", group: "Blotter" },

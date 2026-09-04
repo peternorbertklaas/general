@@ -1,9 +1,9 @@
 import { type InterpolatedCurve } from "../curves/curve.js";
 import { getIndex } from "../curves/index-definitions.js";
-import { toISO } from "../dates/date.js";
+import { parseISO, toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
 import { frequencyPerYear } from "../dates/schedule.js";
-import { formatPctDe } from "../format.js";
+import { formatDateDe, formatDe, formatPctDe } from "../format.js";
 import { embeddedOptionLegs, tradeMaturityDate } from "../instruments/trade-dates.js";
 import { type FloatLeg, type PricingResult, type SwapLeg, type Trade } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve } from "../market/market-context.js";
@@ -114,7 +114,9 @@ function volSurfaceExtrapolation(ctx: MarketContext, trade: Trade, pricing: Pric
   const beyond = (what: string, value: number, grid: number[] | undefined, surfaceId: string) => {
     const last = grid?.[grid.length - 1];
     if (last !== undefined && value > last + tol)
-      reasons.push(`${what} ${value.toFixed(2)}Y über letztem Gitterpunkt (${last}Y) der Volatilitätsfläche ${surfaceId} hinaus (Extrapolation)`);
+      reasons.push(
+        `${what} ${formatDe(value, 2)}Y über letztem Gitterpunkt (${formatDe(last, last % 1 === 0 ? 0 : 2)}Y) der Volatilitätsfläche ${surfaceId} hinaus (Extrapolation)`,
+      );
   };
   if (trade.type === "Swaption") {
     const ccy = trade.underlying.legs[0]?.currency ?? "";
@@ -168,7 +170,7 @@ export function ifrs13Level(ctx: MarketContext, trade: Trade, pricing: PricingRe
     const c = ctx.curves[id]!;
     const last = c.nodeDates[c.nodeDates.length - 1];
     if (last !== undefined && maturity > last + EXTRAPOLATION_TOLERANCE_DAYS) {
-      reasons.push(`Fälligkeit ${toISO(maturity)} über letzten Pillar (${toISO(last)}) der genutzten Kurve ${c.id} hinaus (Extrapolation)`);
+      reasons.push(`Fälligkeit ${formatDateDe(maturity)} über letzten Pillar (${formatDateDe(last)}) der genutzten Kurve ${c.id} hinaus (Extrapolation)`);
     }
   }
   reasons.push(...volSurfaceExtrapolation(ctx, trade, pricing));
@@ -397,6 +399,11 @@ function pct(x: number, digits = 3): string {
   return formatPctDe(x, digits);
 }
 
+/** ISO spot date of `pricing.details` → TT.MM.JJJJ for the methodology text. */
+function spotDateDe(iso: string): string {
+  return /^\d{4}-\d{2}-\d{2}$/.test(iso) ? formatDateDe(parseISO(iso)) : iso;
+}
+
 function legsOf(trade: Trade): SwapLeg[] {
   if (trade.type === "InterestRateSwap" || trade.type === "CrossCurrencySwap") return trade.legs;
   if (trade.type === "Swaption") return trade.underlying.legs;
@@ -445,7 +452,7 @@ function curveLines(ctx: MarketContext, trade: Trade): string[] {
     const interp = c.interpolation ? (INTERPOLATION_LABELS[c.interpolation] ?? c.interpolation) : "n/a";
     const extra = c.extrapolation ? (EXTRAPOLATION_LABELS[c.extrapolation] ?? c.extrapolation) : "n/a";
     lines.push(
-      `Kurve ${id}: sequentielles Bootstrapping (Brent je Pillar), Interpolation ${interp}, Extrapolation jenseits des letzten Pillars${last !== undefined ? ` (${toISO(last)})` : ""}: ${extra}; am kurzen Ende erster Forward.`,
+      `Kurve ${id}: sequentielles Bootstrapping (Brent je Pillar), Interpolation ${interp}, Extrapolation jenseits des letzten Pillars${last !== undefined ? ` (${formatDateDe(last)})` : ""}: ${extra}; am kurzen Ende erster Forward.`,
     );
   }
   return lines;
@@ -459,7 +466,7 @@ function conventionLines(trade: Trade): string[] {
     ];
   const parts = legs.map((l, i) => {
     const kind =
-      l.type === "Fixed" ? `Fix ${pct(l.rate)}` : `Float ${l.index}${l.spread ? ` ${l.spread >= 0 ? "+" : ""}${(l.spread * 1e4).toFixed(1)} bp` : ""}`;
+      l.type === "Fixed" ? `Fix ${pct(l.rate)}` : `Float ${l.index}${l.spread ? ` ${l.spread >= 0 ? "+" : ""}${formatDe(l.spread * 1e4, 1)} bp` : ""}`;
     return `Leg ${i + 1} (${l.payReceive === "Receive" ? "Empfang" : "Zahlung"}, ${kind}): ${l.frequency}, ${l.dayCount}, ${l.businessDayConvention ?? "ModifiedFollowing"}, Kalender ${l.calendar}, Stub ${l.stub ?? "ShortFront"}${l.endOfMonth ? ", EOM-Roll" : ""}${l.roll === "IMM" ? ", IMM-Roll" : ""}${l.paymentLag ? `, Zahlungsverzug ${l.paymentLag} GT` : ""}`;
   });
   return [
@@ -543,7 +550,7 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
             : "Fallback-Vol 70 bp (keine Fläche)";
       const vol =
         typeof a.volatility === "number"
-          ? ` – verwendete Vol ${s?.volType === "Normal" || !s ? `${(a.volatility * 1e4).toFixed(2)} bp` : pct(a.volatility, 2)}`
+          ? ` – verwendete Vol ${s?.volType === "Normal" || !s ? `${formatDe(a.volatility * 1e4, 2)} bp` : pct(a.volatility, 2)}`
           : "";
       return [
         `Europäische Swaption, Modell ${model}${model === "ShiftedBlack" ? ` (Shift ${pct(trade.shift ?? s?.shift ?? 0, 2)})` : ""} auf den Forward-Swapsatz; Settlement ${String(a.settlement ?? trade.settlement)} (${trade.settlement === "Cash" && (trade.cashSettlementConvention ?? "CollateralisedCashPrice") === "IRR" ? "IRR-Cash-Annuität, auf das Settlement-Datum diskontiert" : "Diskont-Annuität"}); Volatilität: ${volSrc}${vol}. Greeks analytisch (Annuitäts-gewichtet).`,
@@ -555,7 +562,8 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
       const q = trade.type === "FxForward" ? trade.sellCurrency : trade.nearLeg.sellCurrency;
       const lag = fxSpotLag(b, q);
       return [
-        `FX-Forward über Zinsparität mit Spot-Date-Anker (${b}${q}: T+${lag} auf dem Paar-Kalender${b !== "USD" && q !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${pricing.details.spotDate}` : ""}): F = S · [DF_Basis(T)/DF_Basis(t_s)] / [DF_Quote(T)/DF_Quote(t_s)]; Barwert = diskontierte Zahlungsströme beider Währungen, umgerechnet zum auf den Bewertungstag angepassten Spot S·DF_Quote(t_s)/DF_Basis(t_s).`,
+        `FX-Forward über Zinsparität mit Spot-Date-Anker (${b}${q}: T+${lag} auf dem Paar-Kalender${b !== "USD" && q !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${spotDateDe(pricing.details.spotDate)}` : ""}): F = S · [DF_Basis(T)/DF_Basis(t_s)] / [DF_Quote(T)/DF_Quote(t_s)]; Barwert = diskontierte Zahlungsströme beider Währungen, umgerechnet zum auf den Bewertungstag angepassten Spot S·DF_Quote(t_s)/DF_Basis(t_s).`,
+        `FX-Delta: deltaAmount = Barwertänderung in der Reporting-Währung bei +1 % Spot der Kaufwährung ${b} gegen ${q} (linear: ±Barwert des Legs in der bewegten Währung × 1 %); ein deltaPct wird für lineare FX-Geschäfte nicht ausgewiesen (Delta ±1).`,
       ];
     }
     case "FxOption": {
@@ -575,7 +583,8 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
             : "Fallback-Vol 8 % (keine Fläche)";
       const vol = typeof a.volatility === "number" ? `, verwendete Vol ${pct(a.volatility, 3)}` : "";
       return [
-        `${kind}: Garman-Kohlhagen${trade.barrier ? " / Reiner-Rubinstein (Single-Barrier, Diskontierung und Forward auf das Lieferdatum, Diffusion bis Expiry)" : trade.digital ? " (Digital analytisch, Cash- bzw. Asset-or-nothing)" : ""}; Forward Spot-Date-verankert (${base}${quote}: T+${lag} auf dem Paar-Kalender${base !== "USD" && quote !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${pricing.details.spotDate}` : ""}), Diskontierung bis Lieferdatum ${toISO(trade.deliveryDate)}, Vol-Zeit bis Expiry ${toISO(trade.expiryDate)}; ${smile}${vol}; ${greeks}.`,
+        `${kind}: Garman-Kohlhagen${trade.barrier ? " / Reiner-Rubinstein (Single-Barrier, Diskontierung und Forward auf das Lieferdatum, Diffusion bis Expiry)" : trade.digital ? " (Digital analytisch, Cash- bzw. Asset-or-nothing)" : ""}; Forward Spot-Date-verankert (${base}${quote}: T+${lag} auf dem Paar-Kalender${base !== "USD" && quote !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${spotDateDe(pricing.details.spotDate)}` : ""}), Diskontierung bis Lieferdatum ${formatDateDe(trade.deliveryDate)}, Vol-Zeit bis Expiry ${formatDateDe(trade.expiryDate)}; ${smile}${vol}; ${greeks}.`,
+        `FX-Delta: deltaAmount = Barwertänderung in der Reporting-Währung bei +1 % Spot der Basiswährung ${base} gegen ${quote} (Geldbetrag); deltaPct = vorzeichenbehaftetes Spot-Delta als Anteil des Nominals (= deltaAmount / (1 % des Nominals in Reporting-Währung), Long Call ≈ +0,5 am Geld, Long Put ≈ −0,5; für Vanillas in [−1, 1]). Vega-Buckets je Expiry-Zeile der FX-Fläche (ATM +1 Vol-Punkt, optional RR/BF als Smile-Buckets).`,
       ];
     }
   }
@@ -585,7 +594,7 @@ function riskLines(risk: RiskReport | undefined, xva: XvaResult | undefined): st
   const lines: string[] = [];
   if (risk) {
     lines.push(
-      "Sensitivitäten per Bump-and-Reprice: DV01 und Buckets als zentrale Differenz ±1 bp der Zero-Sätze (parallel bzw. je Pillar), Vega +1 bp Normal-Vol (bzw. +1 Vol-Punkt lognormal/FX), FX-Delta ±1 % Spot; Theta = 1-Tages-Constant-Curve-Roll (Zero-Sätze je Laufzeit konstant, Vol-Flächen sticky expiry) plus in (t, t+1] gezahlte Cashflows, zerlegt in Carry (Forward-Roll) und Roll-Down.",
+      "Sensitivitäten per Bump-and-Reprice: DV01 und Buckets als zentrale Differenz ±1 bp der Zero-Sätze (parallel bzw. je Pillar), Vega +1 bp Normal-Vol (bzw. +1 Vol-Punkt lognormal/FX), FX-Delta ±1 % Spot (Barwertänderung in Reporting-Währung je +1 % Aufwertung der Fremdwährung – Geldbetrag wie analytics.deltaAmount, nicht die Delta-Quote deltaPct); Theta = 1-Tages-Constant-Curve-Roll (Zero-Sätze je Laufzeit konstant, Vol-Flächen sticky expiry) plus in (t, t+1] gezahlte Cashflows, zerlegt in Carry (Forward-Roll) und Roll-Down.",
     );
   }
   if (xva)

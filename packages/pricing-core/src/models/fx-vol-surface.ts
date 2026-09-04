@@ -388,3 +388,19 @@ export function fxStrikeFromDelta(s: FxVolSurface, t: number, forward: number, d
 export function shiftFxSurface(s: FxVolSurface, absShift: number): FxVolSurface {
   return { ...s, atm: s.atm.map((v) => Math.max(1e-4, v + absShift)) };
 }
+
+/** Smile quote of an FX surface row that can be bumped separately (vega buckets). */
+export type FxSmileComponent = "atm" | "rr25" | "bf25";
+
+/**
+ * Bump one expiry row of the surface: the ATM vol (floored at 1 bp) or, for
+ * smile buckets, the 25Δ risk reversal / butterfly of that row. Other rows and
+ * the 10Δ quotes are unchanged.
+ */
+export function shiftFxSurfaceRow(s: FxVolSurface, row: number, absShift: number, component: FxSmileComponent = "atm"): FxVolSurface {
+  const bump = (arr: number[], floor: number | undefined) =>
+    arr.map((v, i) => (i === row ? (floor === undefined ? v + absShift : Math.max(floor, v + absShift)) : v));
+  if (component === "rr25") return { ...s, rr25: bump(s.rr25, undefined) };
+  if (component === "bf25") return { ...s, bf25: bump(s.bf25, undefined) };
+  return { ...s, atm: bump(s.atm, 1e-4) };
+}
