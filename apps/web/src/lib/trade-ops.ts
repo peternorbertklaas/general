@@ -31,7 +31,7 @@ export function keyMetricLabel(t: Trade): string {
 /** Formatted headline quote from the pricing analytics (all de-DE). */
 export function keyMetric(t: Trade, a?: Record<string, number | string | undefined>): string {
   if (!a) return "–";
-  const num = (k: string) => (typeof a[k] === "number" ? (a[k] as number) : undefined);
+  const num = (k: string) => (typeof a[k] === "number" ? a[k] : undefined);
   switch (t.type) {
     case "InterestRateSwap":
     case "CrossCurrencySwap":
@@ -215,7 +215,7 @@ export function applyParSolve(t: Trade, r: PricingResult | undefined, ctx?: ParS
             }
             return { ...l, spread: fair };
           }),
-        } as Trade;
+        };
       }
       const hasSchedule = t.legs.some((l) => l.type === "Fixed" && (l.rateSchedule?.length ?? 0) > 0);
       const par = (hasSchedule ? (r.analytics.parRateBase as number | undefined) : undefined) ?? (r.analytics.parRate as number | undefined);
@@ -230,7 +230,7 @@ export function applyParSolve(t: Trade, r: PricingResult | undefined, ctx?: ParS
           const shift = par - r0;
           return { ...l, rate: l.rate + shift, rateSchedule: shiftSchedule(l.rateSchedule, "rate", shift) };
         }),
-      } as Trade;
+      };
     }
     case "Swaption": {
       const fwd = r.analytics.forwardSwapRate as number | undefined;

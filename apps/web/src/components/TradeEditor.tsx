@@ -2,7 +2,6 @@ import { useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
   type BusinessDayConvention,
-  type CrossCurrencySwap,
   type FixedLeg,
   type FloatLeg,
   type StubType,
@@ -857,7 +856,7 @@ export function TradeEditor({ trade, onChange }: Props) {
         }
       >
         <Select
-          value={(trade.collateralCurrency ?? "") as string}
+          value={trade.collateralCurrency ?? ""}
           options={reg.collateral(trade.collateralCurrency)}
           ariaLabel="Collateral-Währung"
           onChange={(v) => upd({ collateralCurrency: v || undefined })}
@@ -899,15 +898,14 @@ export function TradeEditor({ trade, onChange }: Props) {
   switch (trade.type) {
     case "InterestRateSwap":
     case "CrossCurrencySwap": {
-      const setLeg = (i: number, patch: LegPatch) =>
-        onChange({ ...trade, legs: trade.legs.map((l, j) => (j === i ? ({ ...l, ...patch } as SwapLeg) : l)) } as Trade);
-      const setBoth = (patch: LegPatch) => onChange({ ...trade, legs: trade.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } as Trade);
+      const setLeg = (i: number, patch: LegPatch) => onChange({ ...trade, legs: trade.legs.map((l, j) => (j === i ? { ...l, ...patch } : l)) });
+      const setBoth = (patch: LegPatch) => onChange({ ...trade, legs: trade.legs.map((l) => ({ ...l, ...patch })) });
       /** Currency change of a swap: the float legs move to the new currency's index with a curve in the market (R7-02). */
       const setSwapCurrency = (ccy: string) =>
         onChange({
           ...trade,
-          legs: trade.legs.map((l) => (l.type === "Float" ? { ...l, currency: ccy, index: reg.legIndex(ccy, l.index) } : { ...l, currency: ccy }) as SwapLeg),
-        } as Trade);
+          legs: trade.legs.map((l) => (l.type === "Float" ? { ...l, currency: ccy, index: reg.legIndex(ccy, l.index) } : { ...l, currency: ccy })),
+        });
       const leg0 = trade.legs[0]!;
       return (
         <div className="stack">
@@ -989,7 +987,7 @@ export function TradeEditor({ trade, onChange }: Props) {
                       ...trade.legs.map((l, i) => ({ v: String(i), l: `Leg ${i + 1} (${l.currency})` })),
                     ]}
                     ariaLabel="MtM-Reset"
-                    onChange={(v) => upd({ mtmReset: v === "" ? undefined : { resettingLegIndex: Number(v) } } as Partial<CrossCurrencySwap>)}
+                    onChange={(v) => upd({ mtmReset: v === "" ? undefined : { resettingLegIndex: Number(v) } })}
                   />
                 </Field>
               </>
@@ -998,13 +996,13 @@ export function TradeEditor({ trade, onChange }: Props) {
           <AmortisationEditor
             legs={trade.legs.map((l) => ({ ...l, label: l.type === "Fixed" ? "Fest" : l.index }))}
             onSchedule={(targets, schedule) =>
-              onChange({ ...trade, legs: trade.legs.map((l, i) => (targets.includes(i) ? { ...l, notionalSchedule: schedule } : l)) } as Trade)
+              onChange({ ...trade, legs: trade.legs.map((l, i) => (targets.includes(i) ? { ...l, notionalSchedule: schedule } : l)) })
             }
           />
           {trade.legs.map((leg, i) => (
             <div key={i} className="card" style={{ padding: 10 }}>
               <h3>
-                Leg {i + 1} · {leg.type === "Fixed" ? "Festzins" : `Variabel ${(leg as FloatLeg).index}`}
+                Leg {i + 1} · {leg.type === "Fixed" ? "Festzins" : `Variabel ${leg.index}`}
                 <span className="right">
                   <div className="seg" role="group" aria-label={`Richtung Leg ${i + 1}`}>
                     {(["Pay", "Receive"] as const).map((p) => (
@@ -1028,7 +1026,7 @@ export function TradeEditor({ trade, onChange }: Props) {
                       <Select
                         value={leg.currency}
                         options={reg.ccy(leg.currency)}
-                        onChange={(v) => setLeg(i, leg.type === "Float" ? { currency: v, index: reg.legIndex(v, (leg as FloatLeg).index) } : { currency: v })}
+                        onChange={(v) => setLeg(i, leg.type === "Float" ? { currency: v, index: reg.legIndex(v, leg.index) } : { currency: v })}
                       />
                     </Field>
                     <Field label="Nominal">
@@ -1047,7 +1045,7 @@ export function TradeEditor({ trade, onChange }: Props) {
                 {leg.type === "Fixed" ? (
                   <Field label="Festsatz">
                     <NumInput
-                      value={(leg as FixedLeg).rate}
+                      value={leg.rate}
                       scale={100}
                       step={0.005}
                       unit="%"
@@ -1060,15 +1058,11 @@ export function TradeEditor({ trade, onChange }: Props) {
                 ) : (
                   <>
                     <Field label="Index">
-                      <Select
-                        value={(leg as FloatLeg).index}
-                        options={reg.index(leg.currency, (leg as FloatLeg).index)}
-                        onChange={(v) => setLeg(i, { index: v })}
-                      />
+                      <Select value={leg.index} options={reg.index(leg.currency, leg.index)} onChange={(v) => setLeg(i, { index: v })} />
                     </Field>
                     <Field label="Spread">
                       <NumInput
-                        value={(leg as FloatLeg).spread ?? 0}
+                        value={leg.spread ?? 0}
                         scale={1e4}
                         step={1}
                         unit="bp"
@@ -1205,7 +1199,7 @@ export function TradeEditor({ trade, onChange }: Props) {
     case "Swaption": {
       const fixed = trade.underlying.legs.find((l): l is FixedLeg => l.type === "Fixed")!;
       const setUnderlying = (patch: LegPatch) =>
-        onChange({ ...trade, underlying: { ...trade.underlying, legs: trade.underlying.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } });
+        onChange({ ...trade, underlying: { ...trade.underlying, legs: trade.underlying.legs.map((l) => ({ ...l, ...patch })) } });
       /**
        * Currency change rebuilds the underlying swap with the market conventions of the new currency (frequencies, day
        * counts – Markt R4-2) and the curve-backed index of the currency (R8-F1): DKK after "+ Kurve" DKK-DESTR → DESTR.
@@ -1269,9 +1263,10 @@ export function TradeEditor({ trade, onChange }: Props) {
                   payerReceiver: v,
                   underlying: {
                     ...trade.underlying,
-                    legs: trade.underlying.legs.map(
-                      (l) => ({ ...l, payReceive: l.type === "Fixed" ? (v === "Payer" ? "Pay" : "Receive") : v === "Payer" ? "Receive" : "Pay" }) as SwapLeg,
-                    ),
+                    legs: trade.underlying.legs.map((l) => ({
+                      ...l,
+                      payReceive: l.type === "Fixed" ? (v === "Payer" ? "Pay" : "Receive") : v === "Payer" ? "Receive" : "Pay",
+                    })),
                   },
                 })
               }
@@ -1590,15 +1585,13 @@ export function TradeEditor({ trade, onChange }: Props) {
                 />
               </Field>
               {trade.barrier.rebate !== undefined && trade.barrier.type.endsWith("Out") && (
-                // core R8 (N7-5): the knock-out rebate convention is part of the trade – at the touch (Haug / QuantLib) or at expiry
-                <Field
-                  label="Rebate-Zahlung"
-                  hint="Knock-out-Rebate bei Berührung (Haug / QuantLib) oder bei Verfall (Reiner–Rubinstein); „Standard“ = bisherige gemischte Konvention"
-                >
+                // core R8/R9 (N7-5): the knock-out rebate convention is part of the trade – at the touch (Haug / QuantLib, the
+                // core default since R9) or at expiry (Reiner–Rubinstein)
+                <Field label="Rebate-Zahlung" hint="Knock-out-Rebate bei Berührung (Haug / QuantLib – Standard des Kerns) oder bei Verfall (Reiner–Rubinstein)">
                   <Select
                     value={trade.barrier.rebateAt ?? "default"}
                     options={[
-                      { v: "default" as const, l: "Standard (gemischt)" },
+                      { v: "default" as const, l: "Standard (bei Berührung)" },
                       { v: "hit" as const, l: "bei Berührung" },
                       { v: "expiry" as const, l: "bei Verfall" },
                     ]}

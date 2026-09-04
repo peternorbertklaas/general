@@ -134,10 +134,10 @@ export function ScenariosView() {
   const tableNav = useTableNav({ onCopied: () => act().showToast("Zeile kopiert") });
   const tradeNav = useTableNav({
     onCopied: () => act().showToast("Zeile kopiert"),
-    onFocusRow: (i) => trades[i] && act().select(trades[i]!.id),
+    onFocusRow: (i) => trades[i] && act().select(trades[i].id),
     onEnter: (i) => {
       if (trades[i]) {
-        act().select(trades[i]!.id);
+        act().select(trades[i].id);
         act().setView("pricing");
       }
     },
@@ -333,7 +333,7 @@ export function ScenariosView() {
                     aria-selected={active || undefined}
                     className={`cell ${r === 0 && f === 0 ? "base" : ""} ${active ? "active" : ""}`}
                     style={{ background: heatBg(pnl >= 0 ? "--pos" : "--neg", a) }}
-                    title={`PV ${fmtMoney(grid.pv[i]![j]!, s.reportingCurrency)} · Klick: What-if Zinsen ${fmtSigned(r, 0, "bp")}, EUR ${fmtSigned(fxCcy === "EUR" ? f : -f, 1, "%")}`}
+                    title={`PV ${fmtMoney(grid.pv[i]![j], s.reportingCurrency)} · Klick: What-if Zinsen ${fmtSigned(r, 0, "bp")}, EUR ${fmtSigned(fxCcy === "EUR" ? f : -f, 1, "%")}`}
                     aria-label={`Zinsen ${fmtSigned(r, 0, "bp")}, ${fxCcy} ${fmtSigned(f, 1, "%")}: P&L ${fmtMoney(pnl, s.reportingCurrency)}`}
                     onClick={() => {
                       // The what-if FX slider shifts EUR vs. everything else; a +x % USD move ≙ −x % EUR.

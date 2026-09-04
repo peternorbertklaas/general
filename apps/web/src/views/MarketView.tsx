@@ -19,14 +19,14 @@ import { NumInput } from "../components/NumInput.js";
 import { useGridNav } from "../hooks/useGridNav.js";
 import { useTableNav } from "../hooks/useTableNav.js";
 import { CDS_TENORS, hazardCurveResult, normaliseCdsQuotes, tenorYears } from "../lib/credit.js";
-import { focusWhenPresent } from "../lib/focus.js";
+import { focusNeighbourAfterRemoval, focusWhenPresent } from "../lib/focus.js";
 import { fmtBp, fmtDate, fmtNum, fmtPct } from "../lib/format.js";
-import { translateCoreMessage } from "../lib/i18n.js";
+import { marketLabelDe, translateCoreMessage } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
 import { defaultIndexFor } from "../lib/register.js";
-import { exportEnvelope } from "../lib/register-envelope.js";
+import { exportEnvelope, quotesOf } from "../lib/register-envelope.js";
 import { readSnapshotJson, snapshotErrorText } from "../lib/snapshot-import.js";
-import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, useStore } from "../state/store.js";
+import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, snapshotQuoteSpecs, useStore } from "../state/store.js";
 
 /**
  * Apply an edited vol surface: structural problems (dimensions, finite vols,
@@ -1016,7 +1016,11 @@ function FxFixingsEditor() {
                       tabIndex={-1}
                       title="FX-Fixing entfernen"
                       aria-label={`FX-Fixing ${i + 1} entfernen`}
-                      onClick={() => remove(i)}
+                      onClick={(e) => {
+                        // R9-04: the keyboard user lands on the neighbour row (or „+ Zeile“ when the table is empty)
+                        focusNeighbourAfterRemoval(e.currentTarget.closest("tr"), '[data-testid="fx-fixing-add"]');
+                        remove(i);
+                      }}
                     >
                       ✕
                     </button>
@@ -1093,7 +1097,7 @@ function CreditCard() {
               {counterparties.map((c) => (
                 <option key={c} value={c}>
                   {c}
-                  {cdsCurves[c]?.length ? ` (${cdsCurves[c]!.length})` : ""}
+                  {cdsCurves[c]?.length ? ` (${cdsCurves[c].length})` : ""}
                 </option>
               ))}
             </select>
@@ -1187,7 +1191,10 @@ function CreditCard() {
                             tabIndex={-1}
                             aria-label={`CDS-Quote ${i + 1} entfernen`}
                             title="Quote entfernen"
-                            onClick={() => setQuotes(quotes.filter((_, j) => j !== i))}
+                            onClick={(e) => {
+                              focusNeighbourAfterRemoval(e.currentTarget.closest("tr"), '[data-testid="cds-add"]');
+                              setQuotes(quotes.filter((_, j) => j !== i));
+                            }}
                           >
                             ✕
                           </button>
@@ -1285,7 +1292,7 @@ function FixingsEditor() {
   const remove = (i: number) =>
     apply(
       fixings.filter((_, j) => j !== i),
-      `Fixing ${fixings[i]?.index ?? ""} ${fixings[i] ? fmtDate(fixings[i]!.date) : ""} entfernt`,
+      `Fixing ${fixings[i]?.index ?? ""} ${fixings[i] ? fmtDate(fixings[i].date) : ""} entfernt`,
     );
   const add = (f: Fixing) => apply([...fixings, f], `Fixing ${f.index} ${fmtDate(f.date)} hinzugefügt`);
   /** Today's EURIBOR-6M from the projection curve (fallback 2 %). */
@@ -1318,7 +1325,7 @@ function FixingsEditor() {
           <button className="btn ghost" onClick={addEuribor6mToday} title="EURIBOR-6M mit dem Kurven-Forward am Bewertungstag anlegen">
             + EURIBOR-6M heute
           </button>
-          <button className="btn" onClick={() => add({ index: "EURIBOR-6M", date: m.valuationDate, value: 0.02 })}>
+          <button className="btn" data-testid="fixings-add-row" onClick={() => add({ index: "EURIBOR-6M", date: m.valuationDate, value: 0.02 })}>
             + Zeile
           </button>
         </span>
@@ -1404,7 +1411,11 @@ function FixingsEditor() {
                         tabIndex={-1}
                         title="Fixing entfernen"
                         aria-label={`Fixing ${i + 1} entfernen`}
-                        onClick={() => remove(i)}
+                        onClick={(e) => {
+                          // R9-04: the keyboard user lands on the neighbour row (or „+ Zeile“ when the table is empty)
+                          focusNeighbourAfterRemoval(e.currentTarget.closest("tr"), '[data-testid="fixings-add-row"]');
+                          remove(i);
+                        }}
                       >
                         ✕
                       </button>
@@ -1508,11 +1519,43 @@ export function MarketView() {
       extraCurves: st.extraCurves,
       extraSpots: st.extraSpots,
       extraVolSurfaces: st.extraVolSurfaces,
+      importedSnapshot: st.importedSnapshot,
     })),
   );
   const act = useStore.getState;
   const m = s.baseMarket;
   const imported = s.marketSource === "import";
+  /** Import a snapshot file – German causes for every failure: JSON, schema, missing fields, core validation (R5-06). */
+  const importSnapshotFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const json = readSnapshotJson(await file.text());
+      const r = act().importSnapshot(json);
+      if (!r.ok) {
+        act().showToast(`Import fehlgeschlagen: ${r.error}`, { ms: 8000 });
+        return;
+      }
+      // The toast names what was discarded and what stays remembered (R8-F2) and what the envelope registered (Markt R8-1).
+      act().showToast(
+        `Snapshot „${r.label}“ importiert · ID ${r.id}${r.dateChanged ? ` · Bewertungstag auf ${fmtDate(r.valuationDate)} gesetzt` : ""}${
+          r.registered ? ` · registriert: ${r.registered}` : ""
+        }${r.quoteCurves.length ? ` · Bootstrap-Quotes für ${r.quoteCurves.length} Kurve${r.quoteCurves.length === 1 ? "" : "n"} (Par-Risiko)` : ""}${
+          r.discarded.length ? ` · verworfen: ${r.discarded.join(", ")} (Rückgängig stellt sie wieder her)` : ""
+        }${r.kept.length ? ` · gemerkt, nach „Zum Sample-Markt“ wieder aktiv: ${r.kept.join(", ")}` : ""}`,
+        { ms: 8000, action: { label: "Rückgängig", run: () => useStore.getState().undo() } },
+      );
+      // Plausibility hints of the imported surfaces (Markt R6-4): the import stands, the user sees why values may look off.
+      if (r.warnings.length)
+        act().showToast(`Snapshot importiert – Hinweis: ${r.warnings[0]}${r.warnings.length > 1 ? ` (+${r.warnings.length - 1} weitere)` : ""}`, {
+          ms: 10000,
+        });
+    } catch (err) {
+      act().showToast(`Import fehlgeschlagen: ${snapshotErrorText(err, (x) => (x instanceof Error ? x.message : String(x)))}`, { ms: 8000 });
+    } finally {
+      e.target.value = "";
+    }
+  };
   // Deterministic id of exactly this base market – the same value the report shows as "Snapshot" (R5-F2).
   const snapshotId = useMemo(() => marketSnapshotId(m), [m]);
   const swptKeys = Object.keys(m.swaptionVols ?? {});
@@ -1567,7 +1610,7 @@ export function MarketView() {
               </span>
             )}
             <br />
-            Label: {m.meta?.label}
+            Label: {marketLabelDe(m.meta?.label, "–")}
             {modified && (
               <span className="badge warn" style={{ marginLeft: 6 }}>
                 modifiziert
@@ -1588,15 +1631,21 @@ export function MarketView() {
               className="btn"
               data-testid="snapshot-export"
               onClick={() => {
-                // The register envelope travels with the file (Markt R8-1): runtime-registered indices, conventions, calendars.
+                // The register envelope travels with the file (Markt R8-1): runtime-registered indices, conventions, calendars –
+                // and the bootstrap specs of the curves outside the sample set (`quotes`, Markt R9-1), so par risk works after a re-import.
                 const envelope = exportEnvelope();
+                const quotes = snapshotQuoteSpecs(m, imported ? {} : s.extraCurves, quotesOf(s.importedSnapshot));
                 downloadText(
                   `deriva-market-${toISO(m.valuationDate)}.json`,
-                  JSON.stringify({ ...serializeMarket(m), ...envelope }, null, 2),
+                  JSON.stringify({ ...serializeMarket(m), ...envelope, ...(quotes.length ? { quotes } : {}) }, null, 2),
                   "application/json",
                 );
                 const n = (envelope.indices?.length ?? 0) + (envelope.conventions?.length ?? 0) + (envelope.calendars?.length ?? 0);
-                act().showToast(`Markt-Snapshot exportiert · ID ${snapshotId}${n ? ` · Register-Envelope (${n} Einträge)` : ""}`);
+                act().showToast(
+                  `Markt-Snapshot exportiert · ID ${snapshotId}${n ? ` · Register-Envelope (${n} Einträge)` : ""}${
+                    quotes.length ? ` · Bootstrap-Quotes für ${quotes.map((q) => q.curveId).join(", ")}` : ""
+                  }`,
+                );
               }}
             >
               ⤓ Snapshot exportieren
@@ -1608,37 +1657,7 @@ export function MarketView() {
                 accept="application/json"
                 style={{ display: "none" }}
                 data-testid="snapshot-import"
-                onChange={async (e) => {
-                  const file = e.target.files?.[0];
-                  if (!file) return;
-                  try {
-                    // German causes for every failure: JSON, schema, missing fields, core validation (R5-06)
-                    const json = readSnapshotJson(await file.text());
-                    const r = act().importSnapshot(json);
-                    if (!r.ok) {
-                      act().showToast(`Import fehlgeschlagen: ${r.error}`, { ms: 8000 });
-                      return;
-                    }
-                    // The toast names what was discarded and what stays remembered (R8-F2) and what the envelope registered (Markt R8-1).
-                    act().showToast(
-                      `Snapshot „${r.label}“ importiert · ID ${r.id}${r.dateChanged ? ` · Bewertungstag auf ${fmtDate(r.valuationDate)} gesetzt` : ""}${
-                        r.registered ? ` · registriert: ${r.registered}` : ""
-                      }${r.discarded.length ? ` · verworfen: ${r.discarded.join(", ")} (Rückgängig stellt sie wieder her)` : ""}${
-                        r.kept.length ? ` · gemerkt, nach „Zum Sample-Markt“ wieder aktiv: ${r.kept.join(", ")}` : ""
-                      }`,
-                      { ms: 8000, action: { label: "Rückgängig", run: () => useStore.getState().undo() } },
-                    );
-                    // Plausibility hints of the imported surfaces (Markt R6-4): the import stands, the user sees why values may look off.
-                    if (r.warnings.length)
-                      act().showToast(`Snapshot importiert – Hinweis: ${r.warnings[0]}${r.warnings.length > 1 ? ` (+${r.warnings.length - 1} weitere)` : ""}`, {
-                        ms: 10000,
-                      });
-                  } catch (err) {
-                    act().showToast(`Import fehlgeschlagen: ${snapshotErrorText(err, (x) => (x instanceof Error ? x.message : String(x)))}`, { ms: 8000 });
-                  } finally {
-                    e.target.value = "";
-                  }
-                }}
+                onChange={(e) => void importSnapshotFile(e)}
               />
             </label>
             {imported && (
@@ -1716,7 +1735,7 @@ export function MarketView() {
                   const extra = !imported && s.quotes.fxSpots[pair] === undefined && s.extraSpots[pair] !== undefined;
                   const orig = imported
                     ? (s.importedBase?.fxSpots[pair] ?? v)
-                    : ((Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? (extra ? s.extraSpots[pair] : undefined) ?? v) as number);
+                    : (Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? (extra ? s.extraSpots[pair] : undefined) ?? v);
                   return (
                     <tr key={pair} style={{ cursor: "default" }} data-testid={`fx-spot-row-${pair}`}>
                       <td className="mono">

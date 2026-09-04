@@ -5,6 +5,7 @@ import {
   addTenor,
   advance,
   getCalendar,
+  knownIndices,
   makeAmortisingSwap,
   makeBasisSwap,
   makeCapFloor,
@@ -20,7 +21,7 @@ import {
   toISO,
 } from "@deriva/pricing-core";
 import { fmtDate, fmtNum } from "./format.js";
-import { defaultIndexFor, indexHasCurve, indexNamesOf, normaliseIndexToken } from "./register.js";
+import { defaultIndexFor, indexHasCurve, indexNamesOf, normaliseIndexToken, unregisteredCurrencyHint } from "./register.js";
 import { swaptionWithUnderlyingIndex } from "./swaption.js";
 import { ccsCollateralCurrency } from "./templates.js";
 
@@ -80,6 +81,10 @@ const DATE = { test: (t: string) => DATE_ISO.test(t) || DATE_DE.test(t) };
 const FRA_PERIOD = /^(\d{1,2})x(\d{1,2})$/i;
 /** Step-up coupon list "2.5/3.0/3.5" (percent, one rate per year). */
 const STEP_LIST = /^-?\d+(?:[.,]\d+)?(?:\/-?\d+(?:[.,]\d+)?)+$/;
+/** Basis-swap legs "3m/6m", "6m/1d" (IBOR vs OIS), "1d/3m" – tenors resolved to the currency's indices (Markt R9-3). */
+const BASIS_LEGS = /^\d+[dwmy]\/\d+[dwmy]$/i;
+/** Basis-swap legs as tenors or index names ("nibor3m/nowa", "3m/estr") – accepted by the basis branch only. */
+const BASIS_LEGS_OR_INDICES = /^(?:\d+[dwmy]|[a-z€][a-z0-9€-]*)\/(?:\d+[dwmy]|[a-z€][a-z0-9€-]*)$/i;
 
 /** Serial date of an ISO / German date token (undefined for impossible dates such as 31.02.). */
 function parseDateToken(tok: string): number | undefined {
@@ -179,7 +184,22 @@ const BARRIER_WORDS: Record<string, BarrierType> = {
   "down-and-out": "DownOut",
   "down-and-in": "DownIn",
 };
-const INDEX_RE = /^(euribor|estr|sofr|sonia|saron|tona|nowa|stibor|wibor|cibor|nibor|polonia|wiron|swestr|destr)/i;
+/**
+ * Whether a token names an index (R9-F1 / Markt R9-5): every *registered* index counts – built in or registered at
+ * runtime ("+ Währung", snapshot envelope: `bubor6m`, `PRIBOR-6M`, `hufonia`) – via `normaliseIndexToken`; in addition a
+ * token that starts with the family name of a registered index ("nibor9m", "pribor3m") is an index token, so the
+ * branch can report "Unbekannter Index „nibor9m“ – für NOK registriert: …" instead of "Unbekanntes Token". The family
+ * list is read from the register on every call, never from a static list.
+ */
+export function isIndexToken(t: string): boolean {
+  if (!/^[a-z€][a-z0-9€-]*$/i.test(t)) return false;
+  if (normaliseIndexToken(t) !== undefined) return true;
+  const up = t.toUpperCase();
+  return knownIndices().some((i) => {
+    const family = /^[A-Z€]+/.exec(i.name)?.[0];
+    return !!family && family.length >= 3 && up.startsWith(family);
+  });
+}
 const COMMANDS = new Set([
   "irs",
   "swap",
@@ -220,8 +240,8 @@ export function isGrammarToken(t: string): boolean {
   if (isCcy(t) || DIRECTION.has(tl) || COMMANDS.has(tl) || MODIFIERS.has(tl) || tl in BARRIER_WORDS) return true;
   if (FRA_PERIOD.test(t) || STEP_LIST.test(t)) return true;
   if (/^[a-z]{6}$/i.test(t) && isPair(t)) return true; // currency pair
-  if (INDEX_RE.test(t)) return true;
-  if (/^\d+m\/\d+m$/i.test(t) || /%$/.test(t) || /bp$/i.test(t)) return true;
+  if (isIndexToken(t)) return true;
+  if (BASIS_LEGS.test(t) || /%$/.test(t) || /bp$/i.test(t)) return true;
   return false;
 }
 
@@ -333,12 +353,41 @@ export function fxVolWarning(pair: string, pairs: string[] | undefined): string 
 
 /* ---------- token-level errors (R6-1) ---------- */
 
-/** German error for a token the branch cannot interpret – names the token, the currencies and the branch grammar. */
-export function unknownTokenError(tok: string, grammar: string): string {
+/**
+ * German error for a token the branch cannot interpret – names the token, the currencies and the branch grammar. A
+ * currency the *market* discounts but the register does not know (a HUF curve from a snapshot without its
+ * `conventions`, R9-F3) gets the "+ Währung" hint instead of "Unbekannte Währung" – the editor says the same there.
+ */
+export function unknownTokenError(tok: string, grammar: string, opts: Pick<QuickEntryOptions, "curveCurrencies"> = {}): string {
   // "Unbekannte Währung" only where the grammar takes a currency token ([ccy]); pair-based branches report a plain token.
   const ccyLike = /\[ccy\]/.test(grammar) && /^[a-z]{3}$/i.test(tok) && !isCcy(tok) && !MODIFIERS.has(tok.toLowerCase()) && !DIRECTION.has(tok.toLowerCase());
-  const head = ccyLike ? `Unbekannte Währung „${tok.toUpperCase()}“` : `Unbekanntes Token „${tok}“`;
+  const up = tok.toUpperCase();
+  if (ccyLike && opts.curveCurrencies?.includes(up))
+    return `Währung „${up}“ hat eine Kurve im Markt, ist aber nicht registriert – ${unregisteredCurrencyHint(up)}`;
+  const head = ccyLike ? `Unbekannte Währung „${up}“` : `Unbekanntes Token „${tok}“`;
   return `${head} – Währungen: ${ccyList()}; erwartet: ${grammar}`;
+}
+
+/**
+ * Index of a basis-swap leg (Markt R9-3): a tenor ("3M", "6M") resolves to the registered index of the currency with
+ * that tenor, "1D" to its OIS index; an index name ("nibor3m", "ESTR") is normalised. Several matches prefer the index
+ * whose curve is in the market. Returns the index or a German error naming the currency's indices.
+ */
+function basisLegIndex(tok: string, ccy: string, opts: QuickEntryOptions): { index: string } | { error: string } {
+  const up = tok.toUpperCase();
+  const registered = knownIndices(ccy);
+  const byTenor = TENOR.test(up) ? registered.filter((i) => (up === "1D" ? i.type === "OIS" : i.type !== "OIS" && i.tenor.toUpperCase() === up)) : [];
+  const withCurve = byTenor.find((i) => opts.curveIds?.includes(i.curveId));
+  const chosen = withCurve ?? byTenor[0];
+  if (chosen) return { index: chosen.name };
+  const named = normaliseIndexToken(tok);
+  if (named && registered.some((i) => i.name === named)) return { index: named };
+  if (named) return { error: `Index ${named} gehört nicht zu ${ccy} – für ${ccy} registriert: ${indexNamesOf(ccy).join(", ") || "–"}` };
+  return {
+    error: `Für ${ccy} ist kein ${up === "1D" ? "OIS-Index (1D)" : `${up}-Index`} registriert – registriert: ${indexNamesOf(ccy).join(", ") || "–"}${
+      indexNamesOf(ccy).length ? "" : " (in der Kurvenansicht mit „+ Währung“ registrieren)"
+    }`,
+  };
 }
 const fail = (error: string): ParseResult => ({ ok: false, error });
 /** A rate product in a currency the market has no curve for (R6-5). */
@@ -386,7 +435,7 @@ const GRAMMAR = {
   fxo: "fxo <pair> call|put <strike> [notional] <datum|tenor> [barrier uo|ui|do|di <level>] [@Kontrahent]",
   fxs: "fxs <pair> <±betrag> <nearKurs> <farKurs> <farDatum|tenor> [@Kontrahent]",
   ccs: "ccs <pair> <tenor> [spreadbp] [notional] [mtm] [pay|rec] [fxSpot] [fixed <rate%>] [@Kontrahent]",
-  basis: "basis [ccy] <tenor> <recTenor>/<payTenor> [spreadbp] [notional] [@Kontrahent]",
+  basis: "basis [ccy] <tenor> <recTenor>/<payTenor> [spreadbp] [notional] [@Kontrahent] (Tenore → Indizes der Währung, 1d = OIS)",
   fra: "fra [ccy] <NxM> pay|rec <rate%> [notional] [index] [@Kontrahent]",
 };
 
@@ -410,32 +459,39 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
   const spot = advance(valuationDate, "2D", cal);
   try {
     if (["basis", "tenorbasis"].includes(cmd)) {
-      // basis [ccy] <tenor> <recIdx>/<payIdx> [spreadbp] [notional]   e.g. "basis 5y 3m/6m 5bp 10m"
+      // basis [ccy] <tenor> <recTenor>/<payTenor> [spreadbp] [notional]   e.g. "basis 5y 3m/6m 5bp 10m", "basis nok 5y 3m/6m"
+      // The leg tenors resolve to the *currency's* registered indices (Markt R9-3): NOK → NIBOR-3M / NIBOR-6M, "1d" → OIS.
       let ccy = "EUR";
       let tenor: string | undefined;
-      let rec = "EURIBOR-3M";
-      let pay = "EURIBOR-6M";
+      let legs: [string, string] = ["3M", "6M"];
       let spread = 0;
       const notional = new AmountSlot(10_000_000);
       for (const t of rest) {
         if (isCcy(t)) ccy = t.toUpperCase();
-        else if (/^\d+m\/\d+m$/i.test(t)) {
-          const [a, b] = t.toUpperCase().split("/");
-          rec = `EURIBOR-${a}`;
-          pay = `EURIBOR-${b}`;
-        } else if (/bp$/i.test(t)) spread = parseRate(t) ?? 0;
+        else if (BASIS_LEGS.test(t) || (BASIS_LEGS_OR_INDICES.test(t) && !DIRECTION.has(t.toLowerCase())))
+          legs = t.toUpperCase().split("/") as [string, string];
+        else if (/bp$/i.test(t)) spread = parseRate(t) ?? 0;
         else if (TENOR.test(t) && !tenor) tenor = t.toUpperCase();
         else {
           const taken = notional.take(t);
-          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.basis));
+          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.basis, opts));
           if (taken !== true) return taken;
         }
       }
       if (!tenor) return fail("Laufzeit fehlt (z.B. basis 5y 3m/6m 5bp 10m)");
       const noCurve = noCurveError(ccy, opts);
       if (noCurve) return noCurve;
+      const recLeg = basisLegIndex(legs[0], ccy, opts);
+      if ("error" in recLeg) return fail(recLeg.error);
+      const payLeg = basisLegIndex(legs[1], ccy, opts);
+      if ("error" in payLeg) return fail(payLeg.error);
+      const rec = recLeg.index;
+      const pay = payLeg.index;
+      if (rec === pay) return fail(`Beide Legs zeigen auf ${rec} – zwei verschiedene Tenore angeben (z.B. 3m/6m oder 6m/1d)`);
+      // A registered index without its projection curve is flagged per leg (same note as the swap branch).
+      const legNotes = [...new Set([missingCurveNote(ccy, rec, opts), missingCurveNote(ccy, pay, opts)])].join("");
       const trade = makeBasisSwap({
-        name: `Basis-Swap ${rec.replace("EURIBOR-", "")}/${pay.replace("EURIBOR-", "")} ${tenor}`,
+        name: `Basis-Swap ${ccy} ${legs[0]}/${legs[1]} ${tenor}`,
         currency: ccy,
         notional: notional.value,
         effectiveDate: spot,
@@ -447,7 +503,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       return {
         ok: true,
         trade,
-        description: `Basis-Swap ${rec} ${spread >= 0 ? "+" : ""}${fmtNum(spread * 1e4, 1)} bp vs ${pay} ${tenor} · Nominal ${fmtNum(notional.value, 0)}`,
+        description: `Basis-Swap ${rec} ${spread >= 0 ? "+" : ""}${fmtNum(spread * 1e4, 1)} bp vs ${pay} ${tenor} · Nominal ${fmtNum(notional.value, 0)}${legNotes}`,
       };
     }
     if (["fxs", "fxswap"].includes(cmd)) {
@@ -570,12 +626,12 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           if (rateTok !== undefined) return duplicate("Satz", rateTok, t);
           rate = parseRate(t);
           rateTok = t;
-        } else if (INDEX_RE.test(t)) {
+        } else if (isIndexToken(t)) {
           index = normaliseIndexToken(t);
           if (!index) badIndexTok = t;
         } else {
           const taken = notional.take(t);
-          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.fra));
+          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.fra, opts));
           if (taken !== true) return taken;
         }
       }
@@ -636,12 +692,12 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           if (rateTok !== undefined) return duplicate("Satz", rateTok, t);
           rate = parseRate(t);
           rateTok = t;
-        } else if (INDEX_RE.test(t)) {
+        } else if (isIndexToken(t)) {
           index = normaliseIndexToken(t);
           if (!index) badIndexTok = t;
         } else {
           const taken = notional.take(t);
-          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.irs));
+          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.irs, opts));
           if (taken !== true) return taken;
         }
       }
@@ -689,7 +745,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
         ok: true,
         trade,
         description: `${isImm ? "IMM-" : ""}${pr === "Pay" ? "Payer" : "Receiver"}-Swap ${ccy} ${tenor} @ ${fmtNum(rate * 100, 3)} %${stepUp ? ` → ${steps!.map((r) => fmtNum(r * 100, 2)).join(" / ")} % Staffel` : ""} · Nominal ${fmtNum(notional.value, 0)}${
-          indexNote || (index && (rest.some((t) => INDEX_RE.test(t)) || cmd === "ois") ? ` · ${index}` : "")
+          indexNote || (index && (rest.some((t) => isIndexToken(t)) || cmd === "ois") ? ` · ${index}` : "")
         }${isAmort ? " · linear amortisierend" : ""}${immNote}`,
       };
     }
@@ -719,7 +775,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           strikeTok = t;
         } else {
           const taken = notional.take(t);
-          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.capfloor));
+          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.capfloor, opts));
           if (taken !== true) return taken;
         }
       }
@@ -771,7 +827,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           strikeTok = t;
         } else {
           const taken = notional.take(t);
-          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.swpt));
+          if (taken === false) return fail(unknownTokenError(t, GRAMMAR.swpt, opts));
           if (taken !== true) return taken;
         }
       }

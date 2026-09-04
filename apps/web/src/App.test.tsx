@@ -183,7 +183,9 @@ describe("App", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     expect(useStore.getState().valuationDate).toBe(useStore.getState().baseMarket.valuationDate);
     expect(screen.getAllByText(/Bewertungstag 31.12.2026/).length).toBeGreaterThan(0);
-    act(() => useStore.getState().setValuationDate("2026-09-03"));
+    act(() => {
+      useStore.getState().setValuationDate("2026-09-03");
+    });
   });
   it("shift+t opens the valuation-date popover, g h the hedge view, delete offers undo", () => {
     render(<App />);
@@ -268,7 +270,9 @@ describe("App", () => {
     const fxf = useStore.getState().trades.find((t) => t.id === "FXF-0001")!;
     act(() => useStore.getState().updateTrade({ ...fxf, sellCurrency: "USD", buyCurrency: "USD" } as typeof fxf));
     expect(screen.getByTestId("valuation-error")).toHaveTextContent("Fehler");
-    act(() => useStore.getState().undo());
+    act(() => {
+      useStore.getState().undo();
+    });
     expect(screen.queryByTestId("valuation-error")).toBeNull();
   });
   it("hedge: default designation lies before the valuation date and the verdict is flagged stale after a change (N-20)", async () => {
@@ -329,7 +333,9 @@ describe("App", () => {
     render(<App />);
     // quick-entry step-up: the core writes {start, 2.5 %} + steps – the editor shows 2 Stufen, not 3
     const stepped = parseQuickEntry("irs 5y pay 2.5% 10m step 2.5/3.0/3.5", useStore.getState().valuationDate).trade!;
-    act(() => useStore.getState().addTrade({ ...stepped, id: "STEP-T1" }, { select: true, goToPricing: true }));
+    act(() => {
+      useStore.getState().addTrade({ ...stepped, id: "STEP-T1" }, { select: true, goToPricing: true });
+    });
     expect(screen.getByTestId("coupon-schedule-0").textContent).toMatch(/2 Stufen/);
     expect(screen.getByTestId("coupon-schedule-0").textContent).toMatch(/2,500 % \(Basis\)/);
     act(() => useStore.getState().removeTrade("STEP-T1"));
@@ -406,7 +412,9 @@ describe("App", () => {
     fireEvent.click(screen.getByTestId("toy-apply"));
     expect(useStore.getState().turnOfYear["EUR-ESTR"]?.bp).toBe(20);
     expect(screen.getByTestId("toy-badge")).toBeInTheDocument();
-    act(() => useStore.getState().setTurnOfYear("EUR-ESTR", undefined));
+    act(() => {
+      useStore.getState().setTurnOfYear("EUR-ESTR", undefined);
+    });
     // CDS term structure for the counterparty of IRS-0001 → report uses the bootstrapped hazard curve
     act(() => useStore.getState().setView("market"));
     fireEvent.change(screen.getByTestId("cds-cpty"), { target: { value: "Landesbank A" } });
@@ -425,7 +433,9 @@ describe("App", () => {
   it("hedge: the hedged item takes the amortisation plan of the instrument; option instruments offer the designation", async () => {
     render(<App />);
     const amort = { ...newTradeTemplate("amort", useStore.getState().valuationDate), id: "AMORT-T1" };
-    act(() => useStore.getState().addTrade(amort, { select: true }));
+    act(() => {
+      useStore.getState().addTrade(amort, { select: true });
+    });
     act(() => useStore.getState().setView("hedge"));
     expect(screen.queryByTestId("hedge-designation")).toBeNull();
     fireEvent.click(screen.getByTestId("hedge-take-schedule"));
@@ -474,12 +484,16 @@ describe("App", () => {
     act(() => useStore.getState().resetWhatIf());
     // … and an empty book yields a hint instead of a file
     const trades = useStore.getState().trades;
-    act(() => useStore.setState({ trades: [], results: {} }));
+    act(() => {
+      useStore.setState({ trades: [], results: {} });
+    });
     fireEvent.keyDown(window, { key: "o" });
     fireEvent.keyDown(window, { key: "p" });
     expect(click).toHaveBeenCalledTimes(3);
     expect(useStore.getState().toasts.some((t) => t.msg.includes("Kein Trade im Bestand"))).toBe(true);
-    act(() => useStore.setState({ trades }));
+    act(() => {
+      useStore.setState({ trades });
+    });
     act(() => useStore.getState().repriceAll());
     confirm.mockRestore();
     spy.mockRestore();
@@ -603,7 +617,9 @@ describe("App", () => {
     expect(useStore.getState().hedgeRelationships["IRS-0001"]?.hedgeRatio).toBeCloseTo(0.5, 10);
     confirm.mockRestore();
     act(() => useStore.getState().removeHedgeRelationship("IRS-0001"));
-    act(() => useStore.setState({ undoStack: [] }));
+    act(() => {
+      useStore.setState({ undoStack: [] });
+    });
   });
   it("curves: a turn-of-year date on/before the valuation date shows a validation message and disables 'Anwenden' (R3-F2); '+ FX-Punkte' adds a removable quote (Markt R3-6)", () => {
     render(<App />);
@@ -628,7 +644,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Quote .* entfernen$/ }));
     expect(document.querySelectorAll('[data-testid="quotes-table"] tbody tr').length).toBe(rows);
     act(() => useStore.getState().resetQuotes());
-    act(() => useStore.setState({ undoStack: [] }));
+    act(() => {
+      useStore.setState({ undoStack: [] });
+    });
   });
   it("market: editing a swaption vol cell marks the market as modified, is undoable and resettable (Markt R3-4)", () => {
     render(<App />);
@@ -649,7 +667,9 @@ describe("App", () => {
     expect(screen.getByTestId("fx-vol-edited")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("fx-vol-reset"));
     expect(screen.queryByTestId("fx-vol-edited")).toBeNull();
-    act(() => useStore.setState({ undoStack: [] }));
+    act(() => {
+      useStore.setState({ undoStack: [] });
+    });
   });
   it("editor: UTI is upper-cased and validated, Esc in a date field restores the old value (R3-10 / R3-12)", () => {
     render(<App />);
@@ -669,12 +689,18 @@ describe("App", () => {
     fireEvent.blur(end);
     expect(end.value).toBe(before);
     expect(document.activeElement).not.toBe(end);
-    act(() => useStore.getState().undo());
-    act(() => useStore.setState({ undoStack: [] }));
+    act(() => {
+      useStore.getState().undo();
+    });
+    act(() => {
+      useStore.setState({ undoStack: [] });
+    });
   });
   it("no store writes during render: risk is filled by effects and views render without React warnings (N-26)", async () => {
     render(<App />);
-    act(() => useStore.setState({ compareIds: ["IRS-0001", "CAP-0001"] }));
+    act(() => {
+      useStore.setState({ compareIds: ["IRS-0001", "CAP-0001"] });
+    });
     act(() => useStore.getState().setView("compare"));
     await waitFor(() => expect(useStore.getState().riskCache["IRS-0001"]).toBeDefined());
     act(() => useStore.getState().setView("pricing"));
@@ -687,6 +713,8 @@ describe("App", () => {
     expect(txt).not.toMatch(/spotDate|greeksMethod|deltaPct|deltaAmount|spotAtValuationDate/);
     expect(txt).not.toMatch(/-?\d{1,3}(\.\d{3}){2,},\d{2} %/);
     expect(screen.getByTestId("cashflow-table").textContent).not.toMatch(/115,0000 %/);
-    act(() => useStore.setState({ compareIds: [] }));
+    act(() => {
+      useStore.setState({ compareIds: [] });
+    });
   });
 });

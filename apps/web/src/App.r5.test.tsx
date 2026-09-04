@@ -69,7 +69,9 @@ describe("App – round 5", () => {
     expect(within(risk).getByText(/Vega Swaption EUR/)).toBeInTheDocument();
     expect(within(risk).queryByText(/Vega swaption EUR/)).toBeNull();
     expect(screen.getByTestId("analytics-table")).toHaveAttribute("aria-label", "Preis-Analytics");
-    act(() => useStore.setState({ view: "blotter" }));
+    act(() => {
+      useStore.setState({ view: "blotter" });
+    });
     expect(screen.getByTestId("inspector-analytics")).toHaveAttribute("aria-label", "Kennzahlen");
     for (const t of document.querySelectorAll("table.grid-table.kv")) expect(t.getAttribute("aria-label")).toBeTruthy();
   });
@@ -176,7 +178,7 @@ describe("App – round 5", () => {
 
   it("valuation-date popover asks before discarding an imported snapshot", async () => {
     const { serializeMarket } = await import("@deriva/pricing-core");
-    const file = JSON.parse(JSON.stringify(serializeMarket(useStore.getState().baseMarket)));
+    const file = JSON.parse(JSON.stringify(serializeMarket(useStore.getState().baseMarket))) as ReturnType<typeof serializeMarket>;
     expect(useStore.getState().importSnapshot(file).ok).toBe(true);
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     render(<App />);

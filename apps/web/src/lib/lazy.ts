@@ -109,11 +109,11 @@ export function lazyComponent<P extends object>(loader: () => Promise<LazyModule
       pending = attempt().then(
         (m) => {
           resolved = m.default;
-          return { ok: m } as Outcome<P>;
+          return { ok: m };
         },
         (e: unknown) => {
           failed = e;
-          return { err: e } as Outcome<P>;
+          return { err: e };
         },
       );
     return pending;

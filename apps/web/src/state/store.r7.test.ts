@@ -29,7 +29,9 @@ const OIS = [
 ];
 /** A snapshot of the *sample* market – the auditor's file without any DKK curve. */
 const sampleSnapshot = (): MarketSnapshotJson =>
-  JSON.parse(JSON.stringify(serializeMarket(buildSampleMarket(st().valuationDate, JSON.parse(JSON.stringify(SAMPLE_QUOTES)))))) as MarketSnapshotJson;
+  JSON.parse(
+    JSON.stringify(serializeMarket(buildSampleMarket(st().valuationDate, JSON.parse(JSON.stringify(SAMPLE_QUOTES)) as typeof SAMPLE_QUOTES))),
+  ) as MarketSnapshotJson;
 const dkkSwap = (): Trade =>
   makeVanillaSwap({
     id: "IRS-DKK",

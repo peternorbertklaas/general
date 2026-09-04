@@ -1310,6 +1310,47 @@ try {
     /↵ übernimmt und kehrt zur Zeile zurück/.test(await page.locator('[data-testid="fixings-keys-hint"]').innerText()),
     "fixings hint documents the ↵ return (R8-03)",
   );
+  // R9-04: removing a row by keyboard (↵ → Tab to ✕ → ↵) lands on the neighbour row, not on body
+  // (the table is paged – the count text „n Fixings“ shrinks, the visible row count stays)
+  const fixingCountBefore = await page.locator('[data-testid="fixings-count"]').innerText();
+  await page.locator('[data-testid="fixings-row-first"]').focus();
+  await page.keyboard.press("Enter");
+  for (let hop = 0; hop < 5 && !/entfernen$/.test(await activeLabel()); hop++) await page.keyboard.press("Tab");
+  check(/^Fixing \d+ entfernen$/.test(await activeLabel()), "Tab reaches ✕ of the first fixings row (R9-04)");
+  await page.keyboard.press("Enter");
+  await wait(400);
+  const afterRemove = await page.evaluate(() => ({
+    tag: document.activeElement?.tagName,
+    inTable: !!document.activeElement?.closest('[data-testid="fixings-table"]'),
+    modified: document.querySelectorAll('[data-testid="fixings-modified"]').length,
+  }));
+  check(
+    afterRemove.tag === "TR" &&
+      afterRemove.inTable &&
+      afterRemove.modified === 1 &&
+      (await page.locator('[data-testid="fixings-count"]').innerText()) !== fixingCountBefore,
+    `removing a fixing by keyboard focuses the neighbour row (${afterRemove.tag}, in table ${afterRemove.inTable}, modified ${afterRemove.modified}) (R9-04)`,
+  );
+  await page.keyboard.press("Control+z");
+  await wait(300);
+  check(
+    (await page.locator('[data-testid="fixings-modified"]').count()) === 0 &&
+      (await page.locator('[data-testid="fixings-count"]').innerText()) === fixingCountBefore,
+    "Ctrl+Z restores the removed fixing row (R9-04)",
+  );
+  // FX fixings: the only row removed by keyboard → focus on „+ Zeile“ of the FX-fixings card
+  await page.locator('[data-testid="fx-fixing-add"]').click();
+  await wait(300);
+  await page.locator('[data-testid="fx-fixings-table"] tbody tr').first().focus();
+  await page.keyboard.press("Enter");
+  for (let hop = 0; hop < 5 && !/entfernen$/.test(await activeLabel()); hop++) await page.keyboard.press("Tab");
+  await page.keyboard.press("Enter");
+  await wait(400);
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "fx-fixing-add" &&
+      (await page.locator('[data-testid="fx-fixings-table"]').count()) === 0,
+    "removing the last FX fixing by keyboard focuses „+ Zeile“ (R9-04)",
+  );
 
   // Markt R8-1: "+ Währung" registers a currency in the workstation register – "+ Kurve" then offers it; undo removes it
   await chord(page, "c");
@@ -1336,6 +1377,44 @@ try {
   await page.locator('[data-testid="add-curve"]').click();
   await wait(200);
   check((await page.locator('[data-testid="add-curve-ccy"] option[value="HUF"]').count()) === 1, "+ Kurve offers the registered currency (Markt R8-1)");
+  // R9-F2: the form preselects the currency just registered (not DKK, the first without a curve alphabetically)
+  check((await page.locator('[data-testid="add-curve-ccy"]').inputValue()) === "HUF", "+ Kurve preselects the currency just registered (R9-F2)");
+  // R9-02: opening the form hands the focus to its first field; Esc closes it and returns to the button
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "add-curve-ccy",
+    "+ Kurve hands the focus to its first field (R9-02)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check(
+    (await page.locator('[data-testid="add-curve-form"]').count()) === 0 &&
+      (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "add-curve",
+    "Esc in the + Kurve form closes it and returns the focus to + Kurve (R9-02)",
+  );
+  await page.locator('[data-testid="add-currency"]').click();
+  await wait(200);
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "add-currency-code",
+    "+ Währung hands the focus to its first field (R9-02)",
+  );
+  check(!(await page.locator('[data-testid="add-currency-form"]').innerText()).includes("`"), "+ Währung form shows no literal backticks (R9-05)");
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check((await page.locator('[data-testid="add-currency-form"]').count()) === 0, "Esc in the + Währung form closes it (R9-02)");
+  // R9-F1: the index token of the registered index is understood by the quick entry (no curve yet → the curve hint, not „Unbekanntes Token“)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("irs huf 5y pay 6% 100m bubor6m");
+  await wait(300);
+  // without a HUF curve the entry is an error preview (`.preview[role=alert]`), not a trade item – both are checked
+  const hufPreview = await page.locator(".palette .preview, .palette .item").first().innerText();
+  check(
+    !/Unbekanntes Token/.test(hufPreview) && /Keine Kurve für HUF|Kurve HUF-BUBOR-6M fehlt/.test(hufPreview),
+    `quick entry knows the registered index token bubor6m (${hufPreview.slice(0, 90)}) (R9-F1)`,
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
+  await page.locator('[data-testid="add-curve"]').click();
+  await wait(200);
   await page.locator("button.btn", { hasText: "Abbrechen" }).click();
   await page.keyboard.press("Control+z");
   await wait(300);
@@ -1435,6 +1514,55 @@ try {
     "the difference explanation is shown only when every curve has quotes (Markt R8-3)",
   );
   await parCard.locator("button.collapse-btn").click();
+  // Markt R9-1: the export carries the bootstrap specs of the "+ Kurve" curve (`quotes`); a re-import bumps them in par risk
+  await chord(page, "m");
+  const [snapDkkDownload] = await Promise.all([page.waitForEvent("download"), page.locator('[data-testid="snapshot-export"]').click()]);
+  const snapDkkPath = join(tmpdir(), `deriva-e2e-snapshot-dkk-${port}.json`);
+  await snapDkkDownload.saveAs(snapDkkPath);
+  const snapDkkDoc = JSON.parse(readFileSync(snapDkkPath, "utf8"));
+  check(
+    Array.isArray(snapDkkDoc.quotes) &&
+      snapDkkDoc.quotes.length === 1 &&
+      snapDkkDoc.quotes[0].curveId === "DKK-DESTR" &&
+      snapDkkDoc.quotes[0].spec.index === "DESTR" &&
+      snapDkkDoc.quotes[0].spec.quotes.length === 6,
+    `snapshot export carries the quotes block of the added curve (${JSON.stringify(snapDkkDoc.quotes?.map?.((q) => q.curveId))}) (Markt R9-1)`,
+  );
+  check(
+    (await page.locator(".toast", { hasText: "Bootstrap-Quotes für DKK-DESTR" }).count()) === 1,
+    "export toast names the curves whose quotes travel with the file (Markt R9-1)",
+  );
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapDkkPath);
+  await wait(1200);
+  check(
+    (await page.locator(".toast", { hasText: "Bootstrap-Quotes für 1 Kurve (Par-Risiko)" }).count()) === 1,
+    "import toast reports the stored bootstrap quotes (Markt R9-1)",
+  );
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type(dkkTradeId);
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(400);
+  await page.keyboard.press("Escape");
+  const parCardQ = page.locator('[data-testid="par-risk-card"]');
+  if ((await parCardQ.locator("button.collapse-btn[aria-expanded='false']").count()) === 1) await parCardQ.locator("button.collapse-btn").click();
+  await wait(150);
+  check(
+    (await page.locator('[data-testid="par-risk-coverage"]').count()) === 0,
+    "import mode: no coverage warning – the snapshot carried the DKK quotes (Markt R9-1)",
+  );
+  await parCardQ.locator("button.btn.xs", { hasText: "Berechnen" }).click();
+  await page
+    .locator('[data-testid="par-risk"]')
+    .waitFor({ timeout: 15000 })
+    .catch(() => undefined);
+  const parTextQ = await page.locator('[data-testid="par-risk"]').innerText();
+  const parTotalQ = await page.locator('[data-testid="par-risk"] .kpi .value').first().innerText();
+  check(
+    /DKK-DESTR · Σ/.test(parTextQ) && !/^0 EUR$/.test(parTotalQ.trim()),
+    `par risk bumps the imported snapshot's DKK curve via its quotes block (total ${parTotalQ}) (Markt R9-1)`,
+  );
+  await parCardQ.locator("button.collapse-btn").click();
   // R7-F1: import a snapshot without the DKK curve → the trade cannot be priced (error names the snapshot, R8-06) → Zum Sample-Markt → reload → priced again, spot present
   await chord(page, "m");
   await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapPrePath);
@@ -1658,6 +1786,40 @@ try {
     /importierten Snapshot/.test(lockState.quoteTitle) && /importierten Snapshot/.test(lockState.selTitle) && /importierten Snapshot/.test(lockState.toyTitle),
     "disabled import-mode controls explain the lock in their title (R6-04)",
   );
+  // R9-03 / Markt R9-2: „+ Währung“ under an imported snapshot – the toast names the way to a curve, the focus lands on an enabled control
+  await page.locator('[data-testid="add-currency"]').click();
+  await wait(200);
+  await page.locator('[data-testid="add-currency-code"]').fill("RON");
+  await page.locator('[data-testid="add-currency-ois"]').fill("ROBOR-ON");
+  await page.locator('[data-testid="add-currency-submit"]').click();
+  await wait(400);
+  const ronToast = (await page.locator(".toast", { hasText: "Registriert: Index ROBOR-ON" }).allInnerTexts()).join(" ");
+  check(
+    /im Import-Modus ist „\+ Kurve“ gesperrt: nach „Zum Sample-Markt“ mit „\+ Kurve“ eine RON-Kurve anlegen oder einen Snapshot mit RON-Kurve importieren/.test(
+      ronToast,
+    ) && !/jetzt mit „\+ Kurve“/.test(ronToast),
+    `+ Währung toast under an import names Zum Sample-Markt / snapshot instead of the locked + Kurve (${ronToast.slice(0, 120)}) (R9-03)`,
+  );
+  const ronFocus = await page.evaluate(() => ({
+    testId: document.activeElement?.getAttribute("data-testid"),
+    disabled: document.activeElement?.disabled ?? false,
+  }));
+  check(
+    ronFocus.testId === "curves-leave-import" && !ronFocus.disabled,
+    `after + Währung under an import the focus is on „Zum Sample-Markt“ (${ronFocus.testId}) (R9-03)`,
+  );
+  await page.keyboard.press("Control+z");
+  await wait(300);
+  // the registration toast may still be visible – the form's „Registriert per + Währung“ list is the source of truth
+  await page.locator('[data-testid="add-currency"]').click();
+  await wait(200);
+  check(
+    (await page.locator('[data-testid="add-currency-registered"]').count()) === 0 ||
+      !(await page.locator('[data-testid="add-currency-registered"]').innerText()).includes("RON"),
+    "Ctrl+Z removes the RON registration again",
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
   // Markt R8-5: a snapshot curve outside the sample set gets a read-only tab „(aus Snapshot)“ with pillars and meta
   const snapDoc = JSON.parse(readFileSync(snapPath, "utf8"));
   const estrCurve = snapDoc.curves.find((c) => c.id === "EUR-ESTR");
@@ -2075,7 +2237,12 @@ try {
   const afterReload = (await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1];
   check(afterReload === beforeReload, `trades persisted across reload (${beforeReload} → ${afterReload})`);
   check((await page.locator(".toast", { hasText: "lokalem Speicher" }).count()) === 1, "restore toast");
-  check((await page.locator(".toast button", { hasText: "Zurücksetzen" }).count()) === 1, "restore toast offers reset");
+  // R9-F4: the restore toast is information only – no destructive „Zurücksetzen“ as the first tab stop after every reload
+  check((await page.locator(".toast button", { hasText: "Zurücksetzen" }).count()) === 0, "restore toast carries no reset action (R9-F4)");
+  check(
+    /Beispielportfolio über die Palette/.test(await page.locator(".toast", { hasText: "lokalem Speicher" }).innerText()),
+    "restore toast says where the sample book is loaded (R9-F4)",
+  );
   // Toast actions are the first tab stops after the skip link (R4-F2)
   await page.locator("a.skip").focus();
   await page.keyboard.press("Tab");
@@ -2089,14 +2256,53 @@ try {
     )) === true,
     "toast stack precedes the app shell in the DOM (R4-F2)",
   );
+  // R9-F4: „Beispielportfolio laden“ (palette) asks first, resets with a Rückgängig toast, Ctrl+Z brings the book back
+  const tradesBeforeReset = Number(afterReload);
+  page.once("dialog", (d) => {
+    check(
+      /^Bestand \(\d+ Trades.*\) durch das Beispielportfolio ersetzen\? \(rückgängig mit Ctrl\+Z\)$/.test(d.message()),
+      `reset asks first (${d.message()}) (R9-F4)`,
+    );
+    void d.dismiss();
+  });
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("Beispielportfolio laden");
+  await wait(250);
+  await page.keyboard.press("Enter");
+  await wait(500);
+  check(Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]) === tradesBeforeReset, "dismissed reset keeps the book (R9-F4)");
+  page.once("dialog", (d) => void d.accept());
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("Beispielportfolio laden");
+  await wait(250);
+  await page.keyboard.press("Enter");
+  await wait(800);
+  check(Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]) === 13, "confirmed reset loads the 13 sample trades (R9-F4)");
+  check(
+    (await page.locator(".toast", { hasText: "Beispielportfolio geladen" }).locator("button", { hasText: "Rückgängig" }).count()) === 1,
+    "reset toast offers Rückgängig (R9-F4)",
+  );
+  await page.keyboard.press("Control+z");
+  await wait(800);
+  check(
+    Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]) === tradesBeforeReset,
+    `Ctrl+Z restores the book after the reset (${tradesBeforeReset} Trades) (R9-F4)`,
+  );
 
-  // 1280 px layout: no horizontal overflow with the inspector open
+  // 1280 px layout: no horizontal overflow with the inspector open; R9-05: no literal backticks in visible text or tooltips
+  const noBackticks = (p) =>
+    p.evaluate(() => ({
+      text: !document.body.innerText.includes("`"),
+      titles: !Array.from(document.querySelectorAll("[title]")).some((e) => (e.getAttribute("title") ?? "").includes("`")),
+    }));
   await page.setViewportSize({ width: 1280, height: 800 });
   await wait(300);
   for (const [k, name] of VIEWS) {
     await chord(page, k);
     const o = await noOverflow(page);
     check(o.page && o.main, `1280px no horizontal overflow (${name})`);
+    const bt = await noBackticks(page);
+    check(bt.text && bt.titles, `no literal backticks in the ${name} view (text ${bt.text}, titles ${bt.titles}) (R9-05)`);
     if (name === "Blotter" || name === "Pricing" || name === "Kurven") await page.screenshot({ path: join(outDir, `1280-${name}.png`) });
   }
   // 1280 px: the blotter toolbar collapses into one row (filter popover, icon buttons) – R3-09 / N-12
@@ -2196,6 +2402,32 @@ try {
   const o1024 = await noOverflow(page);
   check(o1024.page && o1024.main, "1024px no horizontal overflow (Report)");
   await page.screenshot({ path: join(outDir, "1024-report.png") });
+  // R9-01 / R9-05: the „+ Währung“ form (with „+ Kalender“) fits the card at 1024 × 768 – no horizontal scroll, no clipped field, no backticks
+  await chord(page, "c");
+  await page.locator('[data-testid="add-currency"]').click();
+  await wait(300);
+  await page.locator('[data-testid="add-calendar"]').click();
+  await wait(200);
+  const ccyForm1024 = await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="add-currency-form"]');
+    if (!card) return null;
+    const cr = card.getBoundingClientRect();
+    const over = Array.from(card.querySelectorAll("input, select, textarea, button"))
+      .map((el) => ({ label: el.getAttribute("aria-label") ?? el.textContent?.trim() ?? "", right: Math.round(el.getBoundingClientRect().right - cr.right) }))
+      .filter((x) => x.right > 1);
+    return { cardW: Math.round(cr.width), scroll: card.scrollWidth - card.clientWidth, over };
+  });
+  const o1024ccy = await noOverflow(page);
+  check(
+    !!ccyForm1024 && ccyForm1024.over.length === 0 && ccyForm1024.scroll <= 1 && o1024ccy.page && o1024ccy.main,
+    `1024px + Währung form stays inside its card (${ccyForm1024?.cardW} px, over ${JSON.stringify(ccyForm1024?.over)}, main ${o1024ccy.main}) (R9-01)`,
+  );
+  const bt1024 = await noBackticks(page);
+  check(bt1024.text && bt1024.titles, "no literal backticks in the + Währung / + Kalender form (R9-05)");
+  await page.screenshot({ path: join(outDir, "1024-curves-add-currency.png") });
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check((await page.locator('[data-testid="add-currency-form"]').count()) === 0, "Esc closes the + Währung form at 1024px (R9-02)");
   await page.setViewportSize({ width: 1280, height: 800 });
   await wait(200);
 

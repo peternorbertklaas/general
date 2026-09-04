@@ -27,7 +27,9 @@ import { downloadPortfolioReport } from "../lib/portfolio-export.js";
 import {
   CSV_IMPORT_TEMPLATES,
   CSV_TRADE_TYPES,
+  type CsvImportResult,
   type CsvTradeType,
+  CsvTypeMissingError,
   csvErrorsText,
   csvTemplateText,
   downloadText,
@@ -39,7 +41,17 @@ import {
 import { QUICK_ENTRY_EXAMPLES } from "../lib/quick-parser.js";
 import { quoteExpired, tradeTypeBadge } from "../lib/trade-ops.js";
 import { utiValid } from "../lib/validate-trade.js";
-import { type DuplicateStrategy, LS_KEYS, STATUS_LABELS, deleteWithUndo, readLocal, useStore, writeLocal, type TradeStatus } from "../state/store.js";
+import {
+  type DuplicateStrategy,
+  LS_KEYS,
+  STATUS_LABELS,
+  deleteWithUndo,
+  readLocal,
+  resetPortfolioWithConfirm,
+  useStore,
+  writeLocal,
+  type TradeStatus,
+} from "../state/store.js";
 
 type SortKey = "id" | "type" | "notional" | "maturity" | "pv" | "dv01" | "cpty" | "book" | "status";
 const SORT_KEYS: SortKey[] = ["id", "type", "notional", "maturity", "pv", "dv01", "cpty", "book", "status"];
@@ -153,13 +165,7 @@ function EmptyPortfolio() {
         <button className="btn primary" onClick={() => act().setPalette(true)}>
           Schnelleingabe öffnen
         </button>
-        <button
-          className="btn"
-          onClick={() => {
-            act().resetPortfolio();
-            act().showToast("Beispielportfolio geladen");
-          }}
-        >
+        <button className="btn" onClick={() => resetPortfolioWithConfirm()} data-testid="blotter-load-sample">
           Beispielportfolio laden
         </button>
       </div>
@@ -219,6 +225,54 @@ function ImportStrategyDialog({ count, onPick, onClose }: { count: number; onPic
           <b>Umbenennen</b> – Datei-Trades als Kopie mit Suffix „-IMP“ anlegen
         </button>
       </div>
+    </Modal>
+  );
+}
+
+/**
+ * A CSV without a `type` column whose type is neither in the file name nor in the column set (Markt R9-4): the user
+ * picks one of the eleven templates and the import continues with it.
+ */
+function CsvTypeDialog({ fileName, onPick, onClose }: { fileName: string; onPick: (type: CsvTradeType) => void; onClose: () => void }) {
+  const [type, setType] = useState<CsvTradeType>("IRS");
+  return (
+    <Modal
+      title="CSV-Import: Produkttyp wählen"
+      onClose={onClose}
+      width={520}
+      testId="csv-type-dialog"
+      footer={
+        <div className="row" style={{ width: "100%" }}>
+          <span className="grow" />
+          <button className="btn ghost" onClick={onClose}>
+            Abbrechen
+          </button>
+          <button className="btn primary" onClick={() => onPick(type)} data-testid="csv-type-continue">
+            Als {CSV_IMPORT_TEMPLATES[type].label} importieren
+          </button>
+        </div>
+      }
+    >
+      <p className="small" style={{ marginTop: 0 }}>
+        Die Datei „{fileName}“ hat keine Spalte „Typ“, und der Produkttyp lässt sich weder aus dem Dateinamen (z. B. „…-vorlage-ccs.csv“,
+        „CrossCurrencySwap.csv“) noch aus den Spalten ableiten. Alle Zeilen werden mit dem gewählten Typ gelesen.
+      </p>
+      <label className="row" style={{ gap: 8 }}>
+        <span className="muted small">Produkttyp</span>
+        <select
+          className="inline"
+          value={type}
+          aria-label="Produkttyp der CSV-Zeilen"
+          data-testid="csv-type-select"
+          onChange={(e) => setType(e.target.value as CsvTradeType)}
+        >
+          {CSV_TRADE_TYPES.map((k) => (
+            <option key={k} value={k}>
+              {k} – {CSV_IMPORT_TEMPLATES[k].label}
+            </option>
+          ))}
+        </select>
+      </label>
     </Modal>
   );
 }
@@ -375,6 +429,8 @@ export function Blotter() {
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const [pendingImport, setPendingImport] = useState<{ trades: Trade[]; duplicates: number; source: string } | null>(null);
   const [csvErrors, setCsvErrors] = useState<{ errors: { row: number; msg: string }[]; trades: Trade[] } | null>(null);
+  /** CSV whose product type could not be derived (Markt R9-4) – waits for the type dialog. */
+  const [csvTypeAsk, setCsvTypeAsk] = useState<{ text: string; name: string } | null>(null);
   const tableRef = useRef<HTMLTableElement>(null);
   // Popover anchors / panels / toggles (R3-02)
   const exportRef = useRef<HTMLSpanElement>(null);
@@ -532,17 +588,51 @@ export function Blotter() {
       act().showToast(`Import fehlgeschlagen: ${jsonImportError(e)}`, { ms: 7000 });
     }
   };
-  /** CSV: every rejected row is listed in a dialog (R3-F7); valid rows are imported after the user continues. */
+  /** Rows of a parsed CSV: rejected rows go to the dialog (R3-F7), valid rows are staged for the duplicate check. */
+  const handleCsvResult = (res: CsvImportResult) => {
+    // Markt R9-4: the toast says where a derived type came from (file name / column set / dialog)
+    const source =
+      res.typeSource?.from === "file"
+        ? ` (Typ ${res.typeSource.type} aus dem Dateinamen)`
+        : res.typeSource?.from === "columns"
+          ? ` (Typ ${res.typeSource.type} aus dem Spaltensatz)`
+          : "";
+    if (res.errors.length) {
+      act().showToast(`CSV: ${res.errors.length} Zeile(n) übersprungen – Details im Dialog${source}`, { ms: 5000 });
+      setCsvErrors({ errors: res.errors, trades: res.trades });
+      return;
+    }
+    if (res.trades.length) stageImport(res.trades, `CSV${source}`);
+    else act().showToast("CSV enthält keine Trades");
+  };
+  /**
+   * CSV: the `type` column, the file name or the column set names the product type (Markt R9-4) – otherwise a small type
+   * dialog asks; every rejected row is listed in a dialog (R3-F7) and valid rows are imported after the user continues.
+   */
   const importCsv = async (file: File) => {
+    let text: string;
     try {
-      const res = tradesFromCsv(await file.text(), { valuationDate: s.valuationDate, fxSpots: s.market.fxSpots });
-      if (res.errors.length) {
-        act().showToast(`CSV: ${res.errors.length} Zeile(n) übersprungen – Details im Dialog`, { ms: 5000 });
-        setCsvErrors({ errors: res.errors, trades: res.trades });
+      text = await file.text();
+    } catch (e) {
+      act().showToast(`CSV-Import fehlgeschlagen: ${translatePricingError(e)}`);
+      return;
+    }
+    try {
+      handleCsvResult(tradesFromCsv(text, { valuationDate: s.valuationDate, fxSpots: s.market.fxSpots, fileName: file.name }));
+    } catch (e) {
+      if (e instanceof CsvTypeMissingError) {
+        setCsvTypeAsk({ text, name: file.name });
         return;
       }
-      if (res.trades.length) stageImport(res.trades, "CSV");
-      else act().showToast("CSV enthält keine Trades");
+      act().showToast(`CSV-Import fehlgeschlagen: ${translatePricingError(e)}`);
+    }
+  };
+  const importCsvAs = (type: CsvTradeType) => {
+    const ask = csvTypeAsk;
+    setCsvTypeAsk(null);
+    if (!ask) return;
+    try {
+      handleCsvResult(tradesFromCsv(ask.text, { valuationDate: s.valuationDate, fxSpots: s.market.fxSpots, fileName: ask.name, defaultType: type }));
     } catch (e) {
       act().showToast(`CSV-Import fehlgeschlagen: ${translatePricingError(e)}`);
     }
@@ -967,11 +1057,11 @@ export function Blotter() {
                       accept="application/json,.json"
                       style={{ display: "none" }}
                       data-testid="import-json"
-                      onChange={async (e) => {
+                      onChange={(e) => {
                         const file = e.target.files?.[0];
                         setExportOpen(false);
-                        if (file) await importJson(file);
                         e.target.value = "";
+                        if (file) void importJson(file);
                       }}
                     />
                   </label>
@@ -979,7 +1069,7 @@ export function Blotter() {
                     role="menuitem"
                     className="item"
                     style={{ cursor: "pointer" }}
-                    title={`CSV mit Spalte „Typ“ (${CSV_TRADE_TYPES.join(" / ")}) importieren – Spaltennamen deutsch oder englisch, Fehlzeilen werden aufgelistet`}
+                    title={`CSV importieren – Produkttyp aus der Spalte „Typ“ (${CSV_TRADE_TYPES.join(" / ")}), dem Dateinamen oder dem Spaltensatz (API-Vorlagen), sonst Rückfrage; Spaltennamen deutsch oder englisch, Fehlzeilen werden aufgelistet`}
                   >
                     ⤒ CSV importieren
                     <input
@@ -987,11 +1077,11 @@ export function Blotter() {
                       accept="text/csv,.csv,.txt"
                       style={{ display: "none" }}
                       data-testid="import-csv"
-                      onChange={async (e) => {
+                      onChange={(e) => {
                         const file = e.target.files?.[0];
                         setExportOpen(false);
-                        if (file) await importCsv(file);
                         e.target.value = "";
+                        if (file) void importCsv(file);
                       }}
                     />
                   </label>
@@ -1112,6 +1202,7 @@ export function Blotter() {
           onClose={() => setCsvErrors(null)}
         />
       )}
+      {csvTypeAsk && <CsvTypeDialog fileName={csvTypeAsk.name} onPick={importCsvAs} onClose={() => setCsvTypeAsk(null)} />}
     </div>
   );
 }

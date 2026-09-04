@@ -23,9 +23,9 @@ import { DateInput } from "../components/DateInput.js";
 import { EChart, cssVar } from "../components/EChart.js";
 import { NumInput } from "../components/NumInput.js";
 import { useTableNav } from "../hooks/useTableNav.js";
-import { focusWhenPresent } from "../lib/focus.js";
+import { escapeCloses, focusFirstEnabled, focusWhenPresent } from "../lib/focus.js";
 import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
-import { INTERPOLATION_DE, translatePricingError } from "../lib/i18n.js";
+import { INTERPOLATION_DE, marketLabelDe, translatePricingError } from "../lib/i18n.js";
 import { rateOf } from "../lib/portfolio-io.js";
 import { type ExtraCurve, extraCurveSpec, marketModified, useStore, validateExtraCurve } from "../state/store.js";
 import { AddCurrencyForm } from "./AddCurrencyForm.js";
@@ -176,7 +176,7 @@ const INTERP_ALLOWED = new Set<string>(INTERPOLATIONS.map((i) => i.v));
 /** Quote list of a set: the sample quote set for shipped curves, the added curve's own quotes otherwise. */
 function quotesOf(set: QuoteSet, quotes: SampleMarketQuotes): CurveQuote[] {
   if (set.extra) return set.extra.quotes;
-  return (quotes[set.key as keyof Omit<SampleMarketQuotes, "fxSpots">] as CurveQuote[] | undefined) ?? [];
+  return quotes[set.key as keyof Omit<SampleMarketQuotes, "fxSpots">] ?? [];
 }
 
 /** Tab label of an added curve ("NOWA", "STIBOR 3M"). */
@@ -220,12 +220,21 @@ export function parseCurveQuotes(text: string, index: RateIndex | undefined): { 
  * carry, from quotes – conventions from the core registry (`knownCurrencies`,
  * `knownIndices`), optional EUR spot for a new currency, one undo entry.
  */
-function AddCurveForm({ onDone }: { onDone: (id?: string) => void }) {
+function AddCurveForm({ onDone, initialCurrency }: { onDone: (id?: string) => void; initialCurrency?: string }) {
   const baseMarket = useStore((s) => s.baseMarket);
   const fxSpots = useStore((s) => s.quotes.fxSpots);
+  const extraRegister = useStore((s) => s.extraRegister);
   const ccys = knownCurrencies();
   const withoutCurve = ccys.filter((c) => !baseMarket.discountCurveId[c]);
-  const [ccyState, setCcy] = useState(withoutCurve[0] ?? ccys[0] ?? "EUR");
+  // Preselection (R9-F2): the currency just registered with „+ Währung“, else the last „+ Währung“ registration still
+  // without a curve, else the first currency without a curve – never an alphabetical accident (DKK after HUF).
+  const lastRegistered = [...(extraRegister.conventions ?? [])]
+    .reverse()
+    .find((c) => withoutCurve.includes(c.currency.toUpperCase()))
+    ?.currency.toUpperCase();
+  const [ccyState, setCcy] = useState(
+    (initialCurrency && ccys.includes(initialCurrency) ? initialCurrency : undefined) ?? lastRegistered ?? withoutCurve[0] ?? ccys[0] ?? "EUR",
+  );
   const ccy = ccys.includes(ccyState) ? ccyState : (ccys[0] ?? "EUR");
   const candidates = knownIndices(ccy).filter((i) => !(i.curveId in baseMarket.curves));
   const [indexState, setIndex] = useState("");
@@ -250,7 +259,7 @@ function AddCurveForm({ onDone }: { onDone: (id?: string) => void }) {
     onDone(curve.id);
   };
   return (
-    <div className="card" data-testid="add-curve-form">
+    <div className="card" data-testid="add-curve-form" onKeyDown={escapeCloses(() => onDone())}>
       <h3>
         + Kurve aus Quotes anlegen
         <span className="right muted xs">
@@ -297,7 +306,17 @@ function AddCurveForm({ onDone }: { onDone: (id?: string) => void }) {
           >
             <span className="muted small">Spot EUR/{ccy}</span>
             <span style={{ display: "inline-block", width: 120 }}>
-              <NumInput inline value={spot} step={0.01} digits={4} min={0} ariaLabel={`Spot EUR/${ccy}`} testId="add-curve-spot" onChange={setSpot} />
+              <NumInput
+                inline
+                width="100%"
+                value={spot}
+                step={0.01}
+                digits={4}
+                min={0}
+                ariaLabel={`Spot EUR/${ccy}`}
+                testId="add-curve-spot"
+                onChange={setSpot}
+              />
             </span>
           </label>
         )}
@@ -362,7 +381,9 @@ export function CurvesView() {
   const [compare, setCompare] = useState<string | null>("EUR-EURIBOR-6M");
   const [adding, setAdding] = useState(false);
   const [addingCurrency, setAddingCurrency] = useState(false);
-  const snapshotLabel = s.baseMarket.meta?.label ?? "Snapshot";
+  /** Currency of the last „+ Währung“ registration in this view – „+ Kurve“ preselects it (R9-F2). */
+  const [lastRegistered, setLastRegistered] = useState<string | undefined>(undefined);
+  const snapshotLabel = marketLabelDe(s.baseMarket.meta?.label);
   // Shipped curves, the curves the user added from quotes (Markt R6-5) and – read-only – every further curve of an
   // imported snapshot (NOK-NOWA, CZK-CZEONIA …, Markt R8-5), so the auditor can inspect the curve a report is based on.
   const sets: QuoteSet[] = useMemo(() => {
@@ -547,18 +568,17 @@ export function CurvesView() {
   };
   /** Shipped original of a quote (matched by type/tenor/pair, so added rows never shift the mapping); added curves have no original. */
   const original = (q: CurveQuote): CurveQuote | undefined =>
-    set.extra
-      ? undefined
-      : (SAMPLE_QUOTES[set.key as keyof Omit<SampleMarketQuotes, "fxSpots">] as CurveQuote[] | undefined)?.find((x) => quoteKey(x) === quoteKey(q));
+    set.extra ? undefined : SAMPLE_QUOTES[set.key as keyof Omit<SampleMarketQuotes, "fxSpots">]?.find((x) => quoteKey(x) === quoteKey(q));
   const isEdited = (q: CurveQuote) => !set.extra && JSON.stringify(original(q)) !== JSON.stringify(q);
   const interpValue = override ?? curve?.interpolation ?? "logLinear";
-  const interpOptions = INTERP_ALLOWED.has(interpValue) ? INTERPOLATIONS : [...INTERPOLATIONS, { v: interpValue as InterpolationMethod, l: interpValue }];
+  const interpOptions = INTERP_ALLOWED.has(interpValue) ? INTERPOLATIONS : [...INTERPOLATIONS, { v: interpValue, l: interpValue }];
   const overrideCount = Object.keys(s.interpolation).length;
 
   return (
     <div className="stack">
       {adding && !imported && (
         <AddCurveForm
+          initialCurrency={lastRegistered}
           onDone={(id) => {
             setAdding(false);
             if (id) {
@@ -575,20 +595,25 @@ export function CurvesView() {
         <AddCurrencyForm
           onDone={(ccy) => {
             setAddingCurrency(false);
-            // the natural next step is a curve in the new currency – land on "+ Kurve" (R7-03 pattern)
-            void focusWhenPresent(ccy ? '[data-testid="add-curve"]' : '[data-testid="add-currency"]');
+            if (ccy) setLastRegistered(ccy);
+            // The natural next step is a curve in the new currency – land on "+ Kurve" (R7-03 pattern). Under an imported
+            // snapshot „+ Kurve“ is locked (R9-03): the focus goes to „Zum Sample-Markt“ instead, never to a disabled button.
+            void focusFirstEnabled(
+              ccy ? ['[data-testid="add-curve"]', '[data-testid="curves-leave-import"]', '[data-testid="add-currency"]'] : ['[data-testid="add-currency"]'],
+            );
           }}
         />
       )}
       {imported && (
         <div className="warning row wrap" style={{ gap: 10 }} data-testid="curves-import-note">
           <span>
-            Kurven aus importiertem Snapshot „{s.baseMarket.meta?.label ?? "Snapshot"}“ (Bewertungstag {fmtDate(s.valuationDate)}) – die Quote-Tabelle zeigt die
-            Sample-Quotes nur zur Information; Quotes, Interpolation und Turn-of-Year sind nicht editierbar. Kurven des Snapshots außerhalb des Sample-Sets
-            stehen als schreibgeschützte Tabs „(aus Snapshot)“ mit Pillars, Forwards und Meta.
+            Kurven aus importiertem Snapshot „{snapshotLabel}“ (Bewertungstag {fmtDate(s.valuationDate)}) – die Quote-Tabelle zeigt die Sample-Quotes nur zur
+            Information; Quotes, Interpolation und Turn-of-Year sind nicht editierbar. Kurven des Snapshots außerhalb des Sample-Sets stehen als
+            schreibgeschützte Tabs „(aus Snapshot)“ mit Pillars, Forwards und Meta.
           </span>
           <button
             className="btn xs"
+            data-testid="curves-leave-import"
             onClick={() => {
               useStore.getState().leaveImport();
               useStore.getState().showToast(`Sample-Markt aus den Quotes zum ${fmtDate(useStore.getState().valuationDate)} aufgebaut`);
@@ -625,7 +650,11 @@ export function CurvesView() {
         </div>
         <button
           className="btn xs"
-          onClick={() => setAdding((v) => !v)}
+          onClick={() => {
+            // R9-02: opening the form hands the focus to its first field (the form renders above the toolbar)
+            if (!adding) void focusWhenPresent('[data-testid="add-curve-ccy"]');
+            setAdding((v) => !v);
+          }}
           disabled={imported}
           aria-pressed={adding}
           data-testid="add-curve"
@@ -639,10 +668,17 @@ export function CurvesView() {
         </button>
         <button
           className="btn xs"
-          onClick={() => setAddingCurrency((v) => !v)}
+          onClick={() => {
+            if (!addingCurrency) void focusWhenPresent('[data-testid="add-currency-code"]');
+            setAddingCurrency((v) => !v);
+          }}
           aria-pressed={addingCurrency}
           data-testid="add-currency"
-          title="Weitere Währung im Register anlegen (Konventionen, OIS-/IBOR-Index, Kalender) – danach „+ Kurve“; wird mit dem Snapshot exportiert"
+          title={
+            imported
+              ? "Weitere Währung im Register anlegen (Konventionen, OIS-/IBOR-Index, Kalender) – eine Kurve dazu erst nach „Zum Sample-Markt“ mit „+ Kurve“ oder per Snapshot mit Kurve; wird mit dem Snapshot exportiert"
+              : "Weitere Währung im Register anlegen (Konventionen, OIS-/IBOR-Index, Kalender) – danach „+ Kurve“; wird mit dem Snapshot exportiert"
+          }
         >
           + Währung
         </button>
@@ -741,7 +777,7 @@ export function CurvesView() {
             <span
               className="badge warn"
               data-testid="toy-inactive"
-              title={`Der gespeicherte Sprung (${fmtDate(storedToy!.date)}) liegt am oder vor dem Bewertungstag ${fmtDate(s.valuationDate)} und wirkt nicht auf die Kurve – Datum ändern oder mit ✕ entfernen`}
+              title={`Der gespeicherte Sprung (${fmtDate(storedToy.date)}) liegt am oder vor dem Bewertungstag ${fmtDate(s.valuationDate)} und wirkt nicht auf die Kurve – Datum ändern oder mit ✕ entfernen`}
             >
               inaktiv (vor dem Bewertungstag)
             </span>
@@ -927,7 +963,7 @@ export function CurvesView() {
                           </button>
                         )}
                       </td>
-                      <td className="mono muted xs">{boot?.dates[i] ? fmtDate(boot.dates[i]!.end) : ""}</td>
+                      <td className="mono muted xs">{boot?.dates[i] ? fmtDate(boot.dates[i].end) : ""}</td>
                       <td className={`num quote-cell ${edited ? "edited" : ""}`} title={imported ? IMPORT_LOCK : edited ? origText : undefined}>
                         <span style={{ display: "inline-block", width: 104 }}>
                           <NumInput

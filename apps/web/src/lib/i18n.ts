@@ -73,6 +73,15 @@ const CORE_MESSAGES: Rule[] = [
     to: (m) => `Snapshot-Zeitstempel (meta.snapshotTime) ${m[1]} ist kein ISO-8601-Zeitstempel (erwartet JJJJ-MM-TTThh:mm:ssZ)`,
   },
   { re: /^Discount curve (\S+) for (\S+) missing$/, to: (m) => `Diskontkurve ${m[1]} für ${m[2]} fehlt im Snapshot` },
+  // core R9 (`validateMarket`, N9-04): collateral discount curves must exist and be denominated in the CSA's currency
+  {
+    re: /^Collateral discount curve (\S+) for ([A-Z]{3})\|([A-Z]{3}) missing$/,
+    to: (m) => `Collateral-Diskontkurve ${m[1]} für ${m[2]} unter ${m[3]}-CSA (${m[2]}|${m[3]}) fehlt im Snapshot`,
+  },
+  {
+    re: /^Collateral discount curve (\S+) for ([A-Z]{3})\|([A-Z]{3}) is denominated in ([A-Z]{3}), not ([A-Z]{3})$/,
+    to: (m) => `Collateral-Diskontkurve ${m[1]} für ${m[2]} unter ${m[3]}-CSA (${m[2]}|${m[3]}) ist in ${m[4]} denominiert, nicht in ${m[5]}`,
+  },
   {
     re: /^Curve (\S+): discount factor (\S+) at (\d{4}-\d{2}-\d{2}) out of range$/,
     to: (m) => `Kurve ${m[1]}: Diskontfaktor ${m[2]!.replace(".", ",")} am ${isoToDe(m[3]!)} außerhalb (0, 1]`,
@@ -91,7 +100,7 @@ const CORE_MESSAGES: Rule[] = [
   { re: /^FX fixing \[(\d+)\]: pair (\S+) malformed$/, to: (m) => `FX-Fixing ${Number(m[1]) + 1}: Währungspaar ${m[2]} ungültig` },
   {
     re: /^FX fixing \[(\d+)\] \((\S*)\): date must be a serial date$/,
-    to: (m) => `FX-Fixing ${Number(m[1]) + 1}${m[2] ? ` (${pairDe(m[2]!)})` : ""}: Datum fehlt oder ungültig`,
+    to: (m) => `FX-Fixing ${Number(m[1]) + 1}${m[2] ? ` (${pairDe(m[2])})` : ""}: Datum fehlt oder ungültig`,
   },
   { re: /^meta\.snapshotTime (.+) is not an ISO-8601 date-time$/, to: (m) => `Snapshot-Zeitstempel (meta.snapshotTime) ${m[1]} ist kein ISO-8601-Zeitstempel` },
   // Vol-surface structure problems (core `validateVolSurfaces` / `deserializeMarket`, Markt R5-1) – paths like "swaptionVols.USD.atm[3]"
@@ -535,7 +544,7 @@ export function translateTradeIssues(issues: string): string {
     .map((part) => {
       const m = /^(?:trade\.)?(?:legs\[(\d+)\](?:\.(\w+))?|(\w+)):\s*(.+)$/.exec(part.trim());
       if (!m) return translateCoreMessage(part.trim());
-      const msg = translateCoreMessage(m[4]!);
+      const msg = translateCoreMessage(m[4]);
       if (m[1] !== undefined) return `Leg ${Number(m[1]) + 1}: ${msg}`;
       return `${FIELD_DE[m[3]!] ?? m[3]}: ${msg}`;
     })
@@ -628,6 +637,16 @@ function curveRepairMessage(s: string, ctx: MessageContext | undefined): string 
   return curve
     ? `${head} – in der Kurvenansicht mit „+ Kurve“ anlegen${swaption}`
     : `${head} – in der Kurvenansicht mit „+ Kurve“ eine ${ccy}-Kurve anlegen${swaption}`;
+}
+
+/**
+ * German market label (core R9, `rolledMeta`): an imported snapshot rolled to another valuation date carries
+ * `meta.label` "Sample EoD (rolled to 2026-10-01)" – displayed as „Sample EoD (gerollt auf 01.10.2026)“. Other labels
+ * pass through; `undefined` becomes the fallback.
+ */
+export function marketLabelDe(label: string | undefined | null, fallback = "Snapshot"): string {
+  if (!label) return fallback;
+  return label.replace(/ \(rolled to (\d{4}-\d{2}-\d{2})\)$/, (_m, iso: string) => ` (gerollt auf ${isoToDe(iso)})`);
 }
 
 /** Translate a core (English) warning/error into German; unknown messages are passed through. */

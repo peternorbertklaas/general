@@ -41,9 +41,10 @@ import {
   volSurfaceWarnings,
 } from "@deriva/pricing-core";
 import { type ViewId } from "../hotkeys/keymap.js";
-import { type MessageContext, INTERPOLATION_DE, germanTradeName, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
+import { type MessageContext, INTERPOLATION_DE, germanTradeName, marketLabelDe, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { copyName, idPrefix, nextId } from "../lib/ids.js";
 import {
+  type CurveQuotesEntry,
   type RegisterEnvelope,
   type WorkstationSnapshotJson,
   envelopeEmpty,
@@ -52,6 +53,8 @@ import {
   envelopeWithout,
   mergeEnvelopes,
   plausibleEnvelope,
+  quotesOf,
+  quotesProblems,
   registerEnvelope,
   unregisterEnvelope,
 } from "../lib/register-envelope.js";
@@ -155,7 +158,28 @@ export type UndoEntry =
   /** Structural extras of the sample market – "+ Paar" spots and "+ Fläche" surfaces (R8-F2). */
   | { kind: "extras"; extraSpots: Record<string, number>; extraVolSurfaces: VolSurfaces; label: string; at: number }
   /** "+ Währung" register entries (indices, conventions, calendars – Markt R8-1). */
-  | { kind: "register"; extraRegister: RegisterEnvelope; label: string; at: number };
+  | { kind: "register"; extraRegister: RegisterEnvelope; label: string; at: number }
+  /**
+   * "Beispielportfolio laden" / `resetPortfolio` (R9-F4): the whole book before the reset – trades, market source with
+   * quotes / overrides / added curves, structural extras, register entries, CDS curves, hedge documentation and results,
+   * report inputs, selection – so a mistaken reset is one `Ctrl+Z` away.
+   */
+  | {
+      kind: "portfolio";
+      trades: Trade[];
+      market: MarketSourceState;
+      extraSpots: Record<string, number>;
+      extraVolSurfaces: VolSurfaces;
+      extraRegister: RegisterEnvelope;
+      cdsCurves: Record<string, CdsQuote[]>;
+      hedgeRelationships: Record<string, HedgeRelationship>;
+      hedgeResults: Record<string, HedgeResult>;
+      reportInputs: Record<string, ReportInputs>;
+      selectedId: string | null;
+      compareIds: string[];
+      label: string;
+      at: number;
+    };
 
 /**
  * Everything that determines the base market besides the trades – captured by
@@ -262,6 +286,8 @@ export type ImportSnapshotResult =
       kept: string[];
       /** Register entries taken from the snapshot envelope (Markt R8-1) – German summary, empty without envelope. */
       registered: string;
+      /** Curves whose bootstrap specs came with the file (`quotes` block, Markt R9-1) – par risk bumps them in import mode. */
+      quoteCurves: string[];
       /** German plausibility hints of the imported vol surfaces (core `volSurfaceWarnings`, Markt R6-4) – the import succeeds anyway. */
       warnings: string[];
     }
@@ -364,106 +390,106 @@ interface AppState {
   popoverDepth: number;
 
   // actions
-  openModal(): void;
-  closeModal(): void;
-  openPopover(): void;
-  closePopover(): void;
-  setView(v: ViewId): void;
-  select(id: string | null): void;
-  setVisibleIds(ids: string[]): void;
-  selectNext(delta: number): void;
-  addTrade(t: Trade, opts?: { select?: boolean; goToPricing?: boolean; autoId?: boolean }): Trade;
-  importTrades(trades: Trade[], opts?: { onDuplicate?: DuplicateStrategy }): ImportSummary;
-  updateTrade(t: Trade): void;
-  removeTrade(id: string): void;
-  duplicateSelected(): Trade | undefined;
-  undo(): string | null;
-  setWhatIf(w: Partial<WhatIf>): void;
-  resetWhatIf(): void;
-  setReportingCurrency(c: string): void;
-  cycleReportingCurrency(): void;
-  toggleTheme(): void;
-  toggleInspector(): void;
-  toggleCustomerMode(): void;
-  toggleCompare(id: string): void;
-  clearCompare(): void;
-  addScenario(sc: ScenarioDefinition): void;
-  removeScenario(id: string): void;
-  setPalette(open: boolean, initialQuery?: string): void;
-  setHelp(open: boolean): void;
-  setValDateOpen(open: boolean): void;
-  setDoc(kind: DocKind | null): void;
-  showToast(msg: string, opts?: { action?: ToastAction; ms?: number }): number;
-  dismissToast(id: number): void;
-  setChord(p: string | null): void;
-  setMarket(m: MarketContext): void;
-  setQuotes(q: SampleMarketQuotes, label?: string): boolean;
-  resetQuotes(): void;
-  setInterpolation(curveId: string, method: InterpolationMethod | undefined): boolean;
+  openModal: () => void;
+  closeModal: () => void;
+  openPopover: () => void;
+  closePopover: () => void;
+  setView: (v: ViewId) => void;
+  select: (id: string | null) => void;
+  setVisibleIds: (ids: string[]) => void;
+  selectNext: (delta: number) => void;
+  addTrade: (t: Trade, opts?: { select?: boolean; goToPricing?: boolean; autoId?: boolean }) => Trade;
+  importTrades: (trades: Trade[], opts?: { onDuplicate?: DuplicateStrategy }) => ImportSummary;
+  updateTrade: (t: Trade) => void;
+  removeTrade: (id: string) => void;
+  duplicateSelected: () => Trade | undefined;
+  undo: () => string | null;
+  setWhatIf: (w: Partial<WhatIf>) => void;
+  resetWhatIf: () => void;
+  setReportingCurrency: (c: string) => void;
+  cycleReportingCurrency: () => void;
+  toggleTheme: () => void;
+  toggleInspector: () => void;
+  toggleCustomerMode: () => void;
+  toggleCompare: (id: string) => void;
+  clearCompare: () => void;
+  addScenario: (sc: ScenarioDefinition) => void;
+  removeScenario: (id: string) => void;
+  setPalette: (open: boolean, initialQuery?: string) => void;
+  setHelp: (open: boolean) => void;
+  setValDateOpen: (open: boolean) => void;
+  setDoc: (kind: DocKind | null) => void;
+  showToast: (msg: string, opts?: { action?: ToastAction; ms?: number }) => number;
+  dismissToast: (id: number) => void;
+  setChord: (p: string | null) => void;
+  setMarket: (m: MarketContext) => void;
+  setQuotes: (q: SampleMarketQuotes, label?: string) => boolean;
+  resetQuotes: () => void;
+  setInterpolation: (curveId: string, method: InterpolationMethod | undefined) => boolean;
   /** Set / remove a turn-of-year jump; refuses dates on or before the valuation date (R3-F2). */
-  setTurnOfYear(curveId: string, toy: TurnOfYear | undefined): boolean;
-  setCdsCurve(counterparty: string, quotes: CdsQuote[] | undefined): void;
+  setTurnOfYear: (curveId: string, toy: TurnOfYear | undefined) => boolean;
+  setCdsCurve: (counterparty: string, quotes: CdsQuote[] | undefined) => void;
   /** Override one vol surface (undoable, marks the market as modified); `undefined` restores the sample surface. */
-  setVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface | undefined, label: string): boolean;
-  resetVolSurfaces(): void;
+  setVolSurface: (kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface | undefined, label: string) => boolean;
+  resetVolSurfaces: () => void;
   /** Replace the FX fixings (undoable, marks the market as modified); an empty list removes them all. */
-  setFxFixings(next: FxFixing[], label: string): boolean;
+  setFxFixings: (next: FxFixing[], label: string) => boolean;
   /**
    * Set an FX spot. Sample market: the spot lives in the quote set (undo entry "quotes"). Imported snapshot: stored
    * as an override on top of the snapshot – undoable, persisted, exported, flagged "modifiziert" (R6-F1).
    */
-  setFxSpot(pair: string, spot: number, label?: string): boolean;
+  setFxSpot: (pair: string, spot: number, label?: string) => boolean;
   /** Replace the historical rate fixings (`null` = back to the base market's fixings) – undoable, persisted (R6-F1). */
-  setFixings(next: Fixing[] | null, label: string): boolean;
+  setFixings: (next: Fixing[] | null, label: string) => boolean;
   /**
    * Back to the unmodified base market: sample mode resets quotes, interpolation, turn-of-year, vol surfaces, FX fixings
    * and fixings; import mode drops the overrides made on top of the snapshot (vols, FX fixings, spots, fixings).
    */
-  resetMarketOverrides(): void;
+  resetMarketOverrides: () => void;
   /**
    * Add a curve for a currency / index from quotes (Markt R6-5); `fxSpot` also
    * stores the EUR spot of a new currency in the quote set. One undo entry.
    */
-  addExtraCurve(curve: ExtraCurve, opts?: { fxSpot?: { pair: string; rate: number } }): { ok: true } | { ok: false; error: string };
+  addExtraCurve: (curve: ExtraCurve, opts?: { fxSpot?: { pair: string; rate: number } }) => { ok: true } | { ok: false; error: string };
   /** Replace the quotes of an added curve (re-bootstrap, undoable). */
-  setExtraCurveQuotes(id: string, quotes: CurveQuote[], label: string): boolean;
+  setExtraCurveQuotes: (id: string, quotes: CurveQuote[], label: string) => boolean;
   /** Remove an added curve (undoable). */
-  removeExtraCurve(id: string): boolean;
+  removeExtraCurve: (id: string) => boolean;
   /**
    * "+ Paar" in sample mode (R8-F2): a structural spot for a pair the market does not quote – survives snapshot import →
    * "Zum Sample-Markt" → reload. Import mode uses `setFxSpot` (override) instead; returns false there.
    */
-  addExtraSpot(pair: string, rate: number, label?: string): boolean;
+  addExtraSpot: (pair: string, rate: number, label?: string) => boolean;
   /** Remove a "+ Paar" spot again (undoable). */
-  removeExtraSpot(pair: string): boolean;
+  removeExtraSpot: (pair: string) => boolean;
   /**
    * "+ Fläche" in sample mode (R8-F2): add / replace (`surface`) or remove (`undefined`) a structural vol surface for a
    * currency, index or pair the sample market has none for. Undoable, persisted, untouched by a snapshot import.
    */
-  setExtraVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface | undefined, label: string): boolean;
+  setExtraVolSurface: (kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface | undefined, label: string) => boolean;
   /**
    * "+ Währung" (Markt R8-1): validate and register indices / conventions / calendars in the core register, remember them
    * (persisted, re-registered on load) and export them with the snapshot. One undo entry.
    */
-  addCurrencyRegistration(env: RegisterEnvelope): { ok: true; summary: string } | { ok: false; error: string };
+  addCurrencyRegistration: (env: RegisterEnvelope) => { ok: true; summary: string } | { ok: false; error: string };
   /** Remove a "+ Währung" registration again (refused while an added curve of the currency exists). */
-  removeCurrencyRegistration(currency: string): { ok: true } | { ok: false; error: string };
-  repriceAll(): void;
+  removeCurrencyRegistration: (currency: string) => { ok: true } | { ok: false; error: string };
+  repriceAll: () => void;
   /**
    * Risk report from the cache, computed on demand *without* writing to the
    * store – safe to call during render. Use `ensureRisk` (effect) to fill the
    * cache so subsequent renders are cheap (N-26 / arch N-09).
    */
-  risk(id: string): RiskReport | undefined;
+  risk: (id: string) => RiskReport | undefined;
   /** Compute and cache the risk report of a trade (call from effects / handlers, never during render). */
-  ensureRisk(id: string): RiskReport | undefined;
+  ensureRisk: (id: string) => RiskReport | undefined;
   /**
    * Set the valuation date and rebuild the sample market from the quotes. With
    * an imported snapshot the call is refused (returns false) unless
    * `discardImport` is set – the import is never dropped silently (R5-F2); use
    * `changeValuationDate()` from the UI, it asks first.
    */
-  setValuationDate(iso: string, opts?: { discardImport?: boolean }): boolean;
+  setValuationDate: (iso: string, opts?: { discardImport?: boolean }) => boolean;
   /**
    * Replace the whole market by a `deriva.market/1` snapshot (R5-F2): curves,
    * spots, fixings, FX fixings, vol surfaces, credit data and the valuation
@@ -471,20 +497,20 @@ interface AppState {
    * overrides and vol overrides are reset, so the "modifiziert" flag is off and
    * the snapshot id equals the core `marketSnapshotId` of the file.
    */
-  importSnapshot(json: WorkstationSnapshotJson): ImportSnapshotResult;
+  importSnapshot: (json: WorkstationSnapshotJson) => ImportSnapshotResult;
   /** Back to the sample market bootstrapped from the quotes at the current valuation date (undoable, R6-F2). */
-  leaveImport(): void;
-  setHedgeRelationship(rel: HedgeRelationship): void;
+  leaveImport: () => void;
+  setHedgeRelationship: (rel: HedgeRelationship) => void;
   /** Discard the stored hedge documentation of a trade – undoable (R3-F4); its test result is dropped with it. */
-  removeHedgeRelationship(tradeId: string): void;
+  removeHedgeRelationship: (tradeId: string) => void;
   /** Store the effectiveness test result of a trade's hedge relationship (persisted, R5-F3). */
-  setHedgeResult(tradeId: string, result: HedgeResult | undefined): void;
-  setReportInputs(tradeId: string, patch: Partial<ReportInputs>): void;
-  resetReportInputs(tradeId: string): void;
-  generateReport(): string;
-  setReportKey(key: string | null): void;
-  resetPortfolio(): void;
-  clearRestored(): void;
+  setHedgeResult: (tradeId: string, result: HedgeResult | undefined) => void;
+  setReportInputs: (tradeId: string, patch: Partial<ReportInputs>) => void;
+  resetReportInputs: (tradeId: string) => void;
+  generateReport: () => string;
+  setReportKey: (key: string | null) => void;
+  resetPortfolio: () => void;
+  clearRestored: () => void;
 }
 
 function applyWhatIf(base: MarketContext, w: WhatIf): MarketContext {
@@ -735,6 +761,43 @@ export function extraCurveSpec(c: ExtraCurve, discountCurveId: Record<string, st
   return { id: c.id, currency: c.currency, index: c.index, quotes: c.quotes, ...(disc && disc !== c.id ? { discountCurveId: disc } : {}) };
 }
 
+/**
+ * The `quotes` block of the snapshot export (Markt R9-1): one `{ curveId, spec }` per curve of the exported market that
+ * has bootstrap quotes outside the sample set – the "+ Kurve" curves (`extraCurveSpec`) in sample mode, and in import
+ * mode the specs the imported file carried (re-emitted for the curves still present). Curves the market does not hold
+ * are never exported (the API refuses a `quotes` entry without its curve).
+ */
+export function snapshotQuoteSpecs(
+  m: Pick<MarketContext, "curves" | "discountCurveId">,
+  extraCurves: Record<string, ExtraCurve>,
+  imported: CurveQuotesEntry[] = [],
+): CurveQuotesEntry[] {
+  const out = new Map<string, CurveQuotesEntry>();
+  for (const q of imported) if (m.curves[q.curveId]) out.set(q.curveId, q);
+  for (const c of Object.values(extraCurves)) if (m.curves[c.id]) out.set(c.id, { curveId: c.id, spec: extraCurveSpec(c, m.discountCurveId) });
+  return [...out.values()];
+}
+
+/**
+ * Bootstrap specs with quotes for par risk (Markt R8-3 / R9-1): the sample curves plus every "+ Kurve" curve in sample
+ * mode; in import mode the `quotes` block of the imported snapshot for the curves the market holds – the curves stay the
+ * file's, the specs only serve the bump. A curve without a spec is reported by the par-risk card, never counted as 0.
+ */
+export function parRiskSpecs(
+  s: Pick<AppState, "marketSource" | "valuationDate" | "quotes" | "extraCurves" | "importedSnapshot"> & {
+    market: Pick<MarketContext, "curves" | "discountCurveId">;
+  },
+): Record<string, CurveBuildSpec> {
+  const specs: Record<string, CurveBuildSpec> = {};
+  if (s.marketSource === "import") {
+    for (const q of quotesOf(s.importedSnapshot)) if (s.market.curves[q.curveId]) specs[q.curveId] = { ...q.spec, id: q.curveId };
+    return specs;
+  }
+  Object.assign(specs, sampleBootstrapSpecs(s.valuationDate, s.quotes));
+  for (const c of Object.values(s.extraCurves)) specs[c.id] = extraCurveSpec(c, s.market.discountCurveId);
+  return specs;
+}
+
 /** Validation of a curve the user wants to add (German messages). */
 export function validateExtraCurve(c: ExtraCurve, existingCurveIds: string[]): string | undefined {
   if (!/^[A-Z]{3}$/.test(c.currency) || !knownCurrencies().includes(c.currency))
@@ -953,7 +1016,7 @@ export function isPlausibleTrade(raw: unknown): raw is Trade {
   const t = raw as Partial<Trade> & { legs?: unknown; underlying?: { legs?: unknown } };
   if (typeof t.id !== "string" || !t.id || typeof t.type !== "string" || !TRADE_TYPES.has(t.type)) return false;
   if ((t.type === "InterestRateSwap" || t.type === "CrossCurrencySwap") && !(Array.isArray(t.legs) && t.legs.length > 0)) return false;
-  if (t.type === "Swaption" && !(Array.isArray(t.underlying?.legs) && t.underlying!.legs.length > 0)) return false;
+  if (t.type === "Swaption" && !(Array.isArray(t.underlying?.legs) && t.underlying.legs.length > 0)) return false;
   return true;
 }
 
@@ -1038,14 +1101,15 @@ export function loadSnapshot(
   }
   let market: MarketContext;
   try {
-    const { indices: _i, conventions: _c, calendars: _k, ...doc } = json;
+    const { indices: _i, conventions: _c, calendars: _k, quotes: _q, ...doc } = json;
     market = deserializeMarket({ ...doc, fixings: json.fixings ?? [] });
   } catch (e) {
     return { ok: false, error: snapshotErrorText(e, translatePricingError) };
   }
   let problems: string[];
   try {
-    problems = [...validateMarket(market), ...validateVolSurfaces(market)];
+    // The `quotes` block (Markt R9-1) must name curves of the snapshot with matching currency and a registered index.
+    problems = [...validateMarket(market), ...validateVolSurfaces(market), ...quotesProblems(quotesOf(json), market.curves)];
   } catch (e) {
     return { ok: false, error: snapshotErrorText(e, translatePricingError) };
   }
@@ -1635,6 +1699,30 @@ export const useStore = create<AppState>()(
             set({ undoStack: undoStack.slice(0, -1), extraRegister: entry.extraRegister });
             return r.ok ? entry.label : null;
           }
+          if (entry.kind === "portfolio") {
+            // Undo of "Beispielportfolio laden" (R9-F4): register first (curves and the snapshot envelope may build on it),
+            // then the structural extras, then the market source (rebuilds with the added curves), then the book.
+            set({ undoStack: undoStack.slice(0, -1) });
+            if (!envelopeEmpty(entry.extraRegister) && !registerEnvelope(entry.extraRegister).ok) return null;
+            set({
+              extraRegister: entry.extraRegister,
+              extraSpots: entry.extraSpots,
+              extraVolSurfaces: entry.extraVolSurfaces,
+              cdsCurves: entry.cdsCurves,
+              hedgeRelationships: entry.hedgeRelationships,
+              hedgeResults: entry.hedgeResults,
+              reportInputs: entry.reportInputs,
+              trades: entry.trades,
+              compareIds: entry.compareIds,
+            });
+            if (!restoreMarketSource(entry.market)) {
+              // the market could not be rebuilt (registry gone) – the book is back, the market stays the sample one
+              const { results, ms } = priceAll(get().market, entry.trades, get().reportingCurrency, msgCtx());
+              set({ results, lastPricingMs: ms, riskCache: {} });
+            }
+            set({ selectedId: entry.trades.some((t) => t.id === entry.selectedId) ? entry.selectedId : (entry.trades[0]?.id ?? null) });
+            return entry.label;
+          }
           const { results, ms } = priceAll(market, entry.trades, reportingCurrency, msgCtx());
           const selectedId = entry.trades.some((t) => t.id === get().selectedId) ? get().selectedId : (entry.trades[0]?.id ?? null);
           set({
@@ -2127,7 +2215,7 @@ export const useStore = create<AppState>()(
               // Never drop an imported snapshot silently (R5-F2): the caller must confirm the switch back to the quotes market.
               if (!opts?.discardImport) return false;
               // One undoable action (R6-F2): the snapshot, its overrides and the old valuation date come back with Ctrl+Z.
-              pushMarketSourceUndo(`Snapshot „${get().importedBase?.meta?.label ?? "Snapshot"}“ verworfen (Bewertungstag ${isoDe(d)})`);
+              pushMarketSourceUndo(`Snapshot „${marketLabelDe(get().importedBase?.meta?.label)}“ verworfen (Bewertungstag ${isoDe(d)})`);
               set({ marketSource: "sample", importedSnapshot: null, importedBase: null, volSurfaces: {}, fxFixings: [], fxSpotOverrides: {}, fixings: null });
             }
             const baseMarket = rebuildMarket(d, get().quotes);
@@ -2149,7 +2237,7 @@ export const useStore = create<AppState>()(
           if (!loaded.ok) return loaded;
           const imported = loaded.market;
           const before = get().valuationDate;
-          const label = imported.meta?.label ?? toISO(imported.valuationDate);
+          const label = marketLabelDe(imported.meta?.label, toISO(imported.valuationDate));
           // Structural extras (curves, "+ Paar" spots, "+ Fläche" surfaces) are kept, so only real edits count as discarded (R8-F2).
           const { discarded, kept } = importDiscards(get());
           const discardedEdits = discarded.length > 0;
@@ -2186,12 +2274,13 @@ export const useStore = create<AppState>()(
             discarded,
             kept,
             registered: loaded.registered,
+            quoteCurves: quotesOf(json).map((q) => q.curveId),
             warnings: loaded.warnings,
           };
         },
         leaveImport: () => {
           if (get().marketSource !== "import") return;
-          pushMarketSourceUndo(`Zum Sample-Markt (Snapshot „${get().importedBase?.meta?.label ?? "Snapshot"}“ verlassen)`);
+          pushMarketSourceUndo(`Zum Sample-Markt (Snapshot „${marketLabelDe(get().importedBase?.meta?.label)}“ verlassen)`);
           set({
             marketSource: "sample",
             importedSnapshot: null,
@@ -2253,6 +2342,24 @@ export const useStore = create<AppState>()(
           const baseMarket = buildSampleMarket(valuationDate, quotes);
           const market = applyWhatIf(baseMarket, get().whatIf);
           const { results, ms } = priceAll(market, trades, get().reportingCurrency);
+          // One undo entry for the whole book (R9-F4): trades, market, extras, register, hedge documentation and inputs.
+          const prev = get();
+          const entry: UndoEntry = {
+            kind: "portfolio",
+            trades: prev.trades,
+            market: marketSourceState(),
+            extraSpots: { ...prev.extraSpots },
+            extraVolSurfaces: JSON.parse(JSON.stringify(prev.extraVolSurfaces)) as VolSurfaces,
+            extraRegister: JSON.parse(JSON.stringify(prev.extraRegister)) as RegisterEnvelope,
+            cdsCurves: JSON.parse(JSON.stringify(prev.cdsCurves)) as Record<string, CdsQuote[]>,
+            hedgeRelationships: prev.hedgeRelationships,
+            hedgeResults: prev.hedgeResults,
+            reportInputs: prev.reportInputs,
+            selectedId: prev.selectedId,
+            compareIds: prev.compareIds,
+            label: `Beispielportfolio geladen (${prev.trades.length} Trades ersetzt)`,
+            at: Date.now(),
+          };
           // "+ Währung" registrations leave the core register with the reset (built-ins stay).
           unregisterEnvelope(get().extraRegister);
           set({
@@ -2280,7 +2387,7 @@ export const useStore = create<AppState>()(
             riskCache: {},
             selectedId: trades[0]?.id ?? null,
             compareIds: [],
-            undoStack: [],
+            undoStack: [...prev.undoStack, entry].slice(-UNDO_DEPTH),
             hedgeRelationships: {},
             hedgeResults: {},
             reportInputs: {},
@@ -2330,8 +2437,7 @@ export const useStore = create<AppState>()(
           const quotes = isPlausibleQuotes(p.quotes) ? p.quotes : cloneQuotes(SAMPLE_QUOTES);
           const interpolation: Record<string, InterpolationMethod> = {};
           if (p.interpolation && typeof p.interpolation === "object") {
-            for (const [k, v] of Object.entries(p.interpolation))
-              if (typeof v === "string" && INTERPOLATIONS.has(v)) interpolation[k] = v as InterpolationMethod;
+            for (const [k, v] of Object.entries(p.interpolation)) if (typeof v === "string" && INTERPOLATIONS.has(v)) interpolation[k] = v;
           }
           const turnOfYear: Record<string, TurnOfYear> = {};
           if (p.turnOfYear && typeof p.turnOfYear === "object") {
@@ -2353,7 +2459,7 @@ export const useStore = create<AppState>()(
           let importedSnapshot: WorkstationSnapshotJson | null = null;
           let importedBase: MarketContext | null = null;
           if (p.marketSource === "import" && isPlausibleSnapshot(p.importedSnapshot)) {
-            const loaded = loadSnapshot(p.importedSnapshot as WorkstationSnapshotJson);
+            const loaded = loadSnapshot(p.importedSnapshot);
             if (loaded.ok) {
               marketSource = "import";
               importedSnapshot = p.importedSnapshot;
@@ -2512,7 +2618,7 @@ export function changeValuationDate(iso: string): boolean {
   const s = useStore.getState();
   if (s.marketSource === "import") {
     if (toISO(s.valuationDate) === iso) return true;
-    const label = s.baseMarket.meta?.label ?? "Snapshot";
+    const label = marketLabelDe(s.baseMarket.meta?.label);
     const question =
       `Der Markt stammt aus dem importierten Snapshot „${label}“ (Bewertungstag ${dateDe(s.valuationDate)}). ` +
       `Ein anderer Bewertungstag verwirft den Snapshot und baut den Sample-Markt aus den Quotes zum ${iso.split("-").reverse().join(".")} neu auf ` +
@@ -2533,6 +2639,25 @@ export function changeValuationDate(iso: string): boolean {
   const ok = s.setValuationDate(iso);
   if (!ok) s.showToast("Ungültiges Datum");
   return ok;
+}
+
+/**
+ * "Beispielportfolio laden" from the UI (palette, empty blotter – R9-F4): asks first, naming what the reset replaces
+ * (trades, market changes, hedge documentation), resets with one undo entry and shows a toast with „Rückgängig“.
+ * Returns whether the reset happened. The restore toast after a reload carries no reset action any more – a destructive
+ * action must not be the first tab stop after every reload.
+ */
+export function resetPortfolioWithConfirm(): boolean {
+  const s = useStore.getState();
+  const parts = [`${s.trades.length} Trades`];
+  if (marketModified(s) || s.marketSource === "import" || !envelopeEmpty(s.extraRegister)) parts.push("Marktänderungen");
+  if (Object.keys(s.hedgeRelationships).length) parts.push("Hedge-Dokumentation");
+  const question = `Bestand (${parts.join(", ")}) durch das Beispielportfolio ersetzen? (rückgängig mit Ctrl+Z)`;
+  const confirmed = typeof window !== "undefined" && typeof window.confirm === "function" ? window.confirm(question) : false;
+  if (!confirmed) return false;
+  s.resetPortfolio();
+  useStore.getState().showToast("Beispielportfolio geladen", { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+  return true;
 }
 
 export function whatIfActive(w: WhatIf): boolean {

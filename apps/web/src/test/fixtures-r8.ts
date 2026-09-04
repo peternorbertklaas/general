@@ -3,8 +3,21 @@
  * (docs/quality/review-markt-r8.md, R8-1 / R8-2) and snapshot builders that add
  * curves the sample market does not carry.
  */
-import { type MarketSnapshotJson, type RateIndex, type SwapConventions, SAMPLE_QUOTES, buildSampleMarket, serializeMarket } from "@deriva/pricing-core";
+import {
+  type MarketSnapshotJson,
+  type RateIndex,
+  type SampleMarketQuotes,
+  type SwapConventions,
+  SAMPLE_QUOTES,
+  buildSampleMarket,
+  serializeMarket,
+} from "@deriva/pricing-core";
 import { type RegisterEnvelope, type WorkstationSnapshotJson } from "../lib/register-envelope.js";
+
+/** Structural deep clone of a JSON-serialisable value (drops `undefined` fields like a file round trip would). */
+export function jsonClone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T;
+}
 
 export const CZK_ENVELOPE: Required<RegisterEnvelope> = {
   calendars: [{ id: "CZ", name: "Prag", holidays: ["2027-07-05", "2027-07-06", "2027-09-28", "2027-10-28", "2027-11-17"] }],
@@ -53,7 +66,7 @@ export const CZK_ENVELOPE: Required<RegisterEnvelope> = {
 
 /** A snapshot of the *sample* market at `valuationDate` – the auditor's file without any extra curve. */
 export function sampleSnapshot(valuationDate: number): MarketSnapshotJson {
-  return JSON.parse(JSON.stringify(serializeMarket(buildSampleMarket(valuationDate, JSON.parse(JSON.stringify(SAMPLE_QUOTES)))))) as MarketSnapshotJson;
+  return jsonClone(serializeMarket(buildSampleMarket(valuationDate, jsonClone<SampleMarketQuotes>(SAMPLE_QUOTES))));
 }
 
 /**
@@ -65,7 +78,7 @@ export function withCurve(snap: MarketSnapshotJson, id: string, currency: string
   const estr = snap.curves.find((c) => c.id === "EUR-ESTR")!;
   return {
     ...snap,
-    curves: [...snap.curves, { ...JSON.parse(JSON.stringify(estr)), id, currency, meta: { ...(estr.meta ?? {}), source: "fixture" } }],
+    curves: [...snap.curves, { ...jsonClone(estr), id, currency, meta: { ...(estr.meta ?? {}), source: "fixture" } }],
     discountCurveId: { ...snap.discountCurveId, [currency]: id },
     fxSpots: { ...snap.fxSpots, [`EUR${currency}`]: eurSpot },
   };
@@ -73,5 +86,5 @@ export function withCurve(snap: MarketSnapshotJson, id: string, currency: string
 
 /** The API's CZK snapshot of round 8: sample curves + CZK-CZEONIA + EUR/CZK spot + the register envelope. */
 export function czkSnapshot(valuationDate: number): WorkstationSnapshotJson {
-  return { ...withCurve(sampleSnapshot(valuationDate), "CZK-CZEONIA", "CZK", 24.6), ...JSON.parse(JSON.stringify(CZK_ENVELOPE)) };
+  return { ...withCurve(sampleSnapshot(valuationDate), "CZK-CZEONIA", "CZK", 24.6), ...jsonClone<RegisterEnvelope>(CZK_ENVELOPE) };
 }

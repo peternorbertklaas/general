@@ -93,4 +93,4 @@ export function EChart(props: EChartProps) {
 }
 
 /** Load the chart library ahead of time (e.g. when a chord that leads to a chart view starts). */
-export const preloadECharts = Chart.preload;
+export const preloadECharts = (): Promise<void> => Chart.preload();

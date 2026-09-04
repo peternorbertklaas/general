@@ -76,14 +76,14 @@ export function useTableNav(opts: TableNavOptions = {}) {
   const onFocus = useCallback((e: React.FocusEvent<HTMLTableSectionElement>) => {
     const tr = (e.target as HTMLElement).closest("tr");
     if (!tr || tr.parentElement !== e.currentTarget) return;
-    const i = rowsOf(e.currentTarget).indexOf(tr as HTMLTableRowElement);
+    const i = rowsOf(e.currentTarget).indexOf(tr);
     if (i >= 0) setActiveIndex(i);
   }, []);
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
       const target = e.target as HTMLElement;
-      const tr = target.closest("tr") as HTMLTableRowElement | null;
+      const tr = target.closest("tr");
       if (!tr || target !== tr) return; // inputs inside cells keep their own keys
       const tbody = e.currentTarget;
       const rows = rowsOf(tbody);

@@ -1,18 +1,6 @@
 import { useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import {
-  type CurveBuildSpec,
-  type ParRiskReport,
-  type Trade,
-  type VegaBucketReport,
-  parRisk,
-  parseISO,
-  sampleBootstrapSpecs,
-  toCsv,
-  toISO,
-  tradeCurrencies,
-  vegaBuckets,
-} from "@deriva/pricing-core";
+import { type ParRiskReport, type Trade, type VegaBucketReport, parRisk, parseISO, toCsv, toISO, tradeCurrencies, vegaBuckets } from "@deriva/pricing-core";
 import { EChart, negColor, posColor } from "../components/EChart.js";
 import { Term } from "../components/InfoTip.js";
 import { AnalyticsTable } from "../components/Inspector.js";
@@ -22,7 +10,7 @@ import { useTableNav } from "../hooks/useTableNav.js";
 import { useRisk } from "../hooks/useRisk.js";
 import { keysText, HOTKEYS } from "../hotkeys/keymap.js";
 import { fmtDate, fmtMoney, fmtMs, fmtNum, fmtPct, signClass } from "../lib/format.js";
-import { CASHFLOW_KIND_DE, legTypeLabel, t, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
+import { CASHFLOW_KIND_DE, legTypeLabel, marketLabelDe, t, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { copyText, indicationText } from "../lib/indication.js";
 import { analyticsRows, bucketLabel, detailRows } from "../lib/metrics.js";
 import { downloadText } from "../lib/portfolio-io.js";
@@ -38,7 +26,7 @@ import {
   parSolveUnavailable,
   tradeTypeBadge,
 } from "../lib/trade-ops.js";
-import { LS_KEYS, deleteWithUndo, extraCurveSpec, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
+import { LS_KEYS, deleteWithUndo, parRiskSpecs, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
 import { StatusBadge } from "./Blotter.js";
 
 const hk = (id: string) => keysText(HOTKEYS.find((h) => h.id === id) ?? { keys: "" });
@@ -76,6 +64,7 @@ export function PricingWorkspace() {
       undoStack: st.undoStack,
       marketSource: st.marketSource,
       extraCurves: st.extraCurves,
+      importedSnapshot: st.importedSnapshot,
     })),
   );
   const act = useStore.getState;
@@ -105,15 +94,22 @@ export function PricingWorkspace() {
     }
   }, [trade, s.market, s.reportingCurrency, customer, vegaDim, fxSmile, r?.error]);
   /**
-   * Bootstrap specs with quotes (Markt R8-3): the sample curves plus every "+ Kurve" curve in sample mode – the curves of
-   * an imported snapshot carry no quotes, so nothing can be bumped there. `parCoverage` names the trade's curves without a spec.
+   * Bootstrap specs with quotes (Markt R8-3 / R9-1): the sample curves plus every "+ Kurve" curve in sample mode; in import
+   * mode the `quotes` block the snapshot carried (API export or workstation export). `parCoverage` names the trade's curves
+   * without a spec – a snapshot curve without quotes is reported, never counted as 0.
    */
-  const parSpecs = useMemo(() => {
-    if (s.marketSource === "import") return {} as Record<string, CurveBuildSpec>;
-    const specs: Record<string, CurveBuildSpec> = { ...sampleBootstrapSpecs(s.valuationDate, s.quotes) };
-    for (const c of Object.values(s.extraCurves)) specs[c.id] = extraCurveSpec(c, s.market.discountCurveId);
-    return specs;
-  }, [s.marketSource, s.valuationDate, s.quotes, s.extraCurves, s.market.discountCurveId]);
+  const parSpecs = useMemo(
+    () =>
+      parRiskSpecs({
+        marketSource: s.marketSource,
+        valuationDate: s.valuationDate,
+        quotes: s.quotes,
+        extraCurves: s.extraCurves,
+        importedSnapshot: s.importedSnapshot,
+        market: s.market,
+      }),
+    [s.marketSource, s.valuationDate, s.quotes, s.extraCurves, s.importedSnapshot, s.market],
+  );
   const parCoverage = useMemo(() => {
     const ccys = trade ? tradeCurrencies(trade) : [];
     const relevant = Object.values(s.market.curves)
@@ -268,7 +264,7 @@ export function PricingWorkspace() {
                   className="btn ghost"
                   title={`Indikation als Text kopieren (${hk("copy.indication")})`}
                   aria-label="Indikation kopieren"
-                  onClick={copyIndication}
+                  onClick={() => void copyIndication()}
                 >
                   ⎘
                 </button>
@@ -700,7 +696,7 @@ export function PricingWorkspace() {
         </div>
       )}
       <div className="muted xs">
-        Bewertungstag {fmtDate(s.valuationDate)} · Berechnung {fmtMs(res?.timingMs, 2)} · Snapshot {s.baseMarket.meta?.label}
+        Bewertungstag {fmtDate(s.valuationDate)} · Berechnung {fmtMs(res?.timingMs, 2)} · Snapshot {marketLabelDe(s.baseMarket.meta?.label)}
         {s.undoStack.length > 0 && ` · ${hk("undo")} macht „${s.undoStack[s.undoStack.length - 1]!.label}“ rückgängig`}
       </div>
     </div>

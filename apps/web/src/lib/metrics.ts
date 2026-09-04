@@ -136,10 +136,10 @@ const TEXT_METRICS: Record<string, { label: string; values?: Record<string, stri
   mtmReset: { label: "MtM-Reset", values: { yes: "ja", no: "nein" } },
   volConverted: { label: "Vol-Quotierung umgerechnet (Normal ↔ Lognormal)", values: { yes: "ja", no: "nein" } },
   deliveryConvention: { label: "Lieferkonvention", values: { standard: "Standard (Spot-Lag)", "non-standard": "abweichend" } },
-  // core R8 (N7-5): when a knock-out rebate is paid – at the touch, at expiry, or the round-7 mixture (default)
+  // core R8/R9 (N7-5): when a knock-out rebate is paid – at the touch (default since R9, QuantLib) or at expiry
   rebateAt: {
     label: "Rebate-Zahlung",
-    values: { hit: "bei Berührung (Haug / QuantLib)", expiry: "bei Verfall (Reiner–Rubinstein)", default: "Standard (gemischt – Konvention im Trade setzen)" },
+    values: { hit: "bei Berührung (Haug / QuantLib)", expiry: "bei Verfall (Reiner–Rubinstein)" },
   },
   // core R6 (N6-5): knock state of a barrier option – recorded on the trade (`barrier.hit`) or derived from spot / fixing
   barrierState: {

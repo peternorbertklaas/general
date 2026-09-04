@@ -619,6 +619,99 @@ export interface CsvImportResult {
   /** Row number (1-based, excluding header) and German reason for every rejected row. */
   errors: { row: number; msg: string }[];
   columns: CsvColumn[];
+  /** Where the product type came from when the file has no `type` column (Markt R9-4): file name, column set or the type dialog. */
+  typeSource?: { type: CsvTradeType; from: "file" | "columns" | "dialog" };
+}
+
+/** Thrown by `tradesFromCsv` when a file has no `type` column and no type can be derived – the Blotter then asks (Markt R9-4). */
+export class CsvTypeMissingError extends Error {}
+
+/** API template names (`?type=` of `POST /api/trades/import`, also the API's template file names) → workstation type token. */
+export const API_TEMPLATE_TYPES: Record<string, CsvTradeType> = {
+  interestrateswap: "IRS",
+  fxforward: "FXF",
+  capfloor: "CAP",
+  swaption: "SWPT",
+  fxoption: "FXO",
+  crosscurrencyswap: "CCS",
+  fra: "FRA",
+  fxswap: "FXS",
+  basisswap: "BASIS",
+  amortisingswap: "AMORT",
+  immswap: "IMM",
+};
+
+/**
+ * Product type from a CSV file name (Markt R9-4): the workstation's templates („deriva-import-vorlage-ccs.csv“), the
+ * API's template files („CrossCurrencySwap.csv“, `?type=` names anywhere in the name) or a bare type token delimited
+ * by non-letters („irs-2026.csv“, „FXF.csv“). `undefined` when the name says nothing.
+ */
+export function csvTypeFromFileName(name: string | undefined): CsvTradeType | undefined {
+  if (!name) return undefined;
+  const base = name.replace(/^.*[\\/]/, "").toLowerCase();
+  const vorlage = /vorlage-([a-z]+)\.(?:csv|txt)$/.exec(base);
+  if (vorlage && CSV_TRADE_TYPES.includes(vorlage[1]!.toUpperCase() as CsvTradeType)) return vorlage[1]!.toUpperCase() as CsvTradeType;
+  const api = Object.keys(API_TEMPLATE_TYPES)
+    .sort((a, b) => b.length - a.length)
+    .find((k) => base.includes(k));
+  if (api) return API_TEMPLATE_TYPES[api];
+  const token = /(?:^|[^a-z])(irs|fxf|cap|swpt|fxo|ccs|fra|fxs|basis|amort|imm)(?:[^a-z]|$)/.exec(base);
+  return token ? (token[1]!.toUpperCase() as CsvTradeType) : undefined;
+}
+
+/**
+ * Product type from the column set of a CSV without a `type` column (Markt R9-4) – the unique signatures of the eleven
+ * templates in both vocabularies (workstation and API): `domesticNotional` / `fxSpot`+`pair` → CCS, `nearRate` → FXS,
+ * `payerReceiver` or `expiry`+`tenor` without a pair → SWPT, an option type / `expiryDate` / `pair`+`strike` → FXO,
+ * `pair` with amounts or a delivery date → FXF, `period` or a `3x9` start → FRA, `finalNotional` / `amortisation` /
+ * `schedule` → AMORT, two indices → BASIS, `from`+`tenor` without start / maturity → IMM, a cap/floor strike → CAP, a
+ * currency with notional and rate → IRS. `firstRow` (cells of the first data row) decides the FRA period check.
+ */
+export function csvTypeFromColumns(header: string[], firstRow: string[] = []): CsvTradeType | undefined {
+  const keys = header.map((h) => h.trim().toLowerCase());
+  const set = new Set(keys);
+  const has = (...names: string[]) => names.some((n) => set.has(n));
+  const cell = (...names: string[]) => {
+    const i = keys.findIndex((k) => names.includes(k));
+    return i >= 0 ? (firstRow[i] ?? "").trim() : "";
+  };
+  if (has("domesticnotional", "domestic notional", "domesticpayreceive", "foreignnotional")) return "CCS";
+  if (has("pair", "paar") && has("fxspot", "kassakurs", "spot")) return "CCS";
+  if (has("nearrate", "farrate", "neardate", "fardate")) return "FXS";
+  if (has("payerreceiver") || (has("expiry", "verfall") && has("tenor", "swaplaufzeit") && !has("pair", "paar"))) return "SWPT";
+  if (has("optiontype", "optionstyp", "call/put", "expirydate", "barriertype") || (has("pair", "paar") && has("strike"))) return "FXO";
+  if (
+    has("pair", "paar") &&
+    has("baseamount", "rate", "deliverydate", "lieferung", "valuta", "buycurrency", "kaufwährung", "buyamount", "kaufbetrag", "sellcurrency", "sellamount")
+  )
+    return "FXF";
+  if (has("buycurrency", "kaufwährung", "sellcurrency", "verkaufswährung")) return "FXF";
+  if (has("period", "periode") || /^\d{1,2}x\d{1,2}$/i.test(cell("start", "startdatum", "effectivedate", "effective date", "beginn"))) return "FRA";
+  if (has("finalnotional", "amortisation", "schedule", "tilgung", "tilgungsplan")) return "AMORT";
+  if (has("receiveindex", "payindex")) return "BASIS";
+  if (
+    has("from", "ab") &&
+    has("tenor", "swaplaufzeit") &&
+    !has("start", "startdatum", "effectivedate", "effective date", "maturity", "laufzeit", "ende", "enddatum")
+  )
+    return "IMM";
+  if (has("capfloor", "art", "floorstrike", "floor-strike", "cap-strike", "capstrike") || (has("strike") && !has("expiry", "verfall") && !has("pair", "paar")))
+    return "CAP";
+  if (
+    has("currency", "währung", "waehrung", "ccy") &&
+    has("notional", "nominal", "betrag") &&
+    has("rate", "fixedrate", "fixed rate", "satz", "festsatz", "kupon", "coupon", "direction", "payreceive", "richtung", "payrec", "pay/rec")
+  )
+    return "IRS";
+  return undefined;
+}
+
+/** File name first, then the column signature (Markt R9-4). */
+export function detectCsvType(header: string[], firstRow: string[] | undefined, fileName?: string): CsvImportResult["typeSource"] | undefined {
+  const fromName = csvTypeFromFileName(fileName);
+  if (fromName) return { type: fromName, from: "file" };
+  const fromColumns = csvTypeFromColumns(header, firstRow);
+  return fromColumns ? { type: fromColumns, from: "columns" } : undefined;
 }
 
 /** Split a CSV line honouring double quotes; separator is auto-detected (";" preferred, "," or tab). */
@@ -737,12 +830,23 @@ const STATUS_MAP: Record<string, Trade["status"]> = {
 /**
  * Parse an import CSV (BOM tolerated, ";" / "," / tab, decimal comma or point,
  * dates ISO / German / tenor). The `type` column selects the template (IRS /
- * FXF / CAP); `mapping` maps canonical column names to the file's header names
+ * FXF / CAP); without it the type is derived from the file name or the column
+ * set (Markt R9-4 – the API's template files import unchanged), or taken from
+ * `defaultType` (the Blotter's type dialog); `CsvTypeMissingError` when none
+ * applies. `mapping` maps canonical column names to the file's header names
  * when they differ from the aliases.
  */
 export function tradesFromCsv(
   text: string,
-  opts: { mapping?: Partial<Record<CsvColumn, string>>; valuationDate: number; fxSpots?: Record<string, number> },
+  opts: {
+    mapping?: Partial<Record<CsvColumn, string>>;
+    valuationDate: number;
+    fxSpots?: Record<string, number>;
+    /** Name of the imported file – „…-vorlage-ccs.csv“ / „CrossCurrencySwap.csv“ name the type (Markt R9-4). */
+    fileName?: string;
+    /** Type chosen in the dialog when neither the file nor its columns name one (Markt R9-4). */
+    defaultType?: CsvTradeType;
+  },
 ): CsvImportResult {
   const lines = text
     .replace(/^\uFEFF/, "")
@@ -757,7 +861,15 @@ export function tradesFromCsv(
     const key = h.trim().toLowerCase();
     return reverse.get(key) ?? HEADER_ALIASES[key] ?? (Object.values(HEADER_ALIASES).includes(key as CsvColumn) ? (key as CsvColumn) : undefined);
   });
-  if (!columns.includes("type")) throw new Error(`Spalte „Typ“ fehlt (${CSV_TRADE_TYPES.join(" / ")})`);
+  let typeSource: CsvImportResult["typeSource"];
+  if (!columns.includes("type")) {
+    typeSource =
+      detectCsvType(header, splitCsvLine(lines[1]!, sep), opts.fileName) ?? (opts.defaultType ? { type: opts.defaultType, from: "dialog" } : undefined);
+    if (!typeSource)
+      throw new CsvTypeMissingError(
+        `Spalte „Typ“ fehlt (${CSV_TRADE_TYPES.join(" / ")}) und der Produkttyp lässt sich weder aus dem Dateinamen noch aus den Spalten ableiten`,
+      );
+  }
   const trades: Trade[] = [];
   const errors: { row: number; msg: string }[] = [];
   for (let r = 1; r < lines.length; r++) {
@@ -766,6 +878,7 @@ export function tradesFromCsv(
     columns.forEach((c, i) => {
       if (c && cells[i] !== undefined && cells[i] !== "") rec[c] = cells[i];
     });
+    if (typeSource && rec.type === undefined) rec.type = typeSource.type;
     try {
       const t = tradeFromRecord(rec, opts.valuationDate, r, { fxSpots: opts.fxSpots });
       // A built row that fails trade validation (end before start, notional ≤ 0 …) is a row error like any other –
@@ -780,7 +893,7 @@ export function tradesFromCsv(
       errors.push({ row: r, msg: (e as Error).message });
     }
   }
-  return { trades, errors, columns: columns.filter((c): c is CsvColumn => c !== undefined) };
+  return { trades, errors, columns: columns.filter((c): c is CsvColumn => c !== undefined), ...(typeSource ? { typeSource } : {}) };
 }
 
 /**

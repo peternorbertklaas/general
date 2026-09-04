@@ -49,7 +49,9 @@ describe("validate-trade (F-04)", () => {
       counterparty: "X",
     });
     expect(validateTrade({ ...base, uti: "529900T8BM49AURSDO55CCS0001" }).filter((i) => i.field === "uti")).toEqual([]);
-    expect(validateTrade({ ...base, uti: "abc!" }).find((i) => i.field === "uti")).toMatchObject({ level: "warn", msg: expect.stringMatching(/ISO 23897/) });
+    const badUti = validateTrade({ ...base, uti: "abc!" }).find((i) => i.field === "uti");
+    expect(badUti?.level).toBe("warn");
+    expect(badUti?.msg).toMatch(/ISO 23897/);
     expect(validateTrade({ ...base, uti: "A".repeat(53) }).find((i) => i.field === "uti")?.level).toBe("warn");
     expect(validateTrade({ ...base, uti: "MIT LEERZEICHEN" }).find((i) => i.field === "uti")?.level).toBe("warn");
     expect(validateTrade(base).find((i) => i.field === "uti")).toBeUndefined();

@@ -8,6 +8,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runInThisContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import { PRECACHE_PLACEHOLDER, VERSION_PLACEHOLDER, precacheList, renderServiceWorker } from "../scripts/sw-precache-plugin.js";
 
@@ -49,9 +50,13 @@ function makeScope() {
   return { handlers, store, caches, self, opened };
 }
 
+type WorkerFactory = (self: unknown, caches: unknown, fetch: (r: Req) => Promise<Res>) => void;
+
+/** Evaluate the rendered worker source against the stub scope (a script, not an implied eval – `node:vm` in this realm). */
 function load(scope: ReturnType<typeof makeScope>, fetchImpl: (r: Req) => Promise<Res>, assets = ASSETS) {
   const src = renderServiceWorker(template, assets);
-  new Function("self", "caches", "fetch", src)(scope.self, scope.caches, fetchImpl);
+  const factory = runInThisContext(`(function (self, caches, fetch) {\n${src}\n})`, { filename: "sw.js" }) as WorkerFactory;
+  factory(scope.self, scope.caches, fetchImpl);
   return scope.handlers;
 }
 

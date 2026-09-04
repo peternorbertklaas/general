@@ -25,17 +25,16 @@ export default tseslint.config(
       "prefer-const": "error",
     },
   },
-  // Type-aware rules (review R8, N4-03 rest) for the pricing core and the API: `recommendedTypeChecked` on top of
-  // `recommended`, fed by the packages' own tsconfigs (`projectService`). The rules that matter for these two
-  // packages are `no-floating-promises` / `no-misused-promises` (Fastify hooks, async route handlers) and the
-  // `no-unsafe-*` family at the JSON boundaries. The web app keeps the untyped set for now: its sources are owned
-  // by the web workstream and the typed pass there is scheduled with the echarts-6 upgrade (CONTRIBUTING „Lint“).
+  // Type-aware rules (review R8, N4-03 rest) for the pricing core, the API and – since round 9 – the web app:
+  // `recommendedTypeChecked` on top of `recommended`, fed by the packages' own tsconfigs (`projectService`). The rules
+  // that matter are `no-floating-promises` / `no-misused-promises` (Fastify hooks, async route handlers, React effects
+  // and event handlers) and the `no-unsafe-*` family at the JSON boundaries (API bodies, localStorage, file imports).
   ...tseslint.configs.recommendedTypeChecked.map((config) => ({
     ...config,
-    files: ["apps/api/src/**/*.ts", "packages/pricing-core/src/**/*.ts"],
+    files: ["apps/api/src/**/*.ts", "packages/pricing-core/src/**/*.ts", "apps/web/src/**/*.ts", "apps/web/src/**/*.tsx"],
   })),
   {
-    files: ["apps/api/src/**/*.ts", "packages/pricing-core/src/**/*.ts"],
+    files: ["apps/api/src/**/*.ts", "packages/pricing-core/src/**/*.ts", "apps/web/src/**/*.ts", "apps/web/src/**/*.tsx"],
     languageOptions: {
       parserOptions: {
         projectService: true,
@@ -52,6 +51,28 @@ export default tseslint.config(
       "@typescript-eslint/no-base-to-string": "off",
       // Fastify's `async` route handlers return values without awaiting; `require-await` would demand a fake `await`.
       "@typescript-eslint/require-await": "off",
+    },
+  },
+  {
+    // Web app (review R9, N4-03 rest): the typed set with two pragmatic settings. Nullish template expressions are
+    // idiomatic in the German UI texts (`${t.name ?? t.id}` is the exception, `${meta?.label}` the rule – 200+ sites),
+    // so `allowNullish` is on like in the pricing core; `no-unnecessary-type-assertion` stays on for sources (autofixed
+    // in round 9) and is parked for the tests together with `unbound-method` (testing-library's `screen.getBy*` are
+    // unbound by design). Everything else – `no-floating-promises`, `no-misused-promises`, the `no-unsafe-*` family,
+    // `no-implied-eval`, `no-duplicate-type-constituents` – is enforced in sources and tests alike.
+    files: ["apps/web/src/**/*.ts", "apps/web/src/**/*.tsx"],
+    rules: {
+      "@typescript-eslint/restrict-template-expressions": [
+        "error",
+        { allowNumber: true, allowBoolean: true, allowNullish: true, allowRegExp: false, allowAny: false },
+      ],
+    },
+  },
+  {
+    files: ["apps/web/src/**/*.test.ts", "apps/web/src/**/*.test.tsx"],
+    rules: {
+      "@typescript-eslint/no-unnecessary-type-assertion": "off",
+      "@typescript-eslint/unbound-method": "off",
     },
   },
   {

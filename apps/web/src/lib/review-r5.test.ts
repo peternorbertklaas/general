@@ -135,7 +135,8 @@ describe("Markt R5-3 – CCS CSV template with a CSA column", () => {
     expect(ccs("C1").collateralCurrency).toBe("USD");
     expect(ccs("C2").collateralCurrency).toBeUndefined();
     expect(ccs("C3").collateralCurrency).toBe("GBP");
-    expect(r.errors).toEqual([{ row: 4, msg: expect.stringMatching(/Collateral-Währung „Dollar“ nicht lesbar/) }]);
+    expect(r.errors.map((e) => e.row)).toEqual([4]);
+    expect(r.errors[0]!.msg).toMatch(/Collateral-Währung „Dollar“ nicht lesbar/);
     expect(collateralOf("unbesichert", "EURUSD")).toBeNull();
     expect(collateralOf(" chf ", "EURUSD")).toBe("CHF");
   });

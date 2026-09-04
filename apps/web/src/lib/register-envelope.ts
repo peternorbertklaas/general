@@ -15,6 +15,7 @@
  * semantics (cross references inside the envelope, German texts, export).
  */
 import {
+  type CurveBuildSpec,
   type CustomCalendarJson,
   type MarketSnapshotJson,
   type RateIndex,
@@ -43,8 +44,71 @@ export interface RegisterEnvelope {
   calendars?: CustomCalendarJson[];
 }
 
-/** A `deriva.market/1` document plus the register envelope (API `ApiMarketSnapshot`, workstation export). */
-export type WorkstationSnapshotJson = MarketSnapshotJson & RegisterEnvelope;
+/**
+ * One entry of the snapshot envelope's `quotes` (Markt R9-1, ADR-027 R9): the bootstrap spec of a curve outside the
+ * sample set in the shape `POST /api/market/curves` takes (`spec`), keyed by the curve it belongs to. The curve itself
+ * travels in `curves` unchanged; the spec only lets par risk bump the curve's quotes after an import (and lets the API
+ * rebuild it). The workstation exports the block for its "+ Kurve" curves (`extraCurveSpec`) and re-emits imported ones.
+ */
+export interface CurveQuotesEntry {
+  curveId: string;
+  spec: CurveBuildSpec;
+}
+
+/** A `deriva.market/1` document plus the register envelope and the `quotes` block (API `ApiMarketSnapshot`, workstation export). */
+export type WorkstationSnapshotJson = MarketSnapshotJson & RegisterEnvelope & { quotes?: CurveQuotesEntry[] };
+
+/** The `quotes` block of a snapshot (structurally checked by `readSnapshotJson`), empty without one. */
+export function quotesOf(json: unknown): CurveQuotesEntry[] {
+  return isObj(json) && Array.isArray(json.quotes) ? (json.quotes as CurveQuotesEntry[]) : [];
+}
+
+/**
+ * Structural check of the `quotes` block (German problem or `undefined`): a list of `{ curveId, spec }` whose spec has
+ * `id` (= `curveId`), `currency`, `index` and a non-empty `quotes[]`. Cross references to the snapshot's curves and the
+ * register are checked by `quotesProblems` once the market is deserialised.
+ */
+export function validateQuotesBlock(quotes: unknown): string | undefined {
+  if (quotes === undefined || quotes === null) return undefined;
+  if (!Array.isArray(quotes)) return "Snapshot fehlerhaft – Feld „quotes“ muss eine Liste sein";
+  for (const [i, q] of quotes.entries()) {
+    const label = isObj(q) && isStr(q.curveId) ? `Quotes für Kurve „${q.curveId}“` : `Quotes-Eintrag Nr. ${i + 1}`;
+    if (!isObj(q)) return `Snapshot fehlerhaft – ${label} ist kein Objekt`;
+    if (!isStr(q.curveId)) return `Snapshot fehlerhaft – ${label} ohne „curveId“`;
+    if (!isObj(q.spec)) return `Snapshot fehlerhaft – ${label}: „spec“ fehlt (Bootstrap-Spezifikation wie in POST /api/market/curves)`;
+    const s = q.spec;
+    if (!isStr(s.id) || !isStr(s.currency) || !isStr(s.index)) return `Snapshot fehlerhaft – ${label}: „spec“ braucht „id“, „currency“ und „index“`;
+    if (s.id !== q.curveId) return `Snapshot fehlerhaft – ${label}: „spec.id“ (${s.id}) passt nicht zur „curveId“`;
+    if (!Array.isArray(s.quotes) || s.quotes.length === 0) return `Snapshot fehlerhaft – ${label}: „spec.quotes“ muss eine nicht-leere Liste sein`;
+    for (const [j, quote] of (s.quotes as unknown[]).entries())
+      if (!isObj(quote) || !isStr(quote.type)) return `Snapshot fehlerhaft – ${label}: Quote Nr. ${j + 1} ohne „type“`;
+  }
+  return undefined;
+}
+
+/**
+ * Cross references of the `quotes` block against the deserialised market (Markt R9-1, mirrors the API's check): every
+ * entry names a curve of the snapshot, `spec.currency` matches the curve and `spec.index` is registered (the envelope
+ * is registered before this runs). Returns the German problems (empty when fine).
+ */
+export function quotesProblems(quotes: CurveQuotesEntry[], curves: Record<string, { id: string; currency: string }>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const q of quotes) {
+    const label = `Quotes für Kurve „${q.curveId}“`;
+    if (seen.has(q.curveId)) out.push(`${label}: doppelt`);
+    seen.add(q.curveId);
+    const curve = curves[q.curveId];
+    if (!curve) {
+      out.push(`${label}: Kurve nicht im Snapshot (Kurven: ${Object.keys(curves).join(", ")})`);
+      continue;
+    }
+    if (up(q.spec.currency) !== curve.currency) out.push(`${label}: Währung ${q.spec.currency} passt nicht zur Kurve (${curve.currency})`);
+    if (!knownIndices().some((i) => i.name === up(q.spec.index)))
+      out.push(`${label}: Index „${q.spec.index}“ ist nicht registriert – im Envelope unter „indices“ mitliefern oder mit „+ Währung“ registrieren`);
+  }
+  return out;
+}
 
 /** Currencies whose conventions ship with the engine (frozen at module load – registrations happen later). */
 const BUILT_IN_CURRENCIES: ReadonlySet<string> = new Set(Object.keys(SWAP_CONVENTIONS));
@@ -136,13 +200,13 @@ export function validateEnvelope(env: RegisterEnvelope): string | undefined {
   for (const [i, c] of (env.calendars ?? []).entries()) {
     const p = calendarProblem(c, i);
     if (p) return `Snapshot-Envelope: ${p}`;
-    pendingCalendars.add(up((c as CustomCalendarJson).id));
+    pendingCalendars.add(up(c.id));
   }
   const pendingIndices: RateIndex[] = [];
   for (const [i, ix] of (env.indices ?? []).entries()) {
     const p = indexProblem(ix, i, pendingCalendars);
     if (p) return `Snapshot-Envelope: ${p}`;
-    const d = ix as RateIndex;
+    const d = ix;
     pendingIndices.push({ ...d, name: up(d.name), currency: up(d.currency) });
   }
   for (const [i, conv] of (env.conventions ?? []).entries()) {

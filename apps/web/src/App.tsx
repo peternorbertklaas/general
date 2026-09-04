@@ -11,6 +11,7 @@ import { isTextEntry, useHotkeys } from "./hotkeys/useHotkeys.js";
 import { blotterCsv, buildBlotterRows, readBlotterColumns } from "./lib/blotter-export.js";
 import { focusEditorField, focusWhenPresent } from "./lib/focus.js";
 import { fmtDate, fmtMs } from "./lib/format.js";
+import { marketLabelDe } from "./lib/i18n.js";
 import { copyText, indicationText } from "./lib/indication.js";
 import { downloadPortfolioReport } from "./lib/portfolio-export.js";
 import { downloadText } from "./lib/portfolio-io.js";
@@ -89,7 +90,7 @@ export function App() {
       lastPricingMs: st.lastPricingMs,
       compareCount: st.compareIds.length,
       lastUndo: st.undoStack[st.undoStack.length - 1],
-      marketLabel: st.baseMarket.meta?.label,
+      marketLabel: marketLabelDe(st.baseMarket.meta?.label, ""),
     })),
   );
   const act = useStore.getState;
@@ -143,22 +144,18 @@ export function App() {
     };
   }, []);
 
-  // Restore toast (F-13) – once after hydration.
+  // Restore toast (F-13) – once after hydration. It is an information toast without a destructive action (R9-F4): the
+  // toast stack is the first tab stop after the skip link, so „Zurücksetzen“ there was one `Tab`, `↵` away after every
+  // reload. The reset lives in the palette („Beispielportfolio laden“) and the empty blotter, asks first and is undoable.
   useEffect(() => {
     if (!s.restored || restoredShown.current) return;
     restoredShown.current = true;
     const info = s.restored;
     act().clearRestored();
-    act().showToast(`Bestand aus lokalem Speicher geladen (${info.trades} Trades${info.quotesModified ? ", Markt modifiziert" : ""})`, {
-      action: {
-        label: "Zurücksetzen",
-        run: () => {
-          useStore.getState().resetPortfolio();
-          useStore.getState().showToast("Beispielportfolio geladen");
-        },
-      },
-      ms: 8000,
-    });
+    act().showToast(
+      `Bestand aus lokalem Speicher geladen (${info.trades} Trades${info.quotesModified ? ", Markt modifiziert" : ""}) – Beispielportfolio über die Palette (Ctrl+K „Beispielportfolio“)`,
+      { ms: 8000 },
+    );
   }, [s.restored, act]);
 
   const exportCsv = useCallback(() => {

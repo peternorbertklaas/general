@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { type DayCountConvention, type RateIndex, type SwapConventions, knownCurrencies, parseISO, toISO } from "@deriva/pricing-core";
 import { NumInput } from "../components/NumInput.js";
 import { parseDateInput } from "../lib/date-parse.js";
+import { escapeCloses } from "../lib/focus.js";
 import {
   type CustomCalendarJson,
   type RegisterEnvelope,
@@ -103,8 +104,19 @@ export function buildCurrencyEnvelope(p: {
  * one with a holiday list via "+ Kalender"). Persisted like `extraCurves`, re-registered on load, one undo entry,
  * exported in the snapshot envelope. Afterwards "+ Kurve", the quick entry and the editor accept the currency.
  */
+/**
+ * Toast after a successful „+ Währung“ (R9-03 / Markt R9-2): in sample mode the next step is „+ Kurve“; under an
+ * imported snapshot „+ Kurve“ is locked, so the toast names the two ways to a curve instead of a disabled button.
+ */
+export function registrationToast(summary: string, code: string, marketSource: "sample" | "import"): string {
+  return marketSource === "import"
+    ? `Registriert: ${summary} – im Import-Modus ist „+ Kurve“ gesperrt: nach „Zum Sample-Markt“ mit „+ Kurve“ eine ${code}-Kurve anlegen oder einen Snapshot mit ${code}-Kurve importieren`
+    : `Registriert: ${summary} – jetzt mit „+ Kurve“ eine ${code}-Kurve anlegen`;
+}
+
 export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => void }) {
   const extraRegister = useStore((s) => s.extraRegister);
+  const marketSource = useStore((s) => s.marketSource);
   const [ccy, setCcy] = useState("CZK");
   const [calendar, setCalendar] = useState("TARGET");
   const [fixedFrequency, setFixedFrequency] = useState("1Y");
@@ -189,8 +201,9 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
       st.showToast(`Währung nicht registriert – ${r.error}`, { ms: 8000 });
       return;
     }
-    st.showToast(`Registriert: ${r.summary} – jetzt mit „+ Kurve“ eine ${code}-Kurve anlegen`, {
+    st.showToast(registrationToast(r.summary, code, marketSource), {
       action: { label: "Rückgängig", run: () => useStore.getState().undo() },
+      ...(marketSource === "import" ? { ms: 10000 } : {}),
     });
     onDone(code);
   };
@@ -211,12 +224,15 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
       ))}
     </select>
   );
+  // Field groups wrap inside themselves and shrink (R9-01): at 1024 px with the inspector open the card is ~640 px wide.
+  const group: React.CSSProperties = { gap: 6, flexWrap: "wrap", minWidth: 0 };
   return (
-    <div className="card" data-testid="add-currency-form">
+    <div className="card" data-testid="add-currency-form" style={{ maxWidth: "100%", overflowWrap: "anywhere" }} onKeyDown={escapeCloses(() => onDone())}>
       <h3>
         + Währung registrieren
-        <span className="right muted xs">
-          Konventionen, OIS-/IBOR-Index und Kalender wie `POST /api/market/indices|conventions|calendars` · im Snapshot-Envelope exportiert
+        <span className="right muted xs" style={{ whiteSpace: "normal" }}>
+          Konventionen, OIS-/IBOR-Index und Kalender wie <code className="mono">POST /api/market/indices|conventions|calendars</code> · im Snapshot-Envelope
+          exportiert
         </span>
       </h3>
       {registeredHere.length > 0 && (
@@ -277,7 +293,7 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
             aria-pressed={addingCalendar}
             data-testid="add-calendar"
             onClick={() => setAddingCalendar((v) => !v)}
-            title="Eigenen Kalender mit Feiertagsliste anlegen (Kern `CustomCalendar`)"
+            title="Eigenen Kalender mit Feiertagsliste anlegen (Kern-Typ CustomCalendar)"
           >
             + Kalender
           </button>
@@ -304,6 +320,7 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
               min={0}
               max={5}
               ariaLabel="Spot-Lag (Geschäftstage)"
+              width="100%"
               onChange={(v) => setSpotLag(Math.round(v))}
             />
           </span>
@@ -349,7 +366,7 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
         </div>
       )}
       <div className="row wrap" style={{ gap: 12, marginTop: 8, alignItems: "flex-start" }}>
-        <label className="row" style={{ gap: 6 }}>
+        <label className="row" style={group}>
           <span className="muted small">OIS-Index</span>
           <input
             className="mono"
@@ -362,7 +379,7 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
           />
           {dcSelect(oisDayCount, setOisDayCount, "Tageszählung des OIS-Index")}
         </label>
-        <label className="row" style={{ gap: 6 }} title="Fixing-Lag des OIS-Index in Geschäftstagen">
+        <label className="row" style={group} title="Fixing-Lag des OIS-Index in Geschäftstagen">
           <span className="muted small">Fixing-Lag</span>
           <span style={{ display: "inline-block", width: 64 }}>
             <NumInput
@@ -373,11 +390,12 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
               min={0}
               max={5}
               ariaLabel="Fixing-Lag des OIS-Index"
+              width="100%"
               onChange={(v) => setOisFixingLag(Math.round(v))}
             />
           </span>
         </label>
-        <label className="row" style={{ gap: 6 }} title="Zahlungs-Lag der OIS-Swaps in Geschäftstagen">
+        <label className="row" style={group} title="Zahlungs-Lag der OIS-Swaps in Geschäftstagen">
           <span className="muted small">Zahlungs-Lag</span>
           <span style={{ display: "inline-block", width: 64 }}>
             <NumInput
@@ -388,13 +406,15 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
               min={0}
               max={5}
               ariaLabel="Zahlungs-Lag der OIS-Swaps"
+              width="100%"
               onChange={(v) => setOisPaymentLag(Math.round(v))}
             />
           </span>
         </label>
       </div>
-      <div className="row wrap" style={{ gap: 12, marginTop: 8, alignItems: "flex-start" }}>
-        <label className="row" style={{ gap: 6 }}>
+      {/* IBOR group with its fixing lag in one wrapping group (R9-01) – like „Spot-Lag“ in the head row */}
+      <div className="row wrap" style={{ gap: 12, marginTop: 8, alignItems: "flex-start" }} data-testid="add-currency-ibor-row">
+        <label className="row" style={group}>
           <span className="muted small">IBOR-Index (optional)</span>
           <input
             className="mono"
@@ -414,7 +434,7 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
           </select>
           {dcSelect(iborDayCount, setIborDayCount, "Tageszählung des IBOR-Index")}
         </label>
-        <label className="row" style={{ gap: 6 }} title="Fixing-Lag des IBOR-Index in Geschäftstagen">
+        <label className="row" style={group} title="Fixing-Lag des IBOR-Index in Geschäftstagen">
           <span className="muted small">Fixing-Lag</span>
           <span style={{ display: "inline-block", width: 64 }}>
             <NumInput
@@ -425,11 +445,14 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
               min={0}
               max={5}
               ariaLabel="Fixing-Lag des IBOR-Index"
+              width="100%"
               onChange={(v) => setIborFixingLag(Math.round(v))}
             />
           </span>
         </label>
-        <span className="muted xs">Ohne IBOR-Index ist der OIS-Index die Float-Benchmark der Swaps (Frequenz 1Y).</span>
+        <span className="muted xs" style={{ flex: "1 1 220px", minWidth: 0 }}>
+          Ohne IBOR-Index ist der OIS-Index die Float-Benchmark der Swaps (Frequenz 1Y).
+        </span>
       </div>
       <div className="row wrap" style={{ gap: 8, marginTop: 8, alignItems: "center" }}>
         <button className="btn primary" onClick={submit} disabled={!!problem} data-testid="add-currency-submit">
@@ -443,7 +466,7 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
             {problem}
           </span>
         ) : (
-          <span className="muted xs" data-testid="add-currency-preview">
+          <span className="muted xs" data-testid="add-currency-preview" style={{ flex: "1 1 220px", minWidth: 0 }}>
             {envelopeSummary(envelope)} · Kurven-IDs {envelope.indices!.map((i) => i.curveId).join(", ")} · Kalender {envelope.conventions![0]!.calendar}
             {customCalendar
               ? ` (neu, ${customCalendar.holidays.length} Feiertage${customCalendar.holidays[0] ? `, ab ${toISO(parseISO(customCalendar.holidays[0])).split("-").reverse().join(".")}` : ""})`

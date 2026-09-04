@@ -4,7 +4,7 @@ import { METRIC_DEFINITIONS } from "../lib/metrics.js";
  * Small Ⓘ marker with a definition tooltip (hover + keyboard focus). Uses
  * `data-tip` + CSS so it works without JavaScript and inside table headers.
  */
-export function InfoTip({ text, id }: { text?: string; id?: keyof typeof METRIC_DEFINITIONS | string }) {
+export function InfoTip({ text, id }: { text?: string; id?: string }) {
   const tip = text ?? (id ? METRIC_DEFINITIONS[id] : undefined);
   if (!tip) return null;
   return (

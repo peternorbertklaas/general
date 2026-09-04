@@ -5,7 +5,7 @@
  * schema: undefined", "Cannot convert undefined or null to object").
  */
 import { type MarketSnapshotJson } from "@deriva/pricing-core";
-import { type WorkstationSnapshotJson, envelopeOf, validateEnvelope } from "./register-envelope.js";
+import { type WorkstationSnapshotJson, envelopeOf, validateEnvelope, validateQuotesBlock } from "./register-envelope.js";
 
 const SCHEMA = "deriva.market/1";
 const EXPECT = "erwartet wird ein Export aus „Snapshot exportieren“ der Marktansicht oder GET /api/market/snapshot";
@@ -22,8 +22,9 @@ const fail = (msg: string): never => {
  * message for malformed JSON, a missing / unknown schema and missing or
  * mistyped required fields; optional collections default to empty so the core
  * never trips over `undefined`. The register envelope (`indices`, `conventions`,
- * `calendars` – Markt R8-1) is checked structurally and kept on the result, so
- * `loadSnapshot` can register it before the market is deserialised.
+ * `calendars` – Markt R8-1) and the `quotes` block (bootstrap specs, Markt R9-1)
+ * are checked structurally and kept on the result, so `loadSnapshot` can
+ * register the envelope before the market is deserialised and keep the specs.
  */
 export function readSnapshotJson(text: string): WorkstationSnapshotJson {
   let parsed: unknown;
@@ -72,6 +73,9 @@ export function readSnapshotJson(text: string): WorkstationSnapshotJson {
     if (o[key] !== undefined && o[key] !== null && !Array.isArray(o[key])) return fail(`Snapshot fehlerhaft – Feld „${key}“ muss eine Liste sein`);
   const envelopeProblem = validateEnvelope(envelopeOf(o));
   if (envelopeProblem) return fail(envelopeProblem);
+  // Bootstrap specs of curves outside the sample set (Markt R9-1) – structure here, cross references in `loadSnapshot`.
+  const quotesProblem = validateQuotesBlock(o.quotes);
+  if (quotesProblem) return fail(quotesProblem);
   // Optional collections default to empty – the core and the market view iterate over them.
   return {
     ...(o as unknown as MarketSnapshotJson),

@@ -5,7 +5,7 @@ import { focusEditorField } from "../lib/focus.js";
 import { fmtDate, fmtMoney } from "../lib/format.js";
 import { QUICK_ENTRY_EXAMPLES, parseQuickEntry, parseValuationDateCommand } from "../lib/quick-parser.js";
 import { tradeTypeBadge } from "../lib/trade-ops.js";
-import { changeValuationDate, useStore } from "../state/store.js";
+import { changeValuationDate, resetPortfolioWithConfirm, useStore } from "../state/store.js";
 import { restoreFocus, useModalRegistration } from "./Modal.js";
 
 interface Item {
@@ -145,11 +145,11 @@ export function CommandPalette({ onHotkey }: Props) {
         id: "portfolio.reset",
         group: "Aktionen",
         label: "Beispielportfolio laden (Bestand zurücksetzen)",
-        desc: "ersetzt alle Trades und Quotes",
+        desc: "ersetzt alle Trades, Marktänderungen und Hedge-Dokumentationen – fragt nach, rückgängig mit Ctrl+Z",
         icon: "↺",
         run: () => {
-          act().resetPortfolio();
-          act().showToast("Beispielportfolio geladen");
+          // R9-F4: asks first and pushes one undo entry for the whole book
+          resetPortfolioWithConfirm();
           close();
         },
       },
@@ -198,7 +198,7 @@ export function CommandPalette({ onHotkey }: Props) {
             act().showToast(`Angelegt: ${t.id}${pv !== undefined ? ` · PV ${fmtMoney(pv, s.reportingCurrency)}` : ""}`);
             act().setPalette(false);
             // R7-03: the focus lands on the first editor field of the new trade, not on the shell
-            focusEditorField();
+            void focusEditorField();
           },
         }
       : valDateCmd
