@@ -65,7 +65,7 @@ Capmatix, den Treasury-Management-Systemen und Excel + QuantLib schließt:
 
 ### Modulbeschreibungen
 
-| Modul | Zweck | Paket / Ort | Status v0.2 |
+| Modul | Zweck | Paket / Ort | Status v0.3 |
 |---|---|---|---|
 | **M1 Fundament** | Fehlerfreie Datums- und Konventionslogik als Basis jeder Bewertung | `packages/pricing-core/src/dates`, `src/math` | ✅ implementiert, getestet |
 | **M2 Marktdaten & Kurven** | Kurven aus Depos/FRAs/Futures/Swaps/OIS/Tenor-Basis/XCCY-Basis bauen, Vol-Flächen abfragen und plausibilisieren, Snapshots exportieren/importieren, Index-/Konventionsregister (G5 + NOK/SEK/DKK/PLN, `registerRateIndex`), Kurven aus Quotes in der Workstation („+ Kurve“) | `src/curves`, `src/models`, `src/market` | ✅ inkl. Snapshot-Format und Register; Live-Adapter offen |

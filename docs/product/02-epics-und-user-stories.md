@@ -1,7 +1,7 @@
 # DERIVA – Epics und User Stories
 
 Format: **US-x.y** *Als* ‹Rolle› *möchte ich* ‹Ziel›, *um* ‹Nutzen›. – Akzeptanzkriterien (AK) in Given/When/Then-Kurzform.
-Status: ✅ umgesetzt in v0.2 · 🔶 teilweise (Lücke benannt) · ⏳ Roadmap. Umsetzungsnachweis verweist auf Code/Tests; regulatorische Evidenz je Anforderung in [`docs/compliance/01-regulatorik-mapping.md`](../compliance/01-regulatorik-mapping.md).
+Status: ✅ umgesetzt in v0.3 (Stand v0.3.0) · 🔶 teilweise (Lücke benannt) · ⏳ Roadmap. Umsetzungsnachweis verweist auf Code/Tests; regulatorische Evidenz je Anforderung in [`docs/compliance/01-regulatorik-mapping.md`](../compliance/01-regulatorik-mapping.md).
 
 Rollen: **Berater** (Firmenkunden-Sales), **Treasurer** (Kunde), **Risk** (Marktfolge/IPV), **Prüfer**, **Quant**, **Admin**, **Entwickler**.
 
@@ -173,7 +173,7 @@ Rollen: **Berater** (Firmenkunden-Sales), **Treasurer** (Kunde), **Risk** (Markt
 
 | Release | Inhalt |
 |---|---|
-| **v0.2 (dieses Repository)** | Alle ✅-Stories der Epics 1–8 und 10 (inkl. US-2.13 Kurven aus Quotes, US-2.15 Register/„+ Währung“, US-2.16 strukturelle Zusätze, US-6.6 Audit-Trail/Hashes, US-6.7 Dokumente, US-6.8 IFRS-13-Level, US-7.9/7.10 Validierung & API-Vertrag, US-8.15 Kundenmodus, US-8.16 Route-Splitting/Größenbudget, US-8.17 Chunk-Fehlerkarte), US-6.5 EMIR 🔶, Epic 9.1–9.5, 9.9 |
+| **v0.3 (dieses Repository, Tag `v0.3.0`)** | Alle ✅-Stories der Epics 1–8 und 10 (inkl. US-2.13 Kurven aus Quotes, US-2.15 Register/„+ Währung“, US-2.16 strukturelle Zusätze, US-6.6 Audit-Trail/Hashes, US-6.7 Dokumente, US-6.8 IFRS-13-Level, US-7.9/7.10 Validierung & API-Vertrag, US-8.15 Kundenmodus, US-8.16 Route-Splitting/Größenbudget, US-8.17 Chunk-Fehlerkarte), US-6.5 EMIR 🔶, Epic 9.1–9.5, 9.9 |
 | **v1.0** | US-2.10/2.11 Marktdaten-Adapter & Kurven-Governance, US-6.4 PDF-Template, US-6.5 EMIR-Vervollständigung (Tabelle 3, UPI, XML), US-7.6 Persistenz & Auth, US-9.6 Betrieb/DORA-Doku, US-10.6 Hedge-Dokumentation |
 | **v1.1** | US-3.11/3.12 Strukturen, US-3.15 Inflations-ZC-Swap (HICPxT-Kurve), US-4.4 Netting-CVA, US-7.7 Excel-Add-in, US-7.8 Batch/Webhooks, US-8.14 Layout-Presets |
 | **v1.2** | US-4.5 SIMM/CRIF, US-5.6 VaR & Attribution, US-9.7 Validierungs-Suite, US-9.8 Worker/WASM |

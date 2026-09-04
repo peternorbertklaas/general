@@ -26,7 +26,7 @@ import { downloadText } from "../lib/portfolio-io.js";
 import { defaultIndexFor } from "../lib/register.js";
 import { exportEnvelope, quotesOf } from "../lib/register-envelope.js";
 import { readSnapshotJson, snapshotErrorText } from "../lib/snapshot-import.js";
-import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, snapshotQuoteSpecs, useStore } from "../state/store.js";
+import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, exportQuoteSpecs, marketModified, sampleVolSurfaces, useStore } from "../state/store.js";
 
 /**
  * Apply an edited vol surface: structural problems (dimensions, finite vols,
@@ -1525,6 +1525,8 @@ export function MarketView() {
   const act = useStore.getState;
   const m = s.baseMarket;
   const imported = s.marketSource === "import";
+  /** Curves whose bootstrap specs the imported snapshot carries (`quotes`, Markt R10-2) – shown in the market card and note. */
+  const importedQuoteCurves = imported ? quotesOf(s.importedSnapshot).map((q) => q.curveId) : [];
   /** Import a snapshot file – German causes for every failure: JSON, schema, missing fields, core validation (R5-06). */
   const importSnapshotFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1624,6 +1626,12 @@ export function MarketView() {
             <br />
             Kurven: {Object.keys(m.curves).length} · Fixings: {m.fixings?.length ?? 0} · FX-Fixings: {m.fxFixings?.length ?? 0} · Vol-Flächen:{" "}
             {Object.keys(m.swaptionVols ?? {}).length + Object.keys(m.capletVols ?? {}).length + Object.keys(m.fxVols ?? {}).length}
+            {imported && (
+              <span data-testid="snapshot-quote-curves">
+                {" "}
+                · Bootstrap-Quotes: {importedQuoteCurves.length} {importedQuoteCurves.length === 1 ? "Kurve" : "Kurven"}
+              </span>
+            )}
             {Object.keys(s.interpolation).length > 0 && ` · Interpolations-Overrides: ${Object.keys(s.interpolation).join(", ")}`}
           </div>
           <div className="row wrap" style={{ marginTop: 10 }}>
@@ -1632,9 +1640,10 @@ export function MarketView() {
               data-testid="snapshot-export"
               onClick={() => {
                 // The register envelope travels with the file (Markt R8-1): runtime-registered indices, conventions, calendars –
-                // and the bootstrap specs of the curves outside the sample set (`quotes`, Markt R9-1), so par risk works after a re-import.
+                // and the bootstrap specs of every curve with quotes (`quotes`, Markt R9-1 / R10-F1: sample curves included), so
+                // par risk works after a re-import – also for the EUR book.
                 const envelope = exportEnvelope();
-                const quotes = snapshotQuoteSpecs(m, imported ? {} : s.extraCurves, quotesOf(s.importedSnapshot));
+                const quotes = exportQuoteSpecs({ ...s, baseMarket: m });
                 downloadText(
                   `deriva-market-${toISO(m.valuationDate)}.json`,
                   JSON.stringify({ ...serializeMarket(m), ...envelope, ...(quotes.length ? { quotes } : {}) }, null, 2),
@@ -1643,7 +1652,9 @@ export function MarketView() {
                 const n = (envelope.indices?.length ?? 0) + (envelope.conventions?.length ?? 0) + (envelope.calendars?.length ?? 0);
                 act().showToast(
                   `Markt-Snapshot exportiert · ID ${snapshotId}${n ? ` · Register-Envelope (${n} Einträge)` : ""}${
-                    quotes.length ? ` · Bootstrap-Quotes für ${quotes.map((q) => q.curveId).join(", ")}` : ""
+                    quotes.length
+                      ? ` · Bootstrap-Quotes für ${quotes.length > 4 ? `${quotes.length} Kurven (${quotes.map((q) => q.curveId).join(", ")})` : quotes.map((q) => q.curveId).join(", ")}`
+                      : ""
                   }`,
                 );
               }}
@@ -1693,9 +1704,13 @@ export function MarketView() {
           {imported ? (
             <div className="warning" style={{ marginTop: 10 }} data-testid="snapshot-import-note">
               Markt aus importiertem Snapshot: Kurven, Spots, Fixings und Vol-Flächen kommen aus der Datei, der Bewertungstag ist der des Snapshots (
-              {fmtDate(m.valuationDate)}). Quotes, Interpolation und Turn-of-Year sind nicht verfügbar; Spots, Fixings, FX-Fixings und Vol-Flächen sind als
-              Änderung am Snapshot editierbar („modifiziert“, Ctrl+Z, „Auf Snapshot zurücksetzen“). Ein anderer Bewertungstag verwirft den Snapshot nach
-              Rückfrage – auch das ist rückgängig.
+              {fmtDate(m.valuationDate)}). Bootstrap-Quotes: {importedQuoteCurves.length} {importedQuoteCurves.length === 1 ? "Kurve" : "Kurven"}
+              {importedQuoteCurves.length
+                ? ` (${importedQuoteCurves.join(", ")}) – schreibgeschützt für das Par-Risiko, in der Kurvenansicht je Tab einsehbar`
+                : " – die Datei trägt keinen „quotes“-Block, das Par-Risiko kann diese Kurven nicht bumpen"}
+              . Quote-Bearbeitung, Interpolation und Turn-of-Year sind nicht verfügbar; Spots, Fixings, FX-Fixings und Vol-Flächen sind als Änderung am Snapshot
+              editierbar („modifiziert“, Ctrl+Z, „Auf Snapshot zurücksetzen“). Ein anderer Bewertungstag verwirft den Snapshot nach Rückfrage – auch das ist
+              rückgängig.
             </div>
           ) : (
             <div className="warning" style={{ marginTop: 10 }}>

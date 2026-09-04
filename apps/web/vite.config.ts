@@ -43,8 +43,10 @@ export default defineConfig(({ mode }) => ({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
-    // App-level tests render the whole workstation (≈1 300 sample fixings, lazy views); under parallel load 5 s is too tight.
-    testTimeout: 10000,
+    // App-level tests render the whole workstation (≈1 300 sample fixings, lazy views); under parallel load (E2E, API
+    // tests, probes on a 2–4 core runner) 10 s was still too tight (Architektur N10-03) – 20 s for tests and hooks.
+    testTimeout: 20000,
+    hookTimeout: 20000,
     coverage: {
       provider: "v8",
       reporter: ["text-summary", "lcov"],

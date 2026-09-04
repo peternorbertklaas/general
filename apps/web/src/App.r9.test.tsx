@@ -57,10 +57,16 @@ describe("App – round 9", () => {
     expect(toast.textContent).toMatch(/Beispielportfolio über die Palette/);
     expect(within(toast.closest(".toast") as HTMLElement).queryByRole("button", { name: /Zurücksetzen/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "Zurücksetzen" })).toBeNull();
-    // the empty blotter offers the sample book – declined: nothing happens
+    // the empty blotter offers the sample book – with a hedge documentation to lose it asks first; declined: nothing happens
+    const hedgeStub = { hedgingInstrumentId: "IRS-0001" } as never;
+    act(() => {
+      useStore.setState({ hedgeRelationships: { "IRS-0001": hedgeStub } });
+    });
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     fireEvent.click(screen.getByTestId("blotter-load-sample"));
-    expect(confirm).toHaveBeenCalledWith(expect.stringMatching(/^Bestand \(0 Trades\) durch das Beispielportfolio ersetzen\? \(rückgängig mit Ctrl\+Z\)$/));
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringMatching(/^Bestand \(0 Trades, Hedge-Dokumentation\) durch das Beispielportfolio ersetzen\? \(rückgängig mit Ctrl\+Z\)$/),
+    );
     expect(st().trades).toEqual([]);
     // confirmed: sample book, toast with Rückgängig, undo brings the empty book back
     confirm.mockReturnValue(true);

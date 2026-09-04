@@ -642,21 +642,28 @@ export const API_TEMPLATE_TYPES: Record<string, CsvTradeType> = {
 };
 
 /**
- * Product type from a CSV file name (Markt R9-4): the workstation's templates („deriva-import-vorlage-ccs.csv“), the
- * API's template files („CrossCurrencySwap.csv“, `?type=` names anywhere in the name) or a bare type token delimited
- * by non-letters („irs-2026.csv“, „FXF.csv“). `undefined` when the name says nothing.
+ * Product type from a CSV file name (Markt R9-4) with its weight: the workstation's templates
+ * („deriva-import-vorlage-ccs.csv“) and the API's template files („CrossCurrencySwap.csv“, `?type=` names anywhere in
+ * the name) are authoritative; a bare type token delimited by non-letters („irs-2026.csv“, „kredit-cap-2026.csv“) is
+ * only a hint (`bare: true`) that a contradicting column signature overrules (R10-F3). `undefined` when the name says
+ * nothing.
  */
-export function csvTypeFromFileName(name: string | undefined): CsvTradeType | undefined {
+export function csvTypeHintFromFileName(name: string | undefined): { type: CsvTradeType; bare: boolean } | undefined {
   if (!name) return undefined;
   const base = name.replace(/^.*[\\/]/, "").toLowerCase();
   const vorlage = /vorlage-([a-z]+)\.(?:csv|txt)$/.exec(base);
-  if (vorlage && CSV_TRADE_TYPES.includes(vorlage[1]!.toUpperCase() as CsvTradeType)) return vorlage[1]!.toUpperCase() as CsvTradeType;
+  if (vorlage && CSV_TRADE_TYPES.includes(vorlage[1]!.toUpperCase() as CsvTradeType)) return { type: vorlage[1]!.toUpperCase() as CsvTradeType, bare: false };
   const api = Object.keys(API_TEMPLATE_TYPES)
     .sort((a, b) => b.length - a.length)
     .find((k) => base.includes(k));
-  if (api) return API_TEMPLATE_TYPES[api];
+  if (api) return { type: API_TEMPLATE_TYPES[api]!, bare: false };
   const token = /(?:^|[^a-z])(irs|fxf|cap|swpt|fxo|ccs|fra|fxs|basis|amort|imm)(?:[^a-z]|$)/.exec(base);
-  return token ? (token[1]!.toUpperCase() as CsvTradeType) : undefined;
+  return token ? { type: token[1]!.toUpperCase() as CsvTradeType, bare: true } : undefined;
+}
+
+/** Product type from a CSV file name (Markt R9-4) – see `csvTypeHintFromFileName`. */
+export function csvTypeFromFileName(name: string | undefined): CsvTradeType | undefined {
+  return csvTypeHintFromFileName(name)?.type;
 }
 
 /**
@@ -706,11 +713,16 @@ export function csvTypeFromColumns(header: string[], firstRow: string[] = []): C
   return undefined;
 }
 
-/** File name first, then the column signature (Markt R9-4). */
+/**
+ * Template / API file names first, then the column signature, then a bare file-name token (Markt R9-4 / R10-F3): IRS
+ * rows in „kredit-cap-2026.csv“ are read as IRS from their columns – a bare token only decides when the columns say
+ * nothing or agree with it.
+ */
 export function detectCsvType(header: string[], firstRow: string[] | undefined, fileName?: string): CsvImportResult["typeSource"] | undefined {
-  const fromName = csvTypeFromFileName(fileName);
-  if (fromName) return { type: fromName, from: "file" };
+  const fromName = csvTypeHintFromFileName(fileName);
+  if (fromName && !fromName.bare) return { type: fromName.type, from: "file" };
   const fromColumns = csvTypeFromColumns(header, firstRow);
+  if (fromName && (!fromColumns || fromColumns === fromName.type)) return { type: fromName.type, from: "file" };
   return fromColumns ? { type: fromColumns, from: "columns" } : undefined;
 }
 
@@ -846,6 +858,8 @@ export function tradesFromCsv(
     fileName?: string;
     /** Type chosen in the dialog when neither the file nor its columns name one (Markt R9-4). */
     defaultType?: CsvTradeType;
+    /** Type chosen in the dialog *against* a derived one („Anderen Produkttyp wählen …“, R10-F3) – beats file name and columns. */
+    forcedType?: CsvTradeType;
   },
 ): CsvImportResult {
   const lines = text
@@ -863,8 +877,9 @@ export function tradesFromCsv(
   });
   let typeSource: CsvImportResult["typeSource"];
   if (!columns.includes("type")) {
-    typeSource =
-      detectCsvType(header, splitCsvLine(lines[1]!, sep), opts.fileName) ?? (opts.defaultType ? { type: opts.defaultType, from: "dialog" } : undefined);
+    typeSource = opts.forcedType
+      ? { type: opts.forcedType, from: "dialog" }
+      : (detectCsvType(header, splitCsvLine(lines[1]!, sep), opts.fileName) ?? (opts.defaultType ? { type: opts.defaultType, from: "dialog" } : undefined));
     if (!typeSource)
       throw new CsvTypeMissingError(
         `Spalte „Typ“ fehlt (${CSV_TRADE_TYPES.join(" / ")}) und der Produkttyp lässt sich weder aus dem Dateinamen noch aus den Spalten ableiten`,
@@ -939,13 +954,18 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
   const start = type === "FRA" ? valuationDate : (dateOf(rec.start, valuationDate, "start") ?? addTenor(valuationDate, "2D"));
   /** Maturity cell: a tenor ("10Y") is passed to the builder, anything else must be a valid date (R5-F1). */
   const maturityOf = (raw: string): string | number => (/^\d+[dwmy]$/i.test(raw.trim()) ? raw.trim().toUpperCase() : dateOf(raw, start, "maturity")!);
+  /** `maturity` or its API alias `tenor` (R10-F2) – for every rate product, not only CCS / SWPT / IMM. */
+  const maturityCell = (r: Partial<Record<CsvColumn, string>>): string => {
+    const raw = r.maturity ?? r.tenor;
+    if (!raw) throw new Error("Laufzeit/Enddatum fehlt (Spalte „maturity“ oder „tenor“)");
+    return raw;
+  };
   if (type === "IRS" || type === "SWAP" || type === "ZINSSWAP") {
     const notional = num(rec.notional);
     const rate = rateOf(rec.rate);
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
     if (rate === undefined) throw new Error("Festsatz fehlt");
-    if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
-    const maturity = maturityOf(rec.maturity);
+    const maturity = maturityOf(maturityCell(rec));
     const dir = (rec.direction ?? "Pay").toLowerCase();
     const t = makeVanillaSwap({
       id,
@@ -969,8 +989,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     const rate = rateOf(rec.rate);
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
     if (rate === undefined) throw new Error("Festsatz fehlt");
-    if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
-    const maturity = maturityOf(rec.maturity);
+    const maturity = maturityOf(maturityCell(rec));
     const finalNotional = num(rec.finalNotional) ?? 0;
     if (finalNotional < 0 || finalNotional >= notional) throw new Error(`Restschuld „${rec.finalNotional ?? ""}“ muss zwischen 0 und dem Nominal liegen`);
     const profile = (rec.amortisation ?? "linear").trim().toLowerCase();
@@ -1029,8 +1048,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     const payIndex = (rec.payIndex ?? "").trim().toUpperCase();
     if (!receiveIndex || !payIndex) throw new Error("Indizes fehlen (Spalten „receiveIndex“ und „payIndex“, z. B. EURIBOR-3M / EURIBOR-6M)");
     if (receiveIndex === payIndex) throw new Error("Empfangs- und Zahlindex müssen sich unterscheiden");
-    if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
-    const maturity = maturityOf(rec.maturity);
+    const maturity = maturityOf(maturityCell(rec));
     const spread = spreadOf(rec.spread) ?? 0;
     const t = makeBasisSwap({
       id,
@@ -1108,8 +1126,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     const capFloor = kindRaw.startsWith("collar") ? "Collar" : kindRaw.startsWith("floor") ? "Floor" : "Cap";
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
     if (strike === undefined) throw new Error("Strike fehlt");
-    if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
-    const maturity = maturityOf(rec.maturity);
+    const maturity = maturityOf(maturityCell(rec));
     const t = makeCapFloor({
       id,
       counterparty: common.counterparty,

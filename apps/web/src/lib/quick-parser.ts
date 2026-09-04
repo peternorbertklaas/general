@@ -429,8 +429,8 @@ class AmountSlot {
 
 const GRAMMAR = {
   irs: "irs|swap|ois|imm|amort [ccy] <tenor> pay|rec <rate%> [notional] [index] [step r1/r2/…] [@Kontrahent]",
-  capfloor: "cap|floor|collar [ccy] <tenor> <strike%>[/<floorStrike%>] [notional] [@Kontrahent]",
-  swpt: "swpt [ccy] <expiry>x<tenor> payer|receiver <strike%> [notional] [cash|physical] [@Kontrahent]",
+  capfloor: "cap|floor|collar [ccy] <tenor> <strike%>[/<floorStrike%>] [notional] [index] [@Kontrahent]",
+  swpt: "swpt [ccy] <expiry>x<tenor> payer|receiver <strike%> [notional] [index] [cash|physical] [@Kontrahent]",
   fxf: "fxf <pair> <±betrag> [kurs] <datum|tenor> [ndf] [@Kontrahent]",
   fxo: "fxo <pair> call|put <strike> [notional] <datum|tenor> [barrier uo|ui|do|di <level>] [@Kontrahent]",
   fxs: "fxs <pair> <±betrag> <nearKurs> <farKurs> <farDatum|tenor> [@Kontrahent]",
@@ -756,6 +756,8 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       let floorStrike: number | undefined;
       const notional = new AmountSlot(10_000_000);
       let ccy = "EUR";
+      let index: string | undefined;
+      let badIndexTok: string | undefined;
       for (const t of rest) {
         if (isCcy(t)) ccy = t.toUpperCase();
         else if (TENOR.test(t) && !tenor) tenor = t.toUpperCase();
@@ -773,17 +775,23 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           if (strikeTok !== undefined) return duplicate("Satz", strikeTok, t);
           strike = parseRate(t);
           strikeTok = t;
+        } else if (isIndexToken(t)) {
+          // Markt R10-3: the caplet index („cap 2y 3% 10m euribor3m“), like `irs` / `fra`
+          index = normaliseIndexToken(t);
+          if (!index) badIndexTok = t;
         } else {
           const taken = notional.take(t);
           if (taken === false) return fail(unknownTokenError(t, GRAMMAR.capfloor, opts));
           if (taken !== true) return taken;
         }
       }
+      if (badIndexTok !== undefined) return unknownIndexError(badIndexTok, ccy);
       if (!tenor || strike === undefined) return fail("Laufzeit und Strike erforderlich (z.B. cap 5y 3% 8m)");
       const noCurve = noCurveError(ccy, opts);
       if (noCurve) return noCurve;
-      // The cap's index follows the same curve-backed rule as the swap (R7-F2 / Markt R7-1: "cap nok …" after "+ Kurve" NOK-NOWA).
-      const chosen = chooseIndex(ccy, opts);
+      // Without a typed index the cap follows the same curve-backed rule as the swap (R7-F2 / Markt R7-1: "cap nok …" after
+      // "+ Kurve" NOK-NOWA); a typed index is taken as is and flagged when its curve is missing.
+      const chosen = index ? { index, note: missingCurveNote(ccy, index, opts) || ` · ${index}` } : chooseIndex(ccy, opts);
       if ("ok" in chosen) return chosen;
       const capFloor = cmd === "cap" ? "Cap" : cmd === "floor" ? "Floor" : "Collar";
       const trade = {
@@ -806,6 +814,8 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       const notional = new AmountSlot(10_000_000);
       let ccy = "EUR";
       let settlement: "Physical" | "Cash" | undefined;
+      let index: string | undefined;
+      let badIndexTok: string | undefined;
       for (const t of rest) {
         const tl = t.toLowerCase();
         const m = /^(\d+[ymd])x?(\d+[ymd])$/i.exec(t);
@@ -825,18 +835,23 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           if (strikeTok !== undefined) return duplicate("Satz", strikeTok, t);
           strike = parseRate(t);
           strikeTok = t;
+        } else if (isIndexToken(t)) {
+          // Markt R10-3: the underlying's index („swpt czk 1y5y payer 4% 50m czeonia“)
+          index = normaliseIndexToken(t);
+          if (!index) badIndexTok = t;
         } else {
           const taken = notional.take(t);
           if (taken === false) return fail(unknownTokenError(t, GRAMMAR.swpt, opts));
           if (taken !== true) return taken;
         }
       }
+      if (badIndexTok !== undefined) return unknownIndexError(badIndexTok, ccy);
       if (!expiry || !tenor) return fail("Format: swpt [usd] 1y5y payer 3% 10m [cash]");
       const noCurve = noCurveError(ccy, opts);
       if (noCurve) return noCurve;
-      // The underlying swap follows the same curve-backed index rule as the swap branch (R8-F1): "swpt dkk …" after
-      // "+ Kurve" DKK-DESTR projects DESTR instead of the conventional CIBOR-6M without a curve.
-      const chosen = chooseIndex(ccy, opts);
+      // Without a typed index the underlying swap follows the same curve-backed index rule as the swap branch (R8-F1):
+      // "swpt dkk …" after "+ Kurve" DKK-DESTR projects DESTR instead of the conventional CIBOR-6M without a curve.
+      const chosen = index ? { index, note: missingCurveNote(ccy, index, opts) || ` · ${index}` } : chooseIndex(ccy, opts);
       if ("ok" in chosen) return chosen;
       const trade = {
         ...swaptionWithUnderlyingIndex(

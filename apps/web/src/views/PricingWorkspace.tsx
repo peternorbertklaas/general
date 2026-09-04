@@ -26,7 +26,7 @@ import {
   parSolveUnavailable,
   tradeTypeBadge,
 } from "../lib/trade-ops.js";
-import { LS_KEYS, deleteWithUndo, parRiskSpecs, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
+import { LS_KEYS, deleteWithUndo, parRiskSpecsChecked, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
 import { StatusBadge } from "./Blotter.js";
 
 const hk = (id: string) => keysText(HOTKEYS.find((h) => h.id === id) ?? { keys: "" });
@@ -94,29 +94,33 @@ export function PricingWorkspace() {
     }
   }, [trade, s.market, s.reportingCurrency, customer, vegaDim, fxSmile, r?.error]);
   /**
-   * Bootstrap specs with quotes (Markt R8-3 / R9-1): the sample curves plus every "+ Kurve" curve in sample mode; in import
-   * mode the `quotes` block the snapshot carried (API export or workstation export). `parCoverage` names the trade's curves
-   * without a spec – a snapshot curve without quotes is reported, never counted as 0.
+   * Bootstrap specs with quotes (Markt R8-3 / R9-1 / R10-1): the sample curves plus every "+ Kurve" curve in sample mode;
+   * in import mode *only* the `quotes` block the snapshot carried (API export or workstation export), each spec checked
+   * against the snapshot's curve – a spec that does not reproduce its curve is excluded (`inconsistent`), never bumped
+   * into a wrong number. `parCoverage` names the trade's curves without a usable spec – reported, never counted as 0.
    */
-  const parSpecs = useMemo(
+  const parChecked = useMemo(
     () =>
-      parRiskSpecs({
+      parRiskSpecsChecked({
         marketSource: s.marketSource,
         valuationDate: s.valuationDate,
         quotes: s.quotes,
         extraCurves: s.extraCurves,
         importedSnapshot: s.importedSnapshot,
         market: s.market,
+        baseMarket: s.baseMarket,
       }),
-    [s.marketSource, s.valuationDate, s.quotes, s.extraCurves, s.importedSnapshot, s.market],
+    [s.marketSource, s.valuationDate, s.quotes, s.extraCurves, s.importedSnapshot, s.market, s.baseMarket],
   );
+  const parSpecs = parChecked.specs;
   const parCoverage = useMemo(() => {
     const ccys = trade ? tradeCurrencies(trade) : [];
     const relevant = Object.values(s.market.curves)
       .filter((c) => ccys.includes(c.currency))
       .map((c) => c.id);
-    return { relevant, missing: relevant.filter((id) => !parSpecs[id]) };
-  }, [trade, s.market.curves, parSpecs]);
+    const inconsistent = relevant.filter((id) => parChecked.inconsistent.includes(id));
+    return { relevant, missing: relevant.filter((id) => !parSpecs[id]), inconsistent };
+  }, [trade, s.market.curves, parSpecs, parChecked.inconsistent]);
 
   if (!trade) {
     return (
@@ -518,9 +522,21 @@ export function PricingWorkspace() {
               {parOpen && parCoverage.missing.length > 0 && (
                 <div className="warning" data-testid="par-risk-coverage">
                   Par-Risiko nur für Kurven mit Quotes ({parCoverage.relevant.length - parCoverage.missing.length} von {parCoverage.relevant.length})
-                  {parCoverage.relevant.length > parCoverage.missing.length ? ` – ohne Quotes: ${parCoverage.missing.join(", ")}` : ""}.{" "}
+                  {parCoverage.relevant.length > parCoverage.missing.length
+                    ? ` – ohne Quotes: ${parCoverage.missing.filter((id) => !parCoverage.inconsistent.includes(id)).join(", ") || "–"}`
+                    : ""}
+                  .{" "}
+                  {parCoverage.inconsistent.length > 0 && (
+                    <span data-testid="par-risk-inconsistent">
+                      Par-Risiko: Spec passt nicht zur Kurve ({parCoverage.inconsistent.length}) – {parCoverage.inconsistent.join(", ")}: die Bootstrap-Quotes
+                      des Snapshots reproduzieren die Kurve nicht (z. B. gebumpter Spec neben ungebumpter Kurve); diese Kurven werden nicht gebumpt, eine Zahl
+                      wäre falsch.{" "}
+                    </span>
+                  )}
                   {s.marketSource === "import"
-                    ? "Die Kurven des importierten Snapshots tragen keine Bootstrap-Quotes – „Zum Sample-Markt“ wechseln oder die Kurve mit „+ Kurve“ aus Quotes anlegen."
+                    ? parCoverage.inconsistent.length === parCoverage.missing.length
+                      ? "„Zum Sample-Markt“ wechseln oder einen Snapshot mit passenden Bootstrap-Quotes importieren."
+                      : "Die übrigen Kurven des importierten Snapshots tragen keine Bootstrap-Quotes – „Zum Sample-Markt“ wechseln oder die Kurve mit „+ Kurve“ aus Quotes anlegen."
                     : "Kurven ohne Quotes (Snapshot-Kurven) werden nicht gebumpt; eine Summe wäre eine stille Null."}
                 </div>
               )}

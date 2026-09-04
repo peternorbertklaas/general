@@ -72,7 +72,7 @@ describe("NumInput (F-03)", () => {
     fireEvent.blur(input);
     expect(input.value).toBe("0,25");
   });
-  it("Esc restores the value the field had on focus and leaves the field; Enter commits (R3-10)", () => {
+  it("Esc restores the value the field had on focus and keeps the focus in the field (R3-10 / R10-01); Enter commits", () => {
     const spy = vi.fn();
     render(<Harness initial={0.025} scale={100} step={0.005} unit="%" onSpy={spy} />);
     const input = screen.getByLabelText("feld") as HTMLInputElement;
@@ -80,10 +80,11 @@ describe("NumInput (F-03)", () => {
     fireEvent.change(input, { target: { value: "3,15" } });
     expect(spy).toHaveBeenLastCalledWith(expect.closeTo(0.0315, 10));
     fireEvent.keyDown(input, { key: "Escape" });
+    // the field does not blur itself any more – a form / grid decides where the focus goes (R10-01)
+    expect(document.activeElement).toBe(input);
     fireEvent.blur(input);
     expect(spy).toHaveBeenLastCalledWith(expect.closeTo(0.025, 10));
     expect(input.value).toBe("2,5");
-    expect(document.activeElement).not.toBe(input);
     // Enter keeps the typed value
     act(() => input.focus());
     fireEvent.change(input, { target: { value: "3,15" } });

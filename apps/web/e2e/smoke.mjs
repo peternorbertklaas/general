@@ -207,6 +207,68 @@ try {
   await page.locator('[data-testid="import-skip"]').click();
   await wait(500);
   check(Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]) === tradesAfterCsv, "skip strategy keeps the trade count");
+  // R10-F2: the API IRS row with `tenor` (alias of `maturity`) and without a type column imports from its column set
+  const csvTenor = join(tmpdir(), `deriva-e2e-tenor-${port}.csv`);
+  writeFileSync(
+    csvTenor,
+    "id;currency;notional;payReceive;fixedRate;effectiveDate;tenor;index\nIRS-API-T1;EUR;10000000;Pay;3,1 %;2026-09-07;10Y;EURIBOR-6M\n",
+    "utf8",
+  );
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
+  await page.locator('[data-testid="import-csv"]').setInputFiles(csvTenor);
+  await wait(800);
+  check(
+    (await page.locator('[data-testid="csv-errors"]').count()) === 0 && (await page.locator("td.id-cell", { hasText: "IRS-API-T1" }).count()) === 1,
+    "API IRS row with tenor instead of maturity imports without a row error (R10-F2)",
+  );
+  check(
+    (await page.locator(".toast", { hasText: "aus CSV (Typ IRS aus dem Spaltensatz) importiert" }).count()) === 1,
+    "the import toast names the column set as the type source (R10-F2 / Markt R9-4)",
+  );
+  // R10-F3: IRS rows in „kredit-cap-2026.csv“ – the column signature beats the bare file-name token
+  const csvMisnamed = join(tmpdir(), `kredit-cap-2026.csv`);
+  writeFileSync(
+    csvMisnamed,
+    "id;currency;notional;direction;rate;start;maturity;index\nIRS-KREDIT-E2E;EUR;10000000;Pay;3 %;2026-09-07;10Y;EURIBOR-6M\n",
+    "utf8",
+  );
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
+  await page.locator('[data-testid="import-csv"]').setInputFiles(csvMisnamed);
+  await wait(800);
+  check(
+    (await page.locator('[data-testid="csv-errors"]').count()) === 0 && (await page.locator("td.id-cell", { hasText: "IRS-KREDIT-E2E" }).count()) === 1,
+    "IRS rows in kredit-cap-2026.csv are read as IRS from the column set, not as CAP from the file name (R10-F3)",
+  );
+  // R10-F3: a misleading template name is authoritative – the error dialog offers the type dialog instead of a dead end
+  const csvWrongTemplate = join(tmpdir(), `deriva-import-vorlage-cap.csv`);
+  writeFileSync(
+    csvWrongTemplate,
+    "id;currency;notional;direction;rate;start;maturity;index\nIRS-RETYPE-E2E;EUR;10000000;Pay;3 %;2026-09-07;10Y;EURIBOR-6M\n",
+    "utf8",
+  );
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
+  await page.locator('[data-testid="import-csv"]').setInputFiles(csvWrongTemplate);
+  await wait(800);
+  check(
+    (await page.locator('[data-testid="csv-errors"]').count()) === 1 && (await page.locator('[data-testid="csv-errors-retype"]').count()) === 1,
+    "a wrong derived type lands in the error dialog with „Anderen Produkttyp wählen …“ (R10-F3)",
+  );
+  await page.locator('[data-testid="csv-errors-retype"]').click();
+  await wait(300);
+  check(
+    /als CAP aus dem Dateinamen gelesen/.test(await page.locator('[data-testid="csv-type-dialog"]').innerText()),
+    "the type dialog names the derived type (R10-F3)",
+  );
+  await page.locator('[data-testid="csv-type-select"]').selectOption("IRS");
+  await page.locator('[data-testid="csv-type-continue"]').click();
+  await wait(800);
+  check(
+    (await page.locator("td.id-cell", { hasText: "IRS-RETYPE-E2E" }).count()) === 1 && (await page.locator('[data-testid="csv-errors"]').count()) === 0,
+    "the chosen type re-reads the file and imports the rows (R10-F3)",
+  );
   // Impossible dates are row errors, never silent defaults (R5-F1)
   const csvDates = join(tmpdir(), `deriva-e2e-dates-${port}.csv`);
   writeFileSync(
@@ -1338,9 +1400,27 @@ try {
       (await page.locator('[data-testid="fixings-count"]').innerText()) === fixingCountBefore,
     "Ctrl+Z restores the removed fixing row (R9-04)",
   );
-  // FX fixings: the only row removed by keyboard → focus on „+ Zeile“ of the FX-fixings card
+  // R10-02: FX fixings with two rows (positional keys) – removing the first by keyboard lands on the survivor, not on „+ Zeile“
+  await page.locator('[data-testid="fx-fixing-add"]').click();
+  await wait(200);
   await page.locator('[data-testid="fx-fixing-add"]').click();
   await wait(300);
+  check((await page.locator('[data-testid="fx-fixings-table"] tbody tr').count()) === 2, "two FX-fixing rows for the neighbour check (R10-02)");
+  await page.locator('[data-testid="fx-fixings-table"] tbody tr').first().focus();
+  await page.keyboard.press("Enter");
+  for (let hop = 0; hop < 5 && !/entfernen$/.test(await activeLabel()); hop++) await page.keyboard.press("Tab");
+  await page.keyboard.press("Enter");
+  await wait(400);
+  const fxAfterRemove = await page.evaluate(() => ({
+    tag: document.activeElement?.tagName,
+    inTable: !!document.activeElement?.closest('[data-testid="fx-fixings-table"]'),
+    rows: document.querySelectorAll('[data-testid="fx-fixings-table"] tbody tr').length,
+  }));
+  check(
+    fxAfterRemove.tag === "TR" && fxAfterRemove.inTable && fxAfterRemove.rows === 1,
+    `removing FX fixing 1 of 2 by keyboard focuses the remaining row (${fxAfterRemove.tag}, in table ${fxAfterRemove.inTable}, rows ${fxAfterRemove.rows}) (R10-02)`,
+  );
+  // FX fixings: the only row removed by keyboard → focus on „+ Zeile“ of the FX-fixings card
   await page.locator('[data-testid="fx-fixings-table"] tbody tr').first().focus();
   await page.keyboard.press("Enter");
   for (let hop = 0; hop < 5 && !/entfernen$/.test(await activeLabel()); hop++) await page.keyboard.press("Tab");
@@ -1384,6 +1464,30 @@ try {
     (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "add-curve-ccy",
     "+ Kurve hands the focus to its first field (R9-02)",
   );
+  // R10-01: Esc in the inline number field „Spot“ – first press restores the typed value and keeps the focus, second closes the form
+  await page.locator('[data-testid="add-curve-spot"]').focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.type("9,99");
+  await page.keyboard.press("Escape");
+  await wait(150);
+  const spotAfterEsc = await page.evaluate(() => ({
+    focus: document.activeElement?.getAttribute("data-testid") ?? document.activeElement?.tagName,
+    formOpen: document.querySelectorAll('[data-testid="add-curve-form"]').length,
+    value: document.querySelector('[data-testid="add-curve-spot"]')?.value,
+  }));
+  check(
+    spotAfterEsc.focus === "add-curve-spot" && spotAfterEsc.formOpen === 1 && spotAfterEsc.value !== "9,99",
+    `Esc in the Spot field restores the value and keeps the focus in the field (${JSON.stringify(spotAfterEsc)}) (R10-01)`,
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check(
+    (await page.locator('[data-testid="add-curve-form"]').count()) === 0 &&
+      (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "add-curve",
+    "the second Esc from the Spot field closes the + Kurve form and returns the focus to + Kurve (R10-01)",
+  );
+  await page.locator('[data-testid="add-curve"]').click();
+  await wait(200);
   await page.keyboard.press("Escape");
   await wait(200);
   check(
@@ -1410,6 +1514,25 @@ try {
   check(
     !/Unbekanntes Token/.test(hufPreview) && /Keine Kurve für HUF|Kurve HUF-BUBOR-6M fehlt/.test(hufPreview),
     `quick entry knows the registered index token bubor6m (${hufPreview.slice(0, 90)}) (R9-F1)`,
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
+  // Markt R10-3: cap / swaption take an [index] token – preview names the caplet / underlying index
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("cap 2y 3% 10m euribor3m");
+  await wait(300);
+  const capPreview = await page.locator(".palette .preview, .palette .item").first().innerText();
+  check(
+    /Cap EUR 2Y/.test(capPreview) && /· EURIBOR-3M/.test(capPreview) && !/Unbekanntes Token/.test(capPreview),
+    `cap accepts an index token (${capPreview.slice(0, 80)}) (Markt R10-3)`,
+  );
+  await page.keyboard.press("Control+a");
+  await page.keyboard.type("swpt 1y5y payer 3% 10m estr");
+  await wait(300);
+  const swptIdxPreview = await page.locator(".palette .preview, .palette .item").first().innerText();
+  check(
+    /Underlying ESTR/.test(swptIdxPreview) && !/Unbekanntes Token/.test(swptIdxPreview),
+    `swaption accepts an index token (${swptIdxPreview.slice(0, 90)}) (Markt R10-3)`,
   );
   await page.keyboard.press("Escape");
   await wait(200);
@@ -1485,6 +1608,19 @@ try {
   await wait(500);
   check((await page.locator(".toast", { hasText: "Dupliziert:" }).count()) === 1, "d duplicates the selected trade");
   check((await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))) === "Bezeichnung", "after d the focus is on „Bezeichnung“ (R8-05)");
+  // R10-03: the toast's ✕ activated by keyboard hands the focus back to where it came from (the editor field), never to body
+  await page.locator('.toast button[aria-label="Meldung schließen"]').last().focus();
+  await page.keyboard.press("Enter");
+  await wait(300);
+  const afterToastClose = await page.evaluate(() => ({
+    tag: document.activeElement?.tagName,
+    label: document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.id ?? "",
+  }));
+  check(
+    afterToastClose.tag !== "BODY" && (afterToastClose.label === "Bezeichnung" || afterToastClose.label === "main"),
+    `toast ✕ by keyboard returns the focus to its origin (${afterToastClose.tag} ${afterToastClose.label}) (R10-03)`,
+  );
+  await page.locator('input[aria-label="Bezeichnung"]').focus();
   await page.keyboard.press("Escape");
   await wait(100);
   await page.keyboard.press("Shift+D");
@@ -1520,24 +1656,58 @@ try {
   const snapDkkPath = join(tmpdir(), `deriva-e2e-snapshot-dkk-${port}.json`);
   await snapDkkDownload.saveAs(snapDkkPath);
   const snapDkkDoc = JSON.parse(readFileSync(snapDkkPath, "utf8"));
+  const dkkQuoteIds = Array.isArray(snapDkkDoc.quotes) ? snapDkkDoc.quotes.map((q) => q.curveId) : [];
+  const dkkEntry = snapDkkDoc.quotes?.find?.((q) => q.curveId === "DKK-DESTR");
   check(
-    Array.isArray(snapDkkDoc.quotes) &&
-      snapDkkDoc.quotes.length === 1 &&
-      snapDkkDoc.quotes[0].curveId === "DKK-DESTR" &&
-      snapDkkDoc.quotes[0].spec.index === "DESTR" &&
-      snapDkkDoc.quotes[0].spec.quotes.length === 6,
-    `snapshot export carries the quotes block of the added curve (${JSON.stringify(snapDkkDoc.quotes?.map?.((q) => q.curveId))}) (Markt R9-1)`,
+    !!dkkEntry && dkkEntry.spec.index === "DESTR" && dkkEntry.spec.quotes.length === 6,
+    `snapshot export carries the quotes block of the added curve (${JSON.stringify(dkkQuoteIds)}) (Markt R9-1)`,
+  );
+  // R10-F1: the sample curves' bootstrap specs travel too (once each), so a re-import keeps par risk for the EUR book
+  check(
+    ["EUR-ESTR", "EUR-EURIBOR-6M", "EUR-EURIBOR-3M", "USD-SOFR"].every((id) => dkkQuoteIds.includes(id)) && new Set(dkkQuoteIds).size === dkkQuoteIds.length,
+    `snapshot export carries the sample curves' bootstrap specs (${dkkQuoteIds.length} curves) (R10-F1)`,
   );
   check(
-    (await page.locator(".toast", { hasText: "Bootstrap-Quotes für DKK-DESTR" }).count()) === 1,
-    "export toast names the curves whose quotes travel with the file (Markt R9-1)",
+    (await page.locator(".toast", { hasText: /Bootstrap-Quotes für \d+ Kurven \(.*DKK-DESTR.*\)/ }).count()) === 1,
+    "export toast names the curves whose quotes travel with the file (Markt R9-1 / R10-F1)",
   );
   await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapDkkPath);
   await wait(1200);
   check(
-    (await page.locator(".toast", { hasText: "Bootstrap-Quotes für 1 Kurve (Par-Risiko)" }).count()) === 1,
-    "import toast reports the stored bootstrap quotes (Markt R9-1)",
+    (await page.locator(".toast", { hasText: /Bootstrap-Quotes für \d+ Kurven \(Par-Risiko\)/ }).count()) === 1,
+    "import toast reports the stored bootstrap quotes (Markt R9-1 / R10-F1)",
   );
+  check(
+    /Bootstrap-Quotes: \d+ Kurven/.test(await page.locator('[data-testid="snapshot-import-note"]').innerText()),
+    "market view import note counts the imported bootstrap quotes (Markt R10-2)",
+  );
+  // R10-F1: the EUR sample trade keeps its par risk under the re-imported export (no „0 von 4“)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("IRS-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(400);
+  await page.keyboard.press("Escape");
+  const parCardEur = page.locator('[data-testid="par-risk-card"]');
+  if ((await parCardEur.locator("button.collapse-btn[aria-expanded='false']").count()) === 1) await parCardEur.locator("button.collapse-btn").click();
+  await wait(150);
+  check(
+    (await page.locator('[data-testid="par-risk-coverage"]').count()) === 0 && (await page.locator('[data-testid="par-risk-inconsistent"]').count()) === 0,
+    "import mode: IRS-0001 has every EUR curve covered by consistent snapshot specs (R10-F1)",
+  );
+  await parCardEur.locator("button.btn.xs", { hasText: "Berechnen" }).click();
+  await page
+    .locator('[data-testid="par-risk"]')
+    .waitFor({ timeout: 20000 })
+    .catch(() => undefined);
+  const parTextEur = await page.locator('[data-testid="par-risk"]').innerText();
+  const parTotalEur = Number((await page.locator('[data-testid="par-risk"] .kpi .value').first().innerText()).replace(/[^\d-]/g, ""));
+  check(
+    /EUR-ESTR · Σ/.test(parTextEur) && Math.abs(parTotalEur) > 3000 && Math.abs(parTotalEur) < 12000,
+    `par risk of IRS-0001 under the re-imported export bumps the sample specs (total ${parTotalEur}) (R10-F1)`,
+  );
+  await parCardEur.locator("button.collapse-btn").click();
+  await chord(page, "m");
   await page.keyboard.press("Control+k");
   await page.keyboard.type(dkkTradeId);
   await wait(200);
@@ -1581,7 +1751,7 @@ try {
     /nach „Zum Sample-Markt“ wieder aktiv/.test((await page.locator('[data-testid="curve-tab-DKK-DESTR"]').getAttribute("title")) ?? ""),
     "the locked extra-curve tab explains how it becomes active again (R8-06)",
   );
-  // Markt R8-3: in import mode the snapshot curves carry no quotes – the par-risk card says so instead of a zero (EUR trade: 4 curves, 0 with quotes)
+  // R10-F1: the workstation export carries the sample specs – under its re-import the EUR trade keeps full par-risk coverage
   await page.keyboard.press("Control+k");
   await page.keyboard.type("IRS-0001");
   await wait(200);
@@ -1589,6 +1759,31 @@ try {
   await wait(400);
   const parCardImp = page.locator('[data-testid="par-risk-card"]');
   if ((await parCardImp.locator("button.collapse-btn[aria-expanded='false']").count()) === 1) await parCardImp.locator("button.collapse-btn").click();
+  await wait(150);
+  check(
+    (await page.locator('[data-testid="par-risk-coverage"]').count()) === 0,
+    "import mode: the re-imported workstation export covers every EUR curve with its sample specs (R10-F1)",
+  );
+  await parCardImp.locator("button.collapse-btn").click();
+  // Markt R8-3: a snapshot *without* a quotes block (foreign EoD) – the par-risk card says „0 von n“ instead of a silent zero
+  const snapPreNoQuotes = JSON.parse(readFileSync(snapPrePath, "utf8"));
+  delete snapPreNoQuotes.quotes;
+  const snapPreNoQuotesPath = join(tmpdir(), `deriva-e2e-snapshot-pre-dkk-noquotes-${port}.json`);
+  writeFileSync(snapPreNoQuotesPath, JSON.stringify(snapPreNoQuotes), "utf8");
+  await chord(page, "m");
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapPreNoQuotesPath);
+  await wait(1200);
+  check(
+    /Bootstrap-Quotes: 0 Kurven/.test(await page.locator('[data-testid="snapshot-import-note"]').innerText()),
+    "market view says the file carries no bootstrap quotes (Markt R10-2)",
+  );
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("IRS-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(400);
+  const parCardNoQ = page.locator('[data-testid="par-risk-card"]');
+  if ((await parCardNoQ.locator("button.collapse-btn[aria-expanded='false']").count()) === 1) await parCardNoQ.locator("button.collapse-btn").click();
   await wait(150);
   check(
     /Par-Risiko nur für Kurven mit Quotes \(0 von \d+\)/.test(
@@ -1599,7 +1794,7 @@ try {
     ),
     "import mode: par-risk card names curves without quotes instead of a silent zero (Markt R8-3)",
   );
-  await parCardImp.locator("button.collapse-btn").click();
+  await parCardNoQ.locator("button.collapse-btn").click();
   await chord(page, "m");
   await page.locator('[data-testid="snapshot-leave"]').click();
   await wait(900);
@@ -1850,6 +2045,23 @@ try {
     curves: [...snapDoc.curves, { ...estrCurve, id: "CZK-CZEONIA", currency: "CZK" }],
     discountCurveId: { ...snapDoc.discountCurveId, CZK: "CZK-CZEONIA" },
     fxSpots: { ...snapDoc.fxSpots, EURCZK: 24.6 },
+    // Markt R10-2: the API's `quotes` block for the snapshot curve – shown read-only on its tab
+    quotes: [
+      {
+        curveId: "CZK-CZEONIA",
+        spec: {
+          id: "CZK-CZEONIA",
+          currency: "CZK",
+          index: "CZEONIA",
+          quotes: [
+            { type: "OIS", tenor: "1Y", rate: 0.041 },
+            { type: "OIS", tenor: "2Y", rate: 0.0415 },
+            { type: "OIS", tenor: "5Y", rate: 0.042 },
+            { type: "OIS", tenor: "10Y", rate: 0.043 },
+          ],
+        },
+      },
+    ],
     calendars: [{ id: "CZ", name: "Prag", holidays: ["2027-07-05", "2027-07-06", "2027-09-28", "2027-10-28", "2027-11-17"] }],
     indices: [
       {
@@ -1901,6 +2113,25 @@ try {
   check(
     (await page.locator(".toast", { hasText: "registriert: 2 Indizes CZEONIA, PRIBOR-6M · Konventionen CZK · Kalender CZ" }).count()) === 1,
     "import toast names the registered envelope (Markt R8-1)",
+  );
+  // Markt R10-2: the snapshot curve's tab shows the imported quotes read-only and says so
+  await chord(page, "c");
+  await page.locator('[data-testid="curve-tab-CZK-CZEONIA"]').click();
+  await wait(300);
+  check(
+    (await page.locator('[data-testid="snapshot-quotes-table"] tbody tr').count()) === 4 &&
+      (await page.locator('[data-testid="snapshot-quotes-badge"]').innerText()) === "aus Snapshot",
+    "snapshot curve tab lists the imported bootstrap quotes read-only with the „aus Snapshot“ badge (Markt R10-2)",
+  );
+  const czkNote = await page.locator('[data-testid="quotes-snapshot-note"]').innerText();
+  check(
+    /mit Bootstrap-Quotes für das Par-Risiko/.test(czkNote) && /Bearbeiten nach „Zum Sample-Markt“/.test(czkNote) && !/ohne Bootstrap-Quotes/.test(czkNote),
+    `snapshot curve note names the quotes and the way to edit them (${czkNote.slice(0, 100)}) (Markt R10-2)`,
+  );
+  await chord(page, "m");
+  check(
+    /Bootstrap-Quotes: 1 Kurve \(CZK-CZEONIA\)/.test(await page.locator('[data-testid="snapshot-import-note"]').innerText()),
+    "market view names the curve with imported bootstrap quotes (Markt R10-2)",
   );
   await page.keyboard.press("Control+k");
   await page.keyboard.type("irs czk 5y pay 4% 100m");

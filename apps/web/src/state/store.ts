@@ -22,6 +22,7 @@ import {
   SAMPLE_QUOTES,
   bootstrapCurves,
   buildSampleMarket,
+  checkParRiskSpecs,
   computeRisk,
   deserializeMarket,
   getIndex,
@@ -762,26 +763,65 @@ export function extraCurveSpec(c: ExtraCurve, discountCurveId: Record<string, st
 }
 
 /**
- * The `quotes` block of the snapshot export (Markt R9-1): one `{ curveId, spec }` per curve of the exported market that
- * has bootstrap quotes outside the sample set – the "+ Kurve" curves (`extraCurveSpec`) in sample mode, and in import
- * mode the specs the imported file carried (re-emitted for the curves still present). Curves the market does not hold
- * are never exported (the API refuses a `quotes` entry without its curve).
+ * The `quotes` block of the snapshot export (Markt R9-1 / R10-F1): one `{ curveId, spec }` per curve of the exported
+ * market that has bootstrap quotes – in sample mode the sample curves (`sample`, see `sampleExportSpecs`) and the
+ * "+ Kurve" curves (`extraCurveSpec`), in import mode the specs the imported file carried (re-emitted for the curves
+ * still present). Curves the market does not hold are never exported (the API refuses a `quotes` entry without its
+ * curve). Later groups win over earlier ones for the same curve id.
  */
 export function snapshotQuoteSpecs(
   m: Pick<MarketContext, "curves" | "discountCurveId">,
   extraCurves: Record<string, ExtraCurve>,
   imported: CurveQuotesEntry[] = [],
+  sample: CurveBuildSpec[] = [],
 ): CurveQuotesEntry[] {
   const out = new Map<string, CurveQuotesEntry>();
+  for (const sp of sample) if (m.curves[sp.id]) out.set(sp.id, { curveId: sp.id, spec: sp });
   for (const q of imported) if (m.curves[q.curveId]) out.set(q.curveId, q);
   for (const c of Object.values(extraCurves)) if (m.curves[c.id]) out.set(c.id, { curveId: c.id, spec: extraCurveSpec(c, m.discountCurveId) });
   return [...out.values()];
 }
 
 /**
- * Bootstrap specs with quotes for par risk (Markt R8-3 / R9-1): the sample curves plus every "+ Kurve" curve in sample
- * mode; in import mode the `quotes` block of the imported snapshot for the curves the market holds – the curves stay the
- * file's, the specs only serve the bump. A curve without a spec is reported by the par-risk card, never counted as 0.
+ * Bootstrap specs of the sample curves *as the market was built* (R10-F1): the current quote set plus the interpolation
+ * and turn-of-year overrides `buildMarket` applies, so a re-import of the export reproduces the curves exactly and the
+ * spec ↔ curve check (`checkParRiskSpecs`) passes.
+ */
+export function sampleExportSpecs(
+  s: Pick<AppState, "valuationDate" | "quotes" | "interpolation" | "turnOfYear">,
+  m: Pick<MarketContext, "curves">,
+): CurveBuildSpec[] {
+  return Object.values(sampleBootstrapSpecs(s.valuationDate, s.quotes))
+    .filter((sp) => m.curves[sp.id])
+    .map((sp) => {
+      let out = sp;
+      if (s.interpolation[sp.id]) out = { ...out, interpolation: s.interpolation[sp.id] };
+      const toy = s.turnOfYear[sp.id];
+      if (toy && toy.date > s.valuationDate && toy.bp !== 0) out = { ...out, turnOfYear: [{ date: toy.date, bp: toy.bp }] };
+      return out;
+    });
+}
+
+/**
+ * The `quotes` block the workstation writes (R10-F1): in sample mode every curve with quotes – the sample curves of the
+ * current quote set *and* the "+ Kurve" curves – so a re-import keeps par risk for the EUR book; in import mode the
+ * imported block is re-emitted unchanged (the "+ Kurve" curves are not applied there).
+ */
+export function exportQuoteSpecs(
+  s: Pick<AppState, "marketSource" | "valuationDate" | "quotes" | "interpolation" | "turnOfYear" | "extraCurves" | "importedSnapshot"> & {
+    baseMarket: Pick<MarketContext, "curves" | "discountCurveId">;
+  },
+): CurveQuotesEntry[] {
+  return s.marketSource === "import"
+    ? snapshotQuoteSpecs(s.baseMarket, {}, quotesOf(s.importedSnapshot))
+    : snapshotQuoteSpecs(s.baseMarket, s.extraCurves, [], sampleExportSpecs(s, s.baseMarket));
+}
+
+/**
+ * Bootstrap specs with quotes for par risk (Markt R8-3 / R9-1 / R10-1): the sample curves plus every "+ Kurve" curve in
+ * sample mode; in import mode *only* the `quotes` block of the imported snapshot for the curves the market holds – never
+ * the local sample quotes, which need not describe the file's curves. The curves stay the file's, the specs only serve
+ * the bump. A curve without a spec is reported by the par-risk card, never counted as 0.
  */
 export function parRiskSpecs(
   s: Pick<AppState, "marketSource" | "valuationDate" | "quotes" | "extraCurves" | "importedSnapshot"> & {
@@ -796,6 +836,27 @@ export function parRiskSpecs(
   Object.assign(specs, sampleBootstrapSpecs(s.valuationDate, s.quotes));
   for (const c of Object.values(s.extraCurves)) specs[c.id] = extraCurveSpec(c, s.market.discountCurveId);
   return specs;
+}
+
+/**
+ * `parRiskSpecs` plus the core's spec ↔ curve check of the import mode (`checkParRiskSpecs`, Markt R10-1 / R10-F1): a
+ * `quotes` entry that does not reproduce the snapshot's curve (bumped spec next to an unbumped curve, foreign EoD with
+ * default quotes) is excluded from the bump and listed in `inconsistent`, so the card says „Spec passt nicht zur Kurve“
+ * instead of showing a wrong number (the API's `PAR_RISK_INCONSISTENT:` warning). Sample-mode specs built the market
+ * themselves and are not re-checked. The check runs against the base market – the what-if shift is not a spec mismatch.
+ */
+export function parRiskSpecsChecked(
+  s: Pick<AppState, "marketSource" | "valuationDate" | "quotes" | "extraCurves" | "importedSnapshot"> & {
+    market: Pick<MarketContext, "curves" | "discountCurveId">;
+    baseMarket: MarketContext;
+  },
+): { specs: Record<string, CurveBuildSpec>; inconsistent: string[] } {
+  const specs = parRiskSpecs(s);
+  if (s.marketSource !== "import" || Object.keys(specs).length === 0) return { specs, inconsistent: [] };
+  const check = checkParRiskSpecs(s.baseMarket, specs);
+  const inconsistent = check.inconsistent.map((c) => c.curveId);
+  for (const id of inconsistent) delete specs[id];
+  return { specs, inconsistent };
 }
 
 /** Validation of a curve the user wants to add (German messages). */
@@ -2645,15 +2706,17 @@ export function changeValuationDate(iso: string): boolean {
  * "Beispielportfolio laden" from the UI (palette, empty blotter – R9-F4): asks first, naming what the reset replaces
  * (trades, market changes, hedge documentation), resets with one undo entry and shows a toast with „Rückgängig“.
  * Returns whether the reset happened. The restore toast after a reload carries no reset action any more – a destructive
- * action must not be the first tab stop after every reload.
+ * action must not be the first tab stop after every reload. An empty book on an untouched market has nothing to lose:
+ * it loads without the question (R10-04) – the undo entry is written all the same.
  */
 export function resetPortfolioWithConfirm(): boolean {
   const s = useStore.getState();
   const parts = [`${s.trades.length} Trades`];
   if (marketModified(s) || s.marketSource === "import" || !envelopeEmpty(s.extraRegister)) parts.push("Marktänderungen");
   if (Object.keys(s.hedgeRelationships).length) parts.push("Hedge-Dokumentation");
+  const nothingToLose = s.trades.length === 0 && parts.length === 1;
   const question = `Bestand (${parts.join(", ")}) durch das Beispielportfolio ersetzen? (rückgängig mit Ctrl+Z)`;
-  const confirmed = typeof window !== "undefined" && typeof window.confirm === "function" ? window.confirm(question) : false;
+  const confirmed = nothingToLose || (typeof window !== "undefined" && typeof window.confirm === "function" ? window.confirm(question) : false);
   if (!confirmed) return false;
   s.resetPortfolio();
   useStore.getState().showToast("Beispielportfolio geladen", { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });

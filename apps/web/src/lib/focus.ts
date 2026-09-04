@@ -54,13 +54,15 @@ export async function focusFirstEnabled(selectors: string[], frames = 6): Promis
  * After a table row was removed by keyboard (R9-04): focus the row that now sits at the removed row's position (or
  * the last one), or – when the table is empty – the control matching `fallback` (the „+ Zeile“ button). Call it
  * *before* the removal with the row that is about to go; the focus moves in the next macrotask, after React re-rendered.
+ * The neighbour is chosen by DOM *position*, never by node identity (R10-02): with positional keys (`key={i}`) React
+ * reuses the removed row's `<tr>` node for the row that moves up, so filtering that node out would skip the neighbour.
  */
 export function focusNeighbourAfterRemoval(tr: HTMLTableRowElement | null | undefined, fallback: string): void {
   if (!tr) return;
   const tbody = tr.parentElement;
   const index = tbody ? Array.from(tbody.children).indexOf(tr) : -1;
   window.setTimeout(() => {
-    const rows = tbody && document.contains(tbody) ? Array.from(tbody.querySelectorAll<HTMLElement>(":scope > tr")).filter((r) => r !== tr) : [];
+    const rows = tbody && document.contains(tbody) ? Array.from(tbody.querySelectorAll<HTMLElement>(":scope > tr")) : [];
     const target = rows[Math.min(Math.max(index, 0), rows.length - 1)];
     if (target) {
       target.focus({ preventScroll: true });

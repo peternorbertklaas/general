@@ -108,11 +108,13 @@ export function HotkeyOverlay() {
           {plain(MARKET_KEYS)}
           <p className="muted xs" style={{ margin: "6px 0 0" }}>
             Schnelleingabe: <code className="mono">swpt usd 1y5y payer 3.5% 10m cash</code> (Währung mit Vol-Cube, Barausgleich),{" "}
-            <code className="mono">ccs eurusd 5y fixed 3% 10m</code> (Fest gegen Variabel), <code className="mono">imm 2y pay 3% 10m</code>,{" "}
-            <code className="mono">fxf eurusd 2m 1.1725 6m ndf</code>, <code className="mono">fxo eurusd put 1.15 3m 9m barrier do 1.05</code>, Daten als{" "}
-            <code className="mono">15.03.2027</code> oder <code className="mono">2027-03-15</code>. Unbekannte Wörter, Währungen ohne Kurve und doppelte Beträge
-            werden als Fehler gemeldet – nichts wird still verworfen. Neue Währungen: „+ Währung“ (Register), „+ Kurve“ (Kurven), „+ Paar“ (Spot), „+ Fläche“
-            (Vols) – <code className="mono">irs czk 5y pay 4% 100m</code> bewertet, sobald Register und Kurve vorliegen (auch aus einem API-Snapshot).
+            <code className="mono">cap 2y 3% 10m euribor3m</code> / <code className="mono">swpt 1y5y payer 3% 10m estr</code> (Caplet- bzw. Underlying-Index wie
+            bei <code className="mono">irs</code>/<code className="mono">fra</code>), <code className="mono">ccs eurusd 5y fixed 3% 10m</code> (Fest gegen
+            Variabel), <code className="mono">imm 2y pay 3% 10m</code>, <code className="mono">fxf eurusd 2m 1.1725 6m ndf</code>,{" "}
+            <code className="mono">fxo eurusd put 1.15 3m 9m barrier do 1.05</code>, Daten als <code className="mono">15.03.2027</code> oder{" "}
+            <code className="mono">2027-03-15</code>. Unbekannte Wörter, Währungen ohne Kurve und doppelte Beträge werden als Fehler gemeldet – nichts wird
+            still verworfen. Neue Währungen: „+ Währung“ (Register), „+ Kurve“ (Kurven), „+ Paar“ (Spot), „+ Fläche“ (Vols) –{" "}
+            <code className="mono">irs czk 5y pay 4% 100m</code> bewertet, sobald Register und Kurve vorliegen (auch aus einem API-Snapshot).
           </p>
         </div>
       </div>

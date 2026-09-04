@@ -109,14 +109,20 @@ export function NumInput(props: NumInputProps) {
     setLocalError(null);
   };
 
+  /**
+   * Esc: restore the value the field had on focus (R3-10). The field keeps the focus (R10-01) – a grid / table cell takes
+   * it back itself (`useGridNav` capture handler), an inline form („+ Kurve“, „+ Währung“) closes on the *next* Esc via
+   * `escapeCloses`; a `blur()` here would strand the focus on `body`. Until the user types again, a blur does not commit.
+   */
   const cancel = () => {
     cancelling.current = true;
     const v = initial.current;
     if (v !== value) onChange(v);
     setText(formatNumberInput(v, scale, 0, Math.max(maxDigits, 2)));
     setLocalError(null);
-    ref.current?.blur();
   };
+  /** Whether Esc has something to restore – otherwise it bubbles to the enclosing form / dialog at once. */
+  const dirty = () => value !== initial.current || text !== formatNumberInput(initial.current, scale, 0, Math.max(maxDigits, 2));
 
   const msg = error ?? localError ?? undefined;
   const invalid = !!(error && level === "error") || !!localError;
@@ -166,6 +172,7 @@ export function NumInput(props: NumInputProps) {
           if (v !== undefined) onCommit?.(v);
           ref.current?.blur();
         } else if (e.key === "Escape") {
+          if (!dirty()) return; // nothing to restore – let the form / dialog handle the Esc (R10-01)
           e.preventDefault();
           e.stopPropagation();
           cancel();
@@ -173,6 +180,7 @@ export function NumInput(props: NumInputProps) {
       }}
       onChange={(e) => {
         const raw = e.target.value;
+        cancelling.current = false;
         setText(raw);
         if (raw.trim() === "") {
           setLocalError(null);
@@ -267,14 +275,15 @@ export function OptNumInput({
           e.preventDefault();
           (e.target as HTMLInputElement).blur();
         } else if (e.key === "Escape") {
-          // Esc restores the value the field had on focus (R3-10).
+          // Esc restores the value the field had on focus (R3-10); the field keeps the focus (R10-01, see `NumInput`).
+          const v = initial.current;
+          const restored = v === undefined ? "" : formatNumberInput(v, scale, 0, Math.max(maxDigits, 2));
+          if (v === value && text === restored) return;
           e.preventDefault();
           e.stopPropagation();
-          const v = initial.current;
           if (v !== value) onChange(v);
-          setText(v === undefined ? "" : formatNumberInput(v, scale, 0, Math.max(maxDigits, 2)));
+          setText(restored);
           setLocalError(null);
-          (e.target as HTMLInputElement).blur();
         }
       }}
       onChange={(e) => {

@@ -27,8 +27,9 @@ import { escapeCloses, focusFirstEnabled, focusWhenPresent } from "../lib/focus.
 import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { INTERPOLATION_DE, marketLabelDe, translatePricingError } from "../lib/i18n.js";
 import { rateOf } from "../lib/portfolio-io.js";
+import { quotesOf as snapshotQuotesOf } from "../lib/register-envelope.js";
 import { type ExtraCurve, extraCurveSpec, marketModified, useStore, validateExtraCurve } from "../state/store.js";
-import { AddCurrencyForm } from "./AddCurrencyForm.js";
+import { AddCurrencyForm, snapshotCurveOf } from "./AddCurrencyForm.js";
 
 export { bumpQuote };
 
@@ -374,9 +375,15 @@ export function CurvesView() {
       baseMarket: st.baseMarket,
       valuationDate: st.valuationDate,
       marketSource: st.marketSource,
+      importedSnapshot: st.importedSnapshot,
     })),
   );
   const imported = s.marketSource === "import";
+  /** Bootstrap specs the imported snapshot carries (`quotes`, Markt R10-2) – shown read-only on the snapshot tabs. */
+  const snapshotSpecs = useMemo(
+    () => new Map(snapshotQuotesOf(imported ? s.importedSnapshot : null).map((q) => [q.curveId, q.spec])),
+    [imported, s.importedSnapshot],
+  );
   const [sel, setSel] = useState(0);
   const [compare, setCompare] = useState<string | null>("EUR-EURIBOR-6M");
   const [adding, setAdding] = useState(false);
@@ -404,14 +411,20 @@ export function CurvesView() {
         key: `snap:${c.id}`,
         curveId: c.id,
         label: snapshotCurveLabel(c.id),
-        title: `${c.id} (aus Snapshot „${snapshotLabel}“ – schreibgeschützt: keine Quotes, Pillars und Forwards aus der Datei)`,
+        title: `${c.id} (aus Snapshot „${snapshotLabel}“ – schreibgeschützt: ${
+          snapshotSpecs.has(c.id)
+            ? "Bootstrap-Quotes für das Par-Risiko, Pillars und Forwards aus der Datei"
+            : "keine Quotes, Pillars und Forwards aus der Datei"
+        })`,
         snapshot: true,
       }));
     return [...base, ...fromSnapshot];
-  }, [s.extraCurves, s.baseMarket.curves, snapshotLabel]);
+  }, [s.extraCurves, s.baseMarket.curves, snapshotLabel, snapshotSpecs]);
   const set = sets[Math.min(sel, sets.length - 1)]!;
   const quotes = s.quotes;
   const setQuotes = quotesOf(set, quotes);
+  /** The imported bootstrap spec of a snapshot tab (Markt R10-2) – read-only quote list next to the pillars. */
+  const snapshotSpec = set.snapshot ? snapshotSpecs.get(set.curveId) : undefined;
   const curve = s.baseMarket.curves[set.curveId] as InterpolatedCurve | undefined;
   const sameCcy = Object.values(s.baseMarket.curves).filter((c) => c.currency === curve?.currency && c.id !== set.curveId);
   const cmpId = compare && sameCcy.some((c) => c.id === compare) ? compare : null;
@@ -597,9 +610,19 @@ export function CurvesView() {
             setAddingCurrency(false);
             if (ccy) setLastRegistered(ccy);
             // The natural next step is a curve in the new currency – land on "+ Kurve" (R7-03 pattern). Under an imported
-            // snapshot „+ Kurve“ is locked (R9-03): the focus goes to „Zum Sample-Markt“ instead, never to a disabled button.
+            // snapshot „+ Kurve“ is locked (R9-03): the focus goes to „Zum Sample-Markt“ instead, never to a disabled button –
+            // unless the snapshot already holds the currency's curve (R10-05): then its tab is the place to look.
+            const st = useStore.getState();
+            const snapCurve = ccy && st.marketSource === "import" ? snapshotCurveOf(st.baseMarket, ccy) : undefined;
             void focusFirstEnabled(
-              ccy ? ['[data-testid="add-curve"]', '[data-testid="curves-leave-import"]', '[data-testid="add-currency"]'] : ['[data-testid="add-currency"]'],
+              ccy
+                ? [
+                    ...(snapCurve ? [`[data-testid="curve-tab-${snapCurve}"]`] : []),
+                    '[data-testid="add-curve"]',
+                    '[data-testid="curves-leave-import"]',
+                    '[data-testid="add-currency"]',
+                  ]
+                : ['[data-testid="add-currency"]'],
             );
           }}
         />
@@ -887,7 +910,16 @@ export function CurvesView() {
             <span className="right row wrap" style={{ gap: 8 }}>
               <span className="muted xs">
                 {set.snapshot ? (
-                  "keine Quotes – die Kurve stammt als Stützpunktliste aus dem Snapshot"
+                  snapshotSpec ? (
+                    <>
+                      <span className="badge info" data-testid="snapshot-quotes-badge">
+                        aus Snapshot
+                      </span>{" "}
+                      schreibgeschützt – Bootstrap-Quotes für das Par-Risiko
+                    </>
+                  ) : (
+                    "keine Quotes – die Kurve stammt als Stützpunktliste aus dem Snapshot"
+                  )
                 ) : imported ? (
                   "gesperrt – „Zum Sample-Markt“ macht die Quotes wieder editierbar"
                 ) : (
@@ -915,9 +947,48 @@ export function CurvesView() {
           </h3>
           {set.snapshot && (
             <div className="muted small" data-testid="quotes-snapshot-note">
-              Kurve „{set.curveId}“ ({curve?.currency}) wurde mit dem Snapshot „{snapshotLabel}“ importiert – ohne Bootstrap-Quotes. Stützpunkte, Zero-Sätze und
-              Forwards stehen in der Pillar-Tabelle und im Diagramm; Vergleich mit jeder anderen Kurve der Währung über „Vergleich“. Bearbeiten: Snapshot mit
-              anderen Kurven importieren oder „Zum Sample-Markt“ und die Kurve mit „+ Kurve“ aus Quotes anlegen.
+              {snapshotSpec ? (
+                <>
+                  Kurve „{set.curveId}“ ({curve?.currency}) wurde mit dem Snapshot „{snapshotLabel}“ importiert – mit Bootstrap-Quotes für das Par-Risiko (
+                  {snapshotSpec.quotes.length} Quotes, Index {snapshotSpec.index}
+                  {snapshotSpec.discountCurveId ? `, Diskontierung ${snapshotSpec.discountCurveId}` : ""}); die Quotes unten sind schreibgeschützt. Stützpunkte,
+                  Zero-Sätze und Forwards stehen in der Pillar-Tabelle und im Diagramm. Bearbeiten nach „Zum Sample-Markt“ (dort mit „+ Kurve“ aus diesen Quotes
+                  anlegen) oder einen Snapshot mit anderen Quotes importieren.
+                </>
+              ) : (
+                <>
+                  Kurve „{set.curveId}“ ({curve?.currency}) wurde mit dem Snapshot „{snapshotLabel}“ importiert – ohne Bootstrap-Quotes. Stützpunkte, Zero-Sätze
+                  und Forwards stehen in der Pillar-Tabelle und im Diagramm; Vergleich mit jeder anderen Kurve der Währung über „Vergleich“. Bearbeiten:
+                  Snapshot mit anderen Kurven importieren oder „Zum Sample-Markt“ und die Kurve mit „+ Kurve“ aus Quotes anlegen.
+                </>
+              )}
+            </div>
+          )}
+          {snapshotSpec && (
+            <div className="table-scroll" style={{ maxHeight: 420 }}>
+              <table className="grid-table quotes compact" data-testid="snapshot-quotes-table" aria-label={`Bootstrap-Quotes ${set.curveId} (aus Snapshot)`}>
+                <thead>
+                  <tr>
+                    <th>Instrument</th>
+                    <th>Tenor</th>
+                    <th className="num">Quote</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {snapshotSpec.quotes.map((q, i) => {
+                    const qv = quoteValue(q);
+                    return (
+                      <tr key={`${quoteKey(q)}-${i}`} style={{ cursor: "default" }}>
+                        <td>{quoteLabel(q)}</td>
+                        <td className="mono muted xs">{quoteTenor(q) || ("start" in q ? q.start : "")}</td>
+                        <td className="num mono">
+                          {fmtNum(qv.value, qv.digits)} {qv.unit}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           )}
           <div className="table-scroll" style={{ maxHeight: 420 }} hidden={set.snapshot}>

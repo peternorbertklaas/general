@@ -5,6 +5,7 @@ import { CommandPalette } from "./components/CommandPalette.js";
 import { ErrorBoundary } from "./components/ErrorBoundary.js";
 import { HotkeyOverlay } from "./components/HotkeyOverlay.js";
 import { Inspector } from "./components/Inspector.js";
+import { restoreFocus } from "./components/Modal.js";
 import { ValuationDatePopover } from "./components/ValuationDatePopover.js";
 import { HOTKEYS, VIEW_HOTKEYS, keyList, keyTokens, keysText, primaryKeys, type HotkeyDef, type ViewId } from "./hotkeys/keymap.js";
 import { isTextEntry, useHotkeys } from "./hotkeys/useHotkeys.js";
@@ -143,6 +144,24 @@ export function App() {
       document.removeEventListener("focusout", onOut);
     };
   }, []);
+
+  /**
+   * Where the focus came from when it entered the toast stack (R10-03): a toast button activated by keyboard vanishes with
+   * its toast, so the focus would fall to `body`. `relatedTarget` of the focus event is the element that lost the focus;
+   * the skip link counts as "nowhere" (the user tabbed in from the page start) and maps to the `main` fallback.
+   */
+  const toastOrigin = useRef<HTMLElement | null>(null);
+  const rememberToastOrigin = (e: React.FocusEvent<HTMLDivElement>) => {
+    const from = e.relatedTarget as HTMLElement | null;
+    if (from && !e.currentTarget.contains(from)) toastOrigin.current = from.matches("a.skip") ? null : from;
+    else if (!from) toastOrigin.current = null;
+  };
+  /** After a toast action / ✕ by keyboard (`detail` 0): back to the origin, or to `main#main` when it is gone (R10-03). */
+  const returnToastFocus = (e: React.MouseEvent) => {
+    if (e.detail !== 0) return;
+    restoreFocus(toastOrigin.current);
+    toastOrigin.current = null;
+  };
 
   // Restore toast (F-13) – once after hydration. It is an information toast without a destructive action (R9-F4): the
   // toast stack is the first tab stop after the skip link, so „Zurücksetzen“ there was one `Tab`, `↵` away after every
@@ -431,6 +450,7 @@ export function App() {
         aria-live="polite"
         onMouseEnter={() => setToastHover(true)}
         onMouseLeave={() => setToastHover(false)}
+        onFocus={rememberToastOrigin}
         data-testid="toast-stack"
       >
         {s.toasts.map((t) => (
@@ -447,9 +467,10 @@ export function App() {
               <button
                 className="btn xs"
                 title={t.action.label === "Rückgängig" ? `Rückgängig (${keysText(hk("undo"))})` : t.action.label}
-                onClick={() => {
+                onClick={(e) => {
                   t.action!.run();
                   act().dismissToast(t.id);
+                  returnToastFocus(e);
                 }}
               >
                 {t.action.label}
@@ -462,7 +483,14 @@ export function App() {
                 )}
               </button>
             )}
-            <button className="close" onClick={() => act().dismissToast(t.id)} aria-label="Meldung schließen">
+            <button
+              className="close"
+              onClick={(e) => {
+                act().dismissToast(t.id);
+                returnToastFocus(e);
+              }}
+              aria-label="Meldung schließen"
+            >
               ✕
             </button>
           </div>

@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { type DayCountConvention, type RateIndex, type SwapConventions, knownCurrencies, parseISO, toISO } from "@deriva/pricing-core";
+import { type DayCountConvention, type MarketContext, type RateIndex, type SwapConventions, knownCurrencies, parseISO, toISO } from "@deriva/pricing-core";
 import { NumInput } from "../components/NumInput.js";
 import { parseDateInput } from "../lib/date-parse.js";
 import { escapeCloses } from "../lib/focus.js";
@@ -106,12 +106,21 @@ export function buildCurrencyEnvelope(p: {
  */
 /**
  * Toast after a successful „+ Währung“ (R9-03 / Markt R9-2): in sample mode the next step is „+ Kurve“; under an
- * imported snapshot „+ Kurve“ is locked, so the toast names the two ways to a curve instead of a disabled button.
+ * imported snapshot „+ Kurve“ is locked, so the toast names the two ways to a curve instead of a disabled button – unless
+ * the snapshot already holds a curve of the currency (`snapshotCurveId`, R10-05): then nothing is missing, the curve is
+ * priceable at once and the toast says so instead of sending the user to „Zum Sample-Markt“ (which would drop it).
  */
-export function registrationToast(summary: string, code: string, marketSource: "sample" | "import"): string {
+export function registrationToast(summary: string, code: string, marketSource: "sample" | "import", snapshotCurveId?: string): string {
+  if (marketSource === "import" && snapshotCurveId)
+    return `Registriert: ${summary} – die Snapshot-Kurve ${snapshotCurveId} ist sofort nutzbar (Schnelleingabe „irs ${code.toLowerCase()} …“)`;
   return marketSource === "import"
     ? `Registriert: ${summary} – im Import-Modus ist „+ Kurve“ gesperrt: nach „Zum Sample-Markt“ mit „+ Kurve“ eine ${code}-Kurve anlegen oder einen Snapshot mit ${code}-Kurve importieren`
     : `Registriert: ${summary} – jetzt mit „+ Kurve“ eine ${code}-Kurve anlegen`;
+}
+
+/** The snapshot curve of `code` under an imported market (discount curve first, else any curve of the currency), else `undefined`. */
+export function snapshotCurveOf(m: Pick<MarketContext, "curves" | "discountCurveId">, code: string): string | undefined {
+  return m.discountCurveId[code] ?? Object.values(m.curves).find((c) => c.currency === code)?.id;
 }
 
 export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => void }) {
@@ -201,7 +210,8 @@ export function AddCurrencyForm({ onDone }: { onDone: (currency?: string) => voi
       st.showToast(`Währung nicht registriert – ${r.error}`, { ms: 8000 });
       return;
     }
-    st.showToast(registrationToast(r.summary, code, marketSource), {
+    const snapshotCurve = marketSource === "import" ? snapshotCurveOf(st.baseMarket, code) : undefined;
+    st.showToast(registrationToast(r.summary, code, marketSource, snapshotCurve), {
       action: { label: "Rückgängig", run: () => useStore.getState().undo() },
       ...(marketSource === "import" ? { ms: 10000 } : {}),
     });
