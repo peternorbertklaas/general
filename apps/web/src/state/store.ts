@@ -2,8 +2,12 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import {
   type CapletVolSurface,
+  type CurveBuildSpec,
+  type CurveQuote,
+  type Fixing,
   type FxFixing,
   type FxVolSurface,
+  type HedgeEffectivenessReport,
   type HedgeRelationship,
   type InterpolationMethod,
   type MarketContext,
@@ -20,7 +24,10 @@ import {
   buildSampleMarket,
   computeRisk,
   deserializeMarket,
+  getIndex,
   hashString,
+  knownCurrencies,
+  knownIndices,
   marketSnapshotId,
   parseISO,
   priceTrade,
@@ -30,9 +37,10 @@ import {
   stableStringify,
   toISO,
   validateMarket,
+  validateVolSurfaces,
+  volSurfaceWarnings,
 } from "@deriva/pricing-core";
 import { type ViewId } from "../hotkeys/keymap.js";
-import { validateVolSurfaces } from "../lib/core-compat.js";
 import { INTERPOLATION_DE, germanTradeName, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { copyName, idPrefix, nextId } from "../lib/ids.js";
 import { snapshotErrorText } from "../lib/snapshot-import.js";
@@ -122,7 +130,62 @@ export type UndoEntry =
   | { kind: "market"; interpolation: Record<string, InterpolationMethod>; turnOfYear: Record<string, TurnOfYear>; label: string; at: number }
   | { kind: "vols"; volSurfaces: VolSurfaces; label: string; at: number }
   | { kind: "fxFixings"; fxFixings: FxFixing[]; label: string; at: number }
+  /** FX-spot overrides on an imported snapshot (R6-F1). */
+  | { kind: "spots"; fxSpotOverrides: Record<string, number>; label: string; at: number }
+  /** Historical fixings override (`null` = the base market's own fixings) – R6-F1. */
+  | { kind: "fixings"; fixings: Fixing[] | null; label: string; at: number }
+  /** Snapshot import / discard / leave: the whole market source before the switch (R6-F2). */
+  | { kind: "marketSource"; before: MarketSourceState; label: string; at: number }
+  /** User-added curves (Markt R6-5); `quotes` when the action also set an FX spot for the new currency. */
+  | { kind: "curves"; extraCurves: Record<string, ExtraCurve>; quotes?: SampleMarketQuotes; label: string; at: number }
   | { kind: "hedge"; tradeId: string; relationship: HedgeRelationship | undefined; label: string; at: number };
+
+/**
+ * Everything that determines the base market besides the trades – captured by
+ * the `marketSource` undo entry so a snapshot import, its discard on a
+ * valuation-date change and "Zum Sample-Markt" are one undoable action each
+ * (R6-F2): vols, quotes, market source, valuation date and overrides come back
+ * exactly as they were.
+ */
+export interface MarketSourceState {
+  marketSource: MarketSource;
+  importedSnapshot: MarketSnapshotJson | null;
+  quotes: SampleMarketQuotes;
+  interpolation: Record<string, InterpolationMethod>;
+  turnOfYear: Record<string, TurnOfYear>;
+  volSurfaces: VolSurfaces;
+  fxFixings: FxFixing[];
+  fxSpotOverrides: Record<string, number>;
+  fixings: Fixing[] | null;
+  extraCurves: Record<string, ExtraCurve>;
+  valuationDate: number;
+}
+
+/**
+ * A curve the user added in the curves view from quotes (Markt R6-5) – for a
+ * currency / index the sample market does not carry (NOK-NOWA, SEK-STIBOR-3M,
+ * …). Bootstrapped after the sample curves with the core conventions of the
+ * index (`knownIndices`); the first curve of a new currency becomes its
+ * discount curve. Sample mode only, persisted, undoable, counts as
+ * "modifiziert".
+ */
+export interface ExtraCurve {
+  /** Curve id = the index's curve id ("NOK-NOWA"). */
+  id: string;
+  currency: string;
+  /** Registered rate index ("NOWA", "STIBOR-3M"). */
+  index: string;
+  quotes: CurveQuote[];
+}
+
+/** Persisted effectiveness test result of a hedge relationship (R5-F3): survives the reload, flagged stale when `key` no longer matches. */
+export interface HedgeResult {
+  /** Inputs key at test time (relationship, trade, market id, valuation date, options). */
+  key: string;
+  report: HedgeEffectivenessReport;
+  /** ISO timestamp of the test. */
+  at: string;
+}
 
 export interface RestoreInfo {
   trades: number;
@@ -161,7 +224,19 @@ export interface CdsQuote {
  */
 export type MarketSource = "sample" | "import";
 
-export type ImportSnapshotResult = { ok: true; id: string; label: string; valuationDate: number; dateChanged: boolean } | { ok: false; error: string };
+export type ImportSnapshotResult =
+  | {
+      ok: true;
+      id: string;
+      label: string;
+      valuationDate: number;
+      dateChanged: boolean;
+      /** Market edits (quotes, vols, overrides) that were active before the import – restored by `undo()` (R6-F2). */
+      discardedEdits: boolean;
+      /** German plausibility hints of the imported vol surfaces (core `volSurfaceWarnings`, Markt R6-4) – the import succeeds anyway. */
+      warnings: string[];
+    }
+  | { ok: false; error: string };
 
 interface AppState {
   valuationDate: number;
@@ -183,6 +258,18 @@ interface AppState {
   volSurfaces: VolSurfaces;
   /** Historical FX fixings for MtM-reset notionals (pair, date, rate) – part of the market, persisted, undoable (core R4-1). */
   fxFixings: FxFixing[];
+  /**
+   * FX-spot edits on an imported snapshot (pair → spot), persisted and undoable; the sample market keeps its spots
+   * in the quote set instead. Counts as "modifiziert" relative to the snapshot (R6-F1).
+   */
+  fxSpotOverrides: Record<string, number>;
+  /**
+   * Historical rate fixings edited in the market view – `null` = the base market's own fixings (sample market or
+   * snapshot), a list = override. Persisted, undoable, counts as "modifiziert" (R6-F1).
+   */
+  fixings: Fixing[] | null;
+  /** Curves added from quotes in the curves view (Markt R6-5) – sample mode, persisted, undoable. */
+  extraCurves: Record<string, ExtraCurve>;
   baseMarket: MarketContext;
   market: MarketContext;
   whatIf: WhatIf;
@@ -215,6 +302,8 @@ interface AppState {
   undoStack: UndoEntry[];
   /** Hedge relationships keyed by hedging-instrument trade id (persisted). */
   hedgeRelationships: Record<string, HedgeRelationship>;
+  /** Last effectiveness test result per hedging-instrument trade id (persisted, R5-F3). */
+  hedgeResults: Record<string, HedgeResult>;
   /** Report inputs keyed by trade id (persisted). */
   reportInputs: Record<string, ReportInputs>;
   /** Timestamp fixed by "Report erzeugen"; null → report not generated yet. */
@@ -275,6 +364,27 @@ interface AppState {
   resetVolSurfaces(): void;
   /** Replace the FX fixings (undoable, marks the market as modified); an empty list removes them all. */
   setFxFixings(next: FxFixing[], label: string): boolean;
+  /**
+   * Set an FX spot. Sample market: the spot lives in the quote set (undo entry "quotes"). Imported snapshot: stored
+   * as an override on top of the snapshot – undoable, persisted, exported, flagged "modifiziert" (R6-F1).
+   */
+  setFxSpot(pair: string, spot: number, label?: string): boolean;
+  /** Replace the historical rate fixings (`null` = back to the base market's fixings) – undoable, persisted (R6-F1). */
+  setFixings(next: Fixing[] | null, label: string): boolean;
+  /**
+   * Back to the unmodified base market: sample mode resets quotes, interpolation, turn-of-year, vol surfaces, FX fixings
+   * and fixings; import mode drops the overrides made on top of the snapshot (vols, FX fixings, spots, fixings).
+   */
+  resetMarketOverrides(): void;
+  /**
+   * Add a curve for a currency / index from quotes (Markt R6-5); `fxSpot` also
+   * stores the EUR spot of a new currency in the quote set. One undo entry.
+   */
+  addExtraCurve(curve: ExtraCurve, opts?: { fxSpot?: { pair: string; rate: number } }): { ok: true } | { ok: false; error: string };
+  /** Replace the quotes of an added curve (re-bootstrap, undoable). */
+  setExtraCurveQuotes(id: string, quotes: CurveQuote[], label: string): boolean;
+  /** Remove an added curve (undoable). */
+  removeExtraCurve(id: string): boolean;
   repriceAll(): void;
   /**
    * Risk report from the cache, computed on demand *without* writing to the
@@ -299,11 +409,13 @@ interface AppState {
    * the snapshot id equals the core `marketSnapshotId` of the file.
    */
   importSnapshot(json: MarketSnapshotJson): ImportSnapshotResult;
-  /** Back to the sample market bootstrapped from the quotes at the current valuation date. */
+  /** Back to the sample market bootstrapped from the quotes at the current valuation date (undoable, R6-F2). */
   leaveImport(): void;
   setHedgeRelationship(rel: HedgeRelationship): void;
-  /** Discard the stored hedge documentation of a trade – undoable (R3-F4). */
+  /** Discard the stored hedge documentation of a trade – undoable (R3-F4); its test result is dropped with it. */
   removeHedgeRelationship(tradeId: string): void;
+  /** Store the effectiveness test result of a trade's hedge relationship (persisted, R5-F3). */
+  setHedgeResult(tradeId: string, result: HedgeResult | undefined): void;
   setReportInputs(tradeId: string, patch: Partial<ReportInputs>): void;
   resetReportInputs(tradeId: string): void;
   generateReport(): string;
@@ -390,11 +502,22 @@ export function volSurfaceCount(v: VolSurfaces | undefined): number {
   return Object.keys(v.swaptionVols ?? {}).length + Object.keys(v.capletVols ?? {}).length + Object.keys(v.fxVols ?? {}).length;
 }
 
+/** Normalised FX fixings for comparisons (order-independent). */
+function fxFixingsKey(list: FxFixing[] | undefined): string {
+  return JSON.stringify(
+    (list ?? [])
+      .filter(isPlausibleFxFixing)
+      .map((f) => [f.pair.toUpperCase(), f.date, f.rate] as const)
+      .sort((a, b) => a[0].localeCompare(b[0]) || a[1] - b[1]),
+  );
+}
+
 /**
- * Quotes, spots, interpolation overrides, turn-of-year jumps, vol surfaces or FX
- * fixings differ from the sample market (N-23, R3-4). For an imported snapshot
- * only vol edits made *after* the import count – the snapshot itself is the
- * reference, not the sample (R5-F2).
+ * Quotes, spots, interpolation overrides, turn-of-year jumps, vol surfaces, FX
+ * fixings or fixings differ from the sample market (N-23, R3-4). For an imported
+ * snapshot every edit made *after* the import counts – vol surfaces, FX-spot
+ * overrides, fixings and FX-fixing changes – the snapshot itself is the
+ * reference, not the sample (R5-F2, R6-F1).
  */
 export function marketModified(
   s: Pick<AppState, "quotes" | "interpolation"> & {
@@ -402,16 +525,114 @@ export function marketModified(
     volSurfaces?: VolSurfaces;
     fxFixings?: FxFixing[];
     marketSource?: MarketSource;
+    fxSpotOverrides?: Record<string, number>;
+    fixings?: Fixing[] | null;
+    importedBase?: MarketContext | null;
+    extraCurves?: Record<string, ExtraCurve>;
   },
 ): boolean {
-  if (s.marketSource === "import") return volSurfaceCount(s.volSurfaces) > 0;
+  const fixingsOverride = Array.isArray(s.fixings);
+  if (s.marketSource === "import") {
+    const fxFixingsChanged = s.importedBase ? fxFixingsKey(s.fxFixings) !== fxFixingsKey(s.importedBase.fxFixings) : false;
+    return volSurfaceCount(s.volSurfaces) > 0 || Object.keys(s.fxSpotOverrides ?? {}).length > 0 || fixingsOverride || fxFixingsChanged;
+  }
   return (
     quotesModified(s.quotes) ||
     Object.keys(s.interpolation).length > 0 ||
     Object.keys(s.turnOfYear ?? {}).length > 0 ||
     volSurfaceCount(s.volSurfaces) > 0 ||
-    (s.fxFixings?.length ?? 0) > 0
+    (s.fxFixings?.length ?? 0) > 0 ||
+    fixingsOverride ||
+    Object.keys(s.extraCurves ?? {}).length > 0
   );
+}
+
+/** Persisted extra curves: id, 3-letter currency, index name and a quote list. */
+function plausibleExtraCurves(v: unknown): Record<string, ExtraCurve> {
+  const out: Record<string, ExtraCurve> = {};
+  if (!v || typeof v !== "object") return out;
+  for (const [id, c] of Object.entries(v as Record<string, unknown>)) {
+    if (!c || typeof c !== "object") continue;
+    const o = c as Record<string, unknown>;
+    if (
+      o.id === id &&
+      typeof o.currency === "string" &&
+      /^[A-Z]{3}$/.test(o.currency) &&
+      typeof o.index === "string" &&
+      Array.isArray(o.quotes) &&
+      o.quotes.length > 0
+    )
+      out[id] = { id, currency: o.currency, index: o.index, quotes: o.quotes as CurveQuote[] };
+  }
+  return out;
+}
+
+/**
+ * Bootstrap spec of an added curve: the index's conventions come from the core
+ * registry; an IBOR curve of a currency with a discount curve is stripped
+ * dual-curve against it.
+ */
+export function extraCurveSpec(c: ExtraCurve, discountCurveId: Record<string, string>): CurveBuildSpec {
+  const disc = discountCurveId[c.currency];
+  return { id: c.id, currency: c.currency, index: c.index, quotes: c.quotes, ...(disc && disc !== c.id ? { discountCurveId: disc } : {}) };
+}
+
+/** Validation of a curve the user wants to add (German messages). */
+export function validateExtraCurve(c: ExtraCurve, existingCurveIds: string[]): string | undefined {
+  if (!/^[A-Z]{3}$/.test(c.currency) || !knownCurrencies().includes(c.currency))
+    return `Währung „${c.currency}“ hat keine Swap-Konventionen im Kern (bekannt: ${knownCurrencies().join(", ")})`;
+  const idx = knownIndices(c.currency).find((i) => i.name === c.index.toUpperCase());
+  if (!idx)
+    return `Index „${c.index}“ ist für ${c.currency} nicht registriert (bekannt: ${
+      knownIndices(c.currency)
+        .map((i) => i.name)
+        .join(", ") || "–"
+    })`;
+  if (!c.id) return "Kurven-ID fehlt";
+  if (existingCurveIds.includes(c.id)) return `Kurve „${c.id}“ existiert bereits`;
+  if (c.quotes.length < 2) return "Mindestens zwei Quotes (Tenor und Satz) angeben";
+  for (const q of c.quotes) {
+    const v = "rate" in q ? q.rate : "price" in q ? q.price : "spread" in q ? q.spread : "points" in q ? q.points : Number.NaN;
+    if (!Number.isFinite(v)) return "Jede Quote braucht einen endlichen Satz";
+  }
+  return undefined;
+}
+
+/** Persisted / edited rate fixing: index name, serial date, finite value. */
+export function isPlausibleFixing(v: unknown): v is Fixing {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.index === "string" &&
+    o.index.length > 0 &&
+    typeof o.date === "number" &&
+    Number.isFinite(o.date) &&
+    typeof o.value === "number" &&
+    Number.isFinite(o.value)
+  );
+}
+
+/** Persisted FX-spot overrides: 6-letter pair → positive finite spot. */
+function plausibleSpotOverrides(v: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!v || typeof v !== "object") return out;
+  for (const [pair, spot] of Object.entries(v as Record<string, unknown>))
+    if (/^[A-Z]{6}$/.test(pair) && typeof spot === "number" && Number.isFinite(spot) && spot > 0) out[pair] = spot;
+  return out;
+}
+
+/** Persisted hedge results: key + report object with the relationship id. */
+function plausibleHedgeResults(v: unknown): Record<string, HedgeResult> {
+  const out: Record<string, HedgeResult> = {};
+  if (!v || typeof v !== "object") return out;
+  for (const [id, r] of Object.entries(v as Record<string, unknown>)) {
+    if (!r || typeof r !== "object") continue;
+    const o = r as Record<string, unknown>;
+    const rep = o.report as Record<string, unknown> | undefined;
+    if (typeof o.key === "string" && typeof o.at === "string" && rep && typeof rep === "object" && typeof rep.relationshipId === "string")
+      out[id] = { key: o.key, at: o.at, report: rep as unknown as HedgeEffectivenessReport };
+  }
+  return out;
 }
 
 /** Persisted / imported FX fixings: 6-letter pair, serial date, positive rate. */
@@ -457,29 +678,47 @@ export function buildMarket(
   turnOfYear: Record<string, TurnOfYear> = {},
   volSurfaces: VolSurfaces = {},
   fxFixings: FxFixing[] = [],
+  extraCurves: Record<string, ExtraCurve> = {},
 ): MarketContext {
   const sample = buildSampleMarket(date, quotes);
-  const built = withVolSurfaces(fxFixings.length ? { ...sample, fxFixings } : sample, volSurfaces);
+  let built = withVolSurfaces(fxFixings.length ? { ...sample, fxFixings } : sample, volSurfaces);
   const overrides = Object.keys(interpolation).filter((id) => id in built.curves);
   // A turn-of-year jump only makes sense while the date lies ahead of the valuation date.
   const toys = Object.entries(turnOfYear).filter(([id, t]) => id in built.curves && t.date > date && t.bp !== 0);
-  if (overrides.length === 0 && toys.length === 0) return built;
-  const specs = sampleBootstrapSpecs(date, quotes);
-  const list = Object.values(specs).map((sp) => {
-    let out = sp;
-    if (interpolation[sp.id]) out = { ...out, interpolation: interpolation[sp.id] };
-    const toy = turnOfYear[sp.id];
-    if (toy && toy.date > date && toy.bp !== 0) out = { ...out, turnOfYear: [{ date: toy.date, bp: toy.bp }] };
-    return out;
-  });
-  const { curves } = bootstrapCurves(date, list);
-  return { ...built, curves: { ...built.curves, ...curves } };
+  if (overrides.length > 0 || toys.length > 0) {
+    const specs = sampleBootstrapSpecs(date, quotes);
+    const list = Object.values(specs).map((sp) => {
+      let out = sp;
+      if (interpolation[sp.id]) out = { ...out, interpolation: interpolation[sp.id] };
+      const toy = turnOfYear[sp.id];
+      if (toy && toy.date > date && toy.bp !== 0) out = { ...out, turnOfYear: [{ date: toy.date, bp: toy.bp }] };
+      return out;
+    });
+    const { curves } = bootstrapCurves(date, list);
+    built = { ...built, curves: { ...built.curves, ...curves } };
+  }
+  // User-added curves (Markt R6-5): OIS curves first so they can discount the IBOR curves of the same currency.
+  const extras = Object.values(extraCurves).sort((a, b) => Number(getIndex(b.index).type === "OIS") - Number(getIndex(a.index).type === "OIS"));
+  if (extras.length > 0) {
+    const discountCurveId = { ...built.discountCurveId };
+    for (const c of extras) if (!discountCurveId[c.currency]) discountCurveId[c.currency] = c.id;
+    const specs = extras.map((c) => {
+      const spec = extraCurveSpec(c, discountCurveId);
+      return interpolation[c.id] ? { ...spec, interpolation: interpolation[c.id] } : spec;
+    });
+    const { curves } = bootstrapCurves(date, specs, built.curves);
+    built = { ...built, curves: { ...built.curves, ...curves }, discountCurveId };
+  }
+  return built;
 }
 
-/** Reporting currencies offered by `c`: the majors plus JPY when the market carries a JPY discount curve. */
+/** Reporting currencies offered by `c`: the majors, then every further currency with a discount curve (JPY, added NOK/SEK/… curves). */
 export function reportingCurrencies(m: Pick<MarketContext, "discountCurveId">): string[] {
   const base = ["EUR", "USD", "GBP", "CHF"];
-  return m.discountCurveId.JPY ? [...base, "JPY"] : base;
+  const more = Object.keys(m.discountCurveId)
+    .filter((c) => !base.includes(c))
+    .sort((a, b) => (a === "JPY" ? -1 : b === "JPY" ? 1 : a.localeCompare(b)));
+  return [...base, ...more];
 }
 
 /** localStorage keys outside the persisted slice (theme etc. are read before hydration). */
@@ -618,7 +857,7 @@ function isPlausibleSnapshot(v: unknown): v is MarketSnapshotJson {
  * Deserialize + validate a snapshot for import (curves, spots, FX fixings, meta
  * and – R5-1 – the vol surfaces). Returns the market or a German problem text.
  */
-export function loadSnapshot(json: MarketSnapshotJson): { ok: true; market: MarketContext } | { ok: false; error: string } {
+export function loadSnapshot(json: MarketSnapshotJson): { ok: true; market: MarketContext; warnings: string[] } | { ok: false; error: string } {
   let market: MarketContext;
   try {
     market = deserializeMarket({ ...json, fixings: json.fixings ?? [] });
@@ -635,7 +874,14 @@ export function loadSnapshot(json: MarketSnapshotJson): { ok: true; market: Mark
     const first = translateCoreMessage(problems[0]);
     return { ok: false, error: `Snapshot ungültig: ${first}${problems.length > 1 ? ` (+${problems.length - 1} weitere)` : ""}` };
   }
-  return { ok: true, market };
+  // Structurally fine but implausible surfaces (quotation type vs. numbers, degenerate grids) are warnings, not errors (R6-4).
+  let warnings: string[] = [];
+  try {
+    warnings = volSurfaceWarnings(market).map(translateCoreMessage);
+  } catch {
+    warnings = [];
+  }
+  return { ok: true, market, warnings };
 }
 
 /** Slice of the state written to localStorage. */
@@ -649,12 +895,16 @@ export interface PersistedSlice {
   cdsCurves?: Record<string, CdsQuote[]>;
   volSurfaces?: VolSurfaces;
   fxFixings?: FxFixing[];
+  fxSpotOverrides?: Record<string, number>;
+  fixings?: Fixing[] | null;
+  extraCurves?: Record<string, ExtraCurve>;
   valuationDate: number;
   reportingCurrency: string;
   view: ViewId;
   inspectorOpen: boolean;
   customerMode: boolean;
   hedgeRelationships: Record<string, HedgeRelationship>;
+  hedgeResults?: Record<string, HedgeResult>;
   reportInputs: Record<string, ReportInputs>;
   selectedId: string | null;
 }
@@ -716,12 +966,69 @@ export const useStore = create<AppState>()(
         const entry: UndoEntry = { kind: "fxFixings", fxFixings: fxFixings.map((f) => ({ ...f })), label, at: now };
         set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
       };
+      /** Push an FX-spot-override snapshot for undo (R6-F1, import mode); consecutive edits within 1 s are coalesced. */
+      const pushSpotUndo = (label: string) => {
+        const { undoStack, fxSpotOverrides } = get();
+        const last = undoStack[undoStack.length - 1];
+        const now = Date.now();
+        if (last && last.kind === "spots" && now - last.at < 1000) {
+          set({ undoStack: [...undoStack.slice(0, -1), { ...last, label, at: now }] });
+          return;
+        }
+        const entry: UndoEntry = { kind: "spots", fxSpotOverrides: { ...fxSpotOverrides }, label, at: now };
+        set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
+      };
+      /** Push a fixings snapshot for undo (R6-F1); consecutive edits within 1 s are coalesced. */
+      const pushFixingsUndo = (label: string) => {
+        const { undoStack, fixings } = get();
+        const last = undoStack[undoStack.length - 1];
+        const now = Date.now();
+        if (last && last.kind === "fixings" && now - last.at < 1000) {
+          set({ undoStack: [...undoStack.slice(0, -1), { ...last, label, at: now }] });
+          return;
+        }
+        const entry: UndoEntry = { kind: "fixings", fixings: fixings ? fixings.map((f) => ({ ...f })) : null, label, at: now };
+        set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
+      };
+      /** Capture the complete market source (R6-F2) – before a snapshot import, its discard or "Zum Sample-Markt". */
+      const marketSourceState = (): MarketSourceState => {
+        const s = get();
+        return {
+          marketSource: s.marketSource,
+          importedSnapshot: s.importedSnapshot,
+          quotes: cloneQuotes(s.quotes),
+          interpolation: { ...s.interpolation },
+          turnOfYear: { ...s.turnOfYear },
+          volSurfaces: JSON.parse(JSON.stringify(s.volSurfaces)) as VolSurfaces,
+          fxFixings: s.fxFixings.map((f) => ({ ...f })),
+          fxSpotOverrides: { ...s.fxSpotOverrides },
+          fixings: s.fixings ? s.fixings.map((f) => ({ ...f })) : null,
+          extraCurves: JSON.parse(JSON.stringify(s.extraCurves)) as Record<string, ExtraCurve>,
+          valuationDate: s.valuationDate,
+        };
+      };
+      /** Push an extra-curves snapshot for undo (Markt R6-5). */
+      const pushCurvesUndo = (label: string, withQuotes: boolean) => {
+        const { undoStack, extraCurves, quotes } = get();
+        const entry: UndoEntry = {
+          kind: "curves",
+          extraCurves: JSON.parse(JSON.stringify(extraCurves)) as Record<string, ExtraCurve>,
+          ...(withQuotes ? { quotes: cloneQuotes(quotes) } : {}),
+          label,
+          at: Date.now(),
+        };
+        set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
+      };
+      const pushMarketSourceUndo = (label: string) => {
+        const entry: UndoEntry = { kind: "marketSource", before: marketSourceState(), label, at: Date.now() };
+        set({ undoStack: [...get().undoStack, entry].slice(-UNDO_DEPTH) });
+      };
       /**
        * Base market for the given inputs. Sample mode bootstraps the quotes at
        * `date`; import mode starts from the imported snapshot (its own date and
        * curves – quotes, interpolation and turn-of-year do not apply) and layers
-       * the vol overrides and FX fixings on top (R5-F2). Historical fixings of
-       * the current base market are kept in both modes.
+       * the vol overrides, FX fixings and FX-spot overrides on top (R5-F2,
+       * R6-F1). A fixings override replaces the base market's fixings in both modes.
        */
       const rebuildMarket = (
         date: number,
@@ -730,16 +1037,66 @@ export const useStore = create<AppState>()(
         turnOfYear: Record<string, TurnOfYear> = get().turnOfYear,
         volSurfaces: VolSurfaces = get().volSurfaces,
         fxFixings: FxFixing[] = get().fxFixings,
+        fxSpotOverrides: Record<string, number> = get().fxSpotOverrides,
+        fixings: Fixing[] | null = get().fixings,
+        extraCurves: Record<string, ExtraCurve> = get().extraCurves,
       ): MarketContext => {
         const imported = get().marketSource === "import" ? get().importedBase : null;
         const built = imported
-          ? withVolSurfaces({ ...imported, fxFixings: fxFixings.length ? fxFixings : undefined }, volSurfaces)
-          : buildMarket(date, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
-        const fixings = get().baseMarket.fixings;
-        return fixings && fixings.length > 0 ? { ...built, fixings } : built;
+          ? withVolSurfaces(
+              {
+                ...imported,
+                fxFixings: fxFixings.length ? fxFixings : undefined,
+                fxSpots: Object.keys(fxSpotOverrides).length ? { ...imported.fxSpots, ...fxSpotOverrides } : imported.fxSpots,
+              },
+              volSurfaces,
+            )
+          : buildMarket(date, quotes, interpolation, turnOfYear, volSurfaces, fxFixings, extraCurves);
+        return fixings ? { ...built, fixings } : built;
       };
-      /** Drop undo entries that would rebuild the market from the quotes (they would silently replace an imported snapshot). */
-      const undoWithoutMarketEntries = () => get().undoStack.filter((e) => e.kind === "trades" || e.kind === "hedge");
+      /** Restore a captured market source (undo of import / discard / leave, R6-F2). */
+      const restoreMarketSource = (b: MarketSourceState): boolean => {
+        let importedBase: MarketContext | null = null;
+        if (b.marketSource === "import") {
+          if (!b.importedSnapshot) return false;
+          const loaded = loadSnapshot(b.importedSnapshot);
+          if (!loaded.ok) return false;
+          importedBase = loaded.market;
+        }
+        set({
+          marketSource: b.marketSource,
+          importedSnapshot: b.importedSnapshot,
+          importedBase,
+          quotes: b.quotes,
+          interpolation: b.interpolation,
+          turnOfYear: b.turnOfYear,
+          volSurfaces: b.volSurfaces,
+          fxFixings: b.fxFixings,
+          fxSpotOverrides: b.fxSpotOverrides,
+          fixings: b.fixings,
+          extraCurves: b.extraCurves ?? {},
+          valuationDate: b.valuationDate,
+          reportStamp: null,
+          reportKey: null,
+        });
+        try {
+          const base = rebuildMarket(
+            b.valuationDate,
+            b.quotes,
+            b.interpolation,
+            b.turnOfYear,
+            b.volSurfaces,
+            b.fxFixings,
+            b.fxSpotOverrides,
+            b.fixings,
+            b.extraCurves ?? {},
+          );
+          get().setMarket(base);
+          return true;
+        } catch {
+          return false;
+        }
+      };
       return {
         valuationDate: initialDate,
         marketSource: "sample",
@@ -751,6 +1108,9 @@ export const useStore = create<AppState>()(
         cdsCurves: {},
         volSurfaces: {},
         fxFixings: [],
+        fxSpotOverrides: {},
+        fixings: null,
+        extraCurves: {},
         baseMarket: initialMarket,
         market: initialMarket,
         whatIf: { ratesBp: 0, fxPct: 0, volBp: 0 },
@@ -775,6 +1135,7 @@ export const useStore = create<AppState>()(
         customScenarios: readScenarios(),
         undoStack: [],
         hedgeRelationships: {},
+        hedgeResults: {},
         reportInputs: {},
         reportStamp: null,
         reportKey: null,
@@ -953,6 +1314,66 @@ export const useStore = create<AppState>()(
             try {
               const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, get().volSurfaces, entry.fxFixings);
               set({ fxFixings: entry.fxFixings });
+              get().setMarket(base);
+            } catch {
+              return null;
+            }
+            return entry.label;
+          }
+          if (entry.kind === "spots") {
+            set({ undoStack: undoStack.slice(0, -1) });
+            try {
+              const s = get();
+              const base = rebuildMarket(s.valuationDate, s.quotes, s.interpolation, s.turnOfYear, s.volSurfaces, s.fxFixings, entry.fxSpotOverrides);
+              set({ fxSpotOverrides: entry.fxSpotOverrides });
+              get().setMarket(base);
+            } catch {
+              return null;
+            }
+            return entry.label;
+          }
+          if (entry.kind === "fixings") {
+            set({ undoStack: undoStack.slice(0, -1) });
+            try {
+              const s = get();
+              const base = rebuildMarket(
+                s.valuationDate,
+                s.quotes,
+                s.interpolation,
+                s.turnOfYear,
+                s.volSurfaces,
+                s.fxFixings,
+                s.fxSpotOverrides,
+                entry.fixings,
+              );
+              set({ fixings: entry.fixings });
+              get().setMarket(base);
+            } catch {
+              return null;
+            }
+            return entry.label;
+          }
+          if (entry.kind === "marketSource") {
+            set({ undoStack: undoStack.slice(0, -1) });
+            return restoreMarketSource(entry.before) ? entry.label : null;
+          }
+          if (entry.kind === "curves") {
+            set({ undoStack: undoStack.slice(0, -1) });
+            try {
+              const s = get();
+              const quotes = entry.quotes ?? s.quotes;
+              const base = rebuildMarket(
+                s.valuationDate,
+                quotes,
+                s.interpolation,
+                s.turnOfYear,
+                s.volSurfaces,
+                s.fxFixings,
+                s.fxSpotOverrides,
+                s.fixings,
+                entry.extraCurves,
+              );
+              set({ extraCurves: entry.extraCurves, quotes });
               get().setMarket(base);
             } catch {
               return null;
@@ -1152,6 +1573,137 @@ export const useStore = create<AppState>()(
             return false;
           }
         },
+        setFxSpot: (pair, spot, label) => {
+          if (!/^[A-Z]{6}$/.test(pair) || !Number.isFinite(spot) || spot <= 0) return false;
+          const text = label ?? `Spot ${pair.slice(0, 3)}/${pair.slice(3)} ${String(Math.round(spot * 1e4) / 1e4).replace(".", ",")}`;
+          const s = get();
+          // Sample market: spots are quotes – they survive valuation-date changes and count as "modifiziert" (quotesModified).
+          if (s.marketSource !== "import") return s.setQuotes({ ...s.quotes, fxSpots: { ...s.quotes.fxSpots, [pair]: spot } }, text);
+          // Imported snapshot: an override on top of the file – undoable, persisted, part of the export, flagged "modifiziert" (R6-F1).
+          const fxSpotOverrides = { ...s.fxSpotOverrides };
+          if (s.importedBase && Math.abs((s.importedBase.fxSpots[pair] ?? Number.NaN) - spot) < 1e-12) delete fxSpotOverrides[pair];
+          else fxSpotOverrides[pair] = spot;
+          try {
+            const base = rebuildMarket(s.valuationDate, s.quotes, s.interpolation, s.turnOfYear, s.volSurfaces, s.fxFixings, fxSpotOverrides);
+            pushSpotUndo(text);
+            set({ fxSpotOverrides });
+            get().setMarket(base);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        setFixings: (next, label) => {
+          const fixings = next ? next.filter(isPlausibleFixing).map((f) => ({ index: f.index, date: f.date, value: f.value })) : null;
+          const s = get();
+          try {
+            const base = rebuildMarket(s.valuationDate, s.quotes, s.interpolation, s.turnOfYear, s.volSurfaces, s.fxFixings, s.fxSpotOverrides, fixings);
+            pushFixingsUndo(label);
+            set({ fixings });
+            get().setMarket(base);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        resetMarketOverrides: () => {
+          const s = get();
+          if (s.marketSource === "import") {
+            s.resetVolSurfaces();
+            const baseFx = (s.importedBase?.fxFixings ?? []).filter(isPlausibleFxFixing);
+            if (fxFixingsKey(get().fxFixings) !== fxFixingsKey(baseFx)) get().setFxFixings(baseFx, "FX-Fixings auf den Snapshot zurückgesetzt");
+            if (Object.keys(get().fxSpotOverrides).length) {
+              const st = get();
+              const base = rebuildMarket(st.valuationDate, st.quotes, st.interpolation, st.turnOfYear, st.volSurfaces, st.fxFixings, {});
+              pushSpotUndo("FX-Spots auf den Snapshot zurückgesetzt");
+              set({ fxSpotOverrides: {} });
+              get().setMarket(base);
+            }
+            if (get().fixings) get().setFixings(null, "Fixings auf den Snapshot zurückgesetzt");
+            return;
+          }
+          s.resetQuotes();
+          for (const id of Object.keys(get().interpolation)) get().setInterpolation(id, undefined);
+          for (const id of Object.keys(get().turnOfYear)) get().setTurnOfYear(id, undefined);
+          get().resetVolSurfaces();
+          if (get().fxFixings.length) get().setFxFixings([], "FX-Fixings zurückgesetzt");
+          if (get().fixings) get().setFixings(null, "Fixings zurückgesetzt");
+          for (const id of Object.keys(get().extraCurves)) get().removeExtraCurve(id);
+        },
+        addExtraCurve: (curve, o) => {
+          const s = get();
+          if (s.marketSource === "import") return { ok: false, error: "Kurven stammen aus dem importierten Snapshot – zuerst „Zum Sample-Markt“ wechseln" };
+          const c: ExtraCurve = { ...curve, currency: curve.currency.toUpperCase(), index: curve.index.toUpperCase() };
+          const problem = validateExtraCurve(c, Object.keys(s.baseMarket.curves));
+          if (problem) return { ok: false, error: problem };
+          const extraCurves = { ...s.extraCurves, [c.id]: c };
+          const fx = o?.fxSpot;
+          const quotes =
+            fx && /^[A-Z]{6}$/.test(fx.pair) && Number.isFinite(fx.rate) && fx.rate > 0
+              ? { ...s.quotes, fxSpots: { ...s.quotes.fxSpots, [fx.pair]: fx.rate } }
+              : s.quotes;
+          let base: MarketContext;
+          try {
+            base = buildMarket(s.valuationDate, quotes, s.interpolation, s.turnOfYear, s.volSurfaces, s.fxFixings, extraCurves);
+            if (s.fixings) base = { ...base, fixings: s.fixings };
+          } catch (e) {
+            return { ok: false, error: `Bootstrap fehlgeschlagen: ${translatePricingError(e)}` };
+          }
+          pushCurvesUndo(`Kurve ${c.id} angelegt${fx ? ` · Spot ${fx.pair.slice(0, 3)}/${fx.pair.slice(3)}` : ""}`, quotes !== s.quotes);
+          set({ extraCurves, quotes });
+          get().setMarket(base);
+          return { ok: true };
+        },
+        setExtraCurveQuotes: (id, quotes, label) => {
+          const s = get();
+          const cur = s.extraCurves[id];
+          if (!cur || s.marketSource === "import") return false;
+          const extraCurves = { ...s.extraCurves, [id]: { ...cur, quotes } };
+          try {
+            const base = rebuildMarket(
+              s.valuationDate,
+              s.quotes,
+              s.interpolation,
+              s.turnOfYear,
+              s.volSurfaces,
+              s.fxFixings,
+              s.fxSpotOverrides,
+              s.fixings,
+              extraCurves,
+            );
+            pushCurvesUndo(label, false);
+            set({ extraCurves });
+            get().setMarket(base);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        removeExtraCurve: (id) => {
+          const s = get();
+          if (!s.extraCurves[id]) return false;
+          const extraCurves = { ...s.extraCurves };
+          delete extraCurves[id];
+          try {
+            const base = rebuildMarket(
+              s.valuationDate,
+              s.quotes,
+              s.interpolation,
+              s.turnOfYear,
+              s.volSurfaces,
+              s.fxFixings,
+              s.fxSpotOverrides,
+              s.fixings,
+              extraCurves,
+            );
+            pushCurvesUndo(`Kurve ${id} entfernt`, false);
+            set({ extraCurves });
+            get().setMarket(base);
+            return true;
+          } catch {
+            return false;
+          }
+        },
         setCdsCurve: (counterparty, quotes) => {
           const cdsCurves = { ...get().cdsCurves };
           if (quotes === undefined || quotes.length === 0) delete cdsCurves[counterparty];
@@ -1189,7 +1741,9 @@ export const useStore = create<AppState>()(
               if (d === before) return true;
               // Never drop an imported snapshot silently (R5-F2): the caller must confirm the switch back to the quotes market.
               if (!opts?.discardImport) return false;
-              set({ marketSource: "sample", importedSnapshot: null, importedBase: null });
+              // One undoable action (R6-F2): the snapshot, its overrides and the old valuation date come back with Ctrl+Z.
+              pushMarketSourceUndo(`Snapshot „${get().importedBase?.meta?.label ?? "Snapshot"}“ verworfen (Bewertungstag ${isoDe(d)})`);
+              set({ marketSource: "sample", importedSnapshot: null, importedBase: null, volSurfaces: {}, fxFixings: [], fxSpotOverrides: {}, fixings: null });
             }
             const baseMarket = rebuildMarket(d, get().quotes);
             set({ valuationDate: d, reportStamp: null, reportKey: null });
@@ -1210,7 +1764,11 @@ export const useStore = create<AppState>()(
           if (!loaded.ok) return loaded;
           const imported = loaded.market;
           const before = get().valuationDate;
+          const label = imported.meta?.label ?? toISO(imported.valuationDate);
+          const discardedEdits = marketModified(get());
           const fxFixings = (imported.fxFixings ?? []).filter(isPlausibleFxFixing);
+          // The import is one undoable action (R6-F2): Ctrl+Z brings back the previous market source, quotes, vols, overrides and date.
+          pushMarketSourceUndo(`Snapshot „${label}“ importiert`);
           // Everything that describes the market now comes from the file: quote edits, overrides and vol edits are reset.
           set({
             marketSource: "import",
@@ -1222,9 +1780,10 @@ export const useStore = create<AppState>()(
             turnOfYear: {},
             volSurfaces: {},
             fxFixings,
+            fxSpotOverrides: {},
+            fixings: null,
             reportStamp: null,
             reportKey: null,
-            undoStack: undoWithoutMarketEntries(),
           });
           // Historical fixings come from the snapshot too (not the previous base market).
           const market = applyWhatIf(imported, get().whatIf);
@@ -1233,14 +1792,27 @@ export const useStore = create<AppState>()(
           return {
             ok: true,
             id: marketSnapshotId(imported),
-            label: imported.meta?.label ?? toISO(imported.valuationDate),
+            label,
             valuationDate: imported.valuationDate,
             dateChanged: imported.valuationDate !== before,
+            discardedEdits,
+            warnings: loaded.warnings,
           };
         },
         leaveImport: () => {
           if (get().marketSource !== "import") return;
-          set({ marketSource: "sample", importedSnapshot: null, importedBase: null, volSurfaces: {}, fxFixings: [], reportStamp: null, reportKey: null });
+          pushMarketSourceUndo(`Zum Sample-Markt (Snapshot „${get().importedBase?.meta?.label ?? "Snapshot"}“ verlassen)`);
+          set({
+            marketSource: "sample",
+            importedSnapshot: null,
+            importedBase: null,
+            volSurfaces: {},
+            fxFixings: [],
+            fxSpotOverrides: {},
+            fixings: null,
+            reportStamp: null,
+            reportKey: null,
+          });
           const built = buildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, {}, []);
           get().setMarket(built);
         },
@@ -1250,8 +1822,16 @@ export const useStore = create<AppState>()(
           if (!prev) return;
           const next = { ...get().hedgeRelationships };
           delete next[tradeId];
+          const results = { ...get().hedgeResults };
+          delete results[tradeId];
           const entry: UndoEntry = { kind: "hedge", tradeId, relationship: prev, label: `Sicherungsdokumentation ${tradeId} verworfen`, at: Date.now() };
-          set({ hedgeRelationships: next, undoStack: [...get().undoStack, entry].slice(-UNDO_DEPTH) });
+          set({ hedgeRelationships: next, hedgeResults: results, undoStack: [...get().undoStack, entry].slice(-UNDO_DEPTH) });
+        },
+        setHedgeResult: (tradeId, result) => {
+          const hedgeResults = { ...get().hedgeResults };
+          if (result) hedgeResults[tradeId] = result;
+          else delete hedgeResults[tradeId];
+          set({ hedgeResults });
         },
         setReportInputs: (tradeId, patch) => {
           const cur = get().reportInputs[tradeId] ?? DEFAULT_REPORT_INPUTS;
@@ -1286,6 +1866,9 @@ export const useStore = create<AppState>()(
             cdsCurves: {},
             volSurfaces: {},
             fxFixings: [],
+            fxSpotOverrides: {},
+            fixings: null,
+            extraCurves: {},
             trades,
             baseMarket,
             market,
@@ -1296,6 +1879,7 @@ export const useStore = create<AppState>()(
             compareIds: [],
             undoStack: [],
             hedgeRelationships: {},
+            hedgeResults: {},
             reportInputs: {},
             restored: null,
             reportStamp: null,
@@ -1319,12 +1903,16 @@ export const useStore = create<AppState>()(
         cdsCurves: s.cdsCurves,
         volSurfaces: s.volSurfaces,
         fxFixings: s.fxFixings,
+        fxSpotOverrides: s.fxSpotOverrides,
+        fixings: s.fixings,
+        extraCurves: s.extraCurves,
         valuationDate: s.valuationDate,
         reportingCurrency: s.reportingCurrency,
         view: s.view,
         inspectorOpen: s.inspectorOpen,
         customerMode: s.customerMode,
         hedgeRelationships: s.hedgeRelationships,
+        hedgeResults: s.hedgeResults,
         reportInputs: s.reportInputs,
         selectedId: s.selectedId,
       }),
@@ -1364,9 +1952,29 @@ export const useStore = create<AppState>()(
               valuationDate = loaded.market.valuationDate;
             }
           }
-          const baseMarket = importedBase
-            ? withVolSurfaces({ ...importedBase, fxFixings: fxFixings.length ? fxFixings : undefined }, volSurfaces)
-            : buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
+          // Overrides on top of the base market survive the reload as well (R6-F1): FX spots (import mode) and fixings.
+          const fxSpotOverrides = importedBase ? plausibleSpotOverrides(p.fxSpotOverrides) : {};
+          const fixings = Array.isArray(p.fixings) ? p.fixings.filter(isPlausibleFixing) : null;
+          let extraCurves = importedBase ? {} : plausibleExtraCurves(p.extraCurves);
+          if (Object.keys(extraCurves).length) {
+            // an added curve that no longer bootstraps (registry change, bad quotes) is dropped rather than breaking the start
+            try {
+              buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces, fxFixings, extraCurves);
+            } catch {
+              extraCurves = {};
+            }
+          }
+          const built = importedBase
+            ? withVolSurfaces(
+                {
+                  ...importedBase,
+                  fxFixings: fxFixings.length ? fxFixings : undefined,
+                  fxSpots: Object.keys(fxSpotOverrides).length ? { ...importedBase.fxSpots, ...fxSpotOverrides } : importedBase.fxSpots,
+                },
+                volSurfaces,
+              )
+            : buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces, fxFixings, extraCurves);
+          const baseMarket = fixings ? { ...built, fixings } : built;
           const reportingCurrency =
             typeof p.reportingCurrency === "string" && reportingCurrencies(baseMarket).includes(p.reportingCurrency)
               ? p.reportingCurrency
@@ -1389,19 +1997,37 @@ export const useStore = create<AppState>()(
             cdsCurves,
             volSurfaces,
             fxFixings,
+            fxSpotOverrides,
+            fixings,
+            extraCurves,
             valuationDate,
             reportingCurrency,
             view,
             inspectorOpen: typeof p.inspectorOpen === "boolean" ? p.inspectorOpen : current.inspectorOpen,
             customerMode: typeof p.customerMode === "boolean" ? p.customerMode : current.customerMode,
             hedgeRelationships: p.hedgeRelationships && typeof p.hedgeRelationships === "object" ? p.hedgeRelationships : {},
+            hedgeResults: plausibleHedgeResults(p.hedgeResults),
             reportInputs,
             baseMarket,
             market: baseMarket,
             results,
             lastPricingMs: ms,
             selectedId,
-            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear, volSurfaces, fxFixings, marketSource }) },
+            restored: {
+              trades: trades.length,
+              quotesModified: marketModified({
+                quotes,
+                interpolation,
+                turnOfYear,
+                volSurfaces,
+                fxFixings,
+                marketSource,
+                fxSpotOverrides,
+                fixings,
+                importedBase,
+                extraCurves,
+              }),
+            },
           };
         } catch {
           return current;
@@ -1465,14 +2091,18 @@ export function changeValuationDate(iso: string): boolean {
     const label = s.baseMarket.meta?.label ?? "Snapshot";
     const question =
       `Der Markt stammt aus dem importierten Snapshot „${label}“ (Bewertungstag ${dateDe(s.valuationDate)}). ` +
-      `Ein anderer Bewertungstag verwirft den Snapshot und baut den Sample-Markt aus den Quotes zum ${iso.split("-").reverse().join(".")} neu auf. Fortfahren?`;
+      `Ein anderer Bewertungstag verwirft den Snapshot und baut den Sample-Markt aus den Quotes zum ${iso.split("-").reverse().join(".")} neu auf ` +
+      `(rückgängig mit Ctrl+Z). Fortfahren?`;
     const confirmed = typeof window !== "undefined" && typeof window.confirm === "function" ? window.confirm(question) : false;
     if (!confirmed) {
       s.showToast(`Bewertungstag unverändert – Snapshot „${label}“ bleibt geladen`);
       return false;
     }
     const ok = s.setValuationDate(iso, { discardImport: true });
-    if (ok) s.showToast(`Snapshot „${label}“ verworfen – Sample-Markt aus den Quotes zum ${iso.split("-").reverse().join(".")} aufgebaut`);
+    if (ok)
+      s.showToast(`Snapshot „${label}“ verworfen – Sample-Markt aus den Quotes zum ${iso.split("-").reverse().join(".")} aufgebaut`, {
+        action: { label: "Rückgängig", run: () => useStore.getState().undo() },
+      });
     else s.showToast("Ungültiges Datum");
     return ok;
   }

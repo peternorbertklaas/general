@@ -11,7 +11,7 @@ import {
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
-import { sendError } from "../lib/errors.js";
+import { apiErrorCode, sendError } from "../lib/errors.js";
 import { volSurfaceProblems } from "../lib/vol-surfaces.js";
 import { FREQUENCY_PATTERN, MAX_AMOUNT, arrayResponse, marketSnapshotRef, objectResponse, responses, tradeRef } from "../schemas.js";
 
@@ -218,8 +218,8 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
         designationCtx = req.body.designationSnapshot ? deserializeMarket(req.body.designationSnapshot) : undefined;
       } catch (e) {
         // Structural problems of the client-supplied snapshot are input errors (400 with the core's code), as on `PUT /api/market/snapshot`.
-        const code = isPricingError(e) ? e.code : "SNAPSHOT_MALFORMED";
-        return reply.status(400).send({ error: `designationSnapshot: ${(e as Error).message}`, statusCode: 400, code, requestId: req.id });
+        const code = apiErrorCode(isPricingError(e) ? e.code : undefined, "SNAPSHOT_MALFORMED");
+        return sendError(reply, req, 400, code, `designationSnapshot: ${(e as Error).message}`);
       }
       const report = hedgeEffectivenessReport(ctx.market.get(), rel, instrument, {
         designationCtx,

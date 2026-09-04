@@ -7,7 +7,9 @@ import { type CapFloor, type Cashflow, type PricingResult } from "../instruments
 import { type MarketContext, getCurve, getDiscountCurve, getFixing } from "../market/market-context.js";
 import { type IrVolQuotation, bachelierGreeks, black76Greeks, convertIrVol, type OptionType } from "../models/black.js";
 import { type VolType, capletVol } from "../models/vol-surfaces.js";
+import { surfaceVolWarnings } from "../market/vol-validation.js";
 import { estimateMissingIborRate, fxToReporting, missingFixingMessage } from "./leg-pricer.js";
+import { upfrontPremiumLeg } from "./upfront.js";
 
 export type CapFloorModel = "Bachelier" | "Black" | "ShiftedBlack";
 
@@ -122,6 +124,7 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
   const shift = trade.shift ?? surface?.shift ?? 0;
   const warnings: string[] = [];
   if (!surface && trade.volOverride === undefined) warnings.push("No caplet vol surface – using 60bp normal vol");
+  if (surface && trade.volOverride === undefined) warnings.push(...surfaceVolWarnings(surface)); // Markt R6-4
   const from = surfaceQuotation(surface);
   const to = modelQuotation(model, shift);
   const convert = trade.volOverride === undefined && !sameQuotation(from, to);
@@ -209,19 +212,19 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
     });
     pv += amount * df;
   }
-  let pvRep = pv * fx;
-  if (trade.upfront && trade.upfront.date > val) {
-    const d2 = getDiscountCurve(ctx, trade.upfront.currency, trade.collateralCurrency);
-    const fxu = fxToReporting(ctx, trade.upfront.currency, reporting, trade.collateralCurrency);
-    pvRep -= trade.upfront.amount * d2.df(trade.upfront.date) * fxu;
-  }
+  // N6-1: the upfront premium is a `Premium` cashflow in its own (last) leg, not a silent PV deduction.
+  const upfront = upfrontPremiumLeg(ctx, trade, reporting, 1);
+  const pvRep = pv * fx + (upfront?.pvReporting ?? 0);
   return {
     tradeId: trade.id,
     tradeType: "CapFloor",
     valuationDate: val,
     currency: reporting,
     pv: pvRep,
-    legs: [{ legIndex: 0, legType: `${trade.capFloor} ${trade.index}`, currency: trade.currency, pv, pvReporting: pv * fx, cashflows }],
+    legs: [
+      { legIndex: 0, legType: `${trade.capFloor} ${trade.index}`, currency: trade.currency, pv, pvReporting: pv * fx, cashflows },
+      ...(upfront ? [upfront.leg] : []),
+    ],
     analytics: {
       model,
       strike: trade.strike,

@@ -207,7 +207,8 @@ function checkFxLeg(l: Omit<FxForward, "type" | "id"> | undefined, path: string,
  * `fixingLag` / `lookbackDays`; N5-3: `mtmReset.resettingLegIndex` an integer
  * in [0, legs.length); N5-4: positive digital payout, barrier type from the
  * enum, numeric `spread` / `gearing` / step schedules, boolean
- * `observationShift`, FX swap far leg after near leg). Returns a
+ * `observationShift`, FX swap far leg after near leg; N6-5: boolean
+ * `barrier.hit`). Returns a
  * list of problems (empty = valid); `priceTrade` throws a
  * `PricingError("INVALID_TRADE")` with this list instead of producing a null
  * or NaN PV.
@@ -321,6 +322,8 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
           if (trade.barrier.rebate !== undefined && (!isNum(trade.barrier.rebate) || trade.barrier.rebate < 0)) {
             out.push(`${path}.barrier.rebate must be a non-negative finite number (got ${String(trade.barrier.rebate)})`);
           }
+          // N6-5: the observed knock state is a boolean flag ("yes" would be read as touched).
+          checkOptionalBoolean(trade.barrier.hit, `${path}.barrier.hit`, out);
         }
       }
       // N5-4a: digital payout must be a positive finite amount in a 3-letter currency (−100 gave a bought digital a negative PV).

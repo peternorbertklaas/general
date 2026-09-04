@@ -3,9 +3,11 @@ import { yearFraction } from "../dates/daycount.js";
 import { type Cashflow, type FxForward, type FxOption, type FxSwap, type LegResult, type PricingResult } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve, getFxFixing, getFxSpot } from "../market/market-context.js";
 import { fxRateAtValuationDate, fxSpotDate, fxSpotDateFrom, pipFactor } from "../market/fx-spot.js";
-import { type FxOptionInputs, fxBarrier, fxDigital, fxExoticGreeks, garmanKohlhagen } from "../models/garman-kohlhagen.js";
+import { type BarrierType, type FxOptionInputs, fxBarrier, fxDigital, fxExoticGreeks, garmanKohlhagen } from "../models/garman-kohlhagen.js";
 import { fxVolAtStrike } from "../models/fx-vol-surface.js";
+import { surfaceVolWarnings } from "../market/vol-validation.js";
 import { PricingError } from "../errors.js";
+import { upfrontPremiumLeg } from "./upfront.js";
 
 export function splitPair(pair: string): { base: string; quote: string } {
   const p = pair.replace("/", "").toUpperCase();
@@ -221,6 +223,23 @@ export const EXPIRED_PREFIX = "EXPIRED:";
 export const EXPIRES_TODAY_PREFIX = "EXPIRES_TODAY:";
 /** Warning prefix for a required historical FX fixing that is not loaded (shared with the MtM-reset CCS, R4-1). */
 export const MISSING_FX_FIXING_PREFIX = "MISSING_FX_FIXING:";
+/**
+ * Warning prefix for a barrier option whose knock state is not recorded on the
+ * trade (`barrier.hit` undefined) although it decides the value (N6-5): an
+ * alive option whose spot is at or beyond the barrier (valued as knocked on
+ * today's spot – Reiner–Rubinstein gives the rebate / the vanilla), or an
+ * expired option whose knock state is derived from the expiry fixing alone
+ * (touch events before the expiry are not observed).
+ */
+export const BARRIER_STATE_UNKNOWN_PREFIX = "BARRIER_STATE_UNKNOWN:";
+
+/** Knock state of a barrier option reported in `analytics.barrierState` (N6-5). */
+export type BarrierState = "alive" | "knocked-in" | "knocked-out";
+
+/** Is the spot / fixing `s` at or beyond the barrier (continuous monitoring)? */
+function beyondBarrier(b: { type: BarrierType; level: number }, s: number): boolean {
+  return b.type.startsWith("Up") ? s >= b.level : s <= b.level;
+}
 
 /**
  * Lifecycle state of an FX option on the valuation date (N5-2):
@@ -244,6 +263,8 @@ export function fxOptionLifecycle(trade: Pick<FxOption, "expiryDate" | "delivery
 interface SettledPayoff {
   premiumPerUnit: number;
   spotDelta: number;
+  /** Knock state of a barrier option (undefined for vanillas / digitals). */
+  barrierState?: BarrierState;
 }
 
 /**
@@ -253,10 +274,11 @@ interface SettledPayoff {
  * i.e. sign·(F_del − K)·DF_q per unit base with the linear delta sign·DF_f of
  * that forward. Digitals pay their fixed amount (cash-or-nothing: no spot
  * delta; asset-or-nothing: one unit of base per payout, delta DF_f). Barriers
- * use the fixing as the knock observation (no path monitoring between the
- * trade date and the fixing is available): a knocked-out option is worth its
- * rebate, a knocked-in option that was never triggered is worth 0. No vega,
- * gamma, theta or rho remain.
+ * take the knock state from `barrier.hit` when recorded (N6-5) and otherwise
+ * from the fixing (no path monitoring between the trade date and the fixing
+ * is available): a knocked-out option is worth its rebate (paid on the
+ * delivery date), a knocked-in option that was never triggered is worth 0. No
+ * vega, gamma, theta or rho remain.
  */
 function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: number, dfQ: number, scalePayout: number): SettledPayoff {
   const sign = trade.optionType === "Call" ? 1 : -1;
@@ -270,10 +292,11 @@ function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: num
   }
   if (trade.barrier) {
     const b = trade.barrier;
-    const breached = b.type.startsWith("Up") ? sFix >= b.level : sFix <= b.level;
-    const alive = b.type.endsWith("Out") ? !breached : breached;
-    if (alive) return exercised;
-    return b.type.endsWith("Out") ? { premiumPerUnit: (b.rebate ?? 0) * dfQ, spotDelta: 0 } : { premiumPerUnit: 0, spotDelta: 0 };
+    const touched = b.hit ?? beyondBarrier(b, sFix);
+    const isOut = b.type.endsWith("Out");
+    const barrierState: BarrierState = touched ? (isOut ? "knocked-out" : "knocked-in") : "alive";
+    if (isOut ? !touched : touched) return { ...exercised, barrierState };
+    return isOut ? { premiumPerUnit: (b.rebate ?? 0) * dfQ, spotDelta: 0, barrierState } : { premiumPerUnit: 0, spotDelta: 0, barrierState };
   }
   return exercised;
 }
@@ -305,6 +328,17 @@ function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: num
  * (`SETTLES_TODAY:`, like FX forwards); an option delivered before the
  * valuation date is excluded (PV 0, all Greeks 0, "already settled" warning)
  * – consistent with FX forwards / FRAs and the EMIR delta (0).
+ *
+ * Barrier knock state (N6-5, `barrier.hit`, `analytics.barrierState`): a
+ * recorded `hit: true` overrides the model – knock-out → rebate valued on the
+ * delivery date (Greeks 0, `greeksMethod: "settled-payoff"`), knock-in → the
+ * vanilla; `hit: false` = not touched so far. Without the flag the state is
+ * derived from today's spot (alive) or the expiry fixing (expired) and, when
+ * that derivation decides the value, a `BARRIER_STATE_UNKNOWN:` warning is
+ * raised instead of a silent 0 / vanilla.
+ *
+ * Upfront premium (N6-1): reported as a `Premium` cashflow in its own last leg
+ * (`upfrontPremiumLeg`), no longer a silent PV deduction.
  */
 export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurrency?: string): PricingResult {
   const { base, quote } = splitPair(trade.pair);
@@ -330,6 +364,7 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
     if (!alive) {
       vol = 0; // no optionality left – the smile is not read (N5-2)
     } else if (surface) {
+      warnings.push(...surfaceVolWarnings(surface)); // Markt R6-4: implausible / degenerate smile
       const inverted = !ctx.fxVols?.[`${base}${quote}`];
       vol = inverted
         ? fxVolAtStrike(surface, tExp, 1 / forward, 1 / trade.strike, { dfForeign: dfQ })
@@ -371,9 +406,10 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
   let greeksMethod: string;
   let d1 = 0;
   let d2 = 0;
+  let barrierState: BarrierState | undefined = trade.barrier ? "alive" : undefined;
+  const noGreeks = { gamma: 0, vega: 0, theta: 0, rhoDomestic: 0, rhoForeign: 0 };
   if (!alive) {
     // N5-2: exercise decided on the expiry fixing; the remaining position is a settled payoff (or nothing).
-    const noGreeks = { gamma: 0, vega: 0, theta: 0, rhoDomestic: 0, rhoForeign: 0 };
     greeksMethod = "settled-payoff";
     if (delivered) {
       premiumPerUnit = 0;
@@ -386,6 +422,13 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
       const settled = settledPayoff(trade, sFix, forward, spot, dfQ, scalePayout);
       premiumPerUnit = settled.premiumPerUnit;
       greeks = { spotDelta: settled.spotDelta, ...noGreeks };
+      barrierState = settled.barrierState ?? barrierState;
+      if (trade.barrier && trade.barrier.hit === undefined) {
+        // N6-5: only the expiry fixing is observed – a touch before the expiry cannot be seen.
+        warnings.push(
+          `${BARRIER_STATE_UNKNOWN_PREFIX} knock state of the ${trade.barrier.type} barrier ${trade.barrier.level} derived from the expiry fixing ${sFix} only (${barrierState}) – touch events before the expiry are not observed; set barrier.hit to record the knock state`,
+        );
+      }
       const fixingNote = fixing !== undefined ? `expiry fixing ${sFix}` : "today's spot as proxy for the expiry fixing";
       if (lifecycle === "expires-today") {
         warnings.push(`${EXPIRES_TODAY_PREFIX} FX option expires on the valuation date ${toISO(val)} – intrinsic value on ${fixingNote}, no time value`);
@@ -421,10 +464,36 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
     greeksMethod = "analytic";
     if (trade.barrier) {
       const b = trade.barrier;
-      const priceFn = (i: FxOptionInputs) => fxBarrier({ ...i, barrier: b.level, barrierType: b.type, rebate: b.rebate });
-      premiumPerUnit = priceFn(inputs);
-      greeks = fxExoticGreeks(priceFn, inputs, { barrier: b.level });
-      greeksMethod = "finite-difference";
+      const isOut = b.type.endsWith("Out");
+      const knockedState: BarrierState = isOut ? "knocked-out" : "knocked-in";
+      if (b.hit === true) {
+        // N6-5: the knock has been observed – no barrier optionality is left.
+        barrierState = knockedState;
+        if (isOut) {
+          // Rebate valued as a payment on the delivery date (same convention as the expired path, `settledPayoff`).
+          premiumPerUnit = (b.rebate ?? 0) * dfQ;
+          greeks = { spotDelta: 0, ...noGreeks };
+          greeksMethod = "settled-payoff";
+          warnings.push(
+            `Barrier ${b.type} ${b.level} knocked out (barrier.hit) – ${b.rebate ? `rebate ${b.rebate} per unit base valued as a payment on ${toISO(trade.deliveryDate)}` : "no rebate, PV 0"}, no optionality left`,
+          );
+        } else {
+          // Knocked in → the vanilla (Garman–Kohlhagen value and analytic Greeks already computed above).
+          warnings.push(`Barrier ${b.type} ${b.level} knocked in (barrier.hit) – valued as the vanilla ${trade.optionType}`);
+        }
+      } else {
+        const priceFn = (i: FxOptionInputs) => fxBarrier({ ...i, barrier: b.level, barrierType: b.type, rebate: b.rebate });
+        premiumPerUnit = priceFn(inputs);
+        greeks = fxExoticGreeks(priceFn, inputs, { barrier: b.level });
+        greeksMethod = "finite-difference";
+        if (beyondBarrier(b, spot)) {
+          // N6-5: Reiner–Rubinstein treats a spot at/beyond the barrier as knocked – say so instead of a silent 0 / vanilla.
+          barrierState = knockedState;
+          warnings.push(
+            `${BARRIER_STATE_UNKNOWN_PREFIX} spot ${spot} is ${b.type.startsWith("Up") ? "at or above" : "at or below"} the ${b.type} barrier ${b.level} – valued as ${isOut ? `knocked out (${b.rebate ? "rebate" : "PV 0"})` : "knocked in (vanilla)"} on today's spot${b.hit === false ? " although barrier.hit is false (continuous barrier: a spot beyond the level is a touch)" : "; set barrier.hit to record the knock state"}`,
+          );
+        }
+      }
     } else if (trade.digital) {
       const priceFn = (i: FxOptionInputs) => fxDigital(i, payoutInBase) * scalePayout;
       premiumPerUnit = priceFn(inputs);
@@ -435,12 +504,9 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
   const longShort = trade.payReceive === "Receive" ? 1 : -1;
   const fxQ = fxRateAtValuationDate(ctx, quote, reporting, trade.collateralCurrency);
   const pvQuote = longShort * trade.notional * premiumPerUnit;
-  let pv = pvQuote * fxQ;
-  if (trade.upfront && trade.upfront.date > val) {
-    const d = getDiscountCurve(ctx, trade.upfront.currency, trade.collateralCurrency);
-    const fxu = fxRateAtValuationDate(ctx, trade.upfront.currency, reporting, trade.collateralCurrency);
-    pv -= trade.upfront.amount * d.df(trade.upfront.date) * fxu;
-  }
+  // N6-1: the upfront premium is a `Premium` cashflow in its own (last) leg, not a silent PV deduction.
+  const upfront = upfrontPremiumLeg(ctx, trade, reporting, 1);
+  const pv = pvQuote * fxQ + (upfront?.pvReporting ?? 0);
   const scale = longShort * trade.notional * fxQ;
   // PV change (reporting ccy) for a +1 % spot move of the base currency vs the quote currency.
   const deltaAmount = scale * greeks.spotDelta * spot * 0.01;
@@ -472,6 +538,7 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
           },
         ],
       },
+      ...(upfront ? [upfront.leg] : []),
     ],
     analytics: {
       kind,
@@ -505,8 +572,10 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
       thetaPerDay: (scale * greeks.theta) / 365,
       rhoDomestic: scale * greeks.rhoDomestic * 0.0001,
       rhoForeign: scale * greeks.rhoForeign * 0.0001,
-      /** "analytic" (vanilla), "finite-difference" (barrier / digital) or "settled-payoff" (expired / delivered, N5-2). */
+      /** "analytic" (vanilla), "finite-difference" (barrier / digital) or "settled-payoff" (expired / delivered N5-2, knocked-out N6-5). */
       greeksMethod,
+      /** Barrier options only (N6-5): "alive", "knocked-in" or "knocked-out" – from `barrier.hit`, today's spot or the expiry fixing. */
+      barrierState,
       d1,
       d2,
       /** "standard" when delivery = spot date of the expiry; barriers with a "non-standard" lag use expiry-horizon drift/rebate rates (R3-9). */

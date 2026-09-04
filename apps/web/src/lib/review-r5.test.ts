@@ -1,12 +1,21 @@
 /** Regression tests for the round-5 UI / market / architecture review findings (docs/quality/review-*-r5.md). */
 import { describe, expect, it } from "vitest";
-import { PricingError, SAMPLE_QUOTES, buildSampleMarket, makeCapFloor, parseISO, priceTrade, vegaBuckets, type Trade } from "@deriva/pricing-core";
+import {
+  PricingError,
+  SAMPLE_QUOTES,
+  buildSampleMarket,
+  makeCapFloor,
+  parseISO,
+  priceTrade,
+  validateVolSurfaces,
+  vegaBuckets,
+  type Trade,
+} from "@deriva/pricing-core";
 import { PRICING_ERROR_CODES_DE, translateCoreMessage, translatePricingError } from "./i18n.js";
 import { CSV_IMPORT_TEMPLATES, collateralOf, csvTemplateText, invalidDateMessage, tradesFromCsv } from "./portfolio-io.js";
 import { QUICK_ENTRY_EXAMPLES, fxVolWarning, hasFxVolSurface, parseQuickEntry } from "./quick-parser.js";
 import { readSnapshotJson, snapshotErrorText } from "./snapshot-import.js";
 import { applyParSolve, parSolveLabel, parSolveTitle, parSolveUnavailable, solveCapFloorStrike } from "./trade-ops.js";
-import { localVolSurfaceProblems, validateVolSurfaces } from "./core-compat.js";
 import { ONBOARDING_EXAMPLES } from "../views/Blotter.js";
 
 const VAL = parseISO("2026-09-03");
@@ -197,11 +206,13 @@ describe("R5-06 – snapshot import errors are German with a clear cause", () =>
     );
     expect(translateCoreMessage("Discount curve EUR-X for EUR missing")).toBe("Diskontkurve EUR-X für EUR fehlt im Snapshot");
     expect(translateCoreMessage("FX fixing EURUSD on 2026-03-03 given twice")).toBe("FX-Fixing EUR/USD vom 03.03.2026 ist doppelt hinterlegt");
-    expect(translateCoreMessage("swaptionVols.USD.atm: has 1 rows but there are 11 expiries")).toBe("Swaption-Cube USD, atm: 1 Zeilen, aber 11 Verfälle");
-    expect(translateCoreMessage("fxVols.EURUSD.atm: has 1 entries but there are 7 expiries")).toBe("FX-Vol-Fläche EURUSD, atm: 1 Einträge, aber 7 Verfälle");
-    expect(translateCoreMessage('capletVols.EUR-EURIBOR-6M.volType: unknown vol type "Foo"')).toMatch(
-      /Caplet-Fläche EUR-EURIBOR-6M: unbekannter Vol-Typ "Foo"/,
+    expect(translateCoreMessage("swaptionVols.USD.atm has 1 rows, expected 11 (one per expiry)")).toBe(
+      "Swaption-Cube USD, atm: 1 Zeilen, erwartet 11 (eine je Verfall)",
     );
+    expect(translateCoreMessage("fxVols.EURUSD.atm has 1 entries, expected 7 (one per expiry)")).toBe(
+      "FX-Vol-Fläche EURUSD, atm: 1 Einträge, erwartet 7 (einer je Verfall)",
+    );
+    expect(translateCoreMessage('capletVols.EUR-EURIBOR-6M.volType: unknown vol type "Foo"')).toMatch(/Caplet-Fläche EUR-EURIBOR-6M: Vol-Typ "Foo" unbekannt/);
     expect(PRICING_ERROR_CODES_DE.INVALID_VOL_SURFACE).toBe("Vol-Fläche strukturell ungültig");
   });
   it("core R5 warnings: EXPIRED FX options are German", () => {
@@ -216,15 +227,17 @@ describe("R5-06 – snapshot import errors are German with a clear cause", () =>
   });
 });
 
-describe("Markt R5-1 – vol surfaces are validated before they are applied", () => {
-  it("local fallback and effective validator report malformed grids in the core vocabulary", () => {
+describe("Markt R5-1 / N6-02 – vol surfaces are validated by the core before they are applied (no web fallback validator)", () => {
+  it("the core validator reports malformed grids and accepts the sample surfaces", () => {
     const usd = market.swaptionVols!.USD!;
     const bad = { swaptionVols: { USD: { ...usd, atm: [[0.01]] } } };
-    expect(localVolSurfaceProblems(bad)[0]).toMatch(/^swaptionVols\.USD\.atm: has 1 rows but there are \d+ expiries$/);
-    expect(validateVolSurfaces(bad).length).toBeGreaterThan(0);
+    const problems = validateVolSurfaces(bad);
+    expect(problems.length).toBeGreaterThan(0);
+    expect(problems[0]).toMatch(/^swaptionVols\.USD\.atm has 1 rows, expected \d+ \(one per expiry\)$/);
+    expect(translateCoreMessage(problems[0]!)).toMatch(/^Swaption-Cube USD, atm: 1 Zeilen, erwartet \d+ \(eine je Verfall\)$/);
     expect(validateVolSurfaces({ swaptionVols: market.swaptionVols, capletVols: market.capletVols, fxVols: market.fxVols })).toEqual([]);
     const fx = market.fxVols!.EURUSD!;
-    expect(localVolSurfaceProblems({ fxVols: { EURUSD: { ...fx, atm: [0.5] } } })[0]).toMatch(/fxVols\.EURUSD\.atm: has 1 entries/);
+    expect(validateVolSurfaces({ fxVols: { EURUSD: { ...fx, atm: [0.5] } } })[0]).toMatch(/^fxVols\.EURUSD\.atm has 1 entries, expected \d+/);
   });
 });
 

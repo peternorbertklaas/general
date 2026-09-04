@@ -303,7 +303,9 @@ describe("par risk & vega buckets", () => {
     const roll = await app2.inject({ method: "PUT", url: "/api/market", payload: { valuationDate: "2026-09-04" } });
     expect(roll.json().missingFixingPolicy).toBe("throw");
     expect(roll.json().fxSpotDates.EURUSD).toBe("2026-09-07");
-    // A seasoned swap without fixings now fails semantically instead of silently estimating.
+    // A seasoned swap whose running period needs fixings the market lacks now fails semantically instead of silently
+    // estimating. Since round 6 the sample market carries EURIBOR / €STR history (Markt R6-6: EURIBOR from 2024-06,
+    // €STR from 2026-01-02), so the running €STR period must start before that history.
     const trade = {
       id: "seasoned",
       type: "InterestRateSwap",
@@ -313,29 +315,30 @@ describe("par risk & vega buckets", () => {
           payReceive: "Pay",
           notional: 1e7,
           currency: "EUR",
-          effectiveDate: "2026-03-09",
-          terminationDate: "2031-03-09",
+          effectiveDate: "2025-12-09",
+          terminationDate: "2030-12-09",
           frequency: "1Y",
-          dayCount: "30E/360",
+          dayCount: "ACT/360",
           calendar: "TARGET",
-          rate: 0.026,
+          rate: 0.021,
         },
         {
           type: "Float",
           payReceive: "Receive",
           notional: 1e7,
           currency: "EUR",
-          effectiveDate: "2026-03-09",
-          terminationDate: "2031-03-09",
-          frequency: "6M",
+          effectiveDate: "2025-12-09",
+          terminationDate: "2030-12-09",
+          frequency: "1Y",
           dayCount: "ACT/360",
           calendar: "TARGET",
-          index: "EURIBOR-6M",
+          index: "ESTR",
         },
       ],
     };
     const priced = await app2.inject({ method: "POST", url: "/api/price", payload: { trade } });
-    expect(priced.statusCode).toBe(422);
+    expect(priced.statusCode, priced.body).toBe(422);
+    expect(priced.json().code).toBe("MISSING_FIXING");
     const bad = await app2.inject({ method: "PUT", url: "/api/market", payload: { missingFixingPolicy: "ignore" } });
     expect(bad.statusCode).toBe(400);
     await app2.close();

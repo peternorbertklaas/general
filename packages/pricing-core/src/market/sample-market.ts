@@ -1,7 +1,8 @@
 import { type CurveBuildSpec, type CurveQuote, bootstrapCurves } from "../curves/bootstrap.js";
 import { type Curve } from "../curves/curve.js";
+import { getCalendar } from "../dates/calendar.js";
 import { type SerialDate, parseISO } from "../dates/date.js";
-import { type MarketContext } from "./market-context.js";
+import { type Fixing, type MarketContext } from "./market-context.js";
 import { type SwaptionVolSurface, type CapletVolSurface } from "../models/vol-surfaces.js";
 import { type FxVolSurface } from "../models/fx-vol-surface.js";
 
@@ -619,6 +620,83 @@ export function sampleBootstrapSpecs(
   return specs;
 }
 
+/**
+ * Indicative historical fixing path of the sample market (Markt R6-6): anchor
+ * levels (ISO date → rate) interpolated linearly in time. EURIBOR follows the
+ * 2024–2026 easing cycle down to the sample market's 6M deposit (2.21 % on
+ * 2026-09-03); €STR runs ≈ 15 bp below EURIBOR-6M.
+ */
+const SAMPLE_FIXING_PATH: Record<string, { from: string; anchors: [string, number][] }> = {
+  "EURIBOR-6M": {
+    from: "2024-06-03",
+    anchors: [
+      ["2024-06-03", 0.0371],
+      ["2024-12-02", 0.0263],
+      ["2025-06-02", 0.0209],
+      ["2025-12-01", 0.0212],
+      ["2026-09-03", 0.0221],
+      ["2027-12-31", 0.0235],
+    ],
+  },
+  "EURIBOR-3M": {
+    from: "2024-06-03",
+    anchors: [
+      ["2024-06-03", 0.0372],
+      ["2024-12-02", 0.0292],
+      ["2025-06-02", 0.0202],
+      ["2025-12-01", 0.0205],
+      ["2026-09-03", 0.0215],
+      ["2027-12-31", 0.0228],
+    ],
+  },
+  ESTR: {
+    from: "2026-01-02",
+    anchors: [
+      ["2026-01-02", 0.0195],
+      ["2026-09-03", 0.0203],
+      ["2027-12-31", 0.0218],
+    ],
+  },
+};
+
+/**
+ * Historical fixings of the sample market (Markt R6-6): one fixing per TARGET
+ * business day for EURIBOR-6M and EURIBOR-3M from 2024-06-03 and for €STR from
+ * 2026-01-02, up to but excluding `valuationDate` (today's fixing is carried
+ * by the curve's deposit quotes), on the indicative path `SAMPLE_FIXING_PATH`
+ * (rounded to 1/1000 of a percent). They cover the
+ * running periods of the sample book (e.g. `IRS-0001`, EURIBOR-6M from
+ * 2024-06-17) so the demo trades value without `MISSING_FIXING` warnings,
+ * and they are part of the snapshot format (`fixings`) and of the snapshot id
+ * as before – no schema change.
+ */
+export function sampleFixings(valuationDate: SerialDate = parseISO("2026-09-03")): Fixing[] {
+  const cal = getCalendar("TARGET");
+  const out: Fixing[] = [];
+  for (const [index, path] of Object.entries(SAMPLE_FIXING_PATH)) {
+    const anchors = path.anchors.map(([iso, rate]) => ({ d: parseISO(iso), rate }));
+    const rateAt = (d: SerialDate): number => {
+      if (d <= anchors[0]!.d) return anchors[0]!.rate;
+      for (let i = 1; i < anchors.length; i++) {
+        const a = anchors[i - 1]!;
+        const b = anchors[i]!;
+        if (d <= b.d) return a.rate + ((b.rate - a.rate) * (d - a.d)) / (b.d - a.d);
+      }
+      return anchors[anchors.length - 1]!.rate;
+    };
+    // Strictly before the valuation date: today's fixing is represented by the curve's deposit quotes, so
+    // spot-starting trades (fixing date = valuation date) keep projecting their first period off the curve.
+    for (let d = parseISO(path.from); d < valuationDate; d++) {
+      if (cal.isHoliday(d)) continue;
+      out.push({ index, date: d, value: Math.round(rateAt(d) * 1e5) / 1e5 });
+    }
+  }
+  return out;
+}
+
+/** `sampleFixings()` for the default sample valuation date 2026-09-03. */
+export const SAMPLE_FIXINGS: readonly Fixing[] = sampleFixings();
+
 export function buildSampleMarket(valuationDate: SerialDate = parseISO("2026-09-03"), quotes: SampleMarketQuotes = SAMPLE_QUOTES): MarketContext {
   const specs = sampleBootstrapSpecs(valuationDate, quotes);
   const built = bootstrapCurves(valuationDate, Object.values(specs));
@@ -632,7 +710,8 @@ export function buildSampleMarket(valuationDate: SerialDate = parseISO("2026-09-
     discountCurveId: { EUR: "EUR-ESTR", USD: "USD-SOFR", GBP: "GBP-SONIA", CHF: "CHF-SARON", ...(hasJpy ? { JPY: SAMPLE_CURVE_IDS.jpyTona } : {}) },
     ...(hasXccy ? { collateralDiscountCurveId: { "EUR|USD": SAMPLE_CURVE_IDS.eurUsdXccy } } : {}),
     fxSpots: { ...quotes.fxSpots },
-    fixings: [],
+    // Markt R6-6: indicative EURIBOR / €STR history so the sample book's running periods have their fixings.
+    fixings: sampleFixings(valuationDate),
     // Surfaces keyed the way the pricers look them up: swaption cubes by currency, caplet
     // surfaces by `${ccy}-${index}` (fallback `${ccy}`), FX surfaces by pair (either quotation).
     // Every currency with a discount curve has an IR vol cube and a caplet surface (Markt R4-4: CHF/JPY at Level 2).

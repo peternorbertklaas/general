@@ -393,7 +393,8 @@ describe("N16 CSV import (text/csv, one column template per type)", () => {
       const built = csvToTrades(text, type, 20699);
       expect(built.rejected, `${type}: ${JSON.stringify(built.rejected)}`).toEqual([]);
       expect(built.trades).toHaveLength(1);
-      expect(built.trades[0]!.type).toBe(type);
+      // `?type=` names the template; basis / amortising / IMM templates build `InterestRateSwap`s (R6-2).
+      expect(built.trades[0]!.type).toBe(CSV_TEMPLATES[type].tradeType);
       expect(built.rows).toEqual([1]);
     }
   });
@@ -409,6 +410,12 @@ describe("N16 CSV import (text/csv, one column template per type)", () => {
       FxOption: 'pair;optionType;notional;strike;expiryDate;id;counterparty\nEURUSD;Put;3.000.000;1,15;2027-06-15;FXO-CSV-1;"Muster; GmbH"\n',
       CrossCurrencySwap: "pair;domesticNotional;effectiveDate;tenor;fxSpot;spread;id\nEURUSD;10.000.000;2026-09-07;5Y;1,17;-20 bp;CCS-CSV-1\n",
       FRA: "currency;notional;payReceive;start;rate;id;index\nEUR;5.000.000;Pay;3x9;2,20 %;FRA-CSV-1;EURIBOR-6M\n",
+      // R6-2: the four templates added in round 6, with German header aliases where the web template uses them.
+      FxSwap: "Paar;Betrag;Nahkurs;Fernkurs;Valuta nah;Valuta fern;id\nEUR/USD;5.000.000;1,1625;1,1690;07.09.2026;08.03.2027;FXS-CSV-1\n",
+      BasisSwap: "currency,notional,receiveIndex,payIndex,spread,start,maturity,id\nEUR,10000000,EURIBOR-6M,EURIBOR-3M,12 bp,2026-09-07,5Y,BASIS-CSV-1\n",
+      AmortisingSwap:
+        "Währung;Nominal;Richtung;Festsatz;Startdatum;Laufzeit;Restnominal;id;csa\nEUR;10.000.000;Pay;3,00 %;2026-09-07;10Y;2.000.000;AMORT-CSV-1;none\n",
+      ImmSwap: "currency;notional;payReceive;fixedRate;tenor;von;id\nEUR;10.000.000;Pay;3,00 %;2Y;2026-09-03;IMM-CSV-1\n",
     };
     for (const type of CSV_TRADE_TYPES) {
       const r = await csv(`/api/trades/import?type=${type}`, cases[type], app2);
@@ -419,7 +426,7 @@ describe("N16 CSV import (text/csv, one column template per type)", () => {
       expect(r.headers["x-market-snapshot-id"]).toMatch(/^[0-9a-f]{16}$/);
     }
     const stored = (await app2.inject({ method: "GET", url: "/api/trades" })).json() as { trade: Record<string, unknown> }[];
-    expect(stored.map((s) => s.trade.type).sort()).toEqual([...CSV_TRADE_TYPES].sort());
+    expect(stored.map((s) => s.trade.type).sort()).toEqual(CSV_TRADE_TYPES.map((t) => CSV_TEMPLATES[t].tradeType).sort());
     const irs = stored.find((s) => s.trade.id === "IRS-CSV-1")!.trade as {
       book?: string;
       uti?: string;

@@ -594,7 +594,9 @@ describe("N11 – bootstrapHazardCurve / survival / CVA with a term structure", 
       VAL,
     );
     expect(curve.times).toHaveLength(4);
-    const lambda = hazardFromSpread(0.01, 0.4) * CDS_PREMIUM_ACCRUAL_PER_YEAR;
+    // N6-2: the flat shortcut carries the same 365/360 factor as the bootstrap (no explicit multiplication any more).
+    const lambda = hazardFromSpread(0.01, 0.4);
+    expect(lambda).toBeCloseTo((0.01 * CDS_PREMIUM_ACCRUAL_PER_YEAR) / 0.6, 15);
     for (const h of curve.hazards) expect(Math.abs(h / lambda - 1)).toBeLessThan(2e-3);
     expect(survivalProbability(curve, 0)).toBe(1);
     expect(survivalProbability(curve, 5)).toBeCloseTo(Math.exp(-lambda * 5), 4);

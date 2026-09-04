@@ -10,18 +10,35 @@ export function focusables(root: HTMLElement): HTMLElement[] {
 }
 
 /**
+ * Fallback focus target when the opener is gone or was never an element (a
+ * document opened by a chord from a blotter row switches to the report view,
+ * so the row is no longer in the DOM, R6-03): the first `[data-focus-fallback]`
+ * of the view (e.g. the report's document toolbar) or the main landmark
+ * (`main#main`, `tabIndex=-1`) – the next Tab then continues inside the view
+ * instead of restarting at the skip link.
+ */
+export function focusFallback(): HTMLElement | null {
+  return document.querySelector<HTMLElement>("[data-focus-fallback]") ?? document.getElementById("main");
+}
+
+/**
  * Restore focus to the element that was focused before a dialog opened. The
  * app shell is still `inert` while the dialog's cleanup runs (the attribute is
  * removed in the same commit), so focusing synchronously is a no-op in real
- * browsers (N-03). Defer to the next frame / macrotask and retry once.
+ * browsers (N-03). Defer to the next frame / macrotask and retry once. When the
+ * opener is gone (or was `body`) the focus goes to `focusFallback()` (R6-03).
  */
 export function restoreFocus(el: Element | null): void {
   const p = el as HTMLElement | null;
-  if (!p || typeof p.focus !== "function") return;
+  // The fallback is resolved now, not at attempt time: a deferred attempt must never grab the `main` of a view that
+  // was mounted after the dialog closed (tests render one App per case; a later App must not lose its focus).
+  const fallback = focusFallback();
+  const target = () => (p && typeof p.focus === "function" && p !== document.body && document.contains(p) ? p : fallback);
   const attempt = () => {
-    if (!document.contains(p)) return false;
-    p.focus();
-    return document.activeElement === p;
+    const t = target();
+    if (!t || !document.contains(t)) return false;
+    t.focus();
+    return document.activeElement === t;
   };
   const schedule = (fn: () => void) => (typeof requestAnimationFrame === "function" ? requestAnimationFrame(fn) : window.setTimeout(fn, 0));
   schedule(() => {

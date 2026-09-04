@@ -78,6 +78,9 @@ export function App() {
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
       fxFixings: st.fxFixings,
+      fxSpotOverrides: st.fxSpotOverrides,
+      fixings: st.fixings,
+      importedBase: st.importedBase,
       marketSource: st.marketSource,
       valuationDate: st.valuationDate,
       reportingCurrency: st.reportingCurrency,
@@ -121,9 +124,15 @@ export function App() {
     };
   }, []);
 
-  // "Eingabemodus" indicator (F-05): track whether a text field owns the focus.
+  // "Eingabemodus" indicator (F-05): track whether a text field owns the focus (state is only written when it changes).
   useEffect(() => {
-    const update = () => setInputMode(isTextEntry(document.activeElement));
+    let last: boolean | undefined;
+    const update = () => {
+      const next = isTextEntry(document.activeElement);
+      if (next === last) return;
+      last = next;
+      setInputMode(next);
+    };
     const onOut = () => window.setTimeout(update, 0);
     document.addEventListener("focusin", update);
     document.addEventListener("focusout", onOut);
@@ -583,7 +592,10 @@ export function App() {
             Bewertungstag {fmtDate(s.valuationDate)}
           </button>
           {modified && (
-            <span className="warn-text" title="Marktquotes, Interpolation, Turn-of-Year, Vol-Flächen oder FX-Fixings wurden geändert">
+            <span
+              className="warn-text"
+              title="Marktquotes, Spots, Interpolation, Turn-of-Year, Vol-Flächen, Fixings, FX-Fixings oder Kurven wurden geändert (Ctrl+Z macht jede Änderung rückgängig)"
+            >
               ● Markt modifiziert
             </span>
           )}

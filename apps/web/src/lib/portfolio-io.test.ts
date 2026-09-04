@@ -162,7 +162,7 @@ describe("CSV trade import with column mapping (Markt N16)", () => {
     expect(res.trades.map((t) => t.id)).toEqual(["C"]);
     expect(res.errors).toEqual([
       { row: 1, msg: "Nominal fehlt oder ≤ 0" },
-      { row: 2, msg: "Unbekannter Typ „XYZ“ (erlaubt: IRS, FXF, CAP, SWPT, FXO, CCS, FRA)" },
+      { row: 2, msg: "Unbekannter Typ „XYZ“ (erlaubt: IRS, FXF, CAP, SWPT, FXO, CCS, FRA, FXS, BASIS, AMORT, IMM)" },
     ]);
     expect(() => tradesFromCsv("id;notional\nA;1", { valuationDate: VAL })).toThrow(/Typ/);
     expect(splitCsvLine('a;"b;c";"d""e"', ";")).toEqual(["a", "b;c", 'd"e']);

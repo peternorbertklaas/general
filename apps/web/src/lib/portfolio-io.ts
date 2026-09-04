@@ -1,11 +1,16 @@
 import {
   type Trade,
   addTenor,
+  annuityAmortisationSchedule,
+  makeAmortisingSwap,
+  makeBasisSwap,
   makeCapFloor,
   makeCrossCurrencySwap,
   makeFra,
   makeFxForward,
   makeFxOption,
+  makeFxSwap,
+  makeImmSwap,
   makeSwaption,
   makeVanillaSwap,
   parseISO,
@@ -14,6 +19,7 @@ import {
 import { parseDateInput } from "./date-parse.js";
 import { parseNumberInput } from "./num-parse.js";
 import { ccsCollateralCurrency } from "./templates.js";
+import { hasErrors, validateTrade } from "./validate-trade.js";
 
 /**
  * Portfolio export/import helpers. Trades carry serial dates internally; the
@@ -148,10 +154,27 @@ export type CsvColumn =
   | "fxSpot"
   | "period"
   | "collateral"
-  | "status";
+  | "status"
+  // Markt R6-2: FX swap, tenor-basis swap, amortising swap, IMM swap, step-up coupons
+  | "baseAmount"
+  | "nearRate"
+  | "farRate"
+  | "nearDate"
+  | "farDate"
+  | "receiveIndex"
+  | "payIndex"
+  | "finalNotional"
+  | "amortisation"
+  | "stepUp"
+  | "from"
+  // FX option barrier (API column names): type, level, rebate, knock state
+  | "barrierType"
+  | "barrierLevel"
+  | "barrierRebate"
+  | "barrierHit";
 
-export type CsvTradeType = "IRS" | "FXF" | "CAP" | "SWPT" | "FXO" | "CCS" | "FRA";
-export const CSV_TRADE_TYPES: CsvTradeType[] = ["IRS", "FXF", "CAP", "SWPT", "FXO", "CCS", "FRA"];
+export type CsvTradeType = "IRS" | "FXF" | "CAP" | "SWPT" | "FXO" | "CCS" | "FRA" | "FXS" | "BASIS" | "AMORT" | "IMM";
+export const CSV_TRADE_TYPES: CsvTradeType[] = ["IRS", "FXF", "CAP", "SWPT", "FXO", "CCS", "FRA", "FXS", "BASIS", "AMORT", "IMM"];
 
 export interface CsvTemplate {
   type: CsvTradeType;
@@ -166,7 +189,24 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
   IRS: {
     type: "IRS",
     label: "Zinsswap",
-    columns: ["type", "id", "name", "counterparty", "book", "currency", "notional", "direction", "rate", "start", "maturity", "index", "frequency", "status"],
+    // `stepUp` (Markt R6-2): coupon steps "Datum:Satz|Datum:Satz" – the fixed leg pays `rate` until the first step date.
+    columns: [
+      "type",
+      "id",
+      "name",
+      "counterparty",
+      "book",
+      "currency",
+      "notional",
+      "direction",
+      "rate",
+      "start",
+      "maturity",
+      "index",
+      "frequency",
+      "stepUp",
+      "status",
+    ],
     example: [
       "IRS",
       "IRS-1001",
@@ -181,6 +221,7 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
       "10Y",
       "EURIBOR-6M",
       "1Y",
+      "2027-09-07:3,30 %|2028-09-07:3,50 %",
       "Live",
     ],
   },
@@ -235,8 +276,41 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
   FXO: {
     type: "FXO",
     label: "FX-Option",
-    columns: ["type", "id", "name", "counterparty", "book", "pair", "optionType", "notional", "strike", "expiry", "status"],
-    example: ["FXO", "FXO-1001", "EUR-Put/USD-Call Wareneinkauf", "Commerzbank", "Einkauf", "EURUSD", "Put", "3000000", "1,1500", "2027-06-15", "Live"],
+    // Barrier columns (API names, core R6): `barrierType` UpOut/UpIn/DownOut/DownIn, `barrierLevel`, optional `barrierRebate`, `barrierHit` ja/nein (empty = unknown).
+    columns: [
+      "type",
+      "id",
+      "name",
+      "counterparty",
+      "book",
+      "pair",
+      "optionType",
+      "notional",
+      "strike",
+      "expiry",
+      "barrierType",
+      "barrierLevel",
+      "barrierRebate",
+      "barrierHit",
+      "status",
+    ],
+    example: [
+      "FXO",
+      "FXO-1001",
+      "EUR-Put/USD-Call Wareneinkauf",
+      "Commerzbank",
+      "Einkauf",
+      "EURUSD",
+      "Put",
+      "3000000",
+      "1,1500",
+      "2027-06-15",
+      "",
+      "",
+      "",
+      "",
+      "Live",
+    ],
   },
   CCS: {
     type: "CCS",
@@ -282,6 +356,96 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     label: "FRA",
     columns: ["type", "id", "name", "counterparty", "book", "currency", "notional", "direction", "rate", "period", "start", "maturity", "index", "status"],
     example: ["FRA", "FRA-1001", "FRA EUR 3x6", "DZ BANK", "Liquidität", "EUR", "10000000", "Pay", "2,20 %", "3x6", "", "", "EURIBOR-3M", "Live"],
+  },
+  // Markt R6-2: the four product types that had no template
+  FXS: {
+    type: "FXS",
+    label: "FX-Swap",
+    // `baseAmount` positive = buy the base currency near / sell it far; `nearDate` empty = spot.
+    columns: ["type", "id", "name", "counterparty", "book", "pair", "baseAmount", "nearRate", "farRate", "nearDate", "farDate", "status"],
+    example: [
+      "FXS",
+      "FXS-1001",
+      "FX-Swap EUR/USD Prolongation",
+      "Commerzbank",
+      "Liquidität",
+      "EURUSD",
+      "1000000",
+      "1,1625",
+      "1,1800",
+      "2026-09-07",
+      "2027-09-07",
+      "Live",
+    ],
+  },
+  BASIS: {
+    type: "BASIS",
+    label: "Tenor-Basis-Swap",
+    // `spread` in bp on the receive leg (values ≥ 1 are bp, smaller ones decimals).
+    columns: ["type", "id", "name", "counterparty", "book", "currency", "notional", "receiveIndex", "payIndex", "spread", "start", "maturity", "status"],
+    example: [
+      "BASIS",
+      "BASIS-1001",
+      "Basis-Swap 3M/6M",
+      "Landesbank A",
+      "Treasury",
+      "EUR",
+      "10000000",
+      "EURIBOR-3M",
+      "EURIBOR-6M",
+      "5",
+      "2026-09-07",
+      "5Y",
+      "Live",
+    ],
+  },
+  AMORT: {
+    type: "AMORT",
+    label: "Amortisierender Swap",
+    // `amortisation`: Linear (default) or Annuität (instalment from `rate`); `finalNotional` = residual at maturity.
+    columns: [
+      "type",
+      "id",
+      "name",
+      "counterparty",
+      "book",
+      "currency",
+      "notional",
+      "finalNotional",
+      "amortisation",
+      "direction",
+      "rate",
+      "start",
+      "maturity",
+      "index",
+      "frequency",
+      "status",
+    ],
+    example: [
+      "AMORT",
+      "AMORT-1001",
+      "Tilgungsswap Kredit B",
+      "Landesbank A",
+      "Treasury",
+      "EUR",
+      "10000000",
+      "0",
+      "Linear",
+      "Pay",
+      "3,10 %",
+      "2026-09-07",
+      "10Y",
+      "EURIBOR-6M",
+      "1Y",
+      "Live",
+    ],
+  },
+  IMM: {
+    type: "IMM",
+    label: "IMM-Swap",
+    // `from`: the swap starts on the next IMM date after this date (empty = valuation date); `tenor` in whole months/years.
+    columns: ["type", "id", "name", "counterparty", "book", "currency", "notional", "direction", "rate", "from", "tenor", "index", "status"],
+    example: ["IMM", "IMM-1001", "IMM-Swap EUR 2Y", "DZ BANK", "Treasury", "EUR", "10000000", "Pay", "3,00 %", "2026-09-07", "2Y", "EURIBOR-6M", "Live"],
   },
 };
 
@@ -375,6 +539,56 @@ const HEADER_ALIASES: Record<string, CsvColumn> = {
   "collateral-währung": "collateral",
   besicherung: "collateral",
   status: "status",
+  // Markt R6-2
+  baseamount: "baseAmount",
+  basisbetrag: "baseAmount",
+  "betrag basis": "baseAmount",
+  nearrate: "nearRate",
+  nearkurs: "nearRate",
+  "kurs near": "nearRate",
+  kassakurs_near: "nearRate",
+  farrate: "farRate",
+  farkurs: "farRate",
+  "kurs far": "farRate",
+  neardate: "nearDate",
+  "valuta near": "nearDate",
+  startvaluta: "nearDate",
+  fardate: "farDate",
+  "valuta far": "farDate",
+  endvaluta: "farDate",
+  receiveindex: "receiveIndex",
+  "index erhalten": "receiveIndex",
+  empfangsindex: "receiveIndex",
+  payindex: "payIndex",
+  "index zahlen": "payIndex",
+  zahlindex: "payIndex",
+  finalnotional: "finalNotional",
+  restschuld: "finalNotional",
+  endnominal: "finalNotional",
+  amortisation: "amortisation",
+  tilgung: "amortisation",
+  tilgungsprofil: "amortisation",
+  stepup: "stepUp",
+  staffel: "stepUp",
+  zinsstaffel: "stepUp",
+  kuponstaffel: "stepUp",
+  from: "from",
+  ab: "from",
+  "imm-start": "from",
+  immstart: "from",
+  // API column names of the swap templates
+  payreceive: "direction",
+  "pay/receive": "direction",
+  fixedrate: "rate",
+  barriertype: "barrierType",
+  barriere: "barrierType",
+  barrierlevel: "barrierLevel",
+  "barriere-level": "barrierLevel",
+  barrierrebate: "barrierRebate",
+  rebate: "barrierRebate",
+  barrierhit: "barrierHit",
+  "barriere berührt": "barrierHit",
+  barrierestatus: "barrierHit",
 };
 
 export interface CsvImportResult {
@@ -419,7 +633,8 @@ function num(s: string | undefined, scale = 1): number | undefined {
   return p ? p.value : undefined;
 }
 
-function rateOf(s: string | undefined): number | undefined {
+/** Rate cell → decimal: "3,10 %" / "310bp" via suffix; plain numbers ≥ 0.5 are percent, smaller ones decimals. */
+export function rateOf(s: string | undefined): number | undefined {
   if (s === undefined || s.trim() === "") return undefined;
   // "3,10 %" / "310bp" → decimal via suffix; plain numbers: ≥ 0.5 → percent, else decimal
   const p = parseNumberInput(s, 1);
@@ -434,6 +649,10 @@ const COLUMN_DE: Partial<Record<CsvColumn, string>> = {
   maturity: "Laufzeit/Enddatum",
   deliveryDate: "Lieferdatum",
   expiry: "Verfall",
+  nearDate: "Valuta Near",
+  farDate: "Valuta Far",
+  from: "IMM-Start",
+  stepUp: "Zinsstaffel",
 };
 
 /**
@@ -514,12 +733,43 @@ export function tradesFromCsv(
     });
     try {
       const t = tradeFromRecord(rec, opts.valuationDate, r, { fxSpots: opts.fxSpots });
+      // A built row that fails trade validation (end before start, notional ≤ 0 …) is a row error like any other –
+      // the dialog and the "n gültige Zeilen importieren" count agree with what the import will accept (R6-06).
+      const issues = validateTrade(t);
+      if (hasErrors(issues)) {
+        errors.push({ row: r, msg: [...new Set(issues.filter((i) => i.level === "error").map((i) => i.msg))].join("; ") });
+        continue;
+      }
       trades.push(t);
     } catch (e) {
       errors.push({ row: r, msg: (e as Error).message });
     }
   }
   return { trades, errors, columns: columns.filter((c): c is CsvColumn => c !== undefined) };
+}
+
+/**
+ * Coupon steps of a swap CSV row (Markt R6-2): "2027-09-07:3,30 %|2028-09-07:3,50 %" (also ";" between steps when the
+ * file separator is ",", "=" instead of ":"). Dates ISO / German / tenor from `start`.
+ */
+export function stepUpOf(raw: string | undefined, start: number): { date: number; rate: number }[] | undefined {
+  const s = (raw ?? "").trim();
+  if (!s) return undefined;
+  const steps = s
+    .split(/[|;]/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const m = /^(.+?)\s*[:=]\s*(.+)$/.exec(part);
+      if (!m) throw new Error(`Zinsstaffel „${part}“ nicht lesbar – erwartet Datum:Satz, z. B. 2027-09-07:3,30 %|2028-09-07:3,50 %`);
+      const date = parseDateInput(m[1]!, { base: start });
+      const rate = rateOf(m[2]);
+      if (date === undefined) throw new Error(invalidDateMessage(m[1]!, "stepUp"));
+      if (rate === undefined) throw new Error(`Zinsstaffel: Satz „${m[2]}“ nicht lesbar (z. B. 3,30 %)`);
+      return { date, rate };
+    })
+    .sort((a, b) => a.date - b.date);
+  return steps.length ? steps : undefined;
 }
 
 /** Error list of an import as CSV (Zeile;Meldung) – downloadable from the error dialog (R3-F7). */
@@ -561,7 +811,109 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
       maturity,
       index: rec.index?.toUpperCase(),
       ...(rec.frequency ? { fixedFrequency: rec.frequency.toUpperCase() } : {}),
+      stepUp: stepUpOf(rec.stepUp, start),
     });
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  if (type === "AMORT" || type === "AMORTISING" || type === "TILGUNGSSWAP") {
+    // Markt R6-2: linear (default) or annuity amortisation to `finalNotional`.
+    const notional = num(rec.notional);
+    const rate = rateOf(rec.rate);
+    if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
+    if (rate === undefined) throw new Error("Festsatz fehlt");
+    if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
+    const maturity = maturityOf(rec.maturity);
+    const finalNotional = num(rec.finalNotional) ?? 0;
+    if (finalNotional < 0 || finalNotional >= notional) throw new Error(`Restschuld „${rec.finalNotional ?? ""}“ muss zwischen 0 und dem Nominal liegen`);
+    const profile = (rec.amortisation ?? "linear").trim().toLowerCase();
+    if (!/^(linear|annuit(ä|ae|a)t|annuity)$/.test(profile)) throw new Error(`Tilgungsprofil „${rec.amortisation ?? ""}“ unbekannt (Linear oder Annuität)`);
+    const dir = (rec.direction ?? "Pay").toLowerCase();
+    const params = {
+      id,
+      counterparty: common.counterparty,
+      name: common.name,
+      currency: (rec.currency ?? "EUR").toUpperCase(),
+      notional,
+      payReceiveFixed: /^(rec|receive|receiver|r|erhalten|empf)/.test(dir) ? ("Receive" as const) : ("Pay" as const),
+      fixedRate: rate,
+      effectiveDate: start,
+      maturity,
+      index: rec.index?.toUpperCase(),
+      ...(rec.frequency ? { fixedFrequency: rec.frequency.toUpperCase() } : {}),
+      finalNotional,
+    };
+    let t = makeAmortisingSwap(params);
+    if (profile !== "linear") {
+      const schedule = annuityAmortisationSchedule(t.legs[0]!, notional, rate, finalNotional);
+      t = { ...t, legs: t.legs.map((l) => ({ ...l, notionalSchedule: schedule })) };
+    }
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  if (type === "IMM" || type === "IMMSWAP") {
+    // Markt R6-2: effective on the next IMM date after `from` (default: valuation date), IMM rolls.
+    const notional = num(rec.notional);
+    const rate = rateOf(rec.rate);
+    if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
+    if (rate === undefined) throw new Error("Festsatz fehlt");
+    const tenor = (rec.tenor ?? rec.maturity ?? "").trim().toUpperCase();
+    if (!/^\d+[MY]$/.test(tenor)) throw new Error("Laufzeit fehlt (Tenor in Monaten oder Jahren, z. B. 2Y)");
+    const from = dateOf(rec.from ?? rec.start, valuationDate, "from") ?? valuationDate;
+    const dir = (rec.direction ?? "Pay").toLowerCase();
+    const t = makeImmSwap({
+      id,
+      counterparty: common.counterparty,
+      name: common.name,
+      currency: (rec.currency ?? "EUR").toUpperCase(),
+      notional,
+      payReceiveFixed: /^(rec|receive|receiver|r|erhalten|empf)/.test(dir) ? "Receive" : "Pay",
+      fixedRate: rate,
+      from,
+      tenor,
+      index: rec.index?.toUpperCase(),
+    });
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  if (type === "BASIS" || type === "TENORBASIS" || type === "BASISSWAP") {
+    // Markt R6-2: tenor-basis swap, spread on the receive leg.
+    const notional = num(rec.notional);
+    if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
+    const receiveIndex = (rec.receiveIndex ?? "").trim().toUpperCase();
+    const payIndex = (rec.payIndex ?? "").trim().toUpperCase();
+    if (!receiveIndex || !payIndex) throw new Error("Indizes fehlen (Spalten „receiveIndex“ und „payIndex“, z. B. EURIBOR-3M / EURIBOR-6M)");
+    if (receiveIndex === payIndex) throw new Error("Empfangs- und Zahlindex müssen sich unterscheiden");
+    if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
+    const maturity = maturityOf(rec.maturity);
+    const spreadRaw = num(rec.spread);
+    const spread = spreadRaw === undefined ? 0 : Math.abs(spreadRaw) >= 1 ? spreadRaw / 1e4 : spreadRaw;
+    const t = makeBasisSwap({
+      id,
+      counterparty: common.counterparty,
+      name: common.name,
+      currency: (rec.currency ?? "EUR").toUpperCase(),
+      notional,
+      effectiveDate: start,
+      maturity,
+      receiveIndex,
+      payIndex,
+      spread,
+    });
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  if (type === "FXS" || type === "FXSWAP") {
+    // Markt R6-2: FX swap – near leg at `nearDate` (default spot), far leg at `farDate`.
+    const pair = (rec.pair ?? `${rec.buyCurrency ?? ""}${rec.sellCurrency ?? ""}`).toUpperCase().replace(/[^A-Z]/g, "");
+    if (!/^[A-Z]{6}$/.test(pair)) throw new Error("Währungspaar fehlt (z. B. EURUSD)");
+    const baseAmount = num(rec.baseAmount ?? rec.notional);
+    if (baseAmount === undefined || baseAmount === 0) throw new Error("Basisbetrag fehlt (Spalte „baseAmount“, positiv = Basiswährung near kaufen)");
+    const nearRate = num(rec.nearRate);
+    const farRate = num(rec.farRate);
+    if (nearRate === undefined || nearRate <= 0) throw new Error("Near-Kurs fehlt (Spalte „nearRate“)");
+    if (farRate === undefined || farRate <= 0) throw new Error("Far-Kurs fehlt (Spalte „farRate“)");
+    const nearDate = dateOf(rec.nearDate ?? rec.start, valuationDate, "nearDate") ?? addTenor(valuationDate, "2D");
+    const farDate = dateOf(rec.farDate ?? rec.maturity, nearDate, "farDate");
+    if (farDate === undefined) throw new Error("Far-Valuta fehlt (Spalte „farDate“, Datum oder Tenor ab Near)");
+    if (farDate <= nearDate) throw new Error("Far-Valuta muss nach der Near-Valuta liegen");
+    const t = makeFxSwap({ id, counterparty: common.counterparty, pair, baseAmount, nearRate, farRate, nearDate, farDate });
     return { ...t, ...common, name: common.name ?? t.name } as Trade;
   }
   if (type === "FXF" || type === "FXFORWARD" || type === "FORWARD") {
@@ -637,7 +989,8 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     if (expiry === undefined) throw new Error("Verfall fehlt");
     const optionType = /^(put|p|verkauf)/i.test((rec.optionType ?? rec.direction ?? "Call").trim()) ? "Put" : "Call";
     const t = makeFxOption({ id, counterparty: common.counterparty, pair, optionType, notional, strike, expiryDate: expiry });
-    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+    const barrier = barrierOf(rec);
+    return { ...t, ...common, ...(barrier ? { barrier } : {}), name: common.name ?? t.name } as Trade;
   }
   if (type === "CCS" || type === "XCCY" || type === "CROSSCURRENCYSWAP") {
     const pair = (rec.pair ?? "").toUpperCase().replace(/[^A-Z]/g, "");
@@ -697,6 +1050,48 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     return { ...t, ...common, name: common.name ?? t.name } as Trade;
   }
   throw new Error(`Unbekannter Typ „${rec.type ?? ""}“ (erlaubt: ${CSV_TRADE_TYPES.join(", ")})`);
+}
+
+const BARRIER_TYPES: Record<string, "UpOut" | "UpIn" | "DownOut" | "DownIn"> = {
+  upout: "UpOut",
+  "up-out": "UpOut",
+  "up-and-out": "UpOut",
+  uo: "UpOut",
+  upin: "UpIn",
+  "up-in": "UpIn",
+  "up-and-in": "UpIn",
+  ui: "UpIn",
+  downout: "DownOut",
+  "down-out": "DownOut",
+  "down-and-out": "DownOut",
+  do: "DownOut",
+  downin: "DownIn",
+  "down-in": "DownIn",
+  "down-and-in": "DownIn",
+  di: "DownIn",
+};
+
+/**
+ * Barrier of an FX-option row (API column names `barrierType`, `barrierLevel`, `barrierRebate`, `barrierHit`): empty type
+ * or "none" = vanilla; `barrierHit` ja/nein/true/false records the knock state (core R6 `barrier.hit`), empty = unknown.
+ */
+export function barrierOf(
+  rec: Partial<Record<CsvColumn, string>>,
+): { type: "UpOut" | "UpIn" | "DownOut" | "DownIn"; level: number; rebate?: number; hit?: boolean } | undefined {
+  const raw = (rec.barrierType ?? "").trim().toLowerCase();
+  if (!raw || /^(none|keine|-|–|vanilla)$/.test(raw)) {
+    if (rec.barrierLevel?.trim()) throw new Error("Barriere-Level ohne Barriere-Typ (Spalte „barrierType“: UpOut, UpIn, DownOut, DownIn)");
+    return undefined;
+  }
+  const type = BARRIER_TYPES[raw.replace(/\s+/g, "")] ?? BARRIER_TYPES[raw];
+  if (!type) throw new Error(`Barriere-Typ „${rec.barrierType}“ unbekannt (UpOut, UpIn, DownOut, DownIn)`);
+  const level = num(rec.barrierLevel);
+  if (level === undefined || level <= 0) throw new Error("Barriere-Level fehlt (Spalte „barrierLevel“, z. B. 1,05)");
+  const rebate = num(rec.barrierRebate);
+  const hitRaw = (rec.barrierHit ?? "").trim().toLowerCase();
+  const hit = hitRaw === "" ? undefined : /^(ja|j|yes|y|true|1|berührt|hit)$/.test(hitRaw) ? true : /^(nein|n|no|false|0)$/.test(hitRaw) ? false : null;
+  if (hit === null) throw new Error(`Barriere-Status „${rec.barrierHit}“ nicht lesbar (Spalte „barrierHit“: ja / nein, leer = unbekannt)`);
+  return { type, level, ...(rebate !== undefined ? { rebate } : {}), ...(hit !== undefined ? { hit } : {}) };
 }
 
 /** CSV template text (header + example row) for one trade type. */

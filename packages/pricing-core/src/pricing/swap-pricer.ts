@@ -1,7 +1,7 @@
 import { type SerialDate, toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
 import { PricingError } from "../errors.js";
-import { type MarketContext, getDiscountCurve, getFxFixing } from "../market/market-context.js";
+import { type MarketContext, getFxFixing } from "../market/market-context.js";
 import {
   type CrossCurrencySwap,
   type FixedLeg,
@@ -13,6 +13,7 @@ import {
 } from "../instruments/types.js";
 import { fxForwardRate } from "./fx-pricer.js";
 import { fixedRateAt, floatSpreadAt, fxToReporting, legAccrued, legPeriods, priceLeg } from "./leg-pricer.js";
+import { upfrontPremiumLeg } from "./upfront.js";
 
 /**
  * Swap analytics. Par solver with coupon schedules (step-up swaps):
@@ -71,13 +72,10 @@ export function priceInterestRateSwap(ctx: MarketContext, trade: InterestRateSwa
     warnings.push(...r.warnings);
     return r.result;
   });
-  let pv = legResults.reduce((s, l) => s + l.pvReporting, 0);
   const fxOf = (ccy: string) => fxToReporting(ctx, ccy, reporting, trade.collateralCurrency);
-  // Upfront payment
-  if (trade.upfront && trade.upfront.date > ctx.valuationDate) {
-    const disc = getDiscountCurve(ctx, trade.upfront.currency, trade.collateralCurrency);
-    pv -= trade.upfront.amount * disc.df(trade.upfront.date) * fxOf(trade.upfront.currency);
-  }
+  // Upfront fee (N6-1): a `Premium` cashflow in its own (last) leg, not a silent PV deduction.
+  const upfront = upfrontPremiumLeg(ctx, trade, reporting, trade.legs.length);
+  const pv = legResults.reduce((s, l) => s + l.pvReporting, 0) + (upfront?.pvReporting ?? 0);
   const analytics: Record<string, number | string | undefined> = {};
   const fixed = fixedLegs(trade.legs);
   const floats = floatLegs(trade.legs);
@@ -138,7 +136,7 @@ export function priceInterestRateSwap(ctx: MarketContext, trade: InterestRateSwa
     valuationDate: ctx.valuationDate,
     currency: reporting,
     pv,
-    legs: legResults,
+    legs: upfront ? [...legResults, upfront.leg] : legResults,
     analytics,
     details: { maturity: toISO(maturity) },
     accrued,

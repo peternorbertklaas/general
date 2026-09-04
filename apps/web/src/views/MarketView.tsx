@@ -10,10 +10,11 @@ import {
   serializeMarket,
   survivalProbability,
   toISO,
+  validateVolSurfaces,
+  volSurfaceWarnings,
 } from "@deriva/pricing-core";
 import { DateInput } from "../components/DateInput.js";
 import { NumInput } from "../components/NumInput.js";
-import { validateVolSurfaces } from "../lib/core-compat.js";
 import { CDS_TENORS, hazardCurveResult, normaliseCdsQuotes, tenorYears } from "../lib/credit.js";
 import { fmtBp, fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { translateCoreMessage } from "../lib/i18n.js";
@@ -28,12 +29,18 @@ import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sam
  */
 function applyVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface, label: string): void {
   const act = useStore.getState;
-  const problems = validateVolSurfaces({ [kind]: { [id]: surface } } as Parameters<typeof validateVolSurfaces>[0]);
+  const problems = validateVolSurfaces({ [kind]: { [id]: surface } });
   if (problems.length) {
     act().showToast(`Vol nicht übernommen – ${translateCoreMessage(problems[0])}`);
     return;
   }
-  if (!act().setVolSurface(kind, id, surface, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+  if (!act().setVolSurface(kind, id, surface, label)) {
+    act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+    return;
+  }
+  // Plausibility (Markt R6-4): the edit is applied, but a surface that no longer fits its quotation type is flagged.
+  const hints = volSurfaceWarnings({ [kind]: { [id]: surface } });
+  if (hints.length) act().showToast(`Hinweis: ${translateCoreMessage(hints[0])}`, { ms: 8000 });
 }
 
 /** Expiry in years → "1M" / "3M" / "2Y" (also weeks for FX). */
@@ -665,15 +672,46 @@ function CreditCard() {
   );
 }
 
-/** Editable table of historical fixings (index, date, value in %). */
+/**
+ * Editable table of historical fixings (index, date, value in %). Edits go
+ * through `setFixings` – an undoable, persisted override that flags the market
+ * as "modifiziert" in sample and import mode alike (R6-F1); "Zurücksetzen"
+ * returns to the base market's own fixings.
+ */
+const FIXINGS_PAGE = 60;
+
 function FixingsEditor() {
   const m = useStore((s) => s.baseMarket);
+  const override = useStore((s) => s.fixings);
   const act = useStore.getState;
-  const fixings = m.fixings ?? [];
-  const apply = (next: Fixing[]) => act().setMarket({ ...m, fixings: next });
-  const setRow = (i: number, patch: Partial<Fixing>) => apply(fixings.map((f, j) => (j === i ? { ...f, ...patch } : f)));
-  const remove = (i: number) => apply(fixings.filter((_, j) => j !== i));
-  const add = (f: Fixing) => apply([...fixings, f]);
+  const fixings = useMemo(() => m.fixings ?? [], [m.fixings]);
+  // The sample market carries ≈1 300 historical fixings (core R6-6): filter by index / year and page the table, newest first.
+  const indices = useMemo(() => [...new Set(fixings.map((f) => f.index))].sort(), [fixings]);
+  const years = useMemo(() => [...new Set(fixings.map((f) => toISO(f.date).slice(0, 4)))].sort().reverse(), [fixings]);
+  const [filterIndex, setFilterIndex] = useState("");
+  const [filterYear, setFilterYear] = useState("");
+  const [limit, setLimit] = useState(FIXINGS_PAGE);
+  const visible = useMemo(() => {
+    const rows = fixings
+      .map((f, i) => ({ f, i }))
+      .filter(({ f }) => (!filterIndex || f.index === filterIndex) && (!filterYear || toISO(f.date).startsWith(filterYear)));
+    rows.sort((a, b) => b.f.date - a.f.date || a.f.index.localeCompare(b.f.index));
+    return rows;
+  }, [fixings, filterIndex, filterYear]);
+  const apply = (next: Fixing[], label: string) => {
+    if (!act().setFixings(next, label)) act().showToast("Fixing nicht übernommen (Bewertung fehlgeschlagen)");
+  };
+  const setRow = (i: number, patch: Partial<Fixing>) =>
+    apply(
+      fixings.map((f, j) => (j === i ? { ...f, ...patch } : f)),
+      `Fixing ${fixings[i]?.index ?? ""} ${fmtDate(patch.date ?? fixings[i]?.date ?? m.valuationDate)} geändert`,
+    );
+  const remove = (i: number) =>
+    apply(
+      fixings.filter((_, j) => j !== i),
+      `Fixing ${fixings[i]?.index ?? ""} ${fixings[i] ? fmtDate(fixings[i]!.date) : ""} entfernt`,
+    );
+  const add = (f: Fixing) => apply([...fixings, f], `Fixing ${f.index} ${fmtDate(f.date)} hinzugefügt`);
   /** Today's EURIBOR-6M from the projection curve (fallback 2 %). */
   const addEuribor6mToday = () => {
     const curve = m.curves["EUR-EURIBOR-6M"];
@@ -690,7 +728,17 @@ function FixingsEditor() {
     <div className="card" data-testid="fixings-editor">
       <h3>
         Fixings (editierbar)
+        {override && (
+          <span className="badge warn" style={{ marginLeft: 6 }} title="Fixings weichen vom Basismarkt ab (Undo mit Ctrl+Z)" data-testid="fixings-modified">
+            geändert
+          </span>
+        )}
         <span className="right row">
+          {override && (
+            <button className="btn ghost xs" onClick={() => act().setFixings(null, "Fixings zurückgesetzt")} title="Zurück zu den Fixings des Basismarkts">
+              Zurücksetzen
+            </button>
+          )}
           <button className="btn ghost" onClick={addEuribor6mToday} title="EURIBOR-6M mit dem Kurven-Forward am Bewertungstag anlegen">
             + EURIBOR-6M heute
           </button>
@@ -704,55 +752,83 @@ function FixingsEditor() {
           Keine historischen Fixings hinterlegt – laufende Perioden werden mit dem Kurven-Forward projiziert (Hinweis im Pricing).
         </div>
       ) : (
-        <div className="table-scroll" style={{ maxHeight: 260 }}>
-          <table className="grid-table">
-            <thead>
-              <tr>
-                <th>Index</th>
-                <th>Datum</th>
-                <th className="num">Fixing</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {fixings.map((f, i) => (
-                <tr key={i} style={{ cursor: "default" }}>
-                  <td>
-                    <select className="inline" value={f.index} aria-label={`Index Fixing ${i + 1}`} onChange={(e) => setRow(i, { index: e.target.value })}>
-                      {[...new Set([...FIXING_INDICES, f.index])].map((ix) => (
-                        <option key={ix} value={ix}>
-                          {ix}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td>
-                    <DateInput inline value={f.date} ariaLabel={`Datum Fixing ${i + 1}`} onChange={(v) => setRow(i, { date: v })} />
-                  </td>
-                  <td className="num">
-                    <span style={{ display: "inline-block", width: 130 }}>
-                      <NumInput
-                        inline
-                        value={f.value}
-                        scale={100}
-                        step={0.001}
-                        digits={4}
-                        unit="%"
-                        ariaLabel={`Wert Fixing ${i + 1}`}
-                        onChange={(v) => setRow(i, { value: v })}
-                      />
-                    </span>
-                  </td>
-                  <td className="num">
-                    <button className="btn ghost danger" title="Fixing entfernen" aria-label={`Fixing ${i + 1} entfernen`} onClick={() => remove(i)}>
-                      ✕
-                    </button>
-                  </td>
-                </tr>
+        <>
+          <div className="row wrap" style={{ gap: 8, marginBottom: 6 }} data-testid="fixings-filter">
+            <select className="inline" value={filterIndex} aria-label="Fixings nach Index filtern" onChange={(e) => setFilterIndex(e.target.value)}>
+              <option value="">alle Indizes ({indices.length})</option>
+              {indices.map((ix) => (
+                <option key={ix} value={ix}>
+                  {ix}
+                </option>
               ))}
-            </tbody>
-          </table>
-        </div>
+            </select>
+            <select className="inline" value={filterYear} aria-label="Fixings nach Jahr filtern" onChange={(e) => setFilterYear(e.target.value)}>
+              <option value="">alle Jahre</option>
+              {years.map((y) => (
+                <option key={y} value={y}>
+                  {y}
+                </option>
+              ))}
+            </select>
+            <span className="muted xs" data-testid="fixings-count">
+              {visible.length === fixings.length ? `${fixings.length} Fixings` : `${visible.length} von ${fixings.length} Fixings`} · neueste zuerst
+            </span>
+          </div>
+          <div className="table-scroll" style={{ maxHeight: 260 }}>
+            <table className="grid-table" data-testid="fixings-table">
+              <thead>
+                <tr>
+                  <th>Index</th>
+                  <th>Datum</th>
+                  <th className="num">Fixing</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {visible.slice(0, limit).map(({ f, i }) => (
+                  <tr key={`${f.index}-${f.date}-${i}`} style={{ cursor: "default" }}>
+                    <td>
+                      <select className="inline" value={f.index} aria-label={`Index Fixing ${i + 1}`} onChange={(e) => setRow(i, { index: e.target.value })}>
+                        {[...new Set([...FIXING_INDICES, f.index])].map((ix) => (
+                          <option key={ix} value={ix}>
+                            {ix}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td>
+                      <DateInput inline value={f.date} ariaLabel={`Datum Fixing ${i + 1}`} onChange={(v) => setRow(i, { date: v })} />
+                    </td>
+                    <td className="num">
+                      <span style={{ display: "inline-block", width: 130 }}>
+                        <NumInput
+                          inline
+                          value={f.value}
+                          scale={100}
+                          step={0.001}
+                          digits={4}
+                          unit="%"
+                          ariaLabel={`Wert Fixing ${i + 1}`}
+                          onChange={(v) => setRow(i, { value: v })}
+                        />
+                      </span>
+                    </td>
+                    <td className="num">
+                      <button className="btn ghost danger" title="Fixing entfernen" aria-label={`Fixing ${i + 1} entfernen`} onClick={() => remove(i)}>
+                        ✕
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {visible.length > limit && (
+            <button className="btn ghost xs" style={{ marginTop: 6 }} onClick={() => setLimit((n) => n + FIXINGS_PAGE)} data-testid="fixings-more">
+              weitere {Math.min(FIXINGS_PAGE, visible.length - limit)} anzeigen ({visible.length - limit} ausgeblendet)
+            </button>
+          )}
+        </>
       )}
     </div>
   );
@@ -831,6 +907,9 @@ export function MarketView() {
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
       fxFixings: st.fxFixings,
+      fxSpotOverrides: st.fxSpotOverrides,
+      fixings: st.fixings,
+      importedBase: st.importedBase,
       marketSource: st.marketSource,
     })),
   );
@@ -855,10 +934,10 @@ export function MarketView() {
 
   const setSpot = (pair: string, v: number) => {
     if (!Number.isFinite(v) || v <= 0) return;
-    // Spots live in the quote set so they survive valuation-date changes and are flagged as "modifiziert";
-    // with an imported snapshot the spot is edited on the imported market directly (no quotes there).
-    if (!act().setQuotes({ ...s.quotes, fxSpots: { ...s.quotes.fxSpots, [pair]: v } }, `Spot ${pair} ${fmtNum(v, 4)}`))
-      act().setMarket({ ...m, fxSpots: { ...m.fxSpots, [pair]: v } });
+    // Sample market: the spot is a quote (survives date changes, "modifiziert", Ctrl+Z). Imported snapshot: an undoable,
+    // persisted override on top of the file – the chip shows "modifiziert", "Markt zurücksetzen" returns to the snapshot (R6-F1).
+    if (!act().setFxSpot(pair, v, `Spot ${pair.slice(0, 3)}/${pair.slice(3)} ${fmtNum(v, 4)}`))
+      act().showToast("Spot nicht übernommen (Bewertung fehlgeschlagen)");
   };
   return (
     <div className="stack">
@@ -933,9 +1012,16 @@ export function MarketView() {
                       return;
                     }
                     act().showToast(
-                      `Snapshot „${r.label}“ importiert · ID ${r.id}${r.dateChanged ? ` · Bewertungstag auf ${fmtDate(r.valuationDate)} gesetzt` : ""}`,
-                      { ms: 6000 },
+                      `Snapshot „${r.label}“ importiert · ID ${r.id}${r.dateChanged ? ` · Bewertungstag auf ${fmtDate(r.valuationDate)} gesetzt` : ""}${
+                        r.discardedEdits ? " · vorherige Marktänderungen verworfen (Rückgängig stellt sie wieder her)" : ""
+                      }`,
+                      { ms: 8000, action: { label: "Rückgängig", run: () => useStore.getState().undo() } },
                     );
+                    // Plausibility hints of the imported surfaces (Markt R6-4): the import stands, the user sees why values may look off.
+                    if (r.warnings.length)
+                      act().showToast(`Snapshot importiert – Hinweis: ${r.warnings[0]}${r.warnings.length > 1 ? ` (+${r.warnings.length - 1} weitere)` : ""}`, {
+                        ms: 10000,
+                      });
                   } catch (err) {
                     act().showToast(`Import fehlgeschlagen: ${snapshotErrorText(err, (x) => (x instanceof Error ? x.message : String(x)))}`, { ms: 8000 });
                   } finally {
@@ -949,7 +1035,9 @@ export function MarketView() {
                 className="btn ghost"
                 onClick={() => {
                   act().leaveImport();
-                  act().showToast(`Sample-Markt aus den Quotes zum ${fmtDate(useStore.getState().valuationDate)} aufgebaut`);
+                  act().showToast(`Sample-Markt aus den Quotes zum ${fmtDate(useStore.getState().valuationDate)} aufgebaut`, {
+                    action: { label: "Rückgängig", run: () => useStore.getState().undo() },
+                  });
                 }}
                 data-testid="snapshot-leave"
                 title="Importierten Snapshot verwerfen und den Sample-Markt aus den Quotes am aktuellen Bewertungstag aufbauen"
@@ -960,24 +1048,24 @@ export function MarketView() {
             {modified && (
               <button
                 className="btn ghost"
-                onClick={() => {
-                  act().resetQuotes();
-                  for (const id of Object.keys(act().interpolation)) act().setInterpolation(id, undefined);
-                  for (const id of Object.keys(act().turnOfYear)) act().setTurnOfYear(id, undefined);
-                  act().resetVolSurfaces();
-                  if (act().fxFixings.length) act().setFxFixings([], "FX-Fixings zurückgesetzt");
-                }}
+                onClick={() => act().resetMarketOverrides()}
                 data-testid="market-reset"
+                title={
+                  imported
+                    ? "Vol-, Spot-, Fixing- und FX-Fixing-Änderungen verwerfen – zurück zum importierten Snapshot"
+                    : "Quotes, Interpolation, Turn-of-Year, Vol-Flächen, Fixings und FX-Fixings auf den Sample-Markt zurücksetzen"
+                }
               >
-                Markt zurücksetzen
+                {imported ? "Auf Snapshot zurücksetzen" : "Markt zurücksetzen"}
               </button>
             )}
           </div>
           {imported ? (
             <div className="warning" style={{ marginTop: 10 }} data-testid="snapshot-import-note">
               Markt aus importiertem Snapshot: Kurven, Spots, Fixings und Vol-Flächen kommen aus der Datei, der Bewertungstag ist der des Snapshots (
-              {fmtDate(m.valuationDate)}). Quotes, Interpolation und Turn-of-Year sind nicht verfügbar; ein anderer Bewertungstag verwirft den Snapshot nach
-              Rückfrage.
+              {fmtDate(m.valuationDate)}). Quotes, Interpolation und Turn-of-Year sind nicht verfügbar; Spots, Fixings, FX-Fixings und Vol-Flächen sind als
+              Änderung am Snapshot editierbar („modifiziert“, Ctrl+Z, „Auf Snapshot zurücksetzen“). Ein anderer Bewertungstag verwirft den Snapshot nach
+              Rückfrage – auch das ist rückgängig.
             </div>
           ) : (
             <div className="warning" style={{ marginTop: 10 }}>
@@ -991,7 +1079,9 @@ export function MarketView() {
             <table className="grid-table" aria-label="FX-Spots">
               <tbody>
                 {Object.entries(m.fxSpots).map(([pair, v]) => {
-                  const orig = (Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? v) as number;
+                  const orig = imported
+                    ? (s.importedBase?.fxSpots[pair] ?? v)
+                    : ((Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? v) as number);
                   return (
                     <tr key={pair} style={{ cursor: "default" }}>
                       <td className="mono">
@@ -1002,7 +1092,7 @@ export function MarketView() {
                           <NumInput inline value={v} step={0.0005} digits={4} min={0.0001} ariaLabel={`Spot ${pair}`} onChange={(x) => setSpot(pair, x)} />
                         </span>
                         {Math.abs(orig - v) > 1e-9 && (
-                          <span className="muted xs" title={`Quote ${fmtNum(orig, 4)}`}>
+                          <span className="muted xs" title={`${imported ? "Snapshot" : "Quote"} ${fmtNum(orig, 4)}`} data-testid="spot-edited">
                             {" "}
                             ●
                           </span>

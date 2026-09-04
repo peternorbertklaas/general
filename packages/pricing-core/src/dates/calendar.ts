@@ -230,6 +230,99 @@ class JapanCalendar extends RuleCalendar {
   }
 }
 
+/** Friday in Jun 19–25 (Swedish Midsummer Eve). */
+function midsummerEve(y: number): SerialDate {
+  let d = fromYMD(y, 6, 19);
+  while (dayOfWeek(d) !== 5) d++;
+  return d;
+}
+
+/** Norway (Oslo) – Markt R6-5; rule-based approximation, override with a feed via `registerCalendarHolidays("NO", …)`. */
+class NorwayCalendar extends RuleCalendar {
+  readonly name = "NO";
+  protected holidaysInYear(y: number): SerialDate[] {
+    const easter = easterSunday(y);
+    return [
+      fromYMD(y, 1, 1),
+      easter - 3, // Maundy Thursday
+      easter - 2, // Good Friday
+      easter + 1, // Easter Monday
+      fromYMD(y, 5, 1),
+      fromYMD(y, 5, 17), // Constitution Day
+      easter + 39, // Ascension
+      easter + 50, // Whit Monday
+      fromYMD(y, 12, 25),
+      fromYMD(y, 12, 26),
+    ];
+  }
+}
+
+/** Sweden (Stockholm) – Markt R6-5; rule-based approximation. */
+class SwedenCalendar extends RuleCalendar {
+  readonly name = "SE";
+  protected holidaysInYear(y: number): SerialDate[] {
+    const easter = easterSunday(y);
+    return [
+      fromYMD(y, 1, 1),
+      fromYMD(y, 1, 6), // Epiphany
+      easter - 2,
+      easter + 1,
+      fromYMD(y, 5, 1),
+      easter + 39, // Ascension
+      fromYMD(y, 6, 6), // National Day
+      midsummerEve(y),
+      fromYMD(y, 12, 24),
+      fromYMD(y, 12, 25),
+      fromYMD(y, 12, 26),
+      fromYMD(y, 12, 31),
+    ];
+  }
+}
+
+/** Denmark (Copenhagen) – Markt R6-5; rule-based approximation (Great Prayer Day abolished from 2024). */
+class DenmarkCalendar extends RuleCalendar {
+  readonly name = "DK";
+  protected holidaysInYear(y: number): SerialDate[] {
+    const easter = easterSunday(y);
+    return [
+      fromYMD(y, 1, 1),
+      easter - 3, // Maundy Thursday
+      easter - 2,
+      easter + 1,
+      ...(y < 2024 ? [easter + 26] : []), // Store Bededag
+      easter + 39, // Ascension
+      easter + 50, // Whit Monday
+      fromYMD(y, 6, 5), // Constitution Day
+      fromYMD(y, 12, 24),
+      fromYMD(y, 12, 25),
+      fromYMD(y, 12, 26),
+      fromYMD(y, 12, 31),
+    ];
+  }
+}
+
+/** Poland (Warsaw, NBP settlement) – Markt R6-5; rule-based approximation (Christmas Eve a public holiday from 2025). */
+class PolandCalendar extends RuleCalendar {
+  readonly name = "PL";
+  protected holidaysInYear(y: number): SerialDate[] {
+    const easter = easterSunday(y);
+    return [
+      fromYMD(y, 1, 1),
+      fromYMD(y, 1, 6), // Epiphany
+      easter + 1,
+      fromYMD(y, 5, 1),
+      fromYMD(y, 5, 3), // Constitution Day
+      easter + 60, // Corpus Christi
+      fromYMD(y, 8, 15),
+      fromYMD(y, 11, 1),
+      fromYMD(y, 11, 11), // Independence Day
+      ...(y >= 2025 ? [fromYMD(y, 12, 24)] : []),
+      fromYMD(y, 12, 25),
+      fromYMD(y, 12, 26),
+    ];
+  }
+}
+
 export class JointCalendar implements Calendar {
   readonly name: string;
   constructor(private readonly calendars: Calendar[]) {
@@ -348,6 +441,11 @@ registerCalendar(new UnitedStatesCalendar(), "USNY", "USD", "NYC", "USGS");
 registerCalendar(new UnitedKingdomCalendar(), "GB", "GBP", "GBLO", "LONDON");
 registerCalendar(new SwitzerlandCalendar(), "CHF", "CHZU", "ZURICH");
 registerCalendar(new JapanCalendar(), "JPY", "JPTO", "TOKYO");
+// Nordics and Poland (Markt R6-5): currency codes double as calendar ids, like "EUR" / "USD" above.
+registerCalendar(new NorwayCalendar(), "NOK", "NOOS", "OSLO");
+registerCalendar(new SwedenCalendar(), "SEK", "SEST", "STOCKHOLM");
+registerCalendar(new DenmarkCalendar(), "DKK", "DKCO", "COPENHAGEN");
+registerCalendar(new PolandCalendar(), "PLN", "PLWA", "WARSAW");
 
 /**
  * Resolve a calendar id. Composite ids like "TARGET+US" produce a joint calendar.

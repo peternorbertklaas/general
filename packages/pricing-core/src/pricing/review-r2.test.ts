@@ -204,7 +204,8 @@ describe("R2-6 – methodology text is generated from the valuation switches", (
       effectiveDate: parseISO("2021-03-16"),
       maturity: "10Y",
     });
-    const ms = methodologyFor(seasoned, ctx, priceTrade(ctx, seasoned, "EUR"));
+    const noFixings = { ...ctx, fixings: [] }; // the sample market carries EURIBOR history since Markt R6-6
+    const ms = methodologyFor(seasoned, noFixings, priceTrade(noFixings, seasoned, "EUR"));
     expect(ms.some((l) => l.includes("1 fehlende(s) Fixing(s)"))).toBe(true);
     expect(methodologyFor(swap, { ...ctx, missingFixingPolicy: "throw" }, priceTrade(ctx, swap, "EUR")).some((l) => l.includes("Policy „throw“"))).toBe(true);
     // RFR leg

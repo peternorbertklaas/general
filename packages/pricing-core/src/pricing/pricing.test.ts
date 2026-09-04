@@ -110,8 +110,8 @@ describe("interest rate swap", () => {
     expect(currentFloat?.isFixed).toBe(true);
     expect(currentFloat?.rate).toBeCloseTo(0.0215, 12);
     expect(res.accrued).not.toBe(0);
-    // Without fixing → warning
-    const res2 = priceInterestRateSwap(ctx, swap, "EUR");
+    // Without fixing → warning (the sample market carries EURIBOR history since Markt R6-6, so strip it here)
+    const res2 = priceInterestRateSwap({ ...ctx, fixings: [] }, swap, "EUR");
     expect(res2.warnings.some((w) => w.includes("Missing fixing"))).toBe(true);
   });
   it("OIS swap on flat curve has par ≈ compounded rate", () => {

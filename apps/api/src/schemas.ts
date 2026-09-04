@@ -393,7 +393,16 @@ export const fxOptionSchema = {
     barrier: {
       type: "object",
       required: ["type", "level"],
-      properties: { type: { type: "string", enum: [...BARRIER_TYPES] }, level: positiveNumber, rebate: { type: "number", minimum: 0 } },
+      properties: {
+        type: { type: "string", enum: [...BARRIER_TYPES] },
+        level: positiveNumber,
+        rebate: { type: "number", minimum: 0 },
+        hit: {
+          type: "boolean",
+          description:
+            "Observed knock state (N6-5): `true` = the barrier has been touched (knock-out → rebate only, knock-in → vanilla), `false` = not touched so far. Without the flag the state is derived from today's spot (live option) or the expiry fixing (expired option) and, when that derivation decides the value, the valuation warns `BARRIER_STATE_UNKNOWN:`; `analytics.barrierState` reports alive | knocked-in | knocked-out",
+        },
+      },
       additionalProperties: false,
     },
     digital: {
@@ -1240,6 +1249,8 @@ export const WARNING_PREFIXES = [
   "HAZARD_FLOORED",
   "EXPIRED",
   "EXPIRES_TODAY",
+  "BARRIER_STATE_UNKNOWN",
+  "VOL_IMPLAUSIBLE",
 ] as const;
 
 export const errorResponseSchema = {
@@ -1263,9 +1274,9 @@ export const errorResponseSchema = {
         "INVALID_VOL_SURFACE (a stored vol surface is structurally unusable at pricing time – `details.problems`; 400 when `deserializeMarket` rejects a snapshot / `designationSnapshot`; the API's own pre-check answers VOL_SURFACE_INVALID first), INVALID_SNAPSHOT (400: unsupported snapshot `schema` or malformed `fxFixings` entry), INVALID_CURVE_SPEC (bootstrap specification unusable: malformed FX pair, missing reference curve, circular dependency), INVALID_HEDGE_RELATIONSHIP (hedge relationship structurally inconsistent: FX pair without the hedged currency, non-positive hedge ratio, amortisation without schedule / loan rate), NUMERICAL_FAILURE (root search or implied-vol solve did not converge), DOMAIN_ERROR (plain core error without code). " +
         "400: VALIDATION_ERROR (request body, query, params or headers violate the JSON schema – `validation[]` carries the Ajv errors), INVALID_JSON (body is not valid JSON or is empty with `content-type: application/json`), INVALID_TRADE (programming error while pricing, reported as invalid trade), INVALID_DATE (a date that does not exist, e.g. `2027-02-30`; `details.input`), INVALID_TENOR (unparsable tenor string; `details.input`), TOO_MANY_PERIODS (estimated coupon periods of one leg – or of a hedged item's schedule – above the bound), " +
         "INVALID_REQUEST (semantically invalid request outside the schema, e.g. no trades for a portfolio par-risk run), ID_MISMATCH (body `id` differs from the path id), INVALID_QUERY_MAP (`uti`/`transactionPrice` map malformed or above 4 kB – use the POST body), CSV_INVALID (CSV import: unparsable file / header / missing `?type=`), SNAPSHOT_MALFORMED, VOL_SURFACE_INVALID (a swaption / caplet / FX vol surface in `PUT /api/market`, a snapshot or a `designationSnapshot` is structurally inconsistent – grid rows ≠ expiries, row length ≠ tenors / strikes, FX vectors ≠ expiries, axes not strictly increasing, key ≠ currency / pair; `problems[]` names each path); " +
-        "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request), STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods) and PAYLOAD_TOO_LARGE (body above the 5 MB limit); 415 UNSUPPORTED_MEDIA_TYPE (request body with a content-type other than `application/json` – or `text/csv` on the import route); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED (also on unknown routes); 500 INTERNAL_ERROR. " +
-        "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID and INTERNAL_ERROR (pricing failed for reasons that are not the trade's). " +
-        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset – or of an expired FX option's exercise date – approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `EXPIRED:` (FX option past its expiry with the delivery still pending – settled payoff, Greeks 0), `EXPIRES_TODAY:` (FX option expiring on the valuation date – intrinsic value on today's fixing / spot), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0).",
+        "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request), STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods) and PAYLOAD_TOO_LARGE (body above the 5 MB limit); 415 UNSUPPORTED_MEDIA_TYPE (request body with a content-type other than `application/json` – `text/plain`, `application/xml`, … – or `text/csv` on any route but the import route); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED (also on unknown routes); 500 INTERNAL_ERROR. " +
+        "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID (a CSV row that could not be mapped – parser / builder error – or whose built trade violates the `Trade` schema; the row is reported, the upload proceeds) and INTERNAL_ERROR (pricing failed for reasons that are not the trade's). " +
+        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset – or of an expired FX option's exercise date – approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `EXPIRED:` (FX option past its expiry with the delivery still pending – settled payoff, Greeks 0), `EXPIRES_TODAY:` (FX option expiring on the valuation date – intrinsic value on today's fixing / spot), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0), `BARRIER_STATE_UNKNOWN:` (barrier option without `barrier.hit` whose knock state was derived from today's spot or the expiry fixing – touch events in between are not observed), `VOL_IMPLAUSIBLE:` (a vol surface the valuation read – or a surface sent to `PUT /api/market` / the snapshot import, then in the 200 response's `warnings[]` – has numbers that do not fit its `volType`, e.g. a Lognormal cube with a median below 1 %, or is degenerate: all zeros / identical).",
     },
     details: {
       type: "object",
@@ -1287,12 +1298,12 @@ export const errorResponseSchema = {
 
 export const errorRef = { $ref: "ErrorResponse#" } as const;
 
-/** Common error responses shared by every route (unsupported body media type, rate limit, internal error). */
+/** Error responses shared by every rate-limited route (rate limit, internal error); 415 only where a request body exists (N6-03). */
 const commonErrors = {
   415: {
     ...errorRef,
     description:
-      "Unsupported media type – a request body arrived with a content-type other than `application/json` (`text/csv` only on `POST /api/trades/import`); `code: UNSUPPORTED_MEDIA_TYPE`",
+      "Unsupported media type – the request body arrived with a content-type other than `application/json` (`text/plain`, `application/xml`, …; `text/csv` only on `POST /api/trades/import`); `code: UNSUPPORTED_MEDIA_TYPE`",
   },
   429: {
     ...errorRef,
@@ -1317,11 +1328,20 @@ const ERROR_DESCRIPTIONS: Record<ErrorStatus, string> = {
   428: "Precondition required – `If-Match` missing while the server runs with REQUIRE_IF_MATCH=1 (`code: PRECONDITION_REQUIRED`, `currentEtag`)",
 };
 
-/** Build `response` map: given success responses + selected error statuses + common errors. */
+/** Build `response` map of an operation **with** a request body: success responses + selected error statuses + 415/429/500. */
 export function responses(success: Record<number, unknown>, ...errors: ErrorStatus[]): Record<number, unknown> {
   const out: Record<number, unknown> = { ...success };
   for (const s of errors) out[s] = { ...errorRef, description: ERROR_DESCRIPTIONS[s] };
   return { ...out, ...commonErrors };
+}
+
+/**
+ * Response map of a body-less operation (GET, DELETE): like `responses`, but without 415 – a request without a
+ * body cannot carry an unsupported media type, so documenting it there would be unreachable (N6-03).
+ */
+export function responsesWithoutBody(success: Record<number, unknown>, ...errors: ErrorStatus[]): Record<number, unknown> {
+  const { 415: _unsupportedMediaType, ...rest } = responses(success, ...errors);
+  return rest;
 }
 
 /** Untyped-but-documented value (see file header on fast-json-stringify coercion). */
@@ -1339,11 +1359,13 @@ export const pricingResultSchema = {
     valuationDate: isoDate,
     currency: currency,
     pv: num("PV in reporting currency, positive = asset to us"),
-    legs: anyArray("LegResult[] (pv, pvReporting, annuity, cashflows[] with paymentDate/discountFactor/presentValue)"),
+    legs: anyArray(
+      'LegResult[] (legType, pv, pvReporting, annuity, cashflows[] with kind Interest | Notional | Premium | OptionPayoff | Settlement, paymentDate, discountFactor, presentValue). A trade with an `upfront` premium / fee carries it as the last leg (`legType: "Upfront premium"`) with one cashflow of `kind: "Premium"` (amount −upfront.amount, discounted from `upfront.date`), so the premium appears in the cashflow table, in theta as a cashflow and in the CVA grid; before round 6 it was subtracted from the PV without a cashflow.',
+    ),
     analytics: anyObject(
       "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1). " +
         "Caps/floors and swaptions: `model` (Bachelier | Black | ShiftedBlack), `volatility` in the model's own quotation, `volConverted` (\"yes\" when the surface vols were converted into that quotation because the requested model differs from the surface's vol type – then `warnings[]` carries `VOL_TYPE_CONVERTED:` and swaptions additionally report the unconverted `surfaceVolatility`). " +
-        'FX options additionally: `lifecycle` (state on the valuation date: live | expires-today | expired-pending-delivery | delivered – expired / delivered options are a settled payoff with Greeks 0 and `warnings[]` `EXPIRED:` / `EXPIRES_TODAY:`) and `greeksMethod` ("analytic" for vanillas, "finite-difference" for barrier / digital, "settled-payoff" after expiry). Dates live in `details`.',
+        'FX options additionally: `lifecycle` (state on the valuation date: live | expires-today | expired-pending-delivery | delivered – expired / delivered options are a settled payoff with Greeks 0 and `warnings[]` `EXPIRED:` / `EXPIRES_TODAY:`) and `greeksMethod` ("analytic" for vanillas, "finite-difference" for barrier / digital, "settled-payoff" after expiry); barrier options report `barrierState` (alive | knocked-in | knocked-out – from `barrier.hit` when given, otherwise derived with a `BARRIER_STATE_UNKNOWN:` warning when the derivation decides the value). Dates live in `details`.',
     ),
     details: anyObject(
       "Non-numeric details complementing `analytics`: ISO dates such as `spotDate` (FX; FX options additionally `standardDelivery` = spot date of the expiry, the market-standard delivery the trade's `deliveryDate` may deviate from), `fixingDate`/`settlementDate` (FRA), `maturity` (swaps)",
@@ -1352,7 +1374,8 @@ export const pricingResultSchema = {
     warnings: {
       type: "array",
       items: { type: "string" },
-      description: "Pricer warnings (English); stable prefixes `MISSING_FIXING:`, `VOL_TYPE_CONVERTED:` (see `ErrorResponse.code`)",
+      description:
+        "Pricer warnings (English); stable prefixes `MISSING_FIXING:`, `VOL_TYPE_CONVERTED:`, `BARRIER_STATE_UNKNOWN:`, `VOL_IMPLAUSIBLE:` … (see `ErrorResponse.code`)",
     },
     timingMs: num("Wall-clock pricing time (diagnostic, not part of any hash)"),
   },
@@ -1574,7 +1597,7 @@ export const csvRequestBody = {
   schema: {
     type: "string",
     description:
-      "CSV document: header row plus one trade per row; `?type=` selects the column template (see the operation description), `?mode=upsert` replaces existing ids. Separator `;`/`,`/tab, German or plain numbers, dates ISO or DD.MM.YYYY.",
+      "CSV document: header row plus one trade per row; `?type=` selects one of the eleven column templates (see the operation description; `BasisSwap`/`AmortisingSwap`/`ImmSwap` build `InterestRateSwap`s), `?mode=upsert` replaces existing ids. Separator `;`/`,`/tab, German or plain numbers, dates ISO or DD.MM.YYYY; `collateralCurrency` accepts `none` for an uncollateralised trade. Rows that cannot be mapped or violate the `Trade` schema are reported per row (`CSV_ROW_INVALID`).",
   },
 } as const;
 

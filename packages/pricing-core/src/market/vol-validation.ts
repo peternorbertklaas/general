@@ -211,6 +211,134 @@ export function validateVolSurfaces(input: VolSurfacesInput): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// Plausibility (Markt R6-4): structurally valid surfaces whose numbers cannot be
+// vols in the declared quotation – a lognormal cube filled with normal numbers
+// (0.0097 = 0.97 %) prices a swaption at ≈ 0, an all-zero cube at intrinsic –
+// are reported as warnings, not problems: the market stays loadable, the
+// warning travels with every valuation that reads the surface.
+// ---------------------------------------------------------------------------
+
+/** Warning prefix for a vol surface whose values are implausible in the declared quotation or degenerate (Markt R6-4). */
+export const VOL_IMPLAUSIBLE_PREFIX = "VOL_IMPLAUSIBLE:";
+
+/**
+ * Plausibility thresholds (decimal vols). Per value: lognormal /
+ * shifted-lognormal and FX vols must lie in [0.1 %, 300 %], normal
+ * (basis-point) vols in [0.1 bp, 1000 bp]; exact zeros are tolerated
+ * individually (a legitimate boundary value, R5) but a surface consisting only
+ * of zeros is degenerate. Per surface: the median decides whether the numbers
+ * fit the declared quotation – a Lognormal surface with median < 1 % looks
+ * like normal (bp) numbers, a Normal surface with median > 500 bp like
+ * lognormal numbers (the reviewer's probe: `volType: "Lognormal"` on a cube of
+ * 0.0097 valued a swaption at ≈ 0 without a signal).
+ */
+export const VOL_PLAUSIBILITY = {
+  lognormalMin: 0.001,
+  lognormalMax: 3,
+  normalMin: 0.00001,
+  normalMax: 0.1,
+  /** Median below this on a Lognormal surface → quotation suspicious. */
+  lognormalMedianMin: 0.01,
+  /** Median above this on a Normal surface → quotation suspicious. */
+  normalMedianMax: 0.05,
+} as const;
+
+function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid]! : 0.5 * (s[mid - 1]! + s[mid]!);
+}
+
+function fmtVol(v: number, normal: boolean): string {
+  return normal ? `${(v * 1e4).toFixed(v * 1e4 < 1 ? 2 : 0)} bp` : `${(v * 100).toFixed(v * 100 < 1 ? 2 : 0)} %`;
+}
+
+/** `VOL_IMPLAUSIBLE:` messages for a flat list of vols in the quotation `volType` (Lognormal unless "Normal"). */
+function implausibleVols(values: number[], volType: unknown, path: string): string[] {
+  const finite = values.filter(isNum);
+  if (finite.length === 0) return [];
+  if (finite.every((v) => v === 0)) return [`${VOL_IMPLAUSIBLE_PREFIX} ${path} is degenerate – every vol is 0 (options are valued at intrinsic value only)`];
+  const normal = volType === "Normal";
+  const min = normal ? VOL_PLAUSIBILITY.normalMin : VOL_PLAUSIBILITY.lognormalMin;
+  const max = normal ? VOL_PLAUSIBILITY.normalMax : VOL_PLAUSIBILITY.lognormalMax;
+  const out: string[] = [];
+  const high = finite.filter((v) => v > max);
+  const low = finite.filter((v) => v > 0 && v < min);
+  const quotation = normal ? "normal" : "lognormal";
+  const med = median(finite.filter((v) => v > 0));
+  if (normal && med > VOL_PLAUSIBILITY.normalMedianMax) {
+    out.push(
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path}: median normal vol ${fmtVol(med, true)} is above ${fmtVol(VOL_PLAUSIBILITY.normalMedianMax, true)} – the numbers look like lognormal vols; check the volType of the import`,
+    );
+  } else if (!normal && med > 0 && med < VOL_PLAUSIBILITY.lognormalMedianMin) {
+    out.push(
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path}: median lognormal vol ${fmtVol(med, false)} is below ${fmtVol(VOL_PLAUSIBILITY.lognormalMedianMin, false)} – the numbers look like normal (bp) vols; check the volType of the import`,
+    );
+  }
+  if (high.length) {
+    out.push(
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path} has ${high.length} of ${finite.length} ${quotation} vols above ${fmtVol(max, normal)} (max ${fmtVol(Math.max(...high), normal)}) – check the volType / quotation of the import`,
+    );
+  }
+  if (low.length) {
+    out.push(
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path} has ${low.length} of ${finite.length} ${quotation} vols below ${fmtVol(min, normal)} (min ${fmtVol(Math.min(...low), normal)}) – ${normal ? "normal vols are decimals of the rate (0.0070 = 70 bp)" : "lognormal vols are decimals (0.20 = 20 %); normal numbers on a Lognormal surface collapse option values"}`,
+    );
+  }
+  return out;
+}
+
+function surfaceVolValues(s: object): { values: number[]; volType: unknown } {
+  const x = s as { atm?: unknown; vols?: unknown; volType?: unknown; tenors?: unknown; strikes?: unknown; pair?: unknown };
+  if ("pair" in x) return { values: Array.isArray(x.atm) ? (x.atm as number[]) : [], volType: "Lognormal" };
+  const grid = "strikes" in x ? x.vols : x.atm;
+  return { values: Array.isArray(grid) ? ((grid as unknown[]).flat() as number[]) : [], volType: x.volType };
+}
+
+/**
+ * Plausibility warnings (`VOL_IMPLAUSIBLE:`) of the vol surfaces in `input`
+ * (Markt R6-4), empty = plausible. Surfaces with structural problems are
+ * skipped (report those via `validateVolSurfaces`). Thresholds:
+ * `VOL_PLAUSIBILITY`. Meant for `PUT /api/market` / snapshot import to return
+ * `warnings[]` next to a 200, and shown by the pricers on every valuation
+ * that reads such a surface (`surfaceVolWarnings`).
+ */
+export function volSurfaceWarnings(input: VolSurfacesInput): string[] {
+  const out: string[] = [];
+  const each = (coll: Record<string, unknown> | undefined, name: string, problems: (s: unknown, key: string) => string[]) => {
+    if (!coll || typeof coll !== "object" || Array.isArray(coll)) return;
+    for (const [key, s] of Object.entries(coll)) {
+      if (!s || typeof s !== "object" || problems(s, key).length) continue;
+      const { values, volType } = surfaceVolValues(s);
+      out.push(...implausibleVols(values, volType, `${name}.${key}`));
+    }
+  };
+  each(input.swaptionVols, "swaptionVols", swaptionSurfaceProblems);
+  each(input.capletVols, "capletVols", capletSurfaceProblems);
+  each(input.fxVols, "fxVols", fxSurfaceProblems);
+  return out;
+}
+
+/** Per-surface cache of the plausibility warnings (object identity; surfaces are immutable by convention). */
+const plausibility = new WeakMap<object, string[]>();
+
+/**
+ * `VOL_IMPLAUSIBLE:` warnings of one surface the pricer is about to read
+ * (cached per surface object). The message names the surface by kind and id
+ * (`swaption surface EUR-SWAPTION-NORMAL …`).
+ */
+export function surfaceVolWarnings(s: SwaptionVolSurface | CapletVolSurface | FxVolSurface): string[] {
+  let w = plausibility.get(s);
+  if (!w) {
+    const kind = "pair" in s ? "FX vol surface" : "strikes" in s ? "caplet surface" : "swaption surface";
+    const { values, volType } = surfaceVolValues(s);
+    w = implausibleVols(values, volType, `${kind} ${s.id}`);
+    plausibility.set(s, w);
+  }
+  return w;
+}
+
+// ---------------------------------------------------------------------------
 // Pricing-time guards: a malformed surface raises PricingError("INVALID_VOL_SURFACE"), never a TypeError
 // ---------------------------------------------------------------------------
 

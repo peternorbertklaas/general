@@ -110,6 +110,17 @@ export function validateTrade(t: Trade): TradeIssue[] {
       dateOrder("deliveryDate", t.expiryDate, t.deliveryDate, "Lieferung darf nicht vor dem Verfall liegen", out, true);
       if (t.barrier && (!Number.isFinite(t.barrier.level) || t.barrier.level <= 0))
         out.push({ field: "barrierLevel", level: "error", msg: "Barriere-Level muss größer als 0 sein" });
+      if (t.barrier && t.barrier.hit !== undefined && typeof t.barrier.hit !== "boolean")
+        out.push({ field: "barrierHit", level: "error", msg: "Barriere-Status muss ja/nein sein" });
+      // A recorded knock-out is worth the rebate only – say so instead of showing a surprising PV of 0 (core R6 barrier.hit).
+      if (t.barrier?.hit === true && t.barrier.type.endsWith("Out"))
+        out.push({
+          field: "barrierHit",
+          level: "warn",
+          msg: `Barriere bereits berührt – die ${t.barrier.type.startsWith("Up") ? "Up-and-Out" : "Down-and-Out"}-Option ist ausgeknockt (Wert = Rebate${t.barrier.rebate ? "" : " 0"})`,
+        });
+      if (t.barrier?.hit === true && t.barrier.type.endsWith("In"))
+        out.push({ field: "barrierHit", level: "warn", msg: "Barriere bereits berührt – die Knock-in-Option ist eingeknockt und wird als Vanilla bewertet" });
       if (t.volOverride !== undefined && (t.volOverride <= 0 || t.volOverride > 1))
         out.push({ field: "volOverride", level: "warn", msg: "Vol-Override außerhalb 0 … 100 %" });
       break;

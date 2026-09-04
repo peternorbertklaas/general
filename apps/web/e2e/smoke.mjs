@@ -211,22 +211,34 @@ try {
   const csvDates = join(tmpdir(), `deriva-e2e-dates-${port}.csv`);
   writeFileSync(
     csvDates,
-    "\uFEFFtype;id;name;currency;notional;direction;rate;start;maturity;index\r\nIRS;IRS-D1;Datum 31.02.;EUR;5000000;Pay;3,0 %;31.02.2026;7Y;EURIBOR-6M\r\nIRS;IRS-D2;Datum ISO 30.02.;EUR;5000000;Pay;3,0 %;2026-02-30;7Y;EURIBOR-6M\r\nIRS;IRS-D3;gültig;EUR;5000000;Pay;3,0 %;15.03.2027;7Y;EURIBOR-6M\r\n",
+    "\uFEFFtype;id;name;currency;notional;direction;rate;start;maturity;index\r\nIRS;IRS-D1;Datum 31.02.;EUR;5000000;Pay;3,0 %;31.02.2026;7Y;EURIBOR-6M\r\nIRS;IRS-D2;Datum ISO 30.02.;EUR;5000000;Pay;3,0 %;2026-02-30;7Y;EURIBOR-6M\r\nIRS;IRS-D3;gültig;EUR;5000000;Pay;3,0 %;15.03.2027;7Y;EURIBOR-6M\r\nIRS;IRS-D4;Ende vor Start;EUR;5000000;Pay;3,0 %;15.03.2027;2026-12-01;EURIBOR-6M\r\n",
     "utf8",
   );
   await page.locator('[data-testid="export-menu-btn"]').click();
   await wait(150);
   await page.locator('[data-testid="import-csv"]').setInputFiles(csvDates);
   await wait(800);
-  check((await page.locator('[data-testid="csv-errors-table"] tbody tr').count()) === 2, "impossible start dates are listed as row errors (R5-F1)");
+  check(
+    (await page.locator('[data-testid="csv-errors-table"] tbody tr').count()) === 3,
+    "impossible dates and the validation failure are listed as row errors (R5-F1 / R6-06)",
+  );
   const dateErrs = await page.locator('[data-testid="csv-errors-table"]').innerText();
   check(
     /Ungültiges Datum „31\.02\.2026“ in Spalte „start“/.test(dateErrs) && dateErrs.includes("2026-02-30"),
     "date row errors name value, column and format (R5-F1)",
   );
-  check((await page.locator('[data-testid="csv-errors-continue"]').innerText()).includes("1 gültige"), "only the valid row is offered for import (R5-F1)");
+  check(dateErrs.includes("Enddatum muss nach dem Startdatum liegen"), "a row failing trade validation (end before start) is listed in the dialog (R6-06)");
+  check(
+    (await page.locator('[data-testid="csv-errors-continue"]').innerText()).includes("1 gültige"),
+    "only the valid row is offered for import (R5-F1 / R6-06)",
+  );
   await page.locator('[data-testid="csv-errors-continue"]').click();
   await wait(800);
+  const csvToasts = await page.locator(".toast").allInnerTexts();
+  check(
+    csvToasts.some((t) => /^1 Trades aus CSV importiert/.test(t) && !/ungültig/.test(t)),
+    `import toast count equals the dialog count – no 'ungültig' surprise (${csvToasts.join(" | ")}) (R6-06)`,
+  );
   check(
     (await page.locator("td.id-cell", { hasText: "IRS-D3" }).count()) === 1 && (await page.locator("td.id-cell", { hasText: "IRS-D1" }).count()) === 0,
     "valid row imported, impossible-date rows not (R5-F1)",
@@ -397,6 +409,25 @@ try {
   await page.locator("label.check", { hasText: "Amortisierend" }).locator("input").check();
   await wait(300);
   check((await page.locator('[data-testid="amortisation-table"]').count()) === 1, "amortisation table");
+  const amortStops = await page.evaluate(() => ({
+    rows: document.querySelectorAll('[data-testid="amortisation-table"] tbody tr').length,
+    rowStops: document.querySelectorAll('[data-testid="amortisation-table"] tbody tr[tabindex="0"]').length,
+    inputStops: document.querySelectorAll('[data-testid="amortisation-table"] tbody input:not([tabindex="-1"])').length,
+  }));
+  check(
+    amortStops.rows >= 5 && amortStops.rowStops === 1 && amortStops.inputStops === 0,
+    `amortisation table is one tab stop (${amortStops.rows} rows, ${amortStops.rowStops} row stop, ${amortStops.inputStops} input stops) (R6-02)`,
+  );
+  await page.locator('[data-testid="amortisation-table"] tbody tr[tabindex="0"]').focus();
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))) === "Nominal Periode 2",
+    "Enter on an amortisation row focuses its notional input (R6-02)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(100);
+  check((await page.evaluate(() => document.activeElement?.tagName)) === "TR", "Esc returns from the notional input to the row (R6-02)");
   await page.locator('[aria-label="Tilgungsprofil"] button', { hasText: "Annuität" }).click();
   await wait(300);
   check((await page.locator('input[aria-label="Kreditzins"]').count()) === 1, "annuity profile shows the loan rate");
@@ -710,6 +741,19 @@ try {
   // Termsheet via chord o t (R3-01), with initial market value and German numbers
   await chordO(page, "t");
   check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "o t opens the termsheet modal (R3-01)");
+  // R6-03: Esc from a chord-opened document must not drop the focus on body – it lands in the view (main / document toolbar)
+  await page.keyboard.press("Escape");
+  await wait(300);
+  const focusAfterDoc = await page.evaluate(() => ({
+    tag: document.activeElement?.tagName,
+    id: document.activeElement?.id,
+    inMain: !!document.activeElement?.closest("main"),
+  }));
+  check(
+    focusAfterDoc.tag !== "BODY" && focusAfterDoc.inMain,
+    `focus after Esc from the termsheet lies in the view, not on body (${focusAfterDoc.tag}#${focusAfterDoc.id}) (R6-03)`,
+  );
+  await chordO(page, "t");
   check((await page.locator('[data-testid="doc-whatif-banner"]').count()) === 0, "no what-if banner without a what-if");
   check((await page.locator('[data-testid="document-body"] .doc-section').count()) >= 2, "termsheet sections rendered");
   const docText = await page.locator('[data-testid="document-body"]').innerText();
@@ -822,6 +866,17 @@ try {
   await wait(2500);
   check((await page.locator('[data-testid="hedge-verdict-badge"]').count()) === 1, "hedge effectiveness verdict");
   check((await page.locator('[data-testid="hedge-regression"]').count()) === 1, "regression card");
+  // R5-F3: the test result survives a reload (persisted per relationship, current inputs → not stale)
+  const verdictBefore = await page.locator('[data-testid="hedge-verdict-badge"]').innerText();
+  await page.reload({ waitUntil: "networkidle" });
+  await wait(600);
+  check((await crumb(page)).includes("Hedge"), "hedge view restored after reload");
+  check((await page.locator('[data-testid="hedge-verdict-badge"]').count()) === 1, "hedge effectiveness result survives the reload (R5-F3)");
+  check(
+    (await page.locator('[data-testid="hedge-verdict-badge"]').innerText()) === verdictBefore,
+    `reloaded verdict equals the tested one (${verdictBefore}) (R5-F3)`,
+  );
+  check((await page.locator('[data-testid="hedge-stale"]').count()) === 0, "reloaded result is not flagged stale while inputs are unchanged (R5-F3)");
   check(
     (await page.locator('[data-testid="do-Kumulativ (seit Designation)"] .badge').first().innerText()) !== "nicht beurteilbar",
     "cumulative dollar-offset is assessable with a past designation date",
@@ -1113,6 +1168,58 @@ try {
   await wait(500);
   check((await page.locator('[data-testid="fx-fixings-table"]').count()) === 0, "Ctrl+Z removes the FX fixing again");
 
+  // + Kurve (Markt R6-5): a DKK OIS curve from quotes – conventions from the core registry, then a DKK swap via the palette
+  await chord(page, "c");
+  await page.locator('[data-testid="add-curve"]').click();
+  await wait(300);
+  check((await page.locator('[data-testid="add-curve-form"]').count()) === 1, "+ Kurve opens the curve form (R6-5)");
+  await page.locator('[data-testid="add-curve-ccy"]').selectOption("DKK");
+  await wait(200);
+  const addIndex = await page.locator('[data-testid="add-curve-index"]').inputValue();
+  check(addIndex === "DESTR", `DKK defaults to its OIS index (${addIndex}) (R6-5)`);
+  await page.locator('[data-testid="add-curve-spot"]').fill("7,46");
+  await page.locator('[data-testid="add-curve-submit"]').click();
+  await wait(900);
+  check((await page.locator('[data-testid="curve-tab-DKK-DESTR"]').count()) === 1, "the new DKK-DESTR curve appears as a tab (R6-5)");
+  check((await page.locator(".toast", { hasText: "Kurve DKK-DESTR aus 6 Quotes angelegt" }).count()) === 1, "toast confirms the added curve (R6-5)");
+  check((await page.locator('[data-testid="market-modified-chip"]').count()) === 1, "an added curve counts as modifiziert (R6-5)");
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("irs dkk 5y pay 3% 10m");
+  await wait(300);
+  const dkkPreview = await page.locator(".palette .item").first().innerText();
+  check(/Payer-Swap DKK 5Y/.test(dkkPreview), `quick entry prices a DKK swap once the curve exists (${dkkPreview.slice(0, 60)}) (R6-1 / R6-5)`);
+  await page.keyboard.press("Enter");
+  await wait(700);
+  check((await page.locator('[data-testid="pv-kpi"], .kpi').first().count()) >= 1, "DKK swap opens in the pricing workspace (R6-5)");
+  await page.keyboard.press("Control+z");
+  await wait(400);
+  await chord(page, "c");
+  await page.locator('[data-testid="curve-tab-DKK-DESTR"]').click();
+  await wait(200);
+  page.once("dialog", (d) => d.accept());
+  await page.locator('[data-testid="remove-curve"]').click();
+  await wait(800);
+  check((await page.locator('[data-testid="curve-tab-DKK-DESTR"]').count()) === 0, "the added curve can be removed (R6-5)");
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("irs sek 5y pay 3% 10m");
+  await wait(300);
+  const sekPreview = await page.locator(".palette").innerText();
+  check(
+    /Keine Kurve für SEK im Markt/.test(sekPreview) && /\+ Kurve/.test(sekPreview),
+    "quick entry refuses a currency without a curve and names + Kurve (R6-1)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
+  // the added spot EUR/DKK stays a quote edit until undone – undo it so the snapshot round trip starts from the sample market
+  await page.keyboard.press("Control+z");
+  await wait(600);
+  await chord(page, "m");
+  check(
+    (await page.locator('[data-testid="market-modified-chip"]').count()) === 0 ||
+      !(await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"),
+    "market back to the sample after undoing the curve (R6-5)",
+  );
+
   // Snapshot round trip (R5-F2): export → change a quote → import the same file → identical id, no "modifiziert", quote table reset
   const snapId0 = await page.locator('[data-testid="snapshot-id"]').innerText();
   check(/^[0-9a-f]{12,}$/.test(snapId0), `market view shows the snapshot id (${snapId0}) (R5-F2)`);
@@ -1144,6 +1251,73 @@ try {
     "curves view explains that quotes are not editable for an imported market (R5-F2)",
   );
   check((await page.locator("button.btn", { hasText: "Quotes +10 bp" }).isDisabled()) === true, "quote bump buttons disabled for an imported market (R5-F2)");
+  // R6-04: quote cells, interpolation select and Turn-of-Year "Anwenden" are disabled with a title, not just toasted
+  const lockState = await page.evaluate(() => {
+    const q = document.querySelector('[data-testid="quotes-table"] tbody input');
+    const sel = document.querySelector('[data-testid="interp-select"]');
+    const toy = document.querySelector('[data-testid="toy-apply"]');
+    return {
+      quoteDisabled: q instanceof HTMLInputElement ? q.disabled : null,
+      quoteTitle: q?.closest("td")?.getAttribute("title") ?? "",
+      selDisabled: sel instanceof HTMLSelectElement ? sel.disabled : null,
+      selTitle: sel?.getAttribute("title") ?? "",
+      toyDisabled: toy instanceof HTMLButtonElement ? toy.disabled : null,
+      toyTitle: toy?.getAttribute("title") ?? "",
+      addCurveDisabled: document.querySelector('[data-testid="add-curve"]')?.disabled ?? null,
+    };
+  });
+  check(
+    lockState.quoteDisabled === true && lockState.selDisabled === true && lockState.toyDisabled === true && lockState.addCurveDisabled === true,
+    `import mode disables quote cells, interpolation, Turn-of-Year and + Kurve (${JSON.stringify(lockState)}) (R6-04)`,
+  );
+  check(
+    /importierten Snapshot/.test(lockState.quoteTitle) && /importierten Snapshot/.test(lockState.selTitle) && /importierten Snapshot/.test(lockState.toyTitle),
+    "disabled import-mode controls explain the lock in their title (R6-04)",
+  );
+  // R6-F1: an FX-spot edit on the imported market is an override – flagged, undoable, persisted, never a silent id change
+  await chord(page, "m");
+  const spotInput = page.locator('input[aria-label="Spot EURUSD"]');
+  const spotBefore = await spotInput.inputValue();
+  await spotInput.focus();
+  await spotInput.fill("1,25");
+  await page.keyboard.press("Enter");
+  await wait(600);
+  const spotId1 = await page.locator('[data-testid="snapshot-id"]').innerText();
+  check(spotId1 !== snapId0, "spot override changes the snapshot id visibly (R6-F1)");
+  check(
+    (await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"),
+    "spot override flags the imported market as modifiziert (R6-F1)",
+  );
+  check((await page.locator('[data-testid="spot-edited"]').count()) === 1, "spot row marks the override against the snapshot value (R6-F1)");
+  check(
+    (await page.locator('[data-testid="market-reset"]').innerText()).includes("Auf Snapshot zurücksetzen"),
+    "reset button offers the way back to the snapshot (R6-F1)",
+  );
+  await page.reload({ waitUntil: "networkidle" });
+  await wait(800);
+  await chord(page, "m");
+  check((await page.locator('input[aria-label="Spot EURUSD"]').inputValue()) === "1,25", "spot override survives the reload (R6-F1)");
+  check((await page.locator('[data-testid="snapshot-id"]').innerText()) === spotId1, "snapshot id after reload equals the id before it (R6-F1)");
+  check((await page.locator('[data-testid="snapshot-imported"]').count()) === 1, "the import itself survives the reload with the override (R6-F1)");
+  await page.locator('[data-testid="market-reset"]').click();
+  await wait(600);
+  check((await page.locator('[data-testid="snapshot-id"]').innerText()) === snapId0, `Auf Snapshot zurücksetzen restores the snapshot id ${snapId0} (R6-F1)`);
+  check((await page.locator('input[aria-label="Spot EURUSD"]').inputValue()) === spotBefore, "reset restores the snapshot spot (R6-F1)");
+  check(
+    !(await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"),
+    "after the reset the imported market is not modifiziert (R6-F1)",
+  );
+  await page.keyboard.press("Control+z");
+  await wait(600);
+  check((await page.locator('input[aria-label="Spot EURUSD"]').inputValue()) === "1,25", "Ctrl+Z after the reset brings the spot override back (R6-F1)");
+  // the reload emptied the undo stack – the override itself is removed via the reset button, which is the persisted way back
+  await page.locator('[data-testid="market-reset"]').click();
+  await wait(600);
+  check(
+    (await page.locator('[data-testid="snapshot-id"]').innerText()) === snapId0,
+    "Auf Snapshot zurücksetzen after the undo removes the override again (R6-F1)",
+  );
+  await chord(page, "c");
   // a valuation-date change is refused unless confirmed – the import is never dropped silently
   let dateDialog = "";
   page.once("dialog", (d) => {
@@ -1231,9 +1405,26 @@ try {
   await page.keyboard.press("Escape");
   await wait(200);
   // back to the sample market at the previous date
+  const dateBeforeLeave = (await page.locator(".statusbar").innerText()).match(/Bewertungstag (\d{2}\.\d{2}\.\d{4})/)?.[1];
   await page.locator('[data-testid="snapshot-leave"]').click();
   await wait(800);
   check((await page.locator('[data-testid="snapshot-imported"]').count()) === 0, "Zum Sample-Markt leaves the import (R5-F2)");
+  // R6-F2: leaving (like importing / discarding) is one undoable action – the toast offers Rückgängig, Ctrl+Z restores the snapshot
+  check(
+    (await page.locator(".toast", { hasText: "Sample-Markt aus den Quotes" }).locator("button", { hasText: "Rückgängig" }).count()) === 1,
+    "leave toast offers Rückgängig (R6-F2)",
+  );
+  await page.keyboard.press("Control+z");
+  await wait(800);
+  check((await page.locator('[data-testid="snapshot-imported"]').count()) === 1, "Ctrl+Z after Zum Sample-Markt restores the imported snapshot (R6-F2)");
+  check((await page.locator(".toast", { hasText: "Rückgängig: Zum Sample-Markt" }).count()) === 1, "undo toast names the market-source action (R6-F2)");
+  check(
+    (await page.locator(".statusbar").innerText()).includes(`Bewertungstag ${dateBeforeLeave}`),
+    `undo of the leave restores the snapshot's valuation date (${dateBeforeLeave}) (R6-F2)`,
+  );
+  await page.locator('[data-testid="snapshot-leave"]').click();
+  await wait(800);
+  check((await page.locator('[data-testid="snapshot-imported"]').count()) === 0, "leave again for the rest of the flow");
   await page.keyboard.press("Control+k");
   await page.keyboard.type("stichtag 30.09.2026");
   await wait(200);
@@ -1474,6 +1665,44 @@ try {
   }
   await context.setOffline(false);
   await wait(300);
+
+  // R6-01: a view chunk that fails to load (deploy with new hashes, network drop) → German error card with "Neu laden",
+  // and "Erneut versuchen" really imports again once the chunk is reachable
+  // service workers are blocked here: the precache would serve the chunk from the cache (a real deploy deletes the old cache first)
+  const chunkContext = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "de-DE", serviceWorkers: "block" });
+  const chunkPage = await chunkContext.newPage();
+  const chunkErrors = [];
+  chunkPage.on("pageerror", (e) => chunkErrors.push(String(e)));
+  // the cache-busting retry appends "?retry=…" – the deploy simulation must block that request too (the file is gone)
+  const chunkRoute = /\/assets\/ScenariosView-[^/?]*\.js(\?.*)?$/;
+  await chunkPage.route(chunkRoute, (r) => r.abort());
+  await chunkPage.goto(`http://localhost:${port}/`, { waitUntil: "networkidle" });
+  await chunkPage.keyboard.press("g");
+  await chunkPage.keyboard.press("s");
+  await chunkPage
+    .locator('[data-testid="chunk-error"]')
+    .waitFor({ timeout: 8000 })
+    .catch(() => undefined);
+  const chunkCard = await chunkPage.locator('[data-testid="chunk-error"]').count();
+  check(chunkCard === 1, "failed view chunk shows the German error card instead of the raw engine text (R6-01)");
+  if (chunkCard === 1) {
+    const cardText = await chunkPage.locator('[data-testid="chunk-error"]').innerText();
+    check(
+      /neue Version/.test(cardText) && !/Failed to fetch|http:/.test(cardText),
+      `chunk error card is German without URL (${cardText.slice(0, 80)}) (R6-01)`,
+    );
+    check((await chunkPage.locator('[data-testid="chunk-reload"]').innerText()) === "Neu laden", "chunk error card offers Neu laden (R6-01)");
+    await chunkPage.unroute(chunkRoute);
+    await chunkPage.locator('[data-testid="chunk-retry"]').click();
+    await chunkPage
+      .locator('[data-testid="scenario-table"]')
+      .waitFor({ timeout: 8000 })
+      .catch(() => undefined);
+    check((await chunkPage.locator('[data-testid="scenario-table"]').count()) === 1, "Erneut versuchen re-imports the chunk and renders the view (R6-01)");
+    check((await chunkPage.locator('[data-testid="chunk-error"]').count()) === 0, "error card gone after the successful retry (R6-01)");
+  }
+  check(chunkErrors.length === 0, `chunk failure produces no uncaught page errors (${chunkErrors.join(" | ")}) (R6-01)`);
+  await chunkContext.close();
 
   // Offline after the FIRST online visit (R5-F4): a fresh browser context, one visit, install precaches the assets → offline reload works
   const freshContext = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "de-DE" });

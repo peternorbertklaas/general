@@ -36,10 +36,14 @@ export interface ThetaDetail {
    */
   cashflows: number;
   /**
-   * Undiscounted amount (reporting currency) of the cashflows settling on the
-   * rolled valuation date t+1 that remain part of PV(t+1) as a value-today
-   * exchange and are therefore excluded from `cashflows` (N5-1). 0 for trades
-   * whose pricer drops cashflows on the valuation date (swaps, caps, FRAs).
+   * Undiscounted amount (reporting currency) of the FX exchanges (`kind:
+   * "Notional"` legs of FX forwards / FX swaps / CCS) settling on the rolled
+   * valuation date t+1 that remain part of PV(t+1) as a value-today exchange
+   * and are therefore excluded from `cashflows` (N5-1). Option payoff
+   * placeholders (swaption expiry, FX option delivery) that the rolled pricer
+   * keeps at DF 1 are *not* reported here (N6-4) – they are option values, not
+   * amounts settling on the roll date. 0 for trades whose pricer drops
+   * cashflows on the valuation date (swaps, caps, FRAs).
    */
   valueTodayOnRollDate: number;
 }
@@ -177,9 +181,13 @@ function stillValuedInRolled(rolled: PricingResult, c: Cashflow): boolean {
  * before this rule the theta of an FX forward the day before delivery was ≈
  * its full PV (+122 k on a PV of 123 k instead of −485); an FX exchange
  * settling on t itself (carried in PV(t) as value-today, gone from PV(t + days))
- * is counted as cash received, so its theta is 0 rather than −PV. Without
- * `rolled` (legacy call) every cashflow in (t, t + days] except option payoff
- * placeholders is counted.
+ * is counted as cash received, so its theta is 0 rather than −PV. The upfront
+ * premium of swaptions, caps/floors, FX options and swap fees is a `Premium`
+ * cashflow (N6-1) and follows the same rule: due on t + days it leaves the PV
+ * (DF 0 once settled) and is counted as paid, so the theta on the day before
+ * the premium payment is the carry, not ≈ +premium. Without `rolled` (legacy
+ * call) every cashflow in (t, t + days] except option payoff placeholders is
+ * counted.
  */
 export function cashflowsPaidWithin(
   ctx: MarketContext,
@@ -213,8 +221,11 @@ function splitCashflowsWithin(
         // PV(t) carries as value-today (R4-2) and PV(t + days) has dropped is cash received – theta 0, not −PV.
         if (!(c.paymentDate <= val + days && c.discountFactor > 0)) continue;
         const amount = c.amount * fxToReporting(ctx, c.currency, reportingCurrency, trade.collateralCurrency);
-        if (stillValuedInRolled(rolled, c)) valueToday += amount;
-        else paid += amount;
+        if (stillValuedInRolled(rolled, c)) {
+          // N6-4: only genuine exchanges settling on t + days are reported as value-today; option payoff
+          // placeholders (swaption at expiry, FX option delivery) stay option values inside PV(t + days).
+          if (c.kind !== "OptionPayoff") valueToday += amount;
+        } else paid += amount;
         continue;
       }
       if (!(c.paymentDate > val && c.paymentDate <= val + days)) continue;

@@ -105,10 +105,10 @@ describe("N5-01 every 4xx envelope carries a catalogued code; details survive th
     const emptyJson = await app.inject({ method: "POST", url: "/api/price", headers: { "content-type": "application/json" }, payload: "" });
     expect(emptyJson.statusCode).toBe(400);
     expect(emptyJson.json().code).toBe("INVALID_JSON");
-    // (`text/plain` has a built-in Fastify parser and ends in VALIDATION_ERROR; XML has none.)
-    expect((await app.inject({ method: "POST", url: "/api/price", headers: { "content-type": "text/plain" }, payload: "hello" })).json().code).toBe(
-      "VALIDATION_ERROR",
-    );
+    // Fastify's built-in `text/plain` parser is removed (N6-03): a text body is an unsupported media type, not a schema violation.
+    const textPlain = await app.inject({ method: "POST", url: "/api/price", headers: { "content-type": "text/plain" }, payload: "hello" });
+    expect(textPlain.statusCode).toBe(415);
+    expect(textPlain.json()).toMatchObject({ statusCode: 415, code: "UNSUPPORTED_MEDIA_TYPE" });
     const mediaType = await app.inject({ method: "POST", url: "/api/price", headers: { "content-type": "application/xml" }, payload: "<trade/>" });
     expect(mediaType.statusCode).toBe(415);
     expect(mediaType.json()).toMatchObject({ statusCode: 415, code: "UNSUPPORTED_MEDIA_TYPE" });
@@ -170,7 +170,7 @@ describe("N5-01 every 4xx envelope carries a catalogued code; details survive th
     }
   });
 
-  it("OpenAPI: the new codes are catalogued and described; 415 is documented on every rate-limited operation; 400/412/413 descriptions name the codes", () => {
+  it("OpenAPI: the new codes are catalogued and described; 415 is documented exactly on the operations with a request body (N6-03); 400/412/413 descriptions name the codes", () => {
     const doc = app.swagger() as unknown as Doc;
     const code = doc.components.schemas.ErrorResponse!.properties!.code!;
     for (const c of ["VALIDATION_ERROR", "INVALID_JSON", "UNSUPPORTED_MEDIA_TYPE", "PAYLOAD_TOO_LARGE", "VOL_SURFACE_INVALID"]) {
@@ -178,16 +178,31 @@ describe("N5-01 every 4xx envelope carries a catalogued code; details survive th
       expect(code.examples, c).toContain(c);
       expect(code.description, c).toContain(c);
     }
+    let withBody = 0;
+    let withoutBody = 0;
     for (const [path, methods] of Object.entries(doc.paths)) {
       for (const [method, op] of Object.entries(methods)) {
         const codes = Object.keys(op.responses);
-        if (path.startsWith("/api/health")) expect(codes, path).not.toContain("415");
-        else {
-          expect(codes, `${method} ${path}`).toContain("415");
-          if (codes.includes("400")) expect(op.responses["400"]!.description, `${method} ${path}`).toMatch(/VALIDATION_ERROR/);
+        if (path.startsWith("/api/health")) {
+          expect(codes, path).not.toContain("415");
+          expect(codes, path).not.toContain("429");
+          continue;
         }
+        // A body-less operation (GET, DELETE) cannot carry an unsupported media type – 415 there would be unreachable.
+        if (op.requestBody) {
+          expect(codes, `${method} ${path}`).toContain("415");
+          withBody++;
+        } else {
+          expect(codes, `${method} ${path}`).not.toContain("415");
+          withoutBody++;
+        }
+        expect(codes, `${method} ${path}`).toContain("429");
+        expect(codes, `${method} ${path}`).toContain("500");
+        if (codes.includes("400")) expect(op.responses["400"]!.description, `${method} ${path}`).toMatch(/VALIDATION_ERROR/);
       }
     }
+    expect(withBody).toBeGreaterThanOrEqual(20);
+    expect(withoutBody).toBeGreaterThanOrEqual(12);
     expect(doc.paths["/api/trades/{id}"]!.put!.responses["412"]!.description).toMatch(/strong/);
     expect(doc.paths["/api/trades"]!.post!.responses["413"]!.description).toMatch(/PAYLOAD_TOO_LARGE/);
   });

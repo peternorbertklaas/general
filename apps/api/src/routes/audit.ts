@@ -1,6 +1,6 @@
 import { type FastifyInstance } from "fastify";
 import { type AppContext } from "../app.js";
-import { responses } from "../schemas.js";
+import { responsesWithoutBody } from "../schemas.js";
 
 export async function registerAuditRoutes(app: FastifyInstance, ctx: AppContext) {
   app.get<{ Querystring: { limit?: number } }>(
@@ -11,7 +11,7 @@ export async function registerAuditRoutes(app: FastifyInstance, ctx: AppContext)
         tags: ["audit"],
         summary: "Audit-Trail (append-only, SHA-256-Hash-Kette) – Trade-Änderungen, Markt-Updates, Report-Erzeugung",
         querystring: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 5000 } } },
-        response: responses(
+        response: responsesWithoutBody(
           {
             200: {
               type: "object",

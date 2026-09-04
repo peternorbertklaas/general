@@ -2,7 +2,7 @@
 
 **Zweck.** Dieses Dokument ordnet die regulatorischen und rechnungslegungsbezogenen Anforderungen, die ein Bewertungstool für Zins- und Währungsderivate im DACH-Markt berührt, den konkreten DERIVA-Features zu und benennt je Anforderung die **Evidenz im Repository** (Datei, Test, Endpunkt). Es ist die Arbeitsgrundlage für Prüfer (WP, Revision), Marktfolge/IPV und Modellvalidierung – und es benennt am Ende explizit, was **nicht** abgedeckt ist.
 
-**Stand:** v0.2 (Branch `claude/derivatives-trading-platform-1arsyu`, Review-Runde 5 – Maßnahmenprogramm zu `docs/quality/review-*-r5.md`; der Tag `v0.2.0` wird beim Release gesetzt, siehe `CONTRIBUTING.md` „Release"). Fachliche Herleitung der Anforderungen: [`docs/research/03-domaene-markt-methodik-regulatorik.md`](../research/03-domaene-markt-methodik-regulatorik.md) §4. Architektur: [`docs/architecture/01-architektur.md`](../architecture/01-architektur.md).
+**Stand:** v0.2 (Branch `claude/derivatives-trading-platform-1arsyu`, Review-Runde 6 – Maßnahmenprogramm zu `docs/quality/review-*-r6.md`; der Tag `v0.2.0` wird beim Release gesetzt, siehe `CONTRIBUTING.md` „Release"). Fachliche Herleitung der Anforderungen: [`docs/research/03-domaene-markt-methodik-regulatorik.md`](../research/03-domaene-markt-methodik-regulatorik.md) §4. Architektur: [`docs/architecture/01-architektur.md`](../architecture/01-architektur.md).
 
 **Statuslegende:** ✅ umgesetzt und getestet · 🔶 teilweise (Lücke in der Zeile benannt) · ⏳ Roadmap · ❌ außerhalb des Produktumfangs (bewusst).
 

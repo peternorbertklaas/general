@@ -14,11 +14,23 @@
  * builds a context and answers 400 `VOL_SURFACE_INVALID` with one `problems[]`
  * entry per finding, leaving the market untouched.
  */
-import { type VolSurfacesInput, validateVolSurfaces } from "@deriva/pricing-core";
+import { type VolSurfacesInput, validateVolSurfaces, volSurfaceWarnings } from "@deriva/pricing-core";
 
 export type VolSurfaceInputs = VolSurfacesInput;
 
+const surfacesOf = (vols: VolSurfaceInputs): VolSurfacesInput => ({ swaptionVols: vols.swaptionVols, capletVols: vols.capletVols, fxVols: vols.fxVols });
+
 /** Problems of the given vol surfaces (empty = structurally sound). Paths are `swaptionVols.USD.atm[3]`-style. */
 export function volSurfaceProblems(vols: VolSurfaceInputs): string[] {
-  return validateVolSurfaces({ swaptionVols: vols.swaptionVols, capletVols: vols.capletVols, fxVols: vols.fxVols });
+  return validateVolSurfaces(surfacesOf(vols));
+}
+
+/**
+ * Plausibility warnings (`VOL_IMPLAUSIBLE:` – numbers that do not fit the declared `volType`, degenerate
+ * all-zero / constant surfaces; Markt R6-4) of structurally sound surfaces. Returned as `warnings[]` next to
+ * the 200 of `PUT /api/market` / `PUT /api/market/snapshot`; the pricers repeat them on every valuation
+ * that reads such a surface.
+ */
+export function volSurfacePlausibilityWarnings(vols: VolSurfaceInputs): string[] {
+  return volSurfaceWarnings(surfacesOf(vols));
 }

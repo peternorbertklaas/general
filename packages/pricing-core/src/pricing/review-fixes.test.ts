@@ -64,7 +64,9 @@ describe("H1 / N-A – missing fixings", () => {
       effectiveDate: parseISO("2021-03-16"),
       maturity: "10Y",
     });
-    const res = priceInterestRateSwap(ctx, seasoned, "EUR");
+    // The sample market carries EURIBOR history since Markt R6-6 – strip it to exercise the missing-fixing path.
+    const noFixings: MarketContext = { ...ctx, fixings: [] };
+    const res = priceInterestRateSwap(noFixings, seasoned, "EUR");
     const current = res.legs[1]!.cashflows.find((c) => c.accrualStart! <= VAL && c.accrualEnd! > VAL)!;
     const fwd6m = ctx.curves[SAMPLE_CURVE_IDS.eur6m]!.forwardRate(spot, advance(spot, "6M", TARGET), "ACT/360");
     expect(Math.abs(current.rate! - fwd6m)).toBeLessThan(0.001);
@@ -74,7 +76,7 @@ describe("H1 / N-A – missing fixings", () => {
     // the coupon paying next is of the right order of magnitude (≈ −N·2.2%·0.5)
     expect(Math.abs(current.amount)).toBeGreaterThan(90_000);
     // policy "throw" fails loudly
-    expect(() => priceInterestRateSwap({ ...ctx, missingFixingPolicy: "throw" }, seasoned, "EUR")).toThrow(/MISSING_FIXING/);
+    expect(() => priceInterestRateSwap({ ...noFixings, missingFixingPolicy: "throw" }, seasoned, "EUR")).toThrow(/MISSING_FIXING/);
   });
   it("a spot-starting OIS with a 5-day lookback has no spurious warning and its first coupon stays within 0.5bp of the plain OIS", () => {
     const ois = makeVanillaSwap({
@@ -103,7 +105,7 @@ describe("H1 / N-A – missing fixings", () => {
       maturity: "3Y",
       index: "ESTR",
     });
-    const res = priceTrade(ctx, running, "EUR");
+    const res = priceTrade({ ...ctx, fixings: [] }, running, "EUR");
     const current = res.legs[1]!.cashflows.find((c) => c.accrualStart! <= VAL && c.accrualEnd! > VAL)!;
     expect(current.rate!).toBeGreaterThan(0.018);
     expect(current.rate!).toBeLessThan(0.023);
@@ -405,8 +407,12 @@ describe("M8 – FRA fixings", () => {
     expect(withFix.pv).toBeGreaterThan(100_000); // pay 2%, receive 5% on 10m for 6M
     // fixing date yesterday (start tomorrow), nothing loaded → warning, curve forward used
     const tomorrowStart: ForwardRateAgreement = { ...fra, startDate: VAL + 1, endDate: advance(VAL + 1, "6M", cal) };
-    const missing = priceTrade(ctx, tomorrowStart, "EUR");
+    const missing = priceTrade({ ...ctx, fixings: [] }, tomorrowStart, "EUR");
     expect(missing.warnings.some((w) => w.startsWith("MISSING_FIXING:"))).toBe(true);
+    // …and with the sample market's EURIBOR history (Markt R6-6) yesterday's fixing is found
+    const found = priceTrade(ctx, tomorrowStart, "EUR");
+    expect(found.warnings.some((w) => w.startsWith("MISSING_FIXING:"))).toBe(false);
+    expect(found.analytics.isFixed).toBe("yes");
     expect(missing.analytics.isFixed).toBe("no");
   });
 });

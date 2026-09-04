@@ -198,7 +198,15 @@ export interface FxOption extends TradeBase {
   exercise?: "European";
   /** Premium currency for display: base or quote. */
   premiumCurrency?: string;
-  barrier?: { type: BarrierType; level: number; rebate?: number };
+  /**
+   * Single continuous barrier (Reiner–Rubinstein). `hit` records the observed
+   * knock state (N6-5): `true` = the barrier has been touched (knock-out →
+   * rebate / 0, knock-in → vanilla), `false` = confirmed never touched so far,
+   * `undefined` = unknown – the pricer then derives the state from today's
+   * spot (alive option) or the expiry fixing (expired option) and raises a
+   * `BARRIER_STATE_UNKNOWN:` warning whenever that derivation decides the value.
+   */
+  barrier?: { type: BarrierType; level: number; rebate?: number; hit?: boolean };
   digital?: { payoutCurrency: string; payout: number };
   volOverride?: number;
 }
@@ -240,6 +248,16 @@ export interface Cashflow {
    * compounded RFR legs this is the realised compounding to date.
    */
   accrued?: number;
+  /**
+   * Cashflow class. `"Premium"` is the upfront premium / fee of a trade
+   * (`TradeBase.upfront`, N6-1): every pricer that honours an upfront reports
+   * it as its own leg (`legType: "Upfront premium"`, last leg, `legIndex` =
+   * number of economic legs) with a single cashflow `amount = −upfront.amount`
+   * (positive = we receive), `discountFactor` = DF of the premium currency on
+   * the payment date, or 0 once the premium date is on or before the valuation
+   * date (settled, no longer part of the PV) – so the premium is visible in
+   * cashflow tables and counted exactly once by the theta single-count rule.
+   */
   kind: "Interest" | "Notional" | "Premium" | "OptionPayoff" | "Settlement";
 }
 

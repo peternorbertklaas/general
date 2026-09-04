@@ -28,6 +28,8 @@ export interface NumInputProps {
   width?: number | string;
   /** Test id for e2e. */
   testId?: string;
+  /** `-1` for inputs inside a roving-tabindex table row (the row is the tab stop, Enter/F2 focus the input – R6-02). */
+  tabIndex?: number;
   onCommit?: (v: number) => void;
 }
 
@@ -59,6 +61,7 @@ export function NumInput(props: NumInputProps) {
     style,
     width,
     testId,
+    tabIndex,
     onCommit,
   } = props;
   const label = useFieldLabel(ariaLabel);
@@ -131,6 +134,7 @@ export function NumInput(props: NumInputProps) {
       data-testid={testId}
       placeholder={placeholder}
       disabled={disabled}
+      tabIndex={tabIndex}
       style={{ ...(width !== undefined ? { width } : {}), ...style, textAlign: "right" }}
       value={focused ? text : formatted}
       onFocus={() => {
@@ -213,7 +217,7 @@ export function OptNumInput({
   placeholder,
   ...rest
 }: Omit<NumInputProps, "value" | "onChange" | "min" | "max"> & { value: number | undefined; onChange: (v: number | undefined) => void; placeholder?: string }) {
-  const { scale = 1, step, digits, unit, inline, error, level = "error", ariaLabel, disabled, style, width, testId } = rest;
+  const { scale = 1, step, digits, unit, inline, error, level = "error", ariaLabel, disabled, style, width, testId, tabIndex } = rest;
   const label = useFieldLabel(ariaLabel);
   const maxDigits = digits ?? Math.max(scale === 1 ? 0 : 2, decimalsOf(step ?? 1));
   const formatted = value === undefined ? "" : formatNumberInput(value, scale, 0, Math.max(maxDigits, 2));
@@ -239,6 +243,7 @@ export function OptNumInput({
       data-testid={testId}
       placeholder={placeholder}
       disabled={disabled}
+      tabIndex={tabIndex}
       style={{ ...(width !== undefined ? { width } : {}), ...style, textAlign: "right" }}
       value={focused ? text : formatted}
       onFocus={() => {

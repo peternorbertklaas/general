@@ -53,7 +53,11 @@ Design notes
   on the ACT/365F hazard time, accrual-on-default and protection are discounted
   to the period midpoint. Hazards from a flat spread curve are therefore
   365/360 − 1 ≈ 1.39 % higher than in round 4 (100 bp / R 40 %: 168.56 bp instead
-  of 166.67 bp), CVA from CDS-bootstrapped curves ≈ 1 % higher. The QuantLib block
+  of 166.67 bp), CVA from CDS-bootstrapped curves ≈ 1 % higher. Since round 6
+  (N6-2) the flat shortcut `hazardFromSpread(s, R) = s·(365/360)/(1 − R)` uses
+  the same convention, so a flat spread and a one-pillar bootstrap of the same
+  quote agree (undiscounted to 1e-5, with discounting to ≈ 3e-3) and the
+  flat-spread CVA/DVA path is ≈ 1.3 % higher than before. The QuantLib block
   (`PiecewiseFlatHazardRate` / `SpreadCdsHelper`, ISDA engine) agrees to 3e-4 in
   survival and 3e-3 relative in the hazards; the remaining difference is
   QuantLib's daily integration on the business-day-adjusted coupon schedule

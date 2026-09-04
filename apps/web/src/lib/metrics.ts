@@ -131,6 +131,11 @@ const TEXT_METRICS: Record<string, { label: string; values?: Record<string, stri
   mtmReset: { label: "MtM-Reset", values: { yes: "ja", no: "nein" } },
   volConverted: { label: "Vol-Quotierung umgerechnet (Normal ↔ Lognormal)", values: { yes: "ja", no: "nein" } },
   deliveryConvention: { label: "Lieferkonvention", values: { standard: "Standard (Spot-Lag)", "non-standard": "abweichend" } },
+  // core R6 (N6-5): knock state of a barrier option – recorded on the trade (`barrier.hit`) or derived from spot / fixing
+  barrierState: {
+    label: "Barriere-Status",
+    values: { alive: "nicht berührt (Option lebt)", "knocked-in": "eingeknockt (Vanilla)", "knocked-out": "ausgeknockt (Rebate / 0)" },
+  },
   // core R5 (N5-2): FX option lifecycle – alive, expired (settlement pending), delivered
   lifecycle: {
     label: "Lebenszyklus",

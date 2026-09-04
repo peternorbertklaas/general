@@ -196,7 +196,8 @@ describe("N-06 error envelope", () => {
     const pricingLike = Object.assign(new Error("Missing fixing"), { name: "PricingError", code: "MISSING_FIXING" });
     expect(classifyError(pricingLike)).toMatchObject({ status: 422, code: "MISSING_FIXING", message: "Missing fixing" });
     expect(classifyError(new Error("plain domain message"))).toMatchObject({ status: 422, code: "DOMAIN_ERROR" });
-    expect(classifyError(Object.assign(new Error("socket"), { code: "ECONNRESET" }))).toMatchObject({
+    // Node system errors carry `errno`/`syscall` (N6-03: recognised by those, not by the code's shape).
+    expect(classifyError(Object.assign(new Error("socket"), { code: "ECONNRESET", errno: -104, syscall: "read" }))).toMatchObject({
       status: 500,
       message: "Internal server error",
       level: "error",

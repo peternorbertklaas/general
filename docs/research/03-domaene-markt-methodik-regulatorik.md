@@ -83,6 +83,21 @@ Hinweis [Q]: Die April-2025-Umsätze sind durch die Volatilität rund um den 2. 
 - **€STR:** Veröffentlichung um 08:00 CET am Folgetag (T+1) durch die EZB; volumengewichtetes getrimmtes Mittel (je 25 % oben/unten entfernt); Compounded-Averages und Index um 09:15 CET [Q].
 - **RFR-Compounding in Arrears:** ISDA-2021-Definitionen bieten modulare Varianten: Standard-OIS-Compounding, **Lookback** (Beobachtung k Tage früher, Gewichtung nach Zahlungsperiode), **Observation Period Shift** (Beobachtung und Gewichtung verschoben), **Lockout**, **Payment Delay** (Zahlung z. B. 2 Tage nach Periodenende) [Q]. EURIBOR-Fallbacks basieren auf €STR compounded in arrears mit **2-Tage-Lookback** plus Spread-Adjustierung [Q].
 - **Stub-Perioden**, **IMM-Daten**, **Roll-Konventionen** und **Zahlungs- vs. Accrual-Datum** müssen getrennt modelliert werden.
+- **Swap-Konventionen je Währung [E, Interdealer-Standard nach Bloomberg SWPM / LSEG; Umsetzung `packages/pricing-core/src/curves/index-definitions.ts`, `SWAP_CONVENTIONS`/`RATE_INDICES`, seit Runde 6 zur Laufzeit erweiterbar über `registerRateIndex`/`registerSwapConventions` (Markt R6-5):**
+
+  | Währung | Fixed Leg          | Float Leg          | Kalender | Spot | OIS (Diskontkurve)          | Indizes (Day Count, Fixing)                                  |
+  | ------- | ------------------ | ------------------ | -------- | ---- | --------------------------- | ------------------------------------------------------------ |
+  | EUR     | 1Y 30E/360         | EURIBOR-6M 6M      | TARGET   | T+2  | €STR 1Y ACT/360, T+2        | EURIBOR-1M/-3M/-6M/-12M (ACT/360, T−2), €STR (ACT/360, T+0)  |
+  | USD     | 1Y ACT/360         | SOFR 1Y            | US       | T+2  | SOFR 1Y ACT/360, T+2        | SOFR (ACT/360)                                               |
+  | GBP     | 1Y ACT/365F        | SONIA 1Y           | UK       | T+0  | SONIA 1Y ACT/365F, T+0      | SONIA (ACT/365F)                                             |
+  | CHF     | 1Y ACT/360         | SARON 1Y           | CH       | T+2  | SARON 1Y ACT/360, T+2       | SARON (ACT/360)                                              |
+  | JPY     | 1Y ACT/365F        | TONA 1Y            | JP       | T+2  | TONA 1Y ACT/365F, T+2       | TONA (ACT/365F)                                              |
+  | NOK     | 1Y 30/360          | NIBOR-6M 6M        | NO       | T+2  | NOWA 1Y ACT/365F, T+2       | NIBOR-3M/-6M (ACT/360, T−2), NOWA (ACT/365F)                 |
+  | SEK     | 1Y 30/360          | STIBOR-3M 3M       | SE       | T+2  | SWESTR 1Y ACT/360, T+2      | STIBOR-3M/-6M (ACT/360, T−2), SWESTR (ACT/360)               |
+  | DKK     | 1Y 30/360          | CIBOR-6M 6M        | DK       | T+2  | DESTR 1Y ACT/360, T+2       | CIBOR-3M/-6M (ACT/360, T−2), DESTR (ACT/360)                 |
+  | PLN     | 1Y ACT/ACT ISDA    | WIBOR-6M 6M        | PL       | T+2  | POLONIA 1Y ACT/365F, T+2    | WIBOR-3M/-6M (ACT/365F, T−2), POLONIA (ACT/365F)             |
+
+  Die NOK/SEK/DKK/PLN-Zeilen folgen den veröffentlichten Indexkonventionen (Norske Finansielle Referanser, Swedish Financial Benchmark Facility, Danish Financial Benchmark Facility, GPW Benchmark) und sind indikativ, wo ein Markt mehrere Varianten quotiert (SEK: STIBOR-3M ist der liquide Tenor, DKK: CIBOR-6M); ein Desk mit abweichenden Terms überschreibt sie per `registerSwapConventions`. Kurven in diesen Währungen werden über `POST /api/market/bootstrap` bzw. `/api/market/curves` mit den registrierten Indizes gebootstrappt (z. B. `index: "NOWA"`); der Beispielmarkt selbst bleibt G5 (US-2.9), FX-Vol-Flächen für Kreuze mit diesen Währungen fehlen (Fallback 8 %, Level 3, Palette warnt).
 
 ---
 

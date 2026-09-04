@@ -21,6 +21,7 @@ const Chart = lazyComponent(() => import("./EChartImpl.js"), {
   fallback: (p: EChartProps) => (
     <div className={`${p.className ?? "chart"} chart-loading`} role="img" aria-label={p.ariaLabel ?? "Diagramm"} aria-busy="true" />
   ),
+  label: "Diagramm",
 });
 
 export function EChart(props: EChartProps) {

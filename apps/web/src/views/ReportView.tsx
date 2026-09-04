@@ -47,6 +47,11 @@ export function ReportView() {
       turnOfYear: st.turnOfYear,
       cdsCurves: st.cdsCurves,
       marketSource: st.marketSource,
+      volSurfaces: st.volSurfaces,
+      fxFixings: st.fxFixings,
+      fxSpotOverrides: st.fxSpotOverrides,
+      fixings: st.fixings,
+      importedBase: st.importedBase,
     })),
   );
   const act = useStore.getState;
@@ -86,7 +91,7 @@ export function ReportView() {
   // The market goes into the report unchanged: the snapshot id is the core `marketSnapshotId` of exactly this market, no UI label is
   // hashed into it (R5-F2). "modifiziert" is shown next to the label instead; a modified market changes the id anyway (its curves differ).
   const reportMarket = s.market;
-  const modifiedSuffix = modified ? " · Quotes modifiziert" : "";
+  const modifiedSuffix = modified ? " · modifiziert" : "";
 
   const report = useMemo(() => {
     if (!trade || !s.reportStamp) return null;

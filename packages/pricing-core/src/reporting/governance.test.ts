@@ -102,7 +102,8 @@ describe("F-01 / N-06 – PricingError with codes", () => {
       maturity: "10Y",
     });
     try {
-      priceTrade({ ...ctx, missingFixingPolicy: "throw" }, seasoned, "EUR");
+      // the sample market carries EURIBOR history since Markt R6-6 – strip it to hit the missing-fixing path
+      priceTrade({ ...ctx, fixings: [], missingFixingPolicy: "throw" }, seasoned, "EUR");
     } catch (e) {
       err = e;
     }

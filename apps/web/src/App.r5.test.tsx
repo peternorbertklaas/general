@@ -107,7 +107,7 @@ describe("App – round 5", () => {
     const audit = screen.getByTestId("audit-hashes").textContent ?? "";
     const id = /Snapshot (\w+)/.exec(audit)![1];
     const header = screen.getByTestId("report-header").textContent ?? "";
-    expect(header).toMatch(/Quotes modifiziert/);
+    expect(header).toMatch(/· modifiziert/);
     // the id shown is the id of the market as priced (label untouched)
     return import("@deriva/pricing-core").then(({ marketSnapshotId }) => {
       expect(id).toBe(marketSnapshotId(useStore.getState().market));

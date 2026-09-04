@@ -7,14 +7,16 @@ import {
   type InterpolatedCurve,
   type MarketContext,
   bootstrapCurve,
+  knownCurrencies,
+  knownIndices,
   parseISO,
   toISO,
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import { sendError } from "../lib/errors.js";
-import { volSurfaceProblems } from "../lib/vol-surfaces.js";
-import { arrayResponse, bootstrapBodySchema, marketPutSchema, objectResponse, responses } from "../schemas.js";
+import { volSurfacePlausibilityWarnings, volSurfaceProblems } from "../lib/vol-surfaces.js";
+import { arrayResponse, bootstrapBodySchema, marketPutSchema, objectResponse, responses, responsesWithoutBody } from "../schemas.js";
 
 function curveSummary(c: Curve, valuationDate: number) {
   const ic = c as InterpolatedCurve;
@@ -101,8 +103,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       schema: {
         operationId: "getMarket",
         tags: ["market"],
-        summary: "Marktdaten-Übersicht (Bewertungstag, Kurven, Spots, Vol-Flächen, Fixings, Credit)",
-        response: responses({
+        summary: "Marktdaten-Übersicht (Bewertungstag, Kurven, Spots, Vol-Flächen, Fixings, Credit, registrierte Währungen/Indizes)",
+        response: responsesWithoutBody({
           200: {
             type: "object",
             properties: {
@@ -117,6 +119,15 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
               fxVols: { type: "array", items: { type: "string" } },
               fixings: { type: "integer" },
               credit: objectResponse("Hazard/recovery per counterparty"),
+              currencies: {
+                type: "array",
+                items: { type: "string" },
+                description:
+                  "Currencies with registered swap conventions (`knownCurrencies()` of the core: G5 plus NOK/SEK/DKK/PLN, Markt R6-5) – a curve can be bootstrapped and a swap built in each of them; a discount curve exists only for those listed in `discountCurveId`",
+              },
+              indices: arrayResponse(
+                "Registered floating-rate indices `{ name, currency, type, tenor, dayCount, fixingCalendar, curveId }` (`knownIndices()`)",
+              ),
             },
             additionalProperties: true,
           },
@@ -137,6 +148,16 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         fxVols: Object.keys(m.fxVols ?? {}),
         fixings: m.fixings?.length ?? 0,
         credit: m.credit,
+        currencies: knownCurrencies(),
+        indices: knownIndices().map((ix) => ({
+          name: ix.name,
+          currency: ix.currency,
+          type: ix.type,
+          tenor: ix.tenor,
+          dayCount: ix.dayCount,
+          fixingCalendar: ix.fixingCalendar,
+          curveId: ix.curveId,
+        })),
       };
     },
   );
@@ -150,7 +171,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         tags: ["market"],
         summary: "Kurve mit Pillars, Zero-Rates und Forwards",
         params: curveIdParams,
-        response: responses({ 200: curveSummarySchema }, 400, 404),
+        response: responsesWithoutBody({ 200: curveSummarySchema }, 400, 404),
       },
     },
     async (req, reply) => {
@@ -169,7 +190,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         operationId: "listCurves",
         tags: ["market"],
         summary: "Alle Kurven",
-        response: responses({ 200: { type: "array", items: curveSummarySchema } }),
+        response: responsesWithoutBody({ 200: { type: "array", items: curveSummarySchema } }),
       },
     },
     async () => {
@@ -186,7 +207,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         operationId: "getVols",
         tags: ["market"],
         summary: "Volatilitätsflächen",
-        response: responses({
+        response: responsesWithoutBody({
           200: {
             type: "object",
             properties: {
@@ -301,7 +322,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         summary:
           "Spots/Fixings/FX-Fixings/Spot-Daten/Fixing-Policy/Vol-Flächen setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut; Vol-Flächen je Key ersetzt, ohne kompletten Snapshot; strukturell geprüft → 400 VOL_SURFACE_INVALID)",
         description:
-          "Vol surfaces are validated structurally before the market is touched (Markt R5-1): grid rows = expiries, row length = tenors / strikes, FX vectors = expiries, axes strictly increasing, finite non-negative quotes, key = `currency` / `currency-index` / `pair`. A malformed surface answers 400 `VOL_SURFACE_INVALID` with `problems[]` and leaves the market unchanged – it can no longer be stored and fail every later swaption valuation.",
+          "Vol surfaces are validated structurally before the market is touched (Markt R5-1): grid rows = expiries, row length = tenors / strikes, FX vectors = expiries, axes strictly increasing, finite non-negative quotes, key = `currency` / `currency-index` / `pair`. A malformed surface answers 400 `VOL_SURFACE_INVALID` with `problems[]` and leaves the market unchanged – it can no longer be stored and fail every later swaption valuation. " +
+          "Structurally sound but implausible surfaces (numbers that do not fit the declared `volType` – a Lognormal cube of normal-sized numbers, a Normal surface of lognormal-sized ones – or degenerate all-zero / constant grids, Markt R6-4) are stored and answered 200 with `warnings[]` (`VOL_IMPLAUSIBLE:` per surface); every valuation reading such a surface repeats the warning.",
         body: marketPutSchema,
         response: responses(
           {
@@ -318,6 +340,11 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
                 swaptionVols: { type: "array", items: { type: "string" }, description: "Keys of the swaption vol cubes now in the market" },
                 capletVols: { type: "array", items: { type: "string" }, description: "Keys of the caplet vol surfaces now in the market" },
                 fxVols: { type: "array", items: { type: "string" }, description: "Keys of the FX vol surfaces now in the market" },
+                warnings: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "`VOL_IMPLAUSIBLE:` plausibility warnings of the surfaces just stored (empty when plausible; structural problems are a 400)",
+                },
               },
               additionalProperties: true,
             },
@@ -335,6 +362,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
           problems,
         });
       }
+      // Plausibility (R6-4) is a warning, not a rejection: the surface is stored, the response and every valuation say so.
+      const warnings = volSurfacePlausibilityWarnings(req.body);
       let m = ctx.market.get();
       if (req.body.valuationDate) m = ctx.market.rebuild(parseISO(req.body.valuationDate));
       if (req.body.fxSpots) m = { ...m, fxSpots: { ...m.fxSpots, ...req.body.fxSpots } };
@@ -378,7 +407,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         },
       });
       if (vols.swaption.length + vols.caplet.length + vols.fx.length > 0) {
-        ctx.audit.append({ actor: "api", action: "market.vols", subject: "market", details: { ...vols, snapshotId } });
+        ctx.audit.append({ actor: "api", action: "market.vols", subject: "market", details: { ...vols, warnings: warnings.length, snapshotId } });
       }
       return {
         valuationDate: toISO(m.valuationDate),
@@ -391,6 +420,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         swaptionVols: Object.keys(m.swaptionVols ?? {}),
         capletVols: Object.keys(m.capletVols ?? {}),
         fxVols: Object.keys(m.fxVols ?? {}),
+        warnings,
       };
     },
   );

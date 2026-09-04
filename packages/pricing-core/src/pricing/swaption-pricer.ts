@@ -5,9 +5,11 @@ import { type FixedLeg, type PricingResult, type Swaption } from "../instruments
 import { type MarketContext, getDiscountCurve } from "../market/market-context.js";
 import { bachelierGreeks, black76Greeks } from "../models/black.js";
 import { swaptionVol } from "../models/vol-surfaces.js";
+import { surfaceVolWarnings } from "../market/vol-validation.js";
 import { convertSurfaceVol, modelForVolType, modelQuotation, sameQuotation, surfaceQuotation, volTypeConvertedWarning } from "./capfloor-pricer.js";
 import { fxToReporting } from "./leg-pricer.js";
 import { priceInterestRateSwap } from "./swap-pricer.js";
+import { upfrontPremiumLeg } from "./upfront.js";
 
 /**
  * European swaption priced with Bachelier (default), Black or shifted Black
@@ -57,8 +59,10 @@ export function priceSwaption(ctx: MarketContext, trade: Swaption, reportingCurr
   let vol = trade.volOverride;
   let surfaceVol: number | undefined;
   if (vol === undefined) {
-    if (surface) vol = swaptionVol(surface, tExp, tenorYears, forward, strike);
-    else {
+    if (surface) {
+      vol = swaptionVol(surface, tExp, tenorYears, forward, strike);
+      warnings.push(...surfaceVolWarnings(surface)); // Markt R6-4: implausible / degenerate cube
+    } else {
       vol = 0.007;
       warnings.push("No swaption vol surface – using 70bp normal vol");
     }
@@ -94,12 +98,9 @@ export function priceSwaption(ctx: MarketContext, trade: Swaption, reportingCurr
   const longShort = trade.payReceive === "Receive" ? 1 : -1;
   const notional = fixed.notional;
   const pvCcy = longShort * notional * annuity * g.price;
-  let pv = pvCcy * fx;
-  if (trade.upfront && trade.upfront.date > ctx.valuationDate) {
-    const d2 = getDiscountCurve(ctx, trade.upfront.currency, trade.collateralCurrency);
-    const fxu = fxToReporting(ctx, trade.upfront.currency, reporting, trade.collateralCurrency);
-    pv -= trade.upfront.amount * d2.df(trade.upfront.date) * fxu;
-  }
+  // N6-1: the upfront premium is a `Premium` cashflow in its own (last) leg, not a silent PV deduction.
+  const upfront = upfrontPremiumLeg(ctx, trade, reporting, 1);
+  const pv = pvCcy * fx + (upfront?.pvReporting ?? 0);
   // N5-4g: on the exercise date itself the option is not expired – say so.
   if (trade.expiryDate < ctx.valuationDate) warnings.push("Swaption expired – intrinsic value shown");
   else if (trade.expiryDate === ctx.valuationDate) warnings.push("Swaption expires today – intrinsic value shown");
@@ -134,6 +135,7 @@ export function priceSwaption(ctx: MarketContext, trade: Swaption, reportingCurr
           },
         ],
       },
+      ...(upfront ? [upfront.leg] : []),
     ],
     analytics: {
       model,

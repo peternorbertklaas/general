@@ -12,9 +12,9 @@ import {
   validateMarket,
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
-import { sendError } from "../lib/errors.js";
+import { apiErrorCode, sendError } from "../lib/errors.js";
 import { ifNoneMatchSatisfied } from "../lib/etag.js";
-import { volSurfaceProblems } from "../lib/vol-surfaces.js";
+import { volSurfacePlausibilityWarnings, volSurfaceProblems } from "../lib/vol-surfaces.js";
 import {
   type EMIR_BOOLEAN,
   type EMIR_CLEARED,
@@ -26,6 +26,7 @@ import {
   jsonOrText,
   marketSnapshotRef,
   responses,
+  responsesWithoutBody,
 } from "../schemas.js";
 
 /** Options shared by `GET` (query) and `POST` (body) `/api/emir/valuations`. */
@@ -107,7 +108,7 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
             },
           },
         },
-        response: responses({
+        response: responsesWithoutBody({
           200: marketSnapshotRef,
           304: { type: "null", description: "Not modified (snapshot id matches If-None-Match, weak comparison)" },
         }),
@@ -130,7 +131,7 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
         tags: ["market"],
         summary: "Markt-Snapshot importieren (ersetzt den aktiven Snapshot nach Schema-, Vol-Flächen- und Konsistenzprüfung)",
         description:
-          "Order of checks: JSON schema (400 `VALIDATION_ERROR`) → structural vol-surface check (400 `VOL_SURFACE_INVALID` with `problems[]`: grid dimensions, axis ordering, key ↔ currency/pair) → structural deserialisation (400 `SNAPSHOT_MALFORMED` / `INVALID_TIMESTAMP` / `INVALID_DATE`) → market consistency (`validateMarket`, 422 `SNAPSHOT_INVALID` with `problems[]`). The active snapshot is replaced only when every step passes.",
+          "Order of checks: JSON schema (400 `VALIDATION_ERROR`) → structural vol-surface check (400 `VOL_SURFACE_INVALID` with `problems[]`: grid dimensions, axis ordering, key ↔ currency/pair) → structural deserialisation (400 `SNAPSHOT_MALFORMED` / `INVALID_TIMESTAMP` / `INVALID_DATE`) → market consistency (`validateMarket`, 422 `SNAPSHOT_INVALID` with `problems[]`). The active snapshot is replaced only when every step passes; implausible but structurally sound vol surfaces (numbers not fitting the `volType`, degenerate grids – Markt R6-4) are imported and reported in `warnings[]` (`VOL_IMPLAUSIBLE:`).",
         body: marketSnapshotRef,
         response: responses(
           {
@@ -142,6 +143,11 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
                 valuationDate: { type: "string" },
                 curves: { type: "array", items: { type: "string" } },
                 snapshotId: { type: "string" },
+                warnings: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "`VOL_IMPLAUSIBLE:` warnings of the imported surfaces (empty when plausible)",
+                },
               },
             },
           },
@@ -163,20 +169,22 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
         m = deserializeMarket(req.body);
       } catch (e) {
         // Structural problems the schema cannot express (e.g. an unparsable timestamp) – a client error with the core's code when it has one.
-        const code = isPricingError(e) ? e.code : "SNAPSHOT_MALFORMED";
-        return reply.status(400).send({ error: (e as Error).message, statusCode: 400, code, requestId: req.id });
+        const code = apiErrorCode(isPricingError(e) ? e.code : undefined, "SNAPSHOT_MALFORMED");
+        return sendError(reply, req, 400, code, (e as Error).message);
       }
       const problems = validateMarket(m);
       if (problems.length) return sendError(reply, req, 422, "SNAPSHOT_INVALID", "Snapshot validation failed", { problems });
+      // Implausible (but structurally sound) surfaces are imported with a warning (Markt R6-4).
+      const warnings = volSurfacePlausibilityWarnings(req.body);
       ctx.market.set(m);
       const snapshotId = ctx.market.snapshotId();
       ctx.audit.append({
         actor: "api",
         action: "snapshot.import",
         subject: req.body.valuationDate,
-        details: { curves: Object.keys(m.curves).length, snapshotId },
+        details: { curves: Object.keys(m.curves).length, warnings: warnings.length, snapshotId },
       });
-      return { imported: true, valuationDate: req.body.valuationDate, curves: Object.keys(m.curves), snapshotId };
+      return { imported: true, valuationDate: req.body.valuationDate, curves: Object.keys(m.curves), snapshotId, warnings };
     },
   );
 
@@ -186,12 +194,10 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
     "Clearing fields come from the trade: `cleared` (field 31, `Y`/`N`; `I` = intent to clear via the `intentToClear` option for not-yet-cleared trades), `clearingObligation` (field 30, `TRUE`/`FLSE` – explicit flag or the `clearingObligation` reporter default, `UKWN` when neither is set; never derived from `cleared`), `clearingMember` (Table 1). " +
     "Valuation timestamp (field 23, ISO-8601 date-time): `timestamp` → snapshot `meta.snapshotTime` → `asOf` → 17:00 UTC of the valuation date. Method (field 24): `method` → MTMA for trades with a `transactionPrice` → MTMO. " +
     "Value formats follow ITS Table 2 (booleans `TRUE`/`FLSE`, cleared `Y`/`N`/`I`, clearing obligation `TRUE`/`FLSE`/`UKWN`). The whole trade store is priced: the request budget applies (413 `PERIOD_BUDGET_EXCEEDED`).";
-  const emirResponse = responses(
-    { 200: jsonOrText({ type: "array", items: emirRecordSchema }, "text/csv", csvResponse, "EMIR valuation records (JSON) or CSV download") },
-    400,
-    413,
-    422,
-  );
+  const emirSuccess = { 200: jsonOrText({ type: "array", items: emirRecordSchema }, "text/csv", csvResponse, "EMIR valuation records (JSON) or CSV download") };
+  // GET has no body (no 415), POST has one.
+  const emirResponseGet = responsesWithoutBody(emirSuccess, 400, 413, 422);
+  const emirResponsePost = responses(emirSuccess, 400, 413, 422);
 
   /** Price the store, build the ITS-formatted records and answer as JSON or CSV. */
   const emirRecords = (reply: FastifyReply, opts: EmirOptions, utiMap: Record<string, string>, priceMap: Record<string, number>) => {
@@ -262,7 +268,7 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
           },
           additionalProperties: false,
         },
-        response: emirResponse,
+        response: emirResponseGet,
       },
       // A clear message before Ajv's generic `maxLength` error.
       preValidation: async (req, reply) => {
@@ -307,7 +313,7 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
           emirDescription +
           " Same options as the GET variant; `uti` and `transactionPrice` are JSON objects keyed by trade id (up to 5000 entries each). Prefer this variant for books of more than a few dozen trades and whenever UTIs or prices must not appear in URLs or access logs.",
         body: emirValuationsBodySchema,
-        response: emirResponse,
+        response: emirResponsePost,
       },
     },
     async (req, reply) => emirRecords(reply, req.body, req.body.uti ?? {}, req.body.transactionPrice ?? {}),

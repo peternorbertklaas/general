@@ -95,12 +95,6 @@ const CORE_MESSAGES: Rule[] = [
   },
   { re: /^meta\.snapshotTime (.+) is not an ISO-8601 date-time$/, to: (m) => `Snapshot-Zeitstempel (meta.snapshotTime) ${m[1]} ist kein ISO-8601-Zeitstempel` },
   // Vol-surface structure problems (core `validateVolSurfaces` / `deserializeMarket`, Markt R5-1) – paths like "swaptionVols.USD.atm[3]"
-  { re: /^(\S+): has (\d+) rows but there are (\d+) expiries$/, to: (m) => `${volPathDe(m[1]!)}: ${m[2]} Zeilen, aber ${m[3]} Verfälle` },
-  {
-    re: /^(\S+): has (\d+) columns but there are (\d+) (tenors|strikes)$/,
-    to: (m) => `${volPathDe(m[1]!)}: ${m[2]} Spalten, aber ${m[3]} ${m[4] === "tenors" ? "Tenore" : "Strikes"}`,
-  },
-  { re: /^(\S+): has (\d+) entries but there are (\d+) expiries$/, to: (m) => `${volPathDe(m[1]!)}: ${m[2]} Einträge, aber ${m[3]} Verfälle` },
   { re: /^(\S+): must be a non-empty array of numbers$/, to: (m) => `${volPathDe(m[1]!)}: muss eine nicht leere Zahlenliste sein` },
   { re: /^(\S+): must be an array of numbers$/, to: (m) => `${volPathDe(m[1]!)}: muss eine Zahlenliste sein` },
   { re: /^(\S+): must be a matrix of numbers$/, to: (m) => `${volPathDe(m[1]!)}: muss eine Zahlenmatrix sein` },
@@ -113,7 +107,7 @@ const CORE_MESSAGES: Rule[] = [
   },
   {
     re: /^(\S+)\.volType: unknown vol type (.+)$/,
-    to: (m) => `${volPathDe(m[1]!)}: unbekannter Vol-Typ ${m[2]} (erwartet Normal, Lognormal oder ShiftedLognormal)`,
+    to: (m) => `${volPathDe(m[1]!)}: ${volTypeDe(m[2]!)} (erwartet Normal, Lognormal oder ShiftedLognormal)`,
   },
   { re: /^(\S+)\.shift: must be a finite number ≥ 0$/, to: (m) => `${volPathDe(m[1]!)}: Shift muss eine endliche Zahl ≥ 0 sein` },
   { re: /^(\S+)\.shift: ShiftedLognormal needs a shift > 0$/, to: (m) => `${volPathDe(m[1]!)}: ShiftedLognormal benötigt einen Shift > 0` },
@@ -143,6 +137,46 @@ const CORE_MESSAGES: Rule[] = [
   { re: /^(\S+)\.sabr\.(\S+)\.(\w+): must be a finite number$/, to: (m) => `${volPathDe(m[1]!)}: SABR ${m[2]} – ${m[3]} muss eine endliche Zahl sein` },
   // any other core vol-surface problem line ("swaptionVols.USD.atm has 1 rows, expected 11 (one per expiry)")
   { re: /^(swaptionVols|capletVols|fxVols)\b.*$/, to: (m) => translateVolProblem(m[0]) },
+  // Core R6 (N6-5): knock state of a barrier option not recorded on the trade – derived from spot / expiry fixing
+  {
+    re: /^BARRIER_STATE_UNKNOWN: spot (\S+) is (at or above|at or below) the (\w+) barrier (\S+) – valued as (knocked out \((?:rebate|PV 0)\)|knocked in \(vanilla\)) on today's spot(.*)$/,
+    to: (m) =>
+      `Barriere-Status unbekannt: Spot ${numDe(m[1]!)} liegt ${m[2] === "at or above" ? "auf oder über" : "auf oder unter"} der ${barrierDe(m[3]!)}-Barriere ${numDe(m[4]!)} – ${
+        m[5]!.startsWith("knocked out") ? `als ausgeknockt bewertet (${/rebate/.test(m[5]!) ? "Rebate" : "Barwert 0"})` : "als eingeknockt (Vanilla) bewertet"
+      } auf Basis des heutigen Spots${/hit is false/.test(m[6] ?? "") ? " – obwohl „Barriere bereits berührt“ nicht gesetzt ist (kontinuierliche Barriere: ein Spot jenseits des Levels gilt als Berührung)" : "; „Barriere bereits berührt“ im Trade setzen, um den Status festzuhalten"}`,
+  },
+  {
+    re: /^BARRIER_STATE_UNKNOWN: knock state of the (\w+) barrier (\S+) derived from the expiry fixing (\S+) only \((.+?)\) – touch events before the expiry are not observed.*$/,
+    to: (m) =>
+      `Barriere-Status unbekannt: Knock-Status der ${barrierDe(m[1]!)}-Barriere ${numDe(m[2]!)} nur aus dem Verfallsfixing ${numDe(m[3]!)} abgeleitet (${barrierStateDe(m[4]!)}) – Berührungen vor dem Verfall werden nicht beobachtet; „Barriere bereits berührt“ im Trade setzen, um den Status festzuhalten`,
+  },
+  { re: /^BARRIER_STATE_UNKNOWN: (.+)$/, to: (m) => `Barriere-Status unbekannt – ${germanizeText(m[1]!)}; „Barriere bereits berührt“ im Trade setzen` },
+  // Core R6 (Markt R6-4): vol surface structurally fine but implausible (quotation type vs. numbers, degenerate grid)
+  {
+    re: /^VOL_IMPLAUSIBLE: (.+?) is degenerate – every vol is 0 \(options are valued at intrinsic value only\)$/,
+    to: (m) => `Vol-Fläche unplausibel: ${volSurfaceDe(m[1]!)} ist degeneriert – alle Vols sind 0 (Optionen werden nur zum inneren Wert bewertet)`,
+  },
+  {
+    re: /^VOL_IMPLAUSIBLE: (.+?): median normal vol (.+?) is above (.+?) – the numbers look like lognormal vols; check the volType of the import$/,
+    to: (m) =>
+      `Vol-Fläche unplausibel: ${volSurfaceDe(m[1]!)} – Median der Normal-Vols ${numDe(m[2]!)} liegt über ${numDe(m[3]!)}; die Zahlen sehen wie Lognormal-Vols aus – volType des Imports prüfen`,
+  },
+  {
+    re: /^VOL_IMPLAUSIBLE: (.+?): median lognormal vol (.+?) is below (.+?) – the numbers look like normal \(bp\) vols; check the volType of the import$/,
+    to: (m) =>
+      `Vol-Fläche unplausibel: ${volSurfaceDe(m[1]!)} – Median der Lognormal-Vols ${numDe(m[2]!)} liegt unter ${numDe(m[3]!)}; die Zahlen sehen wie Normal-Vols (bp) aus – volType des Imports prüfen`,
+  },
+  {
+    re: /^VOL_IMPLAUSIBLE: (.+?) has (\d+) of (\d+) (normal|lognormal) vols above (.+?) \(max (.+?)\) – check the volType \/ quotation of the import$/,
+    to: (m) =>
+      `Vol-Fläche unplausibel: ${volSurfaceDe(m[1]!)} – ${m[2]} von ${m[3]} ${quotationDe(m[4]!)}-Vols über ${numDe(m[5]!)} (max ${numDe(m[6]!)}); volType/Quotierung des Imports prüfen`,
+  },
+  {
+    re: /^VOL_IMPLAUSIBLE: (.+?) has (\d+) of (\d+) (normal|lognormal) vols below (.+?) \(min (.+?)\) – (.+)$/,
+    to: (m) =>
+      `Vol-Fläche unplausibel: ${volSurfaceDe(m[1]!)} – ${m[2]} von ${m[3]} ${quotationDe(m[4]!)}-Vols unter ${numDe(m[5]!)} (min ${numDe(m[6]!)}); ${volHintDe(m[7]!)}`,
+  },
+  { re: /^VOL_IMPLAUSIBLE: (.+)$/, to: (m) => `Vol-Fläche unplausibel – ${germanizeText(m[1]!)}` },
   // Core R4-1: historical FX fixing for an MtM reset missing
   {
     re: /^MISSING_FX_FIXING: Missing FX fixing for ([A-Z]{6}) on (\d{4}-\d{2}-\d{2}); MtM reset of leg (\d+) valued with today's rate as proxy.*$/,
@@ -359,6 +393,12 @@ function volPathDe(path: string): string {
   return `${kind} ${m[2]}${rest}`;
 }
 
+/** "Vol-Typ X unbekannt" – a missing `volType` (`undefined`, `null`, empty) reads "Vol-Typ fehlt", never a raw `undefined` (R6-05). */
+function volTypeDe(got: string): string {
+  const g = got.trim().replace(/^"(.*)"$/, "$1");
+  return g === "undefined" || g === "null" || g === "" ? "Vol-Typ fehlt" : `Vol-Typ ${got.trim()} unbekannt`;
+}
+
 const AXIS_DE: Record<string, string> = { expiry: "Verfall", tenor: "Tenor", strike: "Strike", expiries: "Verfälle", tenors: "Tenore", strikes: "Strikes" };
 const axisDe = (a: string) => AXIS_DE[a] ?? a;
 
@@ -392,7 +432,7 @@ function translateVolProblem(p: string): string {
   m = /^(\S+)\.(id|currency|index|pair) missing$/.exec(s);
   if (m) return `${volPathDe(m[1]!)}: Feld „${m[2]}“ fehlt`;
   m = /^(\S+)\.volType must be one of (.+?) \(got (.+)\)$/.exec(s);
-  if (m) return `${volPathDe(m[1]!)}: Vol-Typ ${m[3]} unbekannt (erlaubt ${m[2]})`;
+  if (m) return `${volPathDe(m[1]!)}: ${volTypeDe(m[3]!)} (erlaubt ${m[2]})`;
   m = /^(\S+)\.shift must be a finite, non-negative number \(got (.+)\)$/.exec(s);
   if (m) return `${volPathDe(m[1]!)}: Shift ${m[2]} muss eine endliche Zahl ≥ 0 sein`;
   m = /^(\S+)\.(atmConvention|deltaConvention|smileInterpolation|strangleType) must be (.+?) \(got (.+)\)$/.exec(s);
@@ -419,6 +459,41 @@ function translateVolProblem(p: string): string {
     return `${volPathDe(`${m[1]}.*`).replace(" *", "")}: muss ein Objekt je ${m[2] === "currency pair" ? "Währungspaar" : m[2] === "currency" ? "Währung" : "Währung[-Index]"} sein`;
   m = /^(\S+)[:.]?\s(.*)$/.exec(s);
   return m && /^(swaptionVols|capletVols|fxVols)\./.test(m[1]!) ? `${volPathDe(m[1]!.replace(/:$/, ""))}: ${m[2]}` : s;
+}
+
+/**
+ * Surface reference of a `VOL_IMPLAUSIBLE:` warning: a market path ("swaptionVols.USD" → "Swaption-Cube USD",
+ * `volSurfaceWarnings`) or a pricer label ("swaption surface EUR-SWAPTION-NORMAL" → "Swaption-Fläche EUR-SWAPTION-NORMAL").
+ */
+function volSurfaceDe(ref: string): string {
+  const r = ref.trim();
+  if (/^(swaptionVols|capletVols|fxVols)\./.test(r)) return volPathDe(r);
+  const m = /^(swaption|caplet|FX vol) surface (\S+)$/i.exec(r);
+  if (m) {
+    const k = m[1]!.toLowerCase();
+    return `${k === "swaption" ? "Swaption" : k === "caplet" ? "Caplet" : "FX-Vol"}-Fläche ${m[2]}`;
+  }
+  return r;
+}
+/** Trailing hint of the "vols below" warning. */
+function volHintDe(hint: string): string {
+  if (/^normal vols are decimals of the rate/.test(hint)) return "Normal-Vols sind Dezimalzahlen des Satzes (0,0070 = 70 bp)";
+  if (/^lognormal vols are decimals/.test(hint))
+    return "Lognormal-Vols sind Dezimalzahlen (0,20 = 20 %); Normal-Zahlen auf einer Lognormal-Fläche lassen Optionswerte zusammenfallen";
+  return germanizeText(hint);
+}
+/** "UpOut" → "Up-and-Out" (barrier warnings). */
+function barrierDe(type: string): string {
+  return BARRIER_DE[type] ?? type;
+}
+/** Barrier state fragment of the core ("knocked out", "not touched", "knocked in") → German. */
+function barrierStateDe(state: string): string {
+  const st = state.trim().toLowerCase();
+  if (/knocked[- ]out/.test(st)) return "ausgeknockt";
+  if (/knocked[- ]in/.test(st)) return "eingeknockt";
+  if (/not touched|alive|untouched/.test(st)) return "nicht berührt (Option lebt)";
+  if (/touched|hit/.test(st)) return "berührt";
+  return state;
 }
 
 /** Leg labels of the FX pricer ("FX forward", "near leg", "far leg") → German. */
@@ -508,6 +583,25 @@ export const PRICING_ERROR_CODES_DE: Record<string, string> = {
   INVALID_CURVE_SPEC: "Kurvenspezifikation ungültig",
   NUMERICAL_FAILURE: "Numerische Lösung nicht konvergiert",
   EXPIRED: "Verfallen",
+  // core round 6
+  BARRIER_STATE_UNKNOWN: "Barriere-Status unbekannt",
+  VOL_IMPLAUSIBLE: "Vol-Fläche unplausibel",
+  UNKNOWN_CURRENCY: "Unbekannte Währung",
+};
+
+/** Warning prefixes of the core with their German headline (blotter / inspector badges, R6). */
+export const WARNING_PREFIXES_DE: Record<string, string> = {
+  MISSING_FIXING: "Fixing fehlt",
+  MISSING_FX_FIXING: "FX-Fixing fehlt",
+  SETTLES_TODAY: "Lieferung am Bewertungstag",
+  COLLATERAL_CURVE_MISSING: "Collateral-Kurve fehlt",
+  VOL_TYPE_CONVERTED: "Vol-Quotierung umgerechnet",
+  NEGATIVE_RATE_LOGNORMAL: "Lognormal bei negativem Satz",
+  HAZARD_FLOORED: "Hazard-Rate begrenzt",
+  EXPIRED: "Verfallen",
+  EXPIRES_TODAY: "Verfällt heute",
+  BARRIER_STATE_UNKNOWN: "Barriere-Status unbekannt",
+  VOL_IMPLAUSIBLE: "Vol-Fläche unplausibel",
 };
 
 /**
@@ -538,6 +632,8 @@ export const LEG_TYPE_DE: Record<string, string> = {
   "FX Buy": "Kauf",
   "FX Sell": "Verkauf",
   Premium: "Prämie",
+  // core R6 (N6-1): the upfront premium / fee is its own last leg with one `Premium` cashflow
+  "Upfront premium": "Upfront-Prämie",
   Option: "Option",
   Payoff: "Auszahlung",
   Near: "Near",
@@ -615,6 +711,10 @@ export function optionsFrom<T extends string>(values: readonly T[], map: Record<
 /** "3.100" → "3,100"; "1.1725" → "1,1725" (the caller knows the token is a decimal, not a grouped integer). */
 function deDecimal(num: string): string {
   return num.replace(/\.(\d+)$/, ",$1");
+}
+/** Every decimal point between digits → comma ("0.97 %" → "0,97 %", "1.25" → "1,25") – for core numbers inside warning texts. */
+function numDe(s: string): string {
+  return s.replace(/(\d)\.(\d)/g, "$1,$2");
 }
 
 /** ISO dates → dd.mm.yyyy and English trade-type identifiers → German inside free text (hedge summaries, N-07). */

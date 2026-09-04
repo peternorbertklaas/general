@@ -30,6 +30,7 @@ import {
 import { parseNumberInput } from "../lib/num-parse.js";
 import { hasFxVolSurface } from "../lib/quick-parser.js";
 import { annuityAmortisation, frequencyMonths, parseSchedulePaste, scheduleValueAt } from "../lib/trade-ops.js";
+import { useTableNav } from "../hooks/useTableNav.js";
 import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
 import { LS_KEYS, STATUS_LABELS, TRADE_STATUSES, readLocal, useStore, writeLocal } from "../state/store.js";
 import { DateInput } from "./DateInput.js";
@@ -418,6 +419,24 @@ function AmortisationEditor({
 }) {
   const valuationDate = useStore((s) => s.valuationDate);
   const showToast = useStore((s) => s.showToast);
+  /** Roving tabindex (R6-02): the table is one tab stop, ↑/↓ move between periods, ↵ / F2 focus the notional input of the row. */
+  const rowNav = useTableNav({ onEnter: (_i, tr) => tr.querySelector<HTMLInputElement>("input")?.focus() });
+  const onRowKey = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
+    const target = e.target as HTMLElement;
+    if (e.key === "F2" && target.tagName === "TR") {
+      e.preventDefault();
+      target.querySelector<HTMLInputElement>("input")?.focus();
+      return;
+    }
+    rowNav.onKeyDown(e);
+  };
+  /** Esc inside a notional input returns the focus to its row (capture phase: the input's own Esc handler restores the value and blurs). */
+  const onRowKeyCapture = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
+    const target = e.target as HTMLElement;
+    if (e.key !== "Escape" || target.tagName !== "INPUT") return;
+    const tr = target.closest("tr");
+    window.setTimeout(() => tr?.focus(), 0);
+  };
   const [applyAll, setApplyAll] = useState(legs.every((l) => l.currency === legs[0]!.currency));
   const [legIdx, setLegIdx] = useState(0);
   const [kind, setKind] = useState<AmortKind>("linear");
@@ -577,9 +596,9 @@ function AmortisationEditor({
                   <th className="num">Nominal</th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody onKeyDown={onRowKey} onKeyDownCapture={onRowKeyCapture} onFocus={rowNav.onFocus}>
                 {periodStarts.map((d, i) => (
-                  <tr key={d} style={{ cursor: "default" }} tabIndex={0}>
+                  <tr key={d} style={{ cursor: "default" }} {...rowNav.rowProps(i, periodStarts.length)}>
                     <td className="muted">{i + 1}</td>
                     <td className="mono">{fmtDate(d)}</td>
                     <td className="num">
@@ -591,6 +610,7 @@ function AmortisationEditor({
                           min={0}
                           unit={ref.currency}
                           ariaLabel={`Nominal Periode ${i + 1}`}
+                          tabIndex={-1}
                           onChange={(v) => setRow(i, v)}
                         />
                       </span>
@@ -601,7 +621,8 @@ function AmortisationEditor({
             </table>
           </div>
           <div className="muted xs" style={{ marginTop: 4 }}>
-            Zweispaltige Tabelle (Datum;Nominal, z. B. aus Excel) mit <kbd>Ctrl</kbd>+<kbd>V</kbd> in die Tabelle einfügen – Datum als tt.mm.jjjj oder ISO.
+            Zweispaltige Tabelle (Datum;Nominal, z. B. aus Excel) mit <kbd>Ctrl</kbd>+<kbd>V</kbd> in die Tabelle einfügen – Datum als tt.mm.jjjj oder ISO.{" "}
+            <kbd>↑</kbd>/<kbd>↓</kbd> Periode · <kbd>↵</kbd> oder <kbd>F2</kbd> Nominal bearbeiten · <kbd>Tab</kbd> verlässt die Tabelle.
           </div>
         </>
       )}
@@ -1421,6 +1442,42 @@ export function TradeEditor({ trade, onChange }: Props) {
                   ariaLabel="Barriere-Rebate"
                   onChange={(v) => upd({ barrier: { ...trade.barrier!, rebate: v } })}
                 />
+              </Field>
+              <Field
+                label="Barriere-Status"
+                issue={iss("barrierHit")}
+                hint={
+                  trade.barrier.hit === undefined
+                    ? "Unbekannt: der Kern leitet den Knock-Status aus dem heutigen Spot bzw. dem Verfallsfixing ab und warnt („Barriere-Status unbekannt“)"
+                    : trade.barrier.hit
+                      ? "Berührt: Knock-out → Rebate / 0, Knock-in → Vanilla"
+                      : "Nicht berührt: bislang keine Berührung beobachtet (Berührungen vor dem Verfall werden nicht aus Fixings rekonstruiert)"
+                }
+              >
+                <span className="row wrap" style={{ gap: 12 }} data-testid="barrier-hit">
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={trade.barrier.hit === true}
+                      aria-label="Barriere bereits berührt"
+                      onChange={(e) => upd({ barrier: { ...trade.barrier!, hit: e.target.checked ? true : false } })}
+                    />{" "}
+                    Barriere bereits berührt
+                  </label>
+                  {trade.barrier.hit !== undefined && (
+                    <button
+                      type="button"
+                      className="btn ghost xs"
+                      onClick={() => {
+                        const { hit: _hit, ...rest } = trade.barrier!;
+                        upd({ barrier: rest });
+                      }}
+                      title="Knock-Status nicht festhalten – der Kern leitet ihn ab und warnt"
+                    >
+                      Status unbekannt
+                    </button>
+                  )}
+                </span>
               </Field>
             </>
           )}

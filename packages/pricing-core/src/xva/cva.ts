@@ -654,7 +654,16 @@ export function computeXva(ctx: MarketContext, trade: Trade, credit: CreditInput
   }
 }
 
-/** Convert a CDS spread (decimal) to a flat hazard rate: λ ≈ s / (1 - R). */
+/**
+ * Convert a CDS spread (decimal) to a flat hazard rate with the same
+ * convention as `bootstrapHazardCurve`: λ ≈ s · (365/360) / (1 − R) – the
+ * running spread accrues ACT/360 while the hazard is quoted per ACT/365F year
+ * (`CDS_PREMIUM_ACCRUAL_PER_YEAR`, N5-5). Until round 6 this shortcut was
+ * s / (1 − R) and therefore 1.4 % below the bootstrap of the same flat quote
+ * (N6-2: 100 bp / R 40 % → 166.67 bp vs 168.98 bp undiscounted); a flat-spread
+ * CVA/DVA is now consistent with the CDS-curve path to the quarterly
+ * discretisation of the bootstrap (≈ 3e-3 relative with discounting).
+ */
 export function hazardFromSpread(spread: number, recovery: number): number {
-  return spread / (1 - recovery);
+  return (spread * CDS_PREMIUM_ACCRUAL_PER_YEAR) / (1 - recovery);
 }

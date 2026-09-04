@@ -68,7 +68,7 @@ Capmatix, den Treasury-Management-Systemen und Excel + QuantLib schließt:
 | Modul | Zweck | Paket / Ort | Status v0.2 |
 |---|---|---|---|
 | **M1 Fundament** | Fehlerfreie Datums- und Konventionslogik als Basis jeder Bewertung | `packages/pricing-core/src/dates`, `src/math` | ✅ implementiert, getestet |
-| **M2 Marktdaten & Kurven** | Kurven aus Depos/FRAs/Futures/Swaps/OIS/Tenor-Basis/XCCY-Basis bauen, Vol-Flächen abfragen, Snapshots exportieren/importieren | `src/curves`, `src/models`, `src/market` | ✅ inkl. Snapshot-Format; Live-Adapter offen |
+| **M2 Marktdaten & Kurven** | Kurven aus Depos/FRAs/Futures/Swaps/OIS/Tenor-Basis/XCCY-Basis bauen, Vol-Flächen abfragen und plausibilisieren, Snapshots exportieren/importieren, Index-/Konventionsregister (G5 + NOK/SEK/DKK/PLN, `registerRateIndex`), Kurven aus Quotes in der Workstation („+ Kurve“) | `src/curves`, `src/models`, `src/market` | ✅ inkl. Snapshot-Format und Register; Live-Adapter offen |
 | **M3 Instrumente & Pricer** | Trade-Modell und analytische Bewertung aller v1-Instrumente | `src/instruments`, `src/pricing` | ✅ |
 | **M4 XVA** | Kreditrisikoadjustierung für Fair Value nach IFRS 13 | `src/xva` | ✅ alle Instrumente (Swaption-Replikation, GK, Delta-Normal) |
 | **M5 Risiko & Szenarien** | Sensitivitäten und Stress für Steuerung und IPV | `src/risk` | ✅ |

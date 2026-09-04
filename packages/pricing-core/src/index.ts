@@ -2,31 +2,23 @@
  * Public surface of `@deriva/pricing-core` (ADR-024). Every module is
  * re-exported with an explicit, curated name list – no `export *` – so the
  * public API is readable here and every addition is a visible diff (N4-03,
- * round 5; generated with `tools/gen-index.mjs`, then curated). Values are
- * listed first, `type` exports last. Names that API or Web import today are
- * kept even where ADR-024 marks them as candidates for the future `internal`
- * entry point (`nextTradeId`, interpolation / root-finding helpers).
+ * round 5). Since round 6 (N6-01) the list is genuinely curated: implementation
+ * helpers (root finding, interpolation coefficients, leg-pricing internals,
+ * vol-quotation conversion, exposure engines, the `nextTradeId` module counter,
+ * the indicative sample vol surfaces, …) live behind the second entry point
+ * `@deriva/pricing-core/internal` (`src/internal.ts`), which carries no SemVer
+ * promise. Names the API or the Web app import are always public –
+ * `node tools/gen-index.mjs --check` verifies that every module export is
+ * reachable through exactly one entry point and that every app import is on
+ * this list (`src/surface.test.ts`). Values are listed first, `type` exports
+ * last.
  */
 // Errors, formatting, version
 export { PricingError, isPricingError, type PricingErrorCode } from "./errors.js";
 export { formatDateDe, formatDateTimeDe, formatDe, formatPctDe } from "./format.js";
 export { PACKAGE_NAME, PACKAGE_VERSION } from "./version.js";
-// Math
-export { bivariateNormCdf, normCdf, normInv, normPdf } from "./math/normal.js";
-export { brent, newton, solveBracketed, type RootFindOptions } from "./math/rootfind.js";
-export {
-  cubicSplineCoefficients,
-  cubicSplineInterp,
-  isNonLocalInterpolation,
-  linearInterp,
-  locate,
-  monotoneConvexCoefficients,
-  monotoneConvexForward,
-  monotoneConvexZero,
-  monotoneCubicInterp,
-  type InterpolationMethod,
-  type MonotoneConvexCoefficients,
-} from "./math/interpolation.js";
+// Math (public vocabulary only – the algorithms live in `./internal`)
+export { type InterpolationMethod } from "./math/interpolation.js";
 // Dates
 export {
   addDays,
@@ -99,19 +91,25 @@ export {
   type ForwardJump,
   type InterpolatedCurveOptions,
 } from "./curves/curve.js";
-export { RATE_INDICES, SWAP_CONVENTIONS, getIndex, getSwapConventions, type RateIndex, type SwapConventions } from "./curves/index-definitions.js";
+export {
+  RATE_INDICES,
+  SWAP_CONVENTIONS,
+  getIndex,
+  getSwapConventions,
+  knownCurrencies,
+  knownIndices,
+  registerRateIndex,
+  registerSwapConventions,
+  type RateIndex,
+  type SwapConventions,
+} from "./curves/index-definitions.js";
 export {
   bootstrapCurve,
   bootstrapCurves,
   bumpQuote,
-  curveDependencies,
-  futureImpliedForward,
-  orderCurveSpecs,
   quoteDates,
   quoteLabel,
-  resolveFutureStart,
   spotDate,
-  turnOfYearWindow,
   type BasisSwapQuote,
   type BootstrapResult,
   type BootstrapSpec,
@@ -137,32 +135,14 @@ export {
   type MarketContext,
   type MissingFixingPolicy,
 } from "./market/market-context.js";
-export { currencyCalendar, fxPairCalendar, fxRateAtValuationDate, fxSpotDate, fxSpotDateFrom, fxSpotLag, pipFactor } from "./market/fx-spot.js";
+export { currencyCalendar, fxPairCalendar, fxRateAtValuationDate, fxSpotDate, fxSpotDateFrom, fxSpotLag } from "./market/fx-spot.js";
 export {
-  SAMPLE_CHFJPY_VOLS,
-  SAMPLE_CHF_CAPLET_VOLS,
-  SAMPLE_CHF_SWAPTION_VOLS,
   SAMPLE_CURVE_IDS,
-  SAMPLE_EURCHF_VOLS,
-  SAMPLE_EURGBP_VOLS,
-  SAMPLE_EURJPY_VOLS,
-  SAMPLE_EURUSD_VOLS,
-  SAMPLE_EUR_CAPLET_VOLS,
-  SAMPLE_EUR_SWAPTION_VOLS,
-  SAMPLE_GBPCHF_VOLS,
-  SAMPLE_GBPJPY_VOLS,
-  SAMPLE_GBPUSD_VOLS,
-  SAMPLE_GBP_CAPLET_VOLS,
-  SAMPLE_GBP_SWAPTION_VOLS,
-  SAMPLE_JPY_CAPLET_VOLS,
-  SAMPLE_JPY_SWAPTION_VOLS,
+  SAMPLE_FIXINGS,
   SAMPLE_QUOTES,
-  SAMPLE_USDCHF_VOLS,
-  SAMPLE_USDJPY_VOLS,
-  SAMPLE_USD_CAPLET_VOLS,
-  SAMPLE_USD_SWAPTION_VOLS,
   buildSampleMarket,
   sampleBootstrapSpecs,
+  sampleFixings,
   type SampleMarketQuotes,
 } from "./market/sample-market.js";
 // Models
@@ -196,7 +176,6 @@ export {
 } from "./models/garman-kohlhagen.js";
 export { sabrAlphaFromAtm, sabrLognormalVol, sabrNormalVol, type SabrParams } from "./models/sabr.js";
 export {
-  bilinear,
   capletVol,
   sabrParamsAt,
   shiftCapletSurface,
@@ -267,7 +246,6 @@ export {
   makeImmSwap,
   makeSwaption,
   makeVanillaSwap,
-  nextTradeId,
   type CrossCurrencySwapParams,
   type VanillaSwapParams,
 } from "./instruments/builders.js";
@@ -285,57 +263,31 @@ export {
   xvaMethodLabelDe,
 } from "./instruments/labels.js";
 export { embeddedOptionLegs, hasOptionality, tradeIndexNames, tradeMaturityDate } from "./instruments/trade-dates.js";
-export {
-  estimateMissingIborRate,
-  expectedCollaredRate,
-  fixedRateAt,
-  floatSpreadAt,
-  fxToReporting,
-  legAccrued,
-  legPeriods,
-  missingFixingMessage,
-  priceLeg,
-  projectFloatingRate,
-  scheduleDates,
-  type FloatingRateProjection,
-  type LegPricingOptions,
-} from "./pricing/leg-pricer.js";
-export { missingFxFixingMessage, mtmResetNotionalSchedule, priceCrossCurrencySwap, priceInterestRateSwap, type SwapAnalytics } from "./pricing/swap-pricer.js";
+export { priceCrossCurrencySwap, priceInterestRateSwap, type SwapAnalytics } from "./pricing/swap-pricer.js";
 export { priceFra } from "./pricing/fra-pricer.js";
-export {
-  convertSurfaceVol,
-  modelForVolType,
-  modelQuotation,
-  priceCapFloor,
-  quotationLabel,
-  sameQuotation,
-  surfaceQuotation,
-  volTypeConvertedWarning,
-  type CapFloorModel,
-} from "./pricing/capfloor-pricer.js";
+export { priceCapFloor } from "./pricing/capfloor-pricer.js";
 export { priceSwaption } from "./pricing/swaption-pricer.js";
+export { UPFRONT_LEG_TYPE } from "./pricing/upfront.js";
 export {
+  BARRIER_STATE_UNKNOWN_PREFIX,
   EXPIRED_PREFIX,
   EXPIRES_TODAY_PREFIX,
   MISSING_FX_FIXING_PREFIX,
   SETTLES_TODAY_PREFIX,
   fxForwardRate,
   fxOptionLifecycle,
-  linearFxDeltaAmount,
   priceFxForward,
   priceFxOption,
   priceFxSwap,
   splitPair,
+  type BarrierState,
   type FxOptionLifecycle,
 } from "./pricing/fx-pricer.js";
 export { assertValidTrade, pricePortfolio, priceTrade, tradeCurrencies, validateTrade } from "./pricing/price.js";
 // Risk & XVA
 export {
-  capletSurfaceKeysFor,
-  cashflowsPaidWithin,
   computeRisk,
   computeTheta,
-  fxSurfaceKeysFor,
   parRisk,
   parRiskPortfolio,
   relevantCurveIds,
@@ -343,7 +295,6 @@ export {
   rollMarketForward,
   shiftCurvesParallel,
   shiftFxSpots,
-  tenorLabel,
   tradeCurveIds,
   vegaBuckets,
   type BucketedDelta,
@@ -371,15 +322,10 @@ export {
   type ScenarioResult,
 } from "./risk/scenarios.js";
 export {
-  BASIS_SPREAD_VOL_FRACTION,
   CDS_PREMIUM_ACCRUAL_PER_YEAR,
   assertValidCreditInputs,
   bootstrapHazardCurve,
   computeXva,
-  cvaBasisSwap,
-  cvaFxForward,
-  cvaGeneric,
-  cvaSwap,
   flatHazardCurve,
   hazardFromSpread,
   marginalPd,
@@ -397,7 +343,6 @@ export {
   buildValuationReport,
   cashflowTable,
   costTransparencyFor,
-  csvCell,
   hashString,
   ifrs13Level,
   marketSnapshotId,
@@ -411,17 +356,8 @@ export {
   type ValuationReport,
   type ValuationReportOptions,
 } from "./reporting/valuation-report.js";
-export { deserializeMarket, isIsoDateTime, serializeCurve, serializeMarket, validateMarket, type MarketSnapshotJson } from "./market/snapshot.js";
-export {
-  assertCapletSurface,
-  assertFxSurface,
-  assertSwaptionSurface,
-  capletSurfaceProblems,
-  fxSurfaceProblems,
-  swaptionSurfaceProblems,
-  validateVolSurfaces,
-  type VolSurfacesInput,
-} from "./market/vol-validation.js";
+export { deserializeMarket, serializeMarket, validateMarket, type MarketSnapshotJson } from "./market/snapshot.js";
+export { VOL_IMPLAUSIBLE_PREFIX, VOL_PLAUSIBILITY, validateVolSurfaces, volSurfaceWarnings, type VolSurfacesInput } from "./market/vol-validation.js";
 export {
   EMIR_CSV_HEADER,
   emirBoolean,
@@ -462,20 +398,13 @@ export {
   DEFAULT_EFFECTIVENESS_BAND,
   DEFAULT_MIN_R2,
   MIN_ABS_DELTA,
-  basisCurvesFor,
-  basisScenarios,
   criticalTermsMatch,
-  designationVol,
   dollarOffset,
-  hasOnlyParallelCurveShocks,
   hedgeEffectivenessReport,
-  hedgedItemNotionalSchedule,
   hgbSplit,
   hypotheticalDerivative,
   ifrs9Split,
   intrinsicValue,
-  olsRegression,
-  regressionScenarios,
   regressionTest,
   type AccountingFramework,
   type CostOfHedging,
@@ -495,5 +424,4 @@ export {
   type Ifrs9Result,
   type RegressionPoint,
   type RegressionResult,
-  type RegressionScenarioOptions,
 } from "./hedge/hedge.js";

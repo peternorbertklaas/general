@@ -3,12 +3,16 @@ import { useShallow } from "zustand/react/shallow";
 import {
   SAMPLE_QUOTES,
   type BootstrapResult,
+  type CurveBuildSpec,
   type CurveQuote,
   type InterpolatedCurve,
   type InterpolationMethod,
+  type RateIndex,
   type SampleMarketQuotes,
   bootstrapCurves,
   bumpQuote,
+  knownCurrencies,
+  knownIndices,
   parseISO,
   quoteDates,
   quoteLabel,
@@ -21,7 +25,8 @@ import { NumInput } from "../components/NumInput.js";
 import { useTableNav } from "../hooks/useTableNav.js";
 import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { INTERPOLATION_DE, translatePricingError } from "../lib/i18n.js";
-import { marketModified, useStore } from "../state/store.js";
+import { rateOf } from "../lib/portfolio-io.js";
+import { type ExtraCurve, extraCurveSpec, marketModified, useStore, validateExtraCurve } from "../state/store.js";
 
 export { bumpQuote };
 
@@ -83,7 +88,17 @@ export function newFxPointsQuote(
   };
 }
 
-const QUOTE_SETS: { key: keyof Omit<SampleMarketQuotes, "fxSpots">; curveId: string; label: string; title: string }[] = [
+interface QuoteSet {
+  /** Key into the quote set (sample curves) or `extra:<curveId>` for an added curve. */
+  key: string;
+  curveId: string;
+  label: string;
+  title: string;
+  /** Curve added by the user from quotes (Markt R6-5) – quotes live in `extraCurves`, not in the sample quote set. */
+  extra?: ExtraCurve;
+}
+
+const QUOTE_SETS: QuoteSet[] = [
   { key: "eurOis", curveId: "EUR-ESTR", label: "€STR", title: "EUR €STR OIS" },
   { key: "eur6m", curveId: "EUR-EURIBOR-6M", label: "EUR 6M", title: "EUR EURIBOR 6M" },
   { key: "eur3m", curveId: "EUR-EURIBOR-3M", label: "EUR 3M", title: "EUR EURIBOR 3M" },
@@ -149,6 +164,173 @@ export function withQuoteValue(q: CurveQuote, v: number): CurveQuote {
 
 const INTERP_ALLOWED = new Set<string>(INTERPOLATIONS.map((i) => i.v));
 
+/** Quote list of a set: the sample quote set for shipped curves, the added curve's own quotes otherwise. */
+function quotesOf(set: QuoteSet, quotes: SampleMarketQuotes): CurveQuote[] {
+  if (set.extra) return set.extra.quotes;
+  return (quotes[set.key as keyof Omit<SampleMarketQuotes, "fxSpots">] as CurveQuote[] | undefined) ?? [];
+}
+
+/** Tab label of an added curve ("NOWA", "STIBOR 3M"). */
+function extraLabel(c: ExtraCurve): string {
+  return c.index.replace(/-(\d+[MWY])$/, " $1");
+}
+
+/** Default quote ladder offered in the "+ Kurve" form (tenor;rate %). */
+export const DEFAULT_CURVE_QUOTES_TEXT = "1Y;3,00\n2Y;3,05\n3Y;3,10\n5Y;3,20\n7Y;3,30\n10Y;3,40";
+
+/**
+ * Parse the quote lines of the "+ Kurve" form (Markt R6-5): one `Tenor;Satz`
+ * per line (";", ",", tab or spaces), rates as `3,10`, `3.1 %` or `310bp`. An
+ * overnight index gets OIS quotes; an IBOR index deposits up to its own tenor
+ * and par swaps beyond.
+ */
+export function parseCurveQuotes(text: string, index: RateIndex | undefined): { quotes: CurveQuote[]; error?: string } {
+  const quotes: CurveQuote[] = [];
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const indexMonths = index ? tenorMonths(index.tenor) : 0;
+  for (const line of lines) {
+    const m = /^(\d+[DWMY])\s*[;,\t ]\s*(.+)$/i.exec(line);
+    if (!m) return { quotes, error: `Zeile „${line}“ nicht lesbar – erwartet Tenor;Satz, z. B. 5Y;3,20` };
+    const tenor = m[1]!.toUpperCase();
+    const rate = rateOf(m[2]);
+    if (rate === undefined) return { quotes, error: `Satz „${m[2]}“ in Zeile „${line}“ nicht lesbar (z. B. 3,20 oder 320bp)` };
+    if (quotes.some((q) => quoteTenor(q) === tenor)) return { quotes, error: `Tenor ${tenor} doppelt` };
+    if (!index || index.type === "OIS") quotes.push({ type: "OIS", tenor, rate });
+    else if (tenorMonths(tenor) <= indexMonths) quotes.push({ type: "Deposit", tenor, rate });
+    else quotes.push({ type: "Swap", tenor, rate });
+  }
+  quotes.sort((a, b) => tenorMonths(quoteTenor(a)) - tenorMonths(quoteTenor(b)));
+  return { quotes };
+}
+
+/**
+ * "+ Kurve" (Markt R6-5): add a curve for a currency / index the market does not
+ * carry, from quotes – conventions from the core registry (`knownCurrencies`,
+ * `knownIndices`), optional EUR spot for a new currency, one undo entry.
+ */
+function AddCurveForm({ onDone }: { onDone: (id?: string) => void }) {
+  const baseMarket = useStore((s) => s.baseMarket);
+  const fxSpots = useStore((s) => s.quotes.fxSpots);
+  const ccys = knownCurrencies();
+  const withoutCurve = ccys.filter((c) => !baseMarket.discountCurveId[c]);
+  const [ccyState, setCcy] = useState(withoutCurve[0] ?? ccys[0] ?? "EUR");
+  const ccy = ccys.includes(ccyState) ? ccyState : (ccys[0] ?? "EUR");
+  const candidates = knownIndices(ccy).filter((i) => !(i.curveId in baseMarket.curves));
+  const [indexState, setIndex] = useState("");
+  const idx = candidates.find((i) => i.name === indexState) ?? candidates.find((i) => i.type === "OIS") ?? candidates[0];
+  const [text, setText] = useState(DEFAULT_CURVE_QUOTES_TEXT);
+  const needsSpot = ccy !== "EUR" && fxSpots[`EUR${ccy}`] === undefined && fxSpots[`${ccy}EUR`] === undefined;
+  const [spot, setSpot] = useState<number>(0);
+  const parsed = useMemo(() => parseCurveQuotes(text, idx), [text, idx]);
+  const curve: ExtraCurve | undefined = idx ? { id: idx.curveId, currency: ccy, index: idx.name, quotes: parsed.quotes } : undefined;
+  const problem = parsed.error ?? (curve ? validateExtraCurve(curve, Object.keys(baseMarket.curves)) : "Für diese Währung ist kein weiterer Index registriert");
+  const submit = () => {
+    if (!curve || problem) return;
+    const st = useStore.getState();
+    const r = st.addExtraCurve(curve, needsSpot && spot > 0 ? { fxSpot: { pair: `EUR${ccy}`, rate: spot } } : undefined);
+    if (!r.ok) {
+      st.showToast(`Kurve nicht angelegt – ${r.error}`, { ms: 8000 });
+      return;
+    }
+    st.showToast(`Kurve ${curve.id} aus ${curve.quotes.length} Quotes angelegt${needsSpot && spot > 0 ? ` · Spot EUR/${ccy} ${fmtNum(spot, 4)}` : ""}`, {
+      action: { label: "Rückgängig", run: () => useStore.getState().undo() },
+    });
+    onDone(curve.id);
+  };
+  return (
+    <div className="card" data-testid="add-curve-form">
+      <h3>
+        + Kurve aus Quotes anlegen
+        <span className="right muted xs">
+          Konventionen aus dem Kern-Register (Tageszählung, Kalender, Fixing-Lag) · erste Kurve einer Währung = Diskontkurve
+        </span>
+      </h3>
+      <div className="row wrap" style={{ gap: 12, alignItems: "flex-start" }}>
+        <label className="row" style={{ gap: 6 }}>
+          <span className="muted small">Währung</span>
+          <select className="inline" value={ccy} aria-label="Währung der neuen Kurve" data-testid="add-curve-ccy" onChange={(e) => setCcy(e.target.value)}>
+            {ccys.map((c) => (
+              <option key={c} value={c}>
+                {c}
+                {baseMarket.discountCurveId[c] ? "" : " (ohne Kurve)"}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="row" style={{ gap: 6 }}>
+          <span className="muted small">Index</span>
+          <select
+            className="inline"
+            value={idx?.name ?? ""}
+            aria-label="Index der neuen Kurve"
+            data-testid="add-curve-index"
+            onChange={(e) => setIndex(e.target.value)}
+          >
+            {candidates.map((i) => (
+              <option key={i.name} value={i.name}>
+                {i.name} ({i.type === "OIS" ? "OIS" : `IBOR ${i.tenor}`}, {i.dayCount}, {i.fixingCalendar})
+              </option>
+            ))}
+            {candidates.length === 0 && <option value="">– alle Indizes vorhanden –</option>}
+          </select>
+        </label>
+        <span className="muted small">
+          Kurven-ID <span className="mono">{idx?.curveId ?? "–"}</span>
+        </span>
+        {needsSpot && (
+          <label
+            className="row"
+            style={{ gap: 6 }}
+            title="Kassakurs EUR/Fremdwährung – nötig für FX-Geschäfte und die Umrechnung in die Reporting-Währung (Quote-Set, undo-fähig)"
+          >
+            <span className="muted small">Spot EUR/{ccy}</span>
+            <span style={{ display: "inline-block", width: 120 }}>
+              <NumInput inline value={spot} step={0.01} digits={4} min={0} ariaLabel={`Spot EUR/${ccy}`} testId="add-curve-spot" onChange={setSpot} />
+            </span>
+          </label>
+        )}
+      </div>
+      <div className="row wrap" style={{ gap: 12, marginTop: 8, alignItems: "flex-start" }}>
+        <label className="stack" style={{ gap: 4 }}>
+          <span className="muted small">Quotes (eine Zeile je Tenor: Tenor;Satz in %)</span>
+          <textarea
+            className="mono"
+            rows={7}
+            style={{ width: 220 }}
+            value={text}
+            aria-label="Quotes der neuen Kurve"
+            data-testid="add-curve-quotes"
+            onChange={(e) => setText(e.target.value)}
+            spellCheck={false}
+          />
+        </label>
+        <div className="stack" style={{ gap: 6 }}>
+          <span className="muted xs">
+            {parsed.quotes.length} Quotes · {idx ? (idx.type === "OIS" ? "OIS-Quotes" : `Depots bis ${idx.tenor}, darüber Par-Swaps`) : ""}
+            {baseMarket.discountCurveId[ccy] && idx && idx.type !== "OIS" ? ` · Dual-Curve gegen ${baseMarket.discountCurveId[ccy]}` : ""}
+          </span>
+          {problem && (
+            <span className="field-msg error" role="alert" data-testid="add-curve-problem">
+              {problem}
+            </span>
+          )}
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn primary" onClick={submit} disabled={!!problem} data-testid="add-curve-submit">
+              Kurve anlegen
+            </button>
+            <button className="btn ghost" onClick={() => onDone()}>
+              Abbrechen
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function CurvesView() {
   const s = useStore(
     useShallow((st) => ({
@@ -157,6 +339,10 @@ export function CurvesView() {
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
       fxFixings: st.fxFixings,
+      fxSpotOverrides: st.fxSpotOverrides,
+      fixings: st.fixings,
+      importedBase: st.importedBase,
+      extraCurves: st.extraCurves,
       baseMarket: st.baseMarket,
       valuationDate: st.valuationDate,
       marketSource: st.marketSource,
@@ -165,8 +351,24 @@ export function CurvesView() {
   const imported = s.marketSource === "import";
   const [sel, setSel] = useState(0);
   const [compare, setCompare] = useState<string | null>("EUR-EURIBOR-6M");
-  const set = QUOTE_SETS[sel]!;
+  const [adding, setAdding] = useState(false);
+  // Shipped curves plus the curves the user added from quotes (Markt R6-5)
+  const sets: QuoteSet[] = useMemo(
+    () => [
+      ...QUOTE_SETS,
+      ...Object.values(s.extraCurves).map((c) => ({
+        key: `extra:${c.id}`,
+        curveId: c.id,
+        label: extraLabel(c),
+        title: `${c.currency} ${c.index} (aus Quotes angelegt)`,
+        extra: c,
+      })),
+    ],
+    [s.extraCurves],
+  );
+  const set = sets[Math.min(sel, sets.length - 1)]!;
   const quotes = s.quotes;
+  const setQuotes = quotesOf(set, quotes);
   const curve = s.baseMarket.curves[set.curveId] as InterpolatedCurve | undefined;
   const sameCcy = Object.values(s.baseMarket.curves).filter((c) => c.currency === curve?.currency && c.id !== set.curveId);
   const cmpId = compare && sameCcy.some((c) => c.id === compare) ? compare : null;
@@ -216,7 +418,7 @@ export function CurvesView() {
   const boot = useMemo(() => {
     if (!specs) return null;
     try {
-      const spec = specs[set.curveId];
+      const spec: CurveBuildSpec | undefined = set.extra ? extraCurveSpec(set.extra, s.baseMarket.discountCurveId) : specs[set.curveId];
       if (!spec) return null;
       const toyList = storedToy && storedToy.date > s.valuationDate && storedToy.bp !== 0 ? [{ date: storedToy.date, bp: storedToy.bp }] : undefined;
       const result = bootstrapCurves(s.valuationDate, [{ ...spec, interpolation: override ?? spec.interpolation, turnOfYear: toyList }], s.baseMarket.curves)
@@ -232,51 +434,67 @@ export function CurvesView() {
     } catch {
       return null;
     }
-  }, [specs, s.valuationDate, set.curveId, s.baseMarket.curves, override, storedToy]);
+  }, [specs, s.valuationDate, set.curveId, set.extra, s.baseMarket.curves, s.baseMarket.discountCurveId, override, storedToy]);
 
   const IMPORT_LOCK =
     "Kurven stammen aus dem importierten Snapshot – Quotes, Interpolation und Turn-of-Year sind nicht verfügbar („Zum Sample-Markt“ in der Marktansicht)";
-  const applyQuotes = (next: SampleMarketQuotes, label: string) => {
+  /** Apply a new quote list of the selected set: the sample quote set (undo "quotes") or the added curve (undo "curves"). */
+  const applyList = (list: CurveQuote[], label: string) => {
     const st = useStore.getState();
-    if (st.marketSource === "import") st.showToast(IMPORT_LOCK);
-    else if (!st.setQuotes(next, label)) st.showToast("Bootstrap fehlgeschlagen – Quote nicht übernommen");
+    if (st.marketSource === "import") {
+      st.showToast(IMPORT_LOCK);
+      return;
+    }
+    if (set.extra) {
+      if (!st.setExtraCurveQuotes(set.extra.id, list, label)) st.showToast("Bootstrap fehlgeschlagen – Quote nicht übernommen");
+      return;
+    }
+    const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
+    (next as unknown as Record<string, CurveQuote[]>)[set.key] = list;
+    if (!st.setQuotes(next, label)) st.showToast("Bootstrap fehlgeschlagen – Quote nicht übernommen");
   };
   const updateQuote = (i: number, v: number) => {
-    const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
-    const list = next[set.key] ?? [];
+    const list = [...setQuotes];
     const before = list[i]!;
     list[i] = withQuoteValue(before, v);
     const qv = quoteValue(before);
-    applyQuotes(next, `Quote ${quoteLabel(before)} ${fmtNum(qv.value, qv.digits)} → ${fmtNum(v, qv.digits)} ${qv.unit}`);
+    applyList(list, `Quote ${quoteLabel(before)} ${fmtNum(qv.value, qv.digits)} → ${fmtNum(v, qv.digits)} ${qv.unit}`);
   };
   /** "+ FX-Punkte": add an FX-swap-points quote (short end from FX forwards, R3-6), inserted in pillar order. */
-  const fxPointsCandidate = curve ? newFxPointsQuote(curve.currency, quotes[set.key] ?? [], quotes.fxSpots, s.baseMarket.discountCurveId) : undefined;
+  const fxPointsCandidate = curve ? newFxPointsQuote(curve.currency, setQuotes, quotes.fxSpots, s.baseMarket.discountCurveId) : undefined;
   const addFxPoints = () => {
     if (!fxPointsCandidate) return;
-    const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
-    const list = [...(next[set.key] ?? [])];
+    const list = [...setQuotes];
     const months = tenorMonths(fxPointsCandidate.tenor);
     let at = list.findIndex((q) => tenorMonths(quoteTenor(q)) > months);
     if (at < 0) at = list.length;
     list.splice(at, 0, fxPointsCandidate);
-    next[set.key] = list;
-    applyQuotes(next, `FX-Punkte ${fxPointsCandidate.pair} ${fxPointsCandidate.tenor} hinzugefügt`);
+    applyList(list, `FX-Punkte ${fxPointsCandidate.pair} ${fxPointsCandidate.tenor} hinzugefügt`);
   };
   const removeQuote = (i: number) => {
-    const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
-    const list = [...(next[set.key] ?? [])];
+    const list = [...setQuotes];
     const [removed] = list.splice(i, 1);
-    next[set.key] = list;
-    applyQuotes(next, `Quote ${removed ? quoteLabel(removed) : ""} entfernt`);
+    applyList(list, `Quote ${removed ? quoteLabel(removed) : ""} entfernt`);
   };
   const bumpAll = (bp: number) => {
-    const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
-    next[set.key] = (next[set.key] ?? []).map((q) => bumpQuote(q, bp));
-    applyQuotes(next, `Quotes ${set.label} ${bp > 0 ? "+" : ""}${bp} bp`);
+    applyList(
+      setQuotes.map((q) => bumpQuote(q, bp)),
+      `Quotes ${set.label} ${bp > 0 ? "+" : ""}${bp} bp`,
+    );
+  };
+  const removeCurve = () => {
+    if (!set.extra) return;
+    const st = useStore.getState();
+    const id = set.extra.id;
+    if (!window.confirm(`Kurve ${id} entfernen? Trades in ${set.extra.currency} verlieren ihre Diskont-/Projektionskurve (rückgängig mit Ctrl+Z).`)) return;
+    if (st.removeExtraCurve(id)) {
+      setSel(0);
+      st.showToast(`Kurve ${id} entfernt`, { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+    }
   };
   const setInterp = (m: InterpolationMethod) => {
     const st = useStore.getState();
-    const spec = specs?.[set.curveId];
+    const spec = set.extra ? undefined : specs?.[set.curveId];
     const isDefault = spec?.interpolation ? spec.interpolation === m : m === "logLinear";
     try {
       if (!st.setInterpolation(set.curveId, isDefault ? undefined : m))
@@ -305,15 +523,30 @@ export function CurvesView() {
     useStore.getState().setTurnOfYear(set.curveId, undefined);
     setToyDraft(null);
   };
-  /** Shipped original of a quote (matched by type/tenor/pair, so added rows never shift the mapping). */
-  const original = (q: CurveQuote): CurveQuote | undefined => SAMPLE_QUOTES[set.key]?.find((x) => quoteKey(x) === quoteKey(q));
-  const isEdited = (q: CurveQuote) => JSON.stringify(original(q)) !== JSON.stringify(q);
+  /** Shipped original of a quote (matched by type/tenor/pair, so added rows never shift the mapping); added curves have no original. */
+  const original = (q: CurveQuote): CurveQuote | undefined =>
+    set.extra
+      ? undefined
+      : (SAMPLE_QUOTES[set.key as keyof Omit<SampleMarketQuotes, "fxSpots">] as CurveQuote[] | undefined)?.find((x) => quoteKey(x) === quoteKey(q));
+  const isEdited = (q: CurveQuote) => !set.extra && JSON.stringify(original(q)) !== JSON.stringify(q);
   const interpValue = override ?? curve?.interpolation ?? "logLinear";
   const interpOptions = INTERP_ALLOWED.has(interpValue) ? INTERPOLATIONS : [...INTERPOLATIONS, { v: interpValue as InterpolationMethod, l: interpValue }];
   const overrideCount = Object.keys(s.interpolation).length;
 
   return (
     <div className="stack">
+      {adding && !imported && (
+        <AddCurveForm
+          onDone={(id) => {
+            setAdding(false);
+            if (id) {
+              const i = sets.findIndex((q) => q.curveId === id);
+              // the new set is appended on the next render – select it by position
+              setSel(i >= 0 ? i : sets.length);
+            }
+          }}
+        />
+      )}
       {imported && (
         <div className="warning row wrap" style={{ gap: 10 }} data-testid="curves-import-note">
           <span>
@@ -332,22 +565,38 @@ export function CurvesView() {
         </div>
       )}
       <div className="row wrap toolbar">
-        <div className="seg" role="group" aria-label="Kurve">
-          {QUOTE_SETS.map((q, i) => (
+        <div className="seg wrap" role="group" aria-label="Kurve">
+          {sets.map((q, i) => (
             <button
               key={q.key}
-              className={i === sel ? "active" : ""}
-              aria-pressed={i === sel}
+              className={q === set ? "active" : ""}
+              aria-pressed={q === set}
               title={q.title}
               onClick={() => setSel(i)}
               disabled={!s.baseMarket.curves[q.curveId]}
+              data-testid={q.extra ? `curve-tab-${q.curveId}` : undefined}
             >
               {q.label}
+              {q.extra && <span className="dot" aria-label="aus Quotes angelegt" style={{ background: "var(--info)" }} />}
               {s.interpolation[q.curveId] && <span className="dot warn" aria-label="Interpolation überschrieben" />}
               {s.turnOfYear[q.curveId] && <span className="dot warn" aria-label="Turn-of-Year gesetzt" />}
             </button>
           ))}
         </div>
+        <button
+          className="btn xs"
+          onClick={() => setAdding((v) => !v)}
+          disabled={imported}
+          aria-pressed={adding}
+          data-testid="add-curve"
+          title={
+            imported
+              ? IMPORT_LOCK
+              : "Kurve für eine weitere Währung / einen weiteren Index aus Quotes anlegen (NOK, SEK, DKK, PLN … – Konventionen aus dem Kern-Register)"
+          }
+        >
+          + Kurve
+        </button>
         <label className="row" style={{ gap: 6 }}>
           <span className="muted small">Vergleich</span>
           <select className="inline" value={cmpId ?? ""} onChange={(e) => setCompare(e.target.value || null)} aria-label="Vergleichskurve (gleiche Währung)">
@@ -366,6 +615,8 @@ export function CurvesView() {
             value={interpValue}
             aria-label="Interpolationsmethode"
             data-testid="interp-select"
+            disabled={imported}
+            title={imported ? IMPORT_LOCK : undefined}
             onChange={(e) => setInterp(e.target.value as InterpolationMethod)}
           >
             {interpOptions.map((o) => (
@@ -393,6 +644,7 @@ export function CurvesView() {
             value={toy.date}
             ariaLabel="Turn-of-Year Datum"
             invalid={toyPast}
+            disabled={imported}
             onChange={(v) => setToyDraft({ curveId: set.curveId, date: v, bp: toy.bp })}
           />
           <span style={{ display: "inline-block", width: 96 }}>
@@ -404,6 +656,7 @@ export function CurvesView() {
               unit="bp"
               ariaLabel="Turn-of-Year bp"
               testId="toy-bp"
+              disabled={imported}
               onChange={(v) => setToyDraft({ curveId: set.curveId, date: toy.date, bp: v })}
               onCommit={() => undefined}
             />
@@ -411,14 +664,22 @@ export function CurvesView() {
           <button
             className="btn xs"
             onClick={applyToy}
-            disabled={!toyDirty || toyPast}
+            disabled={imported || !!set.extra || !toyDirty || toyPast}
             data-testid="toy-apply"
-            title={toyPast ? "Datum muss nach dem Bewertungstag liegen" : "Turn-of-Year auf die Kurve anwenden (Bootstrap)"}
+            title={
+              imported
+                ? IMPORT_LOCK
+                : set.extra
+                  ? "Turn-of-Year ist für hinzugefügte Kurven nicht verfügbar"
+                  : toyPast
+                    ? "Datum muss nach dem Bewertungstag liegen"
+                    : "Turn-of-Year auf die Kurve anwenden (Bootstrap)"
+            }
           >
             Anwenden
           </button>
           {storedToy && (
-            <button className="btn ghost xs" onClick={removeToy} title="Turn-of-Year entfernen">
+            <button className="btn ghost xs" onClick={removeToy} title={imported ? IMPORT_LOCK : "Turn-of-Year entfernen"} disabled={imported}>
               ✕
             </button>
           )}
@@ -441,7 +702,11 @@ export function CurvesView() {
         {modified && (
           <span
             className="chip warn"
-            title="Quotes, Spots, Interpolation, Turn-of-Year, Vol-Flächen oder FX-Fixings weichen vom Sample-Markt ab"
+            title={
+              imported
+                ? "Vol-Flächen, Spots, Fixings oder FX-Fixings weichen vom importierten Snapshot ab"
+                : "Quotes, Spots, Interpolation, Turn-of-Year, Vol-Flächen, Fixings, FX-Fixings oder hinzugefügte Kurven weichen vom Sample-Markt ab"
+            }
             data-testid="market-modified-chip"
           >
             <span className="dot" /> Markt modifiziert{overrideCount > 0 ? ` · ${overrideCount} Interpolation` : ""}
@@ -459,15 +724,15 @@ export function CurvesView() {
         <button
           className="btn ghost"
           onClick={() => {
-            const st = useStore.getState();
-            st.resetQuotes();
-            for (const id of Object.keys(st.interpolation)) st.setInterpolation(id, undefined);
-            for (const id of Object.keys(st.turnOfYear)) st.setTurnOfYear(id, undefined);
-            st.resetVolSurfaces();
-            if (st.fxFixings.length) st.setFxFixings([], "FX-Fixings zurückgesetzt");
+            useStore.getState().resetMarketOverrides();
             setToyDraft(null);
           }}
           disabled={!modified}
+          title={
+            imported
+              ? "Vol-, Spot-, Fixing- und FX-Fixing-Änderungen verwerfen – zurück zum importierten Snapshot"
+              : "Quotes, Interpolation, Turn-of-Year, Vol-Flächen, Fixings und FX-Fixings zurücksetzen"
+          }
         >
           Zurücksetzen
         </button>
@@ -477,6 +742,21 @@ export function CurvesView() {
         <div className="card">
           <h3>
             {set.curveId}{" "}
+            {set.extra && (
+              <>
+                <span className="badge info" title={set.title} data-testid="curve-extra-badge">
+                  aus Quotes angelegt
+                </span>{" "}
+                <button
+                  className="btn ghost danger xs"
+                  onClick={removeCurve}
+                  data-testid="remove-curve"
+                  title="Hinzugefügte Kurve entfernen (rückgängig mit Ctrl+Z)"
+                >
+                  ✕ Kurve entfernen
+                </button>
+              </>
+            )}
             <span className="right muted xs">
               {INTERPOLATIONS.find((x) => x.v === curve?.interpolation)?.l ?? curve?.interpolation} · {curve?.dayCount} · Referenz{" "}
               {curve && fmtDate(curve.referenceDate)}
@@ -513,17 +793,28 @@ export function CurvesView() {
         </div>
         <div className="card">
           <h3>
-            Marktquotes (editierbar){" "}
+            {imported ? "Sample-Quotes (nur Information – Kurven aus dem Snapshot)" : "Marktquotes (editierbar)"}{" "}
             <span className="right row wrap" style={{ gap: 8 }}>
               <span className="muted xs">
-                geänderte Zellen orange · Original im Tooltip · <kbd>Ctrl</kbd>+<kbd>Z</kbd> rückgängig
+                {imported ? (
+                  "gesperrt – „Zum Sample-Markt“ macht die Quotes wieder editierbar"
+                ) : (
+                  <>
+                    geänderte Zellen orange · Original im Tooltip · <kbd>Ctrl</kbd>+<kbd>Z</kbd> rückgängig
+                  </>
+                )}
               </span>
               {fxPointsCandidate && (
                 <button
                   className="btn ghost xs"
                   onClick={addFxPoints}
                   data-testid="add-fx-points"
-                  title={`FX-Swap-Punkte ${fxPointsCandidate.pair.slice(0, 3)}/${fxPointsCandidate.pair.slice(3)} ${fxPointsCandidate.tenor} als Quote anlegen (kurzes Ende aus Devisentermingeschäften, Diskontkurve ${fxPointsCandidate.otherDiscountCurveId})`}
+                  disabled={imported}
+                  title={
+                    imported
+                      ? IMPORT_LOCK
+                      : `FX-Swap-Punkte ${fxPointsCandidate.pair.slice(0, 3)}/${fxPointsCandidate.pair.slice(3)} ${fxPointsCandidate.tenor} als Quote anlegen (kurzes Ende aus Devisentermingeschäften, Diskontkurve ${fxPointsCandidate.otherDiscountCurveId})`
+                  }
                 >
                   + FX-Punkte {fxPointsCandidate.pair.slice(0, 3)}/{fxPointsCandidate.pair.slice(3)}
                 </button>
@@ -545,7 +836,7 @@ export function CurvesView() {
                 </tr>
               </thead>
               <tbody>
-                {(quotes[set.key] ?? []).map((q, i) => {
+                {setQuotes.map((q, i) => {
                   const node = curve?.zeroRates()[i];
                   const qv = quoteValue(q);
                   const edited = isEdited(q);
@@ -556,16 +847,17 @@ export function CurvesView() {
                       key={`${quoteKey(q)}-${i}`}
                       style={{ cursor: "default" }}
                       className={edited ? "edited" : ""}
-                      data-testid={orig ? undefined : "added-quote"}
+                      data-testid={orig || set.extra ? undefined : "added-quote"}
                     >
                       <td>
                         {quoteLabel(q)}
-                        {!orig && (
+                        {!orig && setQuotes.length > 2 && (
                           <button
                             className="btn ghost danger xs"
                             style={{ marginLeft: 4 }}
                             aria-label={`Quote ${quoteLabel(q)} entfernen`}
-                            title="Hinzugefügte Quote entfernen"
+                            title={imported ? IMPORT_LOCK : "Hinzugefügte Quote entfernen"}
+                            disabled={imported}
                             onClick={() => removeQuote(i)}
                           >
                             ✕
@@ -573,7 +865,7 @@ export function CurvesView() {
                         )}
                       </td>
                       <td className="mono muted xs">{boot?.dates[i] ? fmtDate(boot.dates[i]!.end) : ""}</td>
-                      <td className={`num quote-cell ${edited ? "edited" : ""}`} title={edited ? origText : undefined}>
+                      <td className={`num quote-cell ${edited ? "edited" : ""}`} title={imported ? IMPORT_LOCK : edited ? origText : undefined}>
                         <span style={{ display: "inline-block", width: 104 }}>
                           <NumInput
                             inline
@@ -582,6 +874,7 @@ export function CurvesView() {
                             digits={qv.digits}
                             unit={qv.unit}
                             ariaLabel={`${quoteLabel(q)} Quote`}
+                            disabled={imported}
                             onChange={(v) => updateQuote(i, v)}
                           />
                         </span>

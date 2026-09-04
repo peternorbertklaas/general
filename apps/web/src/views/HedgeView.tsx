@@ -5,7 +5,6 @@ import {
   type DollarOffsetResult,
   type EffectivenessMethod,
   type HedgeDesignation,
-  type HedgeEffectivenessReport,
   type HedgeRelationship,
   type HedgeType,
   type HedgedItemAmortisation,
@@ -14,6 +13,7 @@ import {
   addTenor,
   hedgeEffectivenessReport,
   hypotheticalDerivative,
+  marketSnapshotId,
 } from "@deriva/pricing-core";
 import { DateInput } from "../components/DateInput.js";
 import { EChart, cssVar, negColor, posColor } from "../components/EChart.js";
@@ -283,23 +283,29 @@ export function HedgeView() {
       interpolation: st.interpolation,
       turnOfYear: st.turnOfYear,
       customerMode: st.customerMode,
+      hedgeResults: st.hedgeResults,
+      extraCurves: st.extraCurves,
     })),
   );
   const act = useStore.getState;
   const trade = useStore(selectedTrade);
   const stored = trade ? s.hedgeRelationships[trade.id] : undefined;
+  // Market identity for the staleness key: quote / vol / snapshot changes invalidate a stored result (R5-F3).
+  const marketId = useMemo(() => marketSnapshotId(s.baseMarket), [s.baseMarket]);
   const rel = useMemo(() => (trade ? (stored ?? defaultRelationship(trade, s.valuationDate)) : null), [trade, stored, s.valuationDate]);
   const [simulateDesignation, setSimulateDesignation] = useState(true);
   /** Freeze the option vol of the hypothetical at designation (IFRS 9 B6.5.5 – vol changes are not hedged-risk ineffectiveness). */
   const [freezeVol, setFreezeVol] = useState(false);
   const [hypo, setHypo] = useState<{ tradeId: string; trade: Trade } | null>(null);
-  const [report, setReport] = useState<{ tradeId: string; key: string; r: HedgeEffectivenessReport } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /** Everything the effectiveness test depends on – shown as "veraltet" when it changes after the test (N-20). */
+  /**
+   * Everything the effectiveness test depends on – shown as "veraltet" when it changes after the test (N-20). The
+   * result itself lives in the store (`hedgeResults`, persisted) so it survives a reload; the key decides whether it
+   * is still current (R5-F3).
+   */
   const testKey =
-    trade && rel
-      ? `${trade.id}|${JSON.stringify(rel)}|${JSON.stringify(trade)}|${s.baseMarket.meta?.label}|${s.valuationDate}|${simulateDesignation}|${freezeVol}`
-      : "";
+    trade && rel ? `${trade.id}|${JSON.stringify(rel)}|${JSON.stringify(trade)}|${marketId}|${s.valuationDate}|${simulateDesignation}|${freezeVol}` : "";
+  const report = trade ? s.hedgeResults[trade.id] : undefined;
 
   if (!trade || !rel) {
     return (
@@ -371,20 +377,20 @@ export function HedgeView() {
       return;
     }
     try {
-      const designationCtx = simulateDesignation ? buildMarket(rel.designationDate, s.quotes, s.interpolation, s.turnOfYear) : undefined;
+      const designationCtx = simulateDesignation ? buildMarket(rel.designationDate, s.quotes, s.interpolation, s.turnOfYear, {}, [], s.extraCurves) : undefined;
       const r = hedgeEffectivenessReport(s.market, rel, trade, {
         designationCtx,
         reportingCurrency: ccy,
         freezeDesignationVol: freezeVol && isOption(trade) && !!designationCtx,
       });
-      setReport({ tradeId: trade.id, key: testKey, r });
+      act().setHedgeResult(trade.id, { key: testKey, report: r, at: new Date().toISOString() });
       setHypo({ tradeId: trade.id, trade: r.hypotheticalDerivative.trade });
       setError(null);
     } catch (e) {
       setError(translatePricingError(e));
     }
   };
-  const rep = report && report.tradeId === trade.id ? report.r : null;
+  const rep = report?.report ?? null;
   const stale = !!rep && report!.key !== testKey;
   const hy = hypo && hypo.tradeId === trade.id ? hypo.trade : null;
   const reg = rep?.regression;

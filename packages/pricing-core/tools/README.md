@@ -5,21 +5,30 @@
 Generates `src/version.ts` from `package.json` (`prebuild` / `pretest` hook) so the
 engine version embedded in every report has a single source.
 
-## `gen-index.mjs` – curated public surface (ADR-024)
+## `gen-index.mjs` – curated public surface and `./internal` entry point (ADR-024)
 
-Prints `src/index.ts` with every `export * from "<module>"` expanded into an explicit
-named export list (values first, then `type` exports) using the TypeScript compiler
-API. Since round 5 (N4-03) `index.ts` contains no wildcard re-export any more; run
-the script after adding a module or an export to get the list to paste and curate:
+Two entry points exist since round 6 (N6-01): `src/index.ts` is the public,
+SemVer-covered surface (`@deriva/pricing-core`), `src/internal.ts` the
+implementation helpers (`@deriva/pricing-core/internal`, no SemVer promise – root
+finding, interpolation coefficients, leg-pricing helpers, vol-quotation conversion,
+exposure engines, `nextTradeId`, sample vol surfaces). Both are explicit name lists,
+no `export *`.
 
 ```sh
 cd packages/pricing-core
-node tools/gen-index.mjs > /tmp/index.ts && diff src/index.ts /tmp/index.ts
+node tools/gen-index.mjs > /tmp/index.ts && diff src/index.ts /tmp/index.ts       # expand `export *` lines (default: src/index.ts)
+node tools/gen-index.mjs src/internal.ts > /tmp/internal.ts                        # same for the internal entry
+node tools/gen-index.mjs --check                                                   # verify both entry points
 ```
 
-Lines that are already explicit are kept verbatim, so the script is idempotent on
-a curated file; a name exported by two modules (e.g. `addDays`, re-exported by
-`dates/calendar.ts`) must be listed once only.
+`--check` fails (exit 1) when a module export is reachable from neither entry point,
+when a name is exported by both, or when a name imported from `@deriva/pricing-core`
+anywhere under `apps/*/src` (tests included) is not public. `src/surface.test.ts`
+runs the check as part of the suite, so adding an export without listing it – or
+moving a name the API/Web still imports into `internal.ts` – breaks the build.
+Lines that are already explicit are kept verbatim by the expansion, so the script is
+idempotent on a curated file; a name exported by two modules (e.g. `addDays`,
+re-exported by `dates/calendar.ts`) must be listed once only.
 
 ## `quantlib-golden.py` – golden-master reference values
 

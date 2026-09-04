@@ -209,7 +209,17 @@ export function ifrs13Level(ctx: MarketContext, trade: Trade, pricing: PricingRe
     );
   }
   if (pricing.warnings.some((w) => w.startsWith("MISSING_FX_FIXING"))) {
-    hints.push("MtM-Reset ohne FX-Fixing für einen vergangenen Reset-Termin – heutiger Kurs als Näherung (Fixing nachladen)");
+    // N6-3: the same warning prefix is raised by the MtM-reset CCS (R4-1) and by expired FX options (N5-2) – say which.
+    hints.push(
+      trade.type === "FxOption"
+        ? `Verfallene FX-Option ohne FX-Fixing des Verfalltags ${formatDateDe(trade.expiryDate)} – Ausübungs-${trade.barrier ? " und Barrier-" : ""}Entscheid auf dem heutigen Spot als Näherung (Fixing nachladen)`
+        : "MtM-Reset ohne FX-Fixing für einen vergangenen Reset-Termin – heutiger Kurs als Näherung (Fixing nachladen)",
+    );
+  }
+  if (pricing.warnings.some((w) => w.startsWith("BARRIER_STATE_UNKNOWN"))) {
+    hints.push(
+      "Knock-Zustand der Barrier nicht bestätigt (aus heutigem Spot bzw. Verfall-Fixing abgeleitet, Warnung BARRIER_STATE_UNKNOWN) – barrier.hit am Geschäft setzen",
+    );
   }
   if (reasons.length) {
     return {
@@ -720,7 +730,7 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
           ? `Lebenszyklus: Option bereits abgewickelt (Lieferung ${formatDateDe(trade.deliveryDate)} vor dem Bewertungstag) – Barwert 0, keine Sensitivitäten, im EMIR-Bewertungsexport mit Wert 0 und Delta 0.`
           : lifecycle === "alive"
             ? undefined
-            : `Lebenszyklus: ${lifecycle === "expires-today" ? "Ausübungstag = Bewertungstag" : `Option am ${formatDateDe(trade.expiryDate)} verfallen, Abwicklung am ${formatDateDe(trade.deliveryDate)} noch offen`} – Ausübungs- bzw. Barrier-Entscheid am FX-Fixing des Verfalltags (${pricing.warnings.some((w) => w.startsWith("MISSING_FX_FIXING")) ? "kein Fixing geladen: heutiger Spot als Näherung, Warnung MISSING_FX_FIXING" : "geladenes Fixing bzw. heutiger Kurs"}); ausgeübte Option = Terminposition zum Strike mit Lieferung am Abwicklungstag (physische Lieferung), Digital = fester Auszahlungsbetrag, ausgeknockte Barrier = Rebate; keine Vega-, Gamma- oder Theta-Sensitivität mehr, Delta der Terminposition${lifecycle === "settles-today" ? "; Abwicklung am Bewertungstag als Value-Today-Austausch undiskontiert (SETTLES_TODAY)" : ""}.`;
+            : `Lebenszyklus: ${lifecycle === "expires-today" ? "Ausübungstag = Bewertungstag" : `Option am ${formatDateDe(trade.expiryDate)} verfallen, Abwicklung am ${formatDateDe(trade.deliveryDate)} noch offen`} – Ausübungs- bzw. Barrier-Entscheid am FX-Fixing des Verfalltags (${pricing.warnings.some((w) => w.startsWith("MISSING_FX_FIXING")) ? "kein Fixing geladen: heutiger Spot als Näherung, Warnung MISSING_FX_FIXING" : "geladenes Fixing bzw. heutiger Kurs"})${trade.barrier ? (trade.barrier.hit !== undefined ? `; Knock-Zustand laut Geschäft (barrier.hit = ${trade.barrier.hit ? "berührt" : "nicht berührt"})` : "; Knock-Zustand nur aus dem Verfall-Fixing abgeleitet, Touch-Ereignisse vor dem Verfall nicht beobachtet (Warnung BARRIER_STATE_UNKNOWN)") : ""}; ausgeübte Option = Terminposition zum Strike mit Lieferung am Abwicklungstag (physische Lieferung), Digital = fester Auszahlungsbetrag, ausgeknockte Barrier = Rebate; keine Vega-, Gamma- oder Theta-Sensitivität mehr, Delta der Terminposition${lifecycle === "settles-today" ? "; Abwicklung am Bewertungstag als Value-Today-Austausch undiskontiert (SETTLES_TODAY)" : ""}.`;
       return [
         `${kind}: Garman-Kohlhagen${barrierNote}; Forward am Spot-Datum verankert (${base}${quote}: T+${lag} auf dem Paar-Kalender${base !== "USD" && quote !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Datum ${spotDateDe(pricing.details.spotDate)}` : ""}), Diskontierung bis Lieferdatum ${formatDateDe(trade.deliveryDate)}, Vol-Zeit bis Ausübung ${formatDateDe(trade.expiryDate)}; ${smile}${vol}; ${greeks}.`,
         ...(lifecycleLine ? [lifecycleLine] : []),

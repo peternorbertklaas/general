@@ -30,9 +30,21 @@
  */
 import { type FastifyReply } from "fastify";
 import { isPricingError } from "@deriva/pricing-core";
-import { type API_ERROR_CODES } from "../schemas.js";
+import { API_ERROR_CODES } from "../schemas.js";
 
 export type ApiErrorCode = (typeof API_ERROR_CODES.core)[number] | (typeof API_ERROR_CODES.api)[number];
+
+const CATALOGUE: ReadonlySet<string> = new Set<string>([...API_ERROR_CODES.core, ...API_ERROR_CODES.api]);
+
+/** `true` when `code` is one of the catalogued `ErrorResponse.code` values. */
+export function isApiErrorCode(code: unknown): code is ApiErrorCode {
+  return typeof code === "string" && CATALOGUE.has(code);
+}
+
+/** A core (or other) code as catalogued `ApiErrorCode`, `fallback` when it is not in the catalogue – for `sendError` on codes that arrive as plain strings. */
+export function apiErrorCode(code: unknown, fallback: ApiErrorCode): ApiErrorCode {
+  return isApiErrorCode(code) ? code : fallback;
+}
 
 export interface ClassifiedError {
   status: number;
@@ -45,7 +57,12 @@ export interface ClassifiedError {
   level: "none" | "warn" | "error";
 }
 
-const SYSTEM_CODE = /^(FST_|ERR_|E[A-Z0-9]+$)/;
+/**
+ * Library codes that never leave the process: Fastify (`FST_*`) and Node's `ERR_*` codes. Node *system* errors
+ * (`ECONNRESET`, `ENOENT`, …) are recognised by `errno`/`syscall` (`isNodeSystemError`), not by their code shape –
+ * a pattern like `E[A-Z0-9]+` would swallow a future domain code such as `EXPIRED` (N6-03).
+ */
+const SYSTEM_CODE = /^(FST_|ERR_)/;
 const DATE_ERROR = /^Invalid (ISO )?date\b/;
 const TENOR_ERROR = /^Invalid tenor\b/;
 /** Core codes that describe malformed client input rather than a pricing problem → 400. */
@@ -53,6 +70,17 @@ const CLIENT_INPUT_CODES = new Set(["INVALID_DATE", "INVALID_TENOR"]);
 
 export function isProgrammingError(e: unknown): boolean {
   return e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof SyntaxError;
+}
+
+/** Node.js system error (`ECONNRESET`, `EPIPE`, `ENOENT`, …): carries `errno` and/or `syscall` – never a domain error. */
+export function isNodeSystemError(e: unknown): boolean {
+  const x = e as { errno?: unknown; syscall?: unknown } | null;
+  return !!x && typeof x === "object" && (typeof x.errno === "number" || typeof x.syscall === "string");
+}
+
+/** Library / system code (`FST_*`, `ERR_*`, Node system errors) that must not be reported as an application code. */
+export function isLibraryError(e: unknown, code: string | undefined): boolean {
+  return (code !== undefined && SYSTEM_CODE.test(code)) || isNodeSystemError(e);
 }
 
 /** Error of the core's date/tenor parsers (`parseISO`, `parseTenor`) – a client input error, answered with 400. */
@@ -69,6 +97,7 @@ export function isDomainError(e: unknown): e is Error & { code?: string } {
   if (statusCode !== undefined) return false;
   if (name === "PricingError") return true;
   // System/library errors (Node ECONNRESET/ERR_*, Fastify FST_*) are never domain errors, even when thrown as plain Error.
+  if (isNodeSystemError(e)) return false;
   if (typeof code === "string") return !SYSTEM_CODE.test(code);
   return Object.getPrototypeOf(e) === Error.prototype;
 }
@@ -117,7 +146,7 @@ export function classifyError(err: unknown): ClassifiedError {
     // library codes (FST_*, ERR_*) stay internal and are mapped to the catalogued code of the status
     // (JSON parse errors → INVALID_JSON, body limit → PAYLOAD_TOO_LARGE, media type → UNSUPPORTED_MEDIA_TYPE, rate limit → RATE_LIMITED).
     const libraryCode = typeof e.code === "string" ? e.code : undefined;
-    const own = libraryCode && !SYSTEM_CODE.test(libraryCode) ? libraryCode : undefined;
+    const own = libraryCode && !isLibraryError(err, libraryCode) ? libraryCode : undefined;
     const code = own ?? fallbackCodeFor(status, libraryCode);
     const details = (e as { details?: unknown }).details;
     const message = code === "INVALID_JSON" ? "Body is not valid JSON" : String(e.message ?? "Request failed");

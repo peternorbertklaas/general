@@ -283,7 +283,10 @@ describe("N4-05 every inline error envelope carries a catalogued code", () => {
       statusCode: 400,
       code: "CSV_INVALID",
     });
-    expect(classifyError(Object.assign(new Error("socket"), { code: "ECONNRESET" }))).toMatchObject({ status: 500, code: "INTERNAL_ERROR" });
+    expect(classifyError(Object.assign(new Error("socket"), { code: "ECONNRESET", errno: -104, syscall: "read" }))).toMatchObject({
+      status: 500,
+      code: "INTERNAL_ERROR",
+    });
     expect(describeRowError(new TypeError("Cannot read properties of undefined"))).toBe("Invalid row");
     expect(describeRowError(new Error('not a number: "abc"'))).toBe('not a number: "abc"');
     expect(describeRowError("x")).toBe("Invalid row");
@@ -460,6 +463,7 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "EmirRecordOptions",
     "EmirValuationRecord",
     "Fixing",
+    "FxOption",
     "HedgeRelationship",
     "InterpolatedCurve",
     "KidOptions",
@@ -499,8 +503,11 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "deserializeMarket",
     "validateMarket",
     "validateVolSurfaces",
+    "volSurfaceWarnings",
     "VolSurfacesInput",
     "marketSnapshotId",
+    "knownCurrencies",
+    "knownIndices",
     // Builders
     "makeVanillaSwap",
     "makeCapFloor",
@@ -509,6 +516,10 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "makeFxOption",
     "makeCrossCurrencySwap",
     "makeFra",
+    "makeFxSwap",
+    "makeBasisSwap",
+    "makeAmortisingSwap",
+    "makeImmSwap",
     // Pricing / risk / scenarios / XVA
     "priceTrade",
     "pricePortfolio",

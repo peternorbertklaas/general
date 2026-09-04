@@ -59,6 +59,7 @@ export function CommandPalette({ onHotkey }: Props) {
       fxSpots: st.market.fxSpots,
       swaptionVols: st.market.swaptionVols,
       fxVols: st.market.fxVols,
+      discountCurveId: st.market.discountCurveId,
     })),
   );
   const act = useStore.getState;
@@ -83,8 +84,10 @@ export function CommandPalette({ onHotkey }: Props) {
         fxSpots: s.fxSpots,
         swaptionVolCurrencies: Object.keys(s.swaptionVols ?? {}),
         fxVolPairs: Object.keys(s.fxVols ?? {}),
+        // R6-1 / R6-5: a rate product in a currency without a curve is an error with the "+ Kurve" remedy, not an unpriceable trade
+        curveCurrencies: Object.keys(s.discountCurveId),
       }),
-    [q, s.valuationDate, s.fxSpots, s.swaptionVols, s.fxVols],
+    [q, s.valuationDate, s.fxSpots, s.swaptionVols, s.fxVols, s.discountCurveId],
   );
   const valDateCmd = useMemo(() => parseValuationDateCommand(q), [q]);
 

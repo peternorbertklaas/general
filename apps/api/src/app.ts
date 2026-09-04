@@ -35,6 +35,8 @@ declare module "fastify" {
   interface FastifyContextConfig {
     /** Emit `X-Market-Snapshot-Id` (id of the market the response was computed on). */
     marketHeader?: boolean;
+    /** Route accepts a `text/csv` body (`POST /api/trades/import`); every other route answers 415 to CSV (N6-03). */
+    acceptsCsv?: boolean;
   }
 }
 
@@ -205,8 +207,16 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     limits: { ...defaultLimits(), ...opts.limits },
     requireIfMatch: opts.requireIfMatch ?? process.env.REQUIRE_IF_MATCH === "1",
   };
-  // CSV uploads (`POST /api/trades/import`, content-type text/csv) arrive as a string under the same body limit; the route maps them to trades.
-  app.addContentTypeParser("text/csv", { parseAs: "string", bodyLimit: BODY_LIMIT }, (_req, body, done) => done(null, body));
+  // Only JSON (and CSV on the import route) is a supported request media type: Fastify's built-in `text/plain`
+  // parser would otherwise turn a text body into a 400 "body must be object" instead of 415 (N6-03).
+  app.removeContentTypeParser("text/plain");
+  // CSV uploads (`POST /api/trades/import`, content-type text/csv) arrive as a string under the same body limit; the route maps
+  // them to trades. Any other route answers 415 `UNSUPPORTED_MEDIA_TYPE`, like every media type without a parser.
+  app.addContentTypeParser("text/csv", { parseAs: "string", bodyLimit: BODY_LIMIT }, (req, body, done) => {
+    // Unknown routes (no `routeOptions.url`) keep their 404; every known route without `acceptsCsv` answers 415.
+    if (!req.routeOptions?.url || req.routeOptions.config?.acceptsCsv) return done(null, body);
+    done(Object.assign(new Error("Unsupported Media Type: text/csv is accepted by POST /api/trades/import only"), { statusCode: 415 }), undefined);
+  });
   if (opts.seedPortfolio ?? true) {
     for (const t of samplePortfolio(ctx.market.get().valuationDate)) ctx.trades.upsert(t);
   }
