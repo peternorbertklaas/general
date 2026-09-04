@@ -1,0 +1,92 @@
+{
+  "case": "rfr-lockout-quantlib",
+  "description": "Compounded SOFR rate of the period 2026-06-01 → 2026-08-03 (ACT/360) with lockout k = 0…3 and lookback 1/2 on the US-SIFMA fixing calendar, fixings 4.00 % + 0.02 %·((d − start) mod 7) (Quant R8 N8-7, R9 N9-1: the last k fixings are replaced by the fixing of the business day before the lockout window – lockoutDays 1 must change the rate).",
+  "derivation": "SOFR period 01.06.–03.08.2026 (ACT/360, τ = 63/360), fixings 4.00 % + 0.02 %·((d − start) mod 7)\n    on the SIFMA business days (Juneteenth 19.06. and 03.07.2026 are no publication days).\n    Lockout k: the last k business days of the period carry the fixing of the business day\n    before the window (`bdays[-k-1]`), every other day its own fixing. Lookback n: day d\n    carries the fixing of the n-th SIFMA business day before d, weights from the accrual\n    period (no observation shift). Compounded rate = (Π(1 + r_i·τ_i) − 1)/τ. QuantLib:\n    `OvernightIndexedCoupon(…, Sofr with the same fixings, Actual360, lookbackDays, lockoutDays)`\n    with `CompoundingOvernightIndexedCouponPricer`.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "index": "SOFR",
+    "fixingCalendar": "US-SIFMA",
+    "accrualStart": "2026-06-01",
+    "accrualEnd": "2026-08-03",
+    "dayCount": "ACT/360",
+    "fixingRule": "0.04 + 0.0002 * (((d - start) mod 7) + 7 mod 7), d and start as serial dates, on every SIFMA business day from start − 10 to end",
+    "fixingHolidays": ["2026-05-25", "2026-06-19", "2026-07-03"]
+  },
+  "expected": {
+    "cases": [
+      {
+        "lockoutDays": 0,
+        "lookbackDays": 0,
+        "rate": 0.04063434219935682
+      },
+      {
+        "lockoutDays": 1,
+        "lookbackDays": 0,
+        "rate": 0.04062475392594221
+      },
+      {
+        "lockoutDays": 2,
+        "lookbackDays": 0,
+        "rate": 0.04061196884590121
+      },
+      {
+        "lockoutDays": 3,
+        "lookbackDays": 0,
+        "rate": 0.04059598697698849
+      },
+      {
+        "lockoutDays": 0,
+        "lookbackDays": 1,
+        "rate": 0.0405704300177044
+      },
+      {
+        "lockoutDays": 0,
+        "lookbackDays": 2,
+        "rate": 0.04050651839320883
+      }
+    ]
+  },
+  "quantlib": {
+    "status": "done",
+    "version": "1.43",
+    "engine": "OvernightIndexedCoupon + CompoundingOvernightIndexedCouponPricer, Sofr() with the synthetic fixings",
+    "cases": [
+      {
+        "lockoutDays": 0,
+        "lookbackDays": 0,
+        "rate": 0.04063434219935682,
+        "lastFixingDates": ["2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30", "2026-07-31"]
+      },
+      {
+        "lockoutDays": 1,
+        "lookbackDays": 0,
+        "rate": 0.04062475392594221,
+        "lastFixingDates": ["2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30", "2026-07-30"]
+      },
+      {
+        "lockoutDays": 2,
+        "lookbackDays": 0,
+        "rate": 0.04061196884590121,
+        "lastFixingDates": ["2026-07-27", "2026-07-28", "2026-07-29", "2026-07-29", "2026-07-29"]
+      },
+      {
+        "lockoutDays": 3,
+        "lookbackDays": 0,
+        "rate": 0.04059598697698849,
+        "lastFixingDates": ["2026-07-27", "2026-07-28", "2026-07-28", "2026-07-28", "2026-07-28"]
+      },
+      {
+        "lockoutDays": 0,
+        "lookbackDays": 1,
+        "rate": 0.0405704300177044,
+        "lastFixingDates": ["2026-07-24", "2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30"]
+      },
+      {
+        "lockoutDays": 0,
+        "lookbackDays": 2,
+        "rate": 0.04050651839320883,
+        "lastFixingDates": ["2026-07-23", "2026-07-24", "2026-07-27", "2026-07-28", "2026-07-29"]
+      }
+    ]
+  }
+}

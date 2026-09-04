@@ -860,6 +860,108 @@ def golden_calendars() -> None:
     write("calendars-quantlib.json", payload)
 
 
+# --------------------------------------------------------------------------
+# K. RFR lockout / lookback compounding (Quant R8 N8-7, R9 N9-1): the last k
+#    fixings of a SOFR period are replaced by the fixing of the business day
+#    before the lockout window (ISDA 2021 "Compounded with Lockout"); the
+#    reference is a closed-form manual compounding over the SIFMA business days
+#    and – with QuantLib – `OvernightIndexedCoupon(lockoutDays = k)`.
+# --------------------------------------------------------------------------
+LOCKOUT_START = d(2026, 6, 1)
+LOCKOUT_END = d(2026, 8, 3)
+# US-SIFMA (SOFR publication) weekday holidays inside the window: Juneteenth, Independence Day observed (04.07. is a Saturday).
+SIFMA_HOLIDAYS_2026 = {d(2026, 6, 19), d(2026, 7, 3)}
+# Holidays before the window that a lookback of up to two days may reach (Memorial Day 25.05.2026).
+SIFMA_HOLIDAYS_BEFORE = {d(2026, 5, 25)}
+
+
+def sifma_bd(x: dt.date) -> bool:
+    return x.weekday() < 5 and x not in SIFMA_HOLIDAYS_2026 and x not in SIFMA_HOLIDAYS_BEFORE
+
+
+def lockout_fixing(x: dt.date) -> float:
+    """Synthetic SOFR fixing: 4.00 % + 0.02 %·((d − start) mod 7), non-negative modulus."""
+    return 0.04 + 0.0002 * (((x - LOCKOUT_START).days % 7 + 7) % 7)
+
+
+def compounded_rate(fixing_day_of) -> float:
+    """Π(1 + r(fixing_day_of(d))·τ_d) − 1 over the SIFMA business days of [start, end), divided by the ACT/360 period."""
+    bdays = [x for x in (LOCKOUT_START + dt.timedelta(n) for n in range(days(LOCKOUT_START, LOCKOUT_END))) if sifma_bd(x)]
+    acc = 1.0
+    for i, x in enumerate(bdays):
+        nxt = bdays[i + 1] if i + 1 < len(bdays) else LOCKOUT_END
+        acc *= 1.0 + lockout_fixing(fixing_day_of(x, i, bdays)) * days(x, nxt) / 360.0
+    return (acc - 1.0) / (days(LOCKOUT_START, LOCKOUT_END) / 360.0)
+
+
+def prev_bd(x: dt.date, n: int) -> dt.date:
+    while n > 0:
+        x -= dt.timedelta(1)
+        if sifma_bd(x):
+            n -= 1
+    return x
+
+
+def golden_lockout() -> None:
+    """SOFR period 01.06.–03.08.2026 (ACT/360, τ = 63/360), fixings 4.00 % + 0.02 %·((d − start) mod 7)
+    on the SIFMA business days (Juneteenth 19.06. and 03.07.2026 are no publication days).
+    Lockout k: the last k business days of the period carry the fixing of the business day
+    before the window (`bdays[-k-1]`), every other day its own fixing. Lookback n: day d
+    carries the fixing of the n-th SIFMA business day before d, weights from the accrual
+    period (no observation shift). Compounded rate = (Π(1 + r_i·τ_i) − 1)/τ. QuantLib:
+    `OvernightIndexedCoupon(…, Sofr with the same fixings, Actual360, lookbackDays, lockoutDays)`
+    with `CompoundingOvernightIndexedCouponPricer`."""
+    cases = []
+    for k in range(0, 4):
+        def fixing_day(x, i, bdays, k=k):
+            return bdays[-k - 1] if k > 0 and i >= len(bdays) - k else x
+        cases.append({"lockoutDays": k, "lookbackDays": 0, "rate": compounded_rate(fixing_day)})
+    for n in (1, 2):
+        cases.append({"lockoutDays": 0, "lookbackDays": n, "rate": compounded_rate(lambda x, i, bdays, n=n: prev_bd(x, n))})
+    ql_block = {"status": "pending", "note": "QuantLib not installed when the file was generated; run tools/quantlib-golden.py with the QuantLib Python bindings."}
+    if HAVE_QL:
+        cal = ql.UnitedStates(ql.UnitedStates.SOFR)
+        start = ql.Date(LOCKOUT_START.day, LOCKOUT_START.month, LOCKOUT_START.year)
+        end = ql.Date(LOCKOUT_END.day, LOCKOUT_END.month, LOCKOUT_END.year)
+        saved = ql.Settings.instance().evaluationDate
+        ql.Settings.instance().evaluationDate = ql.Date(VAL.day, VAL.month, VAL.year)
+        # the engine's holiday assumptions must match the vendor calendar
+        for x in (LOCKOUT_START + dt.timedelta(n) for n in range(-10, days(LOCKOUT_START, LOCKOUT_END) + 1)):
+            assert cal.isBusinessDay(ql.Date(x.day, x.month, x.year)) == sifma_bd(x), x
+        ql_cases = []
+        for c in cases:
+            idx = ql.Sofr()
+            idx.clearFixings()
+            x = LOCKOUT_START - dt.timedelta(10)
+            while x <= LOCKOUT_END:
+                if sifma_bd(x):
+                    idx.addFixing(ql.Date(x.day, x.month, x.year), lockout_fixing(x))
+                x += dt.timedelta(1)
+            cpn = ql.OvernightIndexedCoupon(end, 1.0, start, end, idx, 1.0, 0.0, ql.Date(), ql.Date(), ql.Actual360(), False, ql.RateAveraging.Compound, c["lookbackDays"], c["lockoutDays"], False)
+            cpn.setPricer(ql.CompoundingOvernightIndexedCouponPricer())
+            ql_cases.append({"lockoutDays": c["lockoutDays"], "lookbackDays": c["lookbackDays"], "rate": cpn.rate(), "lastFixingDates": [y.ISO() for y in cpn.fixingDates()][-5:]})
+        ql.Settings.instance().evaluationDate = saved
+        ql_block = {"status": "done", "version": ql.__version__, "engine": "OvernightIndexedCoupon + CompoundingOvernightIndexedCouponPricer, Sofr() with the synthetic fixings", "cases": ql_cases}
+    payload = {
+        "case": "rfr-lockout-quantlib",
+        "description": "Compounded SOFR rate of the period 2026-06-01 → 2026-08-03 (ACT/360) with lockout k = 0…3 and lookback 1/2 on the US-SIFMA fixing calendar, fixings 4.00 % + 0.02 %·((d − start) mod 7) (Quant R8 N8-7, R9 N9-1: the last k fixings are replaced by the fixing of the business day before the lockout window – lockoutDays 1 must change the rate).",
+        "derivation": golden_lockout.__doc__.strip(),
+        "inputs": {
+            "valuationDate": VAL.isoformat(),
+            "index": "SOFR",
+            "fixingCalendar": "US-SIFMA",
+            "accrualStart": LOCKOUT_START.isoformat(),
+            "accrualEnd": LOCKOUT_END.isoformat(),
+            "dayCount": "ACT/360",
+            "fixingRule": "0.04 + 0.0002 * (((d - start) mod 7) + 7 mod 7), d and start as serial dates, on every SIFMA business day from start − 10 to end",
+            "fixingHolidays": sorted(x.isoformat() for x in SIFMA_HOLIDAYS_2026 | SIFMA_HOLIDAYS_BEFORE),
+        },
+        "expected": {"cases": cases},
+        "quantlib": ql_block,
+    }
+    write("rfr-lockout-quantlib.json", payload)
+
+
 if __name__ == "__main__":
     print("QuantLib available:", HAVE_QL)
     golden_swap()
@@ -872,4 +974,5 @@ if __name__ == "__main__":
     golden_sample_bootstrap()
     golden_cds()
     golden_calendars()
+    golden_lockout()
     sys.exit(0)

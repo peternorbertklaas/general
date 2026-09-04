@@ -274,8 +274,13 @@ describe("N6-5 – barrier.hit flag and BARRIER_STATE_UNKNOWN warning", () => {
     expect(out.warnings.filter((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX))).toHaveLength(1);
     expect(out.warnings[0]).toContain("at or above the UpOut barrier 1.15");
     expect(out.analytics.barrierState).toBe("knocked-out");
-    // N7-5: the knocked-out rebate is paid on the delivery date on every path (R6 returned the undiscounted 100 000 here).
-    expect(out.pv).toBeCloseTo(1e7 * 0.01 * getDiscountCurve(ctx, "USD").df(VAL + 182), 6);
+    // N7-5 (R9 default "hit"): a spot beyond the barrier is a touch today – the rebate settles value-today (100 000.00);
+    // "expiry" pays it on the delivery date (98 283.05).
+    expect(out.pv).toBeCloseTo(1e7 * 0.01, 6);
+    expect(priceTrade(ctx, barrierCall({ type: "UpOut", level: 1.15, rebate: 0.01, rebateAt: "expiry" }), "USD").pv).toBeCloseTo(
+      1e7 * 0.01 * getDiscountCurve(ctx, "USD").df(VAL + 182),
+      6,
+    );
     expect(out.analytics.greeksMethod).toBe("settled-payoff");
     const inn = priceTrade(ctx, barrierCall({ type: "UpIn", level: 1.15 }), "USD");
     expect(inn.pv).toBeCloseTo(vanilla.pv, 6);
@@ -292,10 +297,11 @@ describe("N6-5 – barrier.hit flag and BARRIER_STATE_UNKNOWN warning", () => {
     expect(contradicting.warnings.some((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX) && w.includes("barrier.hit is false"))).toBe(true);
   });
 
-  it("alive option with barrier.hit = true: knock-out → rebate on the delivery date with zero Greeks, knock-in → vanilla with analytic Greeks", () => {
-    const out = priceTrade(ctx, barrierCall({ type: "UpOut", level: 1.25, rebate: 0.01, hit: true }), "USD");
+  it("alive option with barrier.hit = true: knock-out → rebate on the delivery date (rebateAt expiry) / already paid (default hit) with zero Greeks, knock-in → vanilla with analytic Greeks", () => {
+    const out = priceTrade(ctx, barrierCall({ type: "UpOut", level: 1.25, rebate: 0.01, hit: true, rebateAt: "expiry" }), "USD");
     const dfQ = getDiscountCurve(ctx, "USD").df(VAL + 182);
     expect(out.pv).toBeCloseTo(1e7 * 0.01 * dfQ, 6);
+    expect(priceTrade(ctx, barrierCall({ type: "UpOut", level: 1.25, rebate: 0.01, hit: true }), "USD").pv).toBe(0); // R9 default "hit": paid at the touch
     expect(out.analytics.barrierState).toBe("knocked-out");
     expect(out.analytics.greeksMethod).toBe("settled-payoff");
     expect(out.analytics.vega).toBe(0);
@@ -329,10 +335,17 @@ describe("N6-5 – barrier.hit flag and BARRIER_STATE_UNKNOWN warning", () => {
     const untouched = priceTrade(fixing, expiredUpIn(false), "USD");
     expect(untouched.pv).toBe(0);
     expect(untouched.warnings.some((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX))).toBe(false);
-    // knocked-out with rebate: rebate · DF, regardless of an OTM fixing
-    const outHit = priceTrade(fixing, barrierCall({ type: "UpOut", level: 1.3, rebate: 0.02, hit: true }, { expiryDate: VAL - 2, deliveryDate: TOM }), "USD");
+    // knocked-out with rebate (rebateAt expiry): rebate · DF, regardless of an OTM fixing; default "hit": already paid (R9)
+    const outHit = priceTrade(
+      fixing,
+      barrierCall({ type: "UpOut", level: 1.3, rebate: 0.02, hit: true, rebateAt: "expiry" }, { expiryDate: VAL - 2, deliveryDate: TOM }),
+      "USD",
+    );
     expect(outHit.pv).toBeCloseTo(1e7 * 0.02 * getDiscountCurve(ctx, "USD").df(TOM), 6);
     expect(outHit.analytics.barrierState).toBe("knocked-out");
+    expect(priceTrade(fixing, barrierCall({ type: "UpOut", level: 1.3, rebate: 0.02, hit: true }, { expiryDate: VAL - 2, deliveryDate: TOM }), "USD").pv).toBe(
+      0,
+    );
     // report methodology names the flag / the derivation
     expect(methodologyFor(expiredUpIn(true), fixing, touched).some((l) => l.includes("barrier.hit = berührt"))).toBe(true);
     expect(methodologyFor(expiredUpIn(), fixing, unknown).some((l) => l.includes("BARRIER_STATE_UNKNOWN"))).toBe(true);

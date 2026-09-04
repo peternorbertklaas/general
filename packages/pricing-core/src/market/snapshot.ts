@@ -162,16 +162,25 @@ function deserializeFxFixings(raw: NonNullable<MarketSnapshotJson["fxFixings"]>)
 }
 
 /**
- * Validate a snapshot for internal consistency (discount-curve mapping, DF
- * range and monotonicity, FX spots, FX fixings, `meta.snapshotTime` and –
- * Markt R5-1 – the structure of every vol surface via `validateVolSurfaces`);
- * returns a list of problems (empty = OK).
+ * Validate a snapshot for internal consistency (discount-curve mapping,
+ * collateral mapping `ccy|csa` → curve of `ccy` (N8-02, R9), DF range and
+ * monotonicity, FX spots, FX fixings, `meta.snapshotTime` and – Markt R5-1 –
+ * the structure of every vol surface via `validateVolSurfaces`); returns a
+ * list of problems (empty = OK).
  */
 export function validateMarket(ctx: MarketContext): string[] {
   const problems: string[] = [];
   problems.push(...validateVolSurfaces({ swaptionVols: ctx.swaptionVols, capletVols: ctx.capletVols, fxVols: ctx.fxVols }));
   for (const [ccy, id] of Object.entries(ctx.discountCurveId)) {
     if (!ctx.curves[id]) problems.push(`Discount curve ${id} for ${ccy} missing`);
+  }
+  // N8-02 (R9): a collateral mapping `ccy|csa` must name a curve of `ccy` – discounting EUR cash flows on a CZK
+  // curve moved a 10Y payer by +19 % without a warning (the API applies the same rule).
+  for (const [key, id] of Object.entries(ctx.collateralDiscountCurveId ?? {})) {
+    const ccy = key.split("|")[0]!;
+    const curve = ctx.curves[id];
+    if (!curve) problems.push(`Collateral discount curve ${id} for ${key} missing`);
+    else if (curve.currency !== ccy) problems.push(`Collateral discount curve ${id} for ${key} is denominated in ${curve.currency}, not ${ccy}`);
   }
   for (const c of Object.values(ctx.curves)) {
     let prev = 1.0001;

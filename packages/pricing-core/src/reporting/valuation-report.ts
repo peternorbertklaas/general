@@ -629,7 +629,7 @@ function fixingLines(ctx: MarketContext, trade: Trade, pricing: PricingResult): 
     }
     if (idxType === "OIS") {
       lines.push(
-        `RFR-Leg ${l.index}: ${(l.compounding ?? "Compound") === "Compound" ? "Compounding" : "arithmetisches Averaging"} in arrears der täglichen Fixings${l.lockoutDays ? ` (Fixingkalender ${getIndex(l.index).fixingCalendar}), Lockout ${l.lockoutDays} Geschäftstage (Fixing des Tages Periodenende − ${l.lockoutDays} eingefroren, ISDA 2021)` : `, Lookback ${l.lookbackDays ?? 0} Geschäftstage${l.lookbackDays ? (l.observationShift ? " mit Observation Shift (Gewichte aus der Beobachtungsperiode)" : " ohne Observation Shift (Gewichte aus der Zinsperiode)") : ""}`}, realisierter Teil bis zum Bewertungstag aus Fixings, Rest aus der Kurve; Accrued = realisiertes Compounding.`,
+        `RFR-Leg ${l.index}: ${(l.compounding ?? "Compound") === "Compound" ? "Compounding" : "arithmetisches Averaging"} in arrears der täglichen Fixings${l.lockoutDays ? ` (Fixingkalender ${getIndex(l.index).fixingCalendar}), Lockout ${l.lockoutDays} Geschäftstage (die letzten ${l.lockoutDays} Geschäftstage tragen das Fixing des Geschäftstags vor dem Lockout-Fenster, ISDA 2021 / QuantLib-Zählung)` : `, Lookback ${l.lookbackDays ?? 0} Geschäftstage${l.lookbackDays ? (l.observationShift ? " mit Observation Shift (Gewichte aus der Beobachtungsperiode)" : " ohne Observation Shift (Gewichte aus der Zinsperiode)") : ""}`}, realisierter Teil bis zum Bewertungstag aus Fixings, Rest aus der Kurve; Accrued = realisiertes Compounding.`,
       );
     }
     if (l.capRate !== undefined || l.floorRate !== undefined) {
@@ -651,7 +651,7 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
   switch (trade.type) {
     case "InterestRateSwap":
       return [
-        "Barwert = Summe diskontierter fixer und projizierter variabler Cashflows; Par-Satz und fairer Spread analytisch aus der Annuität; Umrechnung in die Reporting-Währung zum auf den Bewertungstag angepassten Spot.",
+        `Barwert = Summe diskontierter fixer und projizierter variabler Cashflows; Par-Satz und fairer Spread analytisch aus der Annuität der ökonomischen Legs – eine Upfront-Prämie ist ausgenommen, die All-in-Sicht inkl. Prämie steht als „Par-Satz all-in“ bzw. „fairer Spread all-in“ in den Kennzahlen${typeof a.parRateAllIn === "number" ? ` (hier ${pct(a.parRateAllIn, 4)})` : typeof a.fairSpreadAllIn === "number" ? ` (hier ${pct(a.fairSpreadAllIn, 4)})` : ""}; Umrechnung in die Reporting-Währung zum auf den Bewertungstag angepassten Spot.`,
       ];
     case "CrossCurrencySwap":
       return [
@@ -733,7 +733,7 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
           ? "; Knock-out-Rebate am Verfall (Konvention „expiry“: lebend Rebate·DF·P(Berührung), entschieden Rebate·DF(Lieferung) – eine Konvention, stetig an der Barrier)"
           : trade.barrier.rebateAt === "hit"
             ? "; Knock-out-Rebate bei Berührung (Konvention „hit“: lebend Reiner-Rubinstein-Term F, Spot jenseits der Barrier = Berührung heute value-today, bestätigte Berührung = bereits gezahlt)"
-            : "; Knock-out-Rebate ohne festgelegte Konvention: lebend bei Berührung (Term F), entschieden Rebate·DF(Lieferung) – Sprung Rebate·(1 − DF) an der Barrier; Konvention „hit“ oder „expiry“ am Geschäft setzen"
+            : "; Knock-out-Rebate bei Berührung (Default-Konvention „hit“ = QuantLib, am Geschäft nicht festgelegt: lebend Reiner-Rubinstein-Term F, Spot jenseits der Barrier = Berührung heute value-today, bestätigte Berührung = bereits gezahlt; für eine Zahlung am Verfall die Rebate-Konvention „expiry“ am Geschäft festlegen)"
         : "";
       const barrierNote = trade.barrier
         ? ` / Reiner-Rubinstein (Single-Barrier: Auszahlung auf das Lieferdatum diskontiert und gegen den Lieferdatums-Forward gestellt, Diffusion und Barrier-Drift auf dem Horizont bis zur Ausübung${a.deliveryConvention === "non-standard" ? "; Lieferdatum weicht vom Spot-Datum der Ausübung ab – Drift und Rebate-Diskontierung aus den Kurven bis zum Standard-Lieferdatum, nur Auszahlungsdiskont und Forward auf das tatsächliche Lieferdatum" : ""}${rebateNote})`
@@ -823,7 +823,10 @@ function staticMethodology(trade: Trade): string[] {
   ];
   switch (trade.type) {
     case "InterestRateSwap":
-      return [...common, "Barwert = Summe diskontierter fixer und projizierter variabler Cashflows; Par-Satz und fairer Spread analytisch aus Annuität."];
+      return [
+        ...common,
+        "Barwert = Summe diskontierter fixer und projizierter variabler Cashflows; Par-Satz und fairer Spread analytisch aus der Annuität der ökonomischen Legs (Upfront-Prämie ausgenommen, All-in-Sicht als „Par-Satz all-in“ bzw. „fairer Spread all-in“ in den Kennzahlen).",
+      ];
     case "CrossCurrencySwap":
       return [
         ...common,

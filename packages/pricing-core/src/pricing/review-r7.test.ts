@@ -142,11 +142,12 @@ describe("N7-2 / N7-5 – barrier rebate conventions", () => {
     ).toBe(true);
   });
 
-  it("N7-5: a knocked-out option is worth rebate·DF(delivery) on all three paths (spot beyond without flag, hit: true, expired)", () => {
+  it("N7-5: a knocked-out option (rebateAt expiry) is worth rebate·DF(delivery) on all three paths (spot beyond without flag, hit: true, expired)", () => {
     expect(spot).toBeGreaterThan(1.15);
-    const beyond = priceTrade(ctx, option({ type: "UpOut", level: 1.15, rebate: 0.01 }), "USD");
-    const flagged = priceTrade(ctx, option({ type: "UpOut", level: 1.15, rebate: 0.01, hit: true }), "USD");
-    const contradicting = priceTrade(ctx, option({ type: "UpOut", level: 1.15, rebate: 0.01, hit: false }), "USD");
+    // R9 (N7-5 rest): the default convention became "hit" – this test pins the "expiry" convention explicitly
+    const beyond = priceTrade(ctx, option({ type: "UpOut", level: 1.15, rebate: 0.01, rebateAt: "expiry" }), "USD");
+    const flagged = priceTrade(ctx, option({ type: "UpOut", level: 1.15, rebate: 0.01, hit: true, rebateAt: "expiry" }), "USD");
+    const contradicting = priceTrade(ctx, option({ type: "UpOut", level: 1.15, rebate: 0.01, hit: false, rebateAt: "expiry" }), "USD");
     const expected = 1e7 * 0.01 * dfUsd(VAL + 182);
     for (const r of [beyond, flagged, contradicting]) {
       expect(r.pv).toBeCloseTo(expected, 6); // R6: 100 000.00 undiscounted on the no-flag path vs 98 283.05 with the flag
@@ -160,12 +161,16 @@ describe("N7-2 / N7-5 – barrier rebate conventions", () => {
     expect(contradicting.warnings[0]).toContain("although barrier.hit is false");
     expect(flagged.warnings.some((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX))).toBe(false);
     // down-and-out put with a 0.02 rebate: identical treatment
-    const put = (hit?: boolean) => option({ type: "DownOut", level: 1.2, rebate: 0.02, hit }, { optionType: "Put", strike: 1.25 });
+    const put = (hit?: boolean) => option({ type: "DownOut", level: 1.2, rebate: 0.02, hit, rebateAt: "expiry" }, { optionType: "Put", strike: 1.25 });
     expect(priceTrade(ctx, put(), "USD").pv).toBeCloseTo(1e7 * 0.02 * dfUsd(VAL + 182), 6);
     expect(priceTrade(ctx, put(), "USD").pv).toBeCloseTo(priceTrade(ctx, put(true), "USD").pv, 8);
     // expired with the fixing beyond the barrier: same convention on the delivery date of that trade
     const fixing: MarketContext = { ...ctx, fxFixings: [{ pair: "EURUSD", date: VAL - 1, rate: spot }] };
-    const expired = priceTrade(fixing, option({ type: "UpOut", level: 1.15, rebate: 0.01 }, { expiryDate: VAL - 1, deliveryDate: TOM }), "USD");
+    const expired = priceTrade(
+      fixing,
+      option({ type: "UpOut", level: 1.15, rebate: 0.01, rebateAt: "expiry" }, { expiryDate: VAL - 1, deliveryDate: TOM }),
+      "USD",
+    );
     expect(expired.pv).toBeCloseTo(1e7 * 0.01 * dfUsd(TOM), 6);
     expect(expired.warnings.find((w) => w.startsWith(EXPIRED_PREFIX))).toMatch(/knocked out, rebate 0\.01 per unit base paid on 2026-09-04/);
     // knocked in beyond the barrier without flag = the vanilla with analytic Greeks, like hit: true

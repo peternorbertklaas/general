@@ -102,13 +102,16 @@ export interface FloatLeg extends LegBase {
   /** Observation shift: weights taken from the shifted observation period (true) vs. lookback without shift (false). */
   observationShift?: boolean;
   /**
-   * RFR lockout (ISDA 2021 "Compounded with Lockout", N8-7): the fixing of the
-   * business day `end − lockoutDays` (fixing calendar of the index) applies to
-   * that day and to every later day of the accrual period – the last
-   * `lockoutDays` business days are frozen at the lockout-date rate (2–5 days
-   * for SOFR FRNs / loans), also in the projection (curve forward of the
-   * lockout date's overnight period). Not combinable with `lookbackDays` /
-   * `observationShift` (`INVALID_TRADE`).
+   * RFR lockout (ISDA 2021 "Compounded with Lockout", N8-7 / N9-1): the last
+   * `lockoutDays` business days of the accrual period (fixing calendar of the
+   * index) carry the fixing of the business day **before** the lockout window,
+   * i.e. of `end − (lockoutDays + 1)` – the counting of QuantLib
+   * `OvernightIndexedCoupon(lockoutDays)`: `lockoutDays: 1` replaces the last
+   * fixing (2–5 days for SOFR FRNs / loans), also in the projection (curve
+   * forward of that day's overnight period). A window covering the whole
+   * period freezes it at the fixing in effect on the accrual start. Until
+   * round 9 the engine froze from `end − k` on (k − 1 fixings replaced).
+   * Not combinable with `lookbackDays` / `observationShift` (`INVALID_TRADE`).
    */
   lockoutDays?: number;
 }
@@ -232,10 +235,11 @@ export interface FxOption extends TradeBase {
    *   barrier today is a touch today (rebate settles value-today, DF 1), a
    *   recorded `hit: true` or an expiry fixing beyond the barrier means the
    *   rebate has already been paid (PV 0);
-   * - `undefined` (default, kept for backward compatibility): the round-7
-   *   mixture – live model at the hit, decided paths rebate·DF(delivery), i.e.
-   *   the value jumps by rebate·(1 − DF) at the barrier. Set `rebateAt`
-   *   explicitly for a single convention.
+   * - `undefined`: since round 9 the default is `"hit"` (QuantLib convention;
+   *   `analytics.rebateAt` reports the effective convention). Until round 9 the
+   *   default was the round-7 mixture – live model at the hit, decided paths
+   *   rebate·DF(delivery), a jump of rebate·(1 − DF) at the barrier. The
+   *   builders (`makeFxOption({ barrier })`) set `rebateAt: "hit"` explicitly.
    */
   barrier?: { type: BarrierType; level: number; rebate?: number; hit?: boolean; rebateAt?: "hit" | "expiry" };
   digital?: { payoutCurrency: string; payout: number };

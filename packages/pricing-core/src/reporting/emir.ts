@@ -125,7 +125,11 @@ export function emirValuationTimestamp(ctx: MarketContext, opts: Pick<EmirRecord
   const eod = `${toISO(ctx.valuationDate)}T17:00:00Z`;
   if (opts.timestamp !== undefined) return normaliseTimestamp(opts.timestamp, "timestamp");
   const snap = ctx.meta?.snapshotTime;
-  if (snap !== undefined && (isIsoDateTime(snap) || /^\d{4}-\d{2}-\d{2}$/.test(snap))) return normaliseTimestamp(snap, "meta.snapshotTime");
+  if (snap !== undefined && (isIsoDateTime(snap) || /^\d{4}-\d{2}-\d{2}$/.test(snap))) {
+    // N9-02: a snapshot time from before the valuation date (a rolled snapshot) is stale for field 23 – ignored.
+    const ts = normaliseTimestamp(snap, "meta.snapshotTime");
+    if (ts.slice(0, 10) >= toISO(ctx.valuationDate)) return ts;
+  }
   if (opts.asOf !== undefined) return normaliseTimestamp(opts.asOf, "asOf");
   return eod;
 }

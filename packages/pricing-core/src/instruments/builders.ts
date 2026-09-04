@@ -239,7 +239,8 @@ export function makeFxForward(p: {
 /**
  * FX option. The delivery date defaults to the spot date of the expiry
  * (T+2 / T+1 business days on the pair calendar), so it never falls on a
- * weekend or holiday.
+ * weekend or holiday. An optional `barrier` gets an explicit knock-out rebate
+ * convention – `rebateAt: "hit"` (QuantLib) unless given (R9, N7-5 rest).
  */
 export function makeFxOption(p: {
   id?: string;
@@ -251,10 +252,13 @@ export function makeFxOption(p: {
   deliveryDate?: SerialDate;
   longShort?: "Long" | "Short";
   counterparty?: string;
+  barrier?: NonNullable<FxOption["barrier"]>;
 }): FxOption {
   const base = p.pair.slice(0, 3).toUpperCase();
   const quote = p.pair.slice(3, 6).toUpperCase();
+  const barrier: FxOption["barrier"] = p.barrier ? { ...p.barrier, rebateAt: p.barrier.rebateAt ?? "hit" } : undefined;
   return {
+    ...(barrier ? { barrier } : {}),
     id: p.id ?? nextTradeId("FXO"),
     name: `${p.optionType} ${pairDe(p.pair)} ${formatDe(p.notional, 0)} @ ${fxRateDe(p.strike)}`,
     type: "FxOption",

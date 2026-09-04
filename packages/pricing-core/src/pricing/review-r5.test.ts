@@ -225,10 +225,16 @@ describe("N5-2 – expired and delivered FX options (vanilla, barrier, digital)"
   it("barrier: knock state decided on the fixing – alive UpOut = forward position, knocked-out UpOut = discounted rebate, never-touched UpIn = 0", () => {
     const alive = priceTrade(ctx, fxo({ expiryDate: VAL - 1, deliveryDate: TOM, barrier: { type: "UpOut", level: 1.2 } }), "USD");
     expect(alive.pv).toBeCloseTo(priceTrade(ctx, fxo({ expiryDate: VAL - 1, deliveryDate: TOM }), "USD").pv, 6);
-    const knocked = priceTrade(ctx, fxo({ expiryDate: VAL - 1, deliveryDate: TOM, barrier: { type: "UpOut", level: 1.15, rebate: 0.01 } }), "USD");
+    // R9 (N7-5 rest): the default convention is "hit" (rebate already paid at the touch → 0); "expiry" pays the discounted rebate
+    const knocked = priceTrade(
+      ctx,
+      fxo({ expiryDate: VAL - 1, deliveryDate: TOM, barrier: { type: "UpOut", level: 1.15, rebate: 0.01, rebateAt: "expiry" } }),
+      "USD",
+    );
     expect(spot).toBeGreaterThan(1.15);
     expect(knocked.pv).toBeCloseTo(1e7 * 0.01 * knocked.legs[0]!.cashflows[0]!.discountFactor, 4);
     expect(knocked.analytics.deltaAmount).toBe(0);
+    expect(priceTrade(ctx, fxo({ expiryDate: VAL - 1, deliveryDate: TOM, barrier: { type: "UpOut", level: 1.15, rebate: 0.01 } }), "USD").pv).toBe(0);
     const untouched = priceTrade(ctx, fxo({ expiryDate: VAL - 1, deliveryDate: TOM, barrier: { type: "UpIn", level: 1.3 } }), "USD");
     expect(untouched.pv).toBe(0);
   });

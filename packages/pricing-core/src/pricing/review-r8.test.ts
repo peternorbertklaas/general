@@ -106,32 +106,44 @@ describe("N8-1 – upfront fee: parRate / fairSpread are analytics of the econom
     ] as const) {
       const fee = computeXva(ctx, withUpfront(payer, amount, "EUR", date), credit, "EUR");
       expect(Math.abs(fee.cva / base.cva - 1), `fee ${amount} in ${date - VAL} d`).toBeLessThan(0.001); // R8: −19.6 % / −19.2 % / −65.6 %
-      expect(fee.profile.length).toBe(base.profile.length);
-      fee.profile.slice(1).forEach((p, i) => {
-        expect(p.epe).toBeCloseTo(base.profile[i + 1]!.epe, 6);
-        expect(p.ene).toBeCloseTo(base.profile[i + 1]!.ene, 6);
-      });
+      // R9 (N9-2): the premium date is an extra grid point; every coupon point from the premium date on is unchanged
+      expect(fee.profile.length).toBe(base.profile.length + 1);
+      for (const p of fee.profile.slice(1)) {
+        const b = base.profile.find((x) => x.date === p.date);
+        if (!b) {
+          expect(p.date).toBe(date);
+          continue;
+        }
+        if (p.date >= date) {
+          expect(p.epe).toBeCloseTo(b.epe, 6);
+          expect(p.ene).toBeCloseTo(b.ene, 6);
+        }
+      }
     }
     // the payer's PV is negative with and without the paid fee: t = 0 exposure 0 in both cases
     expect(base.profile[0]!.epe).toBe(0);
   });
 
-  it("receiver symmetry: a received fee only nets the t = 0 exposure – every later point equals the plain receiver's, the plain receiver CVA is unchanged", () => {
+  it("receiver symmetry: a received fee nets the exposure until its payment date – every coupon point equals the plain receiver's, the plain receiver CVA is unchanged", () => {
     const base = computeXva(ctx, receiver, credit, "EUR");
     const fee = computeXva(ctx, withUpfront(receiver, -2e5, "EUR", VAL + 2), credit, "EUR");
     expect(base.cva).toBeGreaterThan(15_000); // reviewer: 21 363
-    fee.profile.slice(1).forEach((p, i) => {
+    // R9 (N9-2): premium date VAL + 2 as grid point (fee paid there → plain exposure), coupon points unchanged
+    expect(fee.profile[1]!.date).toBe(VAL + 2);
+    fee.profile.slice(2).forEach((p, i) => {
+      expect(p.date).toBe(base.profile[i + 1]!.date);
       expect(p.epe).toBeCloseTo(base.profile[i + 1]!.epe, 6);
       expect(p.ene).toBeCloseTo(base.profile[i + 1]!.ene, 6);
     });
     // t = 0: the open premium we receive adds to the current PV (allowed: it is exposure until it is paid)
     const pvFee = priceTrade(ctx, withUpfront(receiver, -2e5, "EUR", VAL + 2), "EUR").pv;
     expect(fee.profile[0]!.epe).toBeCloseTo(Math.max(pvFee, 0), 6);
-    // only the first trapezoid differs
+    // the difference is the two-day exposure of the receivable plus the (fee-independent) extra grid point
+    const zero = computeXva(ctx, withUpfront(receiver, 0, "EUR", VAL + 2), credit, "EUR");
     const lgd = 1 - credit.cptyRecovery;
-    const firstTerm = lgd * fee.profile[1]!.pdCpty * 0.5 * (fee.profile[0]!.epe - base.profile[0]!.epe);
-    expect(fee.cva - base.cva).toBeCloseTo(firstTerm, 6);
-    expect(Math.abs(fee.cva / base.cva - 1)).toBeLessThan(0.1); // R8: +56.6 %
+    const firstTerm = lgd * fee.profile[1]!.pdCpty * 0.5 * (fee.profile[0]!.epe - zero.profile[0]!.epe);
+    expect(fee.cva - zero.cva).toBeCloseTo(firstTerm, 6);
+    expect(Math.abs(fee.cva / base.cva - 1)).toBeLessThan(0.001); // R8: +56.6 %, R9 reviewer: +5.6 % (trapezoid over the first year)
   });
 
   it("basis swap: fairSpread invariant to the fee (fairSpreadAllIn separate), CVA profile from t > 0 unchanged", () => {
@@ -153,8 +165,10 @@ describe("N8-1 – upfront fee: parRate / fairSpread are analytics of the econom
     const base = computeXva(ctx, basis, credit, "EUR");
     const fee = computeXva(ctx, withUpfront(basis, 1e5, "EUR", VAL + 2), credit, "EUR");
     expect(base.method).toMatch(/Basis-swaption/);
-    fee.profile.slice(1).forEach((p, i) => expect(p.epe).toBeCloseTo(base.profile[i + 1]!.epe, 6));
-    expect(Math.abs(fee.cva / base.cva - 1)).toBeLessThan(0.05); // R8: 2 809 → 294 (−89.5 %)
+    // R9 (N9-2): premium date as grid point, coupon points unchanged
+    expect(fee.profile[1]!.date).toBe(VAL + 2);
+    fee.profile.slice(2).forEach((p, i) => expect(p.epe).toBeCloseTo(base.profile[i + 1]!.epe, 6));
+    expect(Math.abs(fee.cva / base.cva - 1)).toBeLessThan(0.001); // R8: 2 809 → 294 (−89.5 %), R9 reviewer: −9.2 %
   });
 });
 
@@ -409,27 +423,28 @@ describe("N7-5 (R8) – barrier.rebateAt drives the model (rebateAtExpiry) and e
     }
   });
 
-  it("default (rebateAt undefined) keeps the round-7 behaviour: live at the hit, decided paths rebate·DF(delivery)", () => {
+  it('default (rebateAt undefined) is "hit" since round 9 (N7-5 rest): live at the hit, a touch today value-today, hit: true already paid', () => {
     const alive = priceTrade(atSpot(1.149999), upOut(), "USD");
     const knocked = priceTrade(atSpot(1.15), upOut(), "USD");
-    expect(knocked.pv).toBeCloseTo(rebateAmount * dfUsd(VAL + 182), 6); // 98 283.05
+    expect(knocked.pv).toBeCloseTo(rebateAmount, 6); // R8 default: 98 283.05 = rebate·DF(delivery)
     expect(alive.pv).toBeGreaterThan(0.999 * rebateAmount); // 99 999.45
-    expect(knocked.analytics.rebateAt).toBe("default");
-    expect(priceTrade(ctx, upOut({ hit: true }), "USD").pv).toBeCloseTo(knocked.pv, 6);
+    expect(knocked.analytics.rebateAt).toBe("hit"); // R8: "default"
+    expect(priceTrade(ctx, upOut({ hit: true }), "USD").pv).toBe(0);
+    expect(priceTrade(atSpot(1.15), upOut({ rebateAt: "hit" }), "USD").pv).toBeCloseTo(knocked.pv, 8);
     // validation
     expect(validateTrade(upOut({ rebateAt: "later" as unknown as "hit" }))).toEqual([
       expect.stringContaining('trade.barrier.rebateAt must be "hit" or "expiry"'),
     ]);
     // the report names the convention
     expect(methodologyFor(upOut({ rebateAt: "expiry" }), ctx, knocked).some((l) => l.includes("Konvention „expiry“"))).toBe(true);
-    expect(methodologyFor(upOut(), ctx, knocked).some((l) => l.includes("ohne festgelegte Konvention"))).toBe(true);
+    expect(methodologyFor(upOut(), ctx, knocked).some((l) => l.includes("Default-Konvention „hit“"))).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
 // N8-7 – lockout compounding
 // ---------------------------------------------------------------------------
-describe("N8-7 – lockoutDays: the fixing of business day end − k is frozen for the last k business days (realised and projected)", () => {
+describe("N8-7 – lockoutDays: the last k business days carry the fixing of the business day before the window (realised and projected; R9 N9-1 counting)", () => {
   const sifma = getCalendar("US-SIFMA");
   const usdCurve = getCurve(ctx, SAMPLE_CURVE_IDS.usdSofr);
   const leg = (effectiveDate: number, terminationDate: number, lockoutDays: number): FloatLeg => ({
@@ -449,41 +464,49 @@ describe("N8-7 – lockoutDays: the fixing of business day end − k is frozen f
   const periodOf = (l: FloatLeg) =>
     buildSchedule({ ...l, businessDayConvention: "ModifiedFollowing", stub: "ShortFront", paymentLag: l.paymentLag ?? 0 }).periods[0]!;
 
-  it("fully realised period 01.06.–03.08.2026 with a 2-day lockout: rate = manual compounding with the 30.07. fixing frozen from 30.07.", () => {
+  it("fully realised period 01.06.–03.08.2026 with a 2-day lockout: rate = manual compounding with the 29.07. fixing applied on 30.07. and 31.07. (QuantLib k = 2)", () => {
     const start = parseISO("2026-06-01");
     const end = parseISO("2026-08-03");
     const fixings: Fixing[] = [];
     for (let d = start - 5; d < VAL; d++) if (isBusinessDay(d, sifma)) fixings.push({ index: "SOFR", date: d, value: 0.04 + 0.0002 * ((d - start) % 7) });
     const market: MarketContext = { ...ctx, fixings };
     const l = leg(start, end, 2);
-    const lockoutDate = addBusinessDays(end, -2, sifma);
+    const lockoutDate = addBusinessDays(end, -2, sifma); // first frozen day
+    const frozenFixing = addBusinessDays(end, -3, sifma); // the business day before the window (N9-1)
     expect(toISO(lockoutDate)).toBe("2026-07-30");
+    expect(toISO(frozenFixing)).toBe("2026-07-29");
     const fix = (d: number) => fixings.find((f) => f.date === d)!.value;
     let manual = 1;
     for (let d = start; d < end;) {
       const next = Math.min(addBusinessDays(d, 1, sifma), end);
-      manual *= 1 + fix(d >= lockoutDate ? lockoutDate : d) * yearFraction(d, next, "ACT/360");
+      manual *= 1 + fix(d >= lockoutDate ? frozenFixing : d) * yearFraction(d, next, "ACT/360");
       d = next;
     }
     const proj = projectFloatingRate(market, l, periodOf(l), usdCurve);
     expect(proj.isFixed).toBe(true);
     expect(proj.rate).toBeCloseTo((manual - 1) / yearFraction(start, end, "ACT/360"), 14);
-    // without lockout the last two business days use their own fixings – a different rate
+    expect(proj.rate).toBeCloseTo(0.04061196884590121, 14); // reviewer: QuantLib lockoutDays 2 = 4.06119688 % (engine round 8: k = 3)
+    // without lockout the last two business days use their own fixings – a different rate; k = 1 already differs (N9-1)
     const plain = projectFloatingRate(market, leg(start, end, 0), periodOf(leg(start, end, 0)), usdCurve);
     expect(plain.rate).not.toBeCloseTo(proj.rate, 8);
+    expect(plain.rate).toBeCloseTo(0.04063434219935682, 14);
+    const one = projectFloatingRate(market, leg(start, end, 1), periodOf(leg(start, end, 1)), usdCurve);
+    expect(one.rate).toBeCloseTo(0.04062475392594221, 14); // QuantLib lockoutDays 1 (round 8: = no lockout)
     // lockout longer than the period: the whole period is frozen at the first day's fixing
     const all = projectFloatingRate(market, leg(start, end, 60), periodOf(leg(start, end, 60)), usdCurve);
     expect(all.rate).toBeCloseTo(compoundFlat(fix(start), start, end) / yearFraction(start, end, "ACT/360"), 12);
   });
 
-  it("projected period 15.09.–15.12.2026 with a 3-day lockout: telescoping forward to 10.12., then the 10.12. overnight forward day by day", () => {
+  it("projected period 15.09.–15.12.2026 with a 3-day lockout: telescoping forward to 10.12., then the 09.12. overnight forward day by day (N9-1)", () => {
     const start = parseISO("2026-09-15");
     const end = parseISO("2026-12-15");
     const l = leg(start, end, 3);
     const lockoutDate = addBusinessDays(end, -3, sifma);
+    const frozenFixing = addBusinessDays(end, -4, sifma);
     expect(toISO(lockoutDate)).toBe("2026-12-10");
+    expect(toISO(frozenFixing)).toBe("2026-12-09");
     const fwd = usdCurve.forwardRate(start, lockoutDate, "ACT/360");
-    const rLock = usdCurve.forwardRate(lockoutDate, addBusinessDays(lockoutDate, 1, sifma), "ACT/360");
+    const rLock = usdCurve.forwardRate(frozenFixing, addBusinessDays(frozenFixing, 1, sifma), "ACT/360");
     let manual = 1 + fwd * yearFraction(start, lockoutDate, "ACT/360");
     for (let d = lockoutDate; d < end;) {
       const next = Math.min(addBusinessDays(d, 1, sifma), end);

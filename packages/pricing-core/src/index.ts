@@ -281,6 +281,7 @@ export { priceSwaption } from "./pricing/swaption-pricer.js";
 export { UPFRONT_LEG_TYPE } from "./pricing/upfront.js";
 export {
   BARRIER_STATE_UNKNOWN_PREFIX,
+  DEFAULT_REBATE_AT,
   EXPIRED_PREFIX,
   EXPIRES_TODAY_PREFIX,
   MISSING_FX_FIXING_PREFIX,
@@ -290,6 +291,7 @@ export {
   priceFxForward,
   priceFxOption,
   priceFxSwap,
+  rebateConvention,
   splitPair,
   type BarrierState,
   type FxOptionLifecycle,
@@ -304,6 +306,7 @@ export {
   relevantCurveIds,
   rollMarket,
   rollMarketForward,
+  rolledMeta,
   shiftCurvesParallel,
   shiftFxSpots,
   tradeCurveIds,

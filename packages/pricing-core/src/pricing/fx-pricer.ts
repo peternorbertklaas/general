@@ -289,6 +289,14 @@ interface SettledPayoff {
  * exactly as the live model values it); both rebates are paid on the delivery
  * date (rebate·DF_q). No vega, gamma, theta or rho remain.
  */
+/** Default knock-out rebate convention when the trade does not fix one (R9, N7-5 rest): at the hit – QuantLib `AnalyticBarrierEngine`. */
+export const DEFAULT_REBATE_AT = "hit";
+
+/** Effective knock-out rebate convention of a barrier (`rebateAt`, defaulting to `DEFAULT_REBATE_AT`). */
+export function rebateConvention(barrier: Pick<NonNullable<FxOption["barrier"]>, "rebateAt">): "hit" | "expiry" {
+  return barrier.rebateAt ?? DEFAULT_REBATE_AT;
+}
+
 function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: number, dfQ: number, scalePayout: number): SettledPayoff {
   const sign = trade.optionType === "Call" ? 1 : -1;
   const dfF = spot > 0 ? (dfQ * forward) / spot : dfQ;
@@ -308,9 +316,10 @@ function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: num
     const isOut = b.type.endsWith("Out");
     const barrierState: BarrierState = touched ? (isOut ? "knocked-out" : "knocked-in") : "alive";
     if (isOut ? !touched : touched) return { ...exercised, barrierState };
-    // Knocked out under the at-hit convention (R8): the rebate was paid when the barrier was touched – nothing left.
-    if (isOut && b.rebateAt === "hit") return { premiumPerUnit: 0, spotDelta: 0, barrierState, outcome: b.rebate ? "rebate-paid" : "none" };
-    // Knocked out, or knock-in never triggered: the rebate (if any) is paid on the delivery date (N7-2 / N7-5).
+    // Knocked out under the at-hit convention (R8, default since R9): the rebate was paid when the barrier was
+    // touched – nothing left.
+    if (isOut && rebateConvention(b) === "hit") return { premiumPerUnit: 0, spotDelta: 0, barrierState, outcome: b.rebate ? "rebate-paid" : "none" };
+    // Knocked out under "expiry", or knock-in never triggered: the rebate (if any) is paid on the delivery date (N7-2 / N7-5).
     const rebate = (b.rebate ?? 0) * dfQ;
     return { premiumPerUnit: rebate, spotDelta: 0, barrierState, outcome: rebate !== 0 ? "rebate" : "none" };
   }
@@ -366,11 +375,11 @@ function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: num
  *   today (rebate settles value-today, DF 1 – continuous with term F → K at the
  *   barrier), a recorded `hit: true` or an expiry fixing beyond the barrier
  *   means the rebate has already been paid (PV 0);
- * - `undefined` (default, unchanged since round 7): live model at the hit,
- *   decided paths rebate·DF_q(delivery) – identical on the three decided paths,
- *   but the value jumps by rebate·(1 − DF) at the barrier; set `rebateAt` for
- *   a single convention. Knocked in → the vanilla (analytic Greeks) in every
- *   case.
+ * - `undefined`: `"hit"` since round 9 (`DEFAULT_REBATE_AT`, N7-5 rest –
+ *   until round 9 the default was the round-7 mixture: live model at the hit,
+ *   decided paths rebate·DF_q(delivery), a jump of rebate·(1 − DF) at the
+ *   barrier); `analytics.rebateAt` reports the effective convention. Knocked in
+ *   → the vanilla (analytic Greeks) in every case.
  *
  * Upfront premium (N6-1): reported as a `Premium` cashflow in its own last leg
  * (`upfrontPremiumLeg`), no longer a silent PV deduction.
@@ -516,9 +525,9 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
         barrierState = knockedState;
         let rebateNote = "no rebate, PV 0";
         if (isOut) {
-          if (b.rebateAt === "hit") {
-            // At-hit convention (R8): a recorded touch means the rebate has been paid; a spot beyond the barrier
-            // today is a touch today – the rebate settles value-today (DF 1), continuous with term F → K.
+          if (rebateConvention(b) === "hit") {
+            // At-hit convention (R8, default since R9): a recorded touch means the rebate has been paid; a spot beyond
+            // the barrier today is a touch today – the rebate settles value-today (DF 1), continuous with term F → K.
             premiumPerUnit = b.hit === true ? 0 : (b.rebate ?? 0);
             if (b.rebate)
               rebateNote =
@@ -546,7 +555,7 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
       } else {
         // N7-5 (R8): the trade's rebate convention drives the model – "expiry" → K·DF·P(hit), otherwise at the hit (term F).
         const priceFn = (i: FxOptionInputs) =>
-          fxBarrier({ ...i, barrier: b.level, barrierType: b.type, rebate: b.rebate, rebateAtExpiry: b.rebateAt === "expiry" });
+          fxBarrier({ ...i, barrier: b.level, barrierType: b.type, rebate: b.rebate, rebateAtExpiry: rebateConvention(b) === "expiry" });
         premiumPerUnit = priceFn(inputs);
         greeks = fxExoticGreeks(priceFn, inputs, { barrier: b.level });
         greeksMethod = "finite-difference";
@@ -628,9 +637,12 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
        * unadjusted delta less the premium in base-currency units,
        * Δ − P/S (Reiswich–Wystup) – the hedge ratio for pairs whose premium is
        * paid in the base currency (USDJPY, EM pairs); `deltaPct` stays the
-       * unadjusted spot delta. 0 without optionality (settled / delivered).
+       * unadjusted spot delta. Exactly 0 without optionality
+       * (`greeksMethod: "settled-payoff"` – expired, delivered or knocked out,
+       * N9-3): a settled rebate claim is not hedged by −Rebate·DF/S.
        */
-      deltaPremiumAdjusted: spot > 0 ? longShort * (greeks.spotDelta - premiumPerUnit / spot) : longShort * greeks.spotDelta,
+      deltaPremiumAdjusted:
+        greeksMethod === "settled-payoff" ? 0 : spot > 0 ? longShort * (greeks.spotDelta - premiumPerUnit / spot) : longShort * greeks.spotDelta,
       gamma: scale * greeks.gamma * spot * spot * 0.0001,
       /** Vega per 1 vol point */
       vega: scale * greeks.vega * 0.01,
@@ -641,8 +653,8 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
       greeksMethod,
       /** Barrier options only (N6-5): "alive", "knocked-in" or "knocked-out" – from `barrier.hit`, today's spot or the expiry fixing. */
       barrierState,
-      /** Barrier options with a rebate (R8): knock-out rebate timing – "hit", "expiry" or "default" (round-7 mixture, see `FxOption.barrier`). */
-      rebateAt: trade.barrier?.rebate ? (trade.barrier.rebateAt ?? "default") : undefined,
+      /** Barrier options with a rebate (R8/R9): the effective knock-out rebate timing – "hit" (default since R9) or "expiry" (see `FxOption.barrier`). */
+      rebateAt: trade.barrier?.rebate ? rebateConvention(trade.barrier) : undefined,
       d1,
       d2,
       /** "standard" when delivery = spot date of the expiry; barriers with a "non-standard" lag use expiry-horizon drift/rebate rates (R3-9). */

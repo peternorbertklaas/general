@@ -1,7 +1,7 @@
 import { type CurveBuildSpec, type CurveQuote, bootstrapCurves, bumpQuote, curveDependencies, orderCurveSpecs, quoteLabel } from "../curves/bootstrap.js";
 import { type Curve } from "../curves/curve.js";
 import { getIndex } from "../curves/index-definitions.js";
-import { toISO } from "../dates/date.js";
+import { type SerialDate, toISO } from "../dates/date.js";
 import { embeddedOptionLegs, tradeIndexNames } from "../instruments/trade-dates.js";
 import { type Cashflow, type PricingResult, type Trade } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve, withCurves } from "../market/market-context.js";
@@ -351,7 +351,24 @@ export function rollMarket(ctx: MarketContext, days: number): MarketContext {
   const newDate = ctx.valuationDate + days;
   const curves: Record<string, Curve> = {};
   for (const [id, c] of Object.entries(ctx.curves)) curves[id] = c.rolledTo(newDate);
-  return { ...ctx, valuationDate: newDate, curves };
+  return { ...ctx, valuationDate: newDate, curves, ...(ctx.meta ? { meta: rolledMeta(ctx.meta, newDate) } : {}) };
+}
+
+/**
+ * Snapshot meta of a rolled market (N9-02): `snapshotTime` is dropped when its
+ * date differs from the new valuation date (the EMIR field-23 default – 17:00
+ * UTC of the valuation date – then applies instead of a stale timestamp) and
+ * `label` is marked ` (rolled to <date>)` (an earlier roll mark is replaced);
+ * `source` and everything else stay.
+ */
+export function rolledMeta(meta: NonNullable<MarketContext["meta"]>, newDate: SerialDate): NonNullable<MarketContext["meta"]> {
+  const iso = toISO(newDate);
+  if (meta.snapshotTime?.slice(0, 10) === iso) return meta;
+  const { snapshotTime: _dropped, label, ...rest } = meta;
+  void _dropped;
+  const out: NonNullable<MarketContext["meta"]> = { ...rest };
+  if (label !== undefined) out.label = `${label.replace(/ \(rolled to \d{4}-\d{2}-\d{2}\)$/, "")} (rolled to ${iso})`;
+  return out;
 }
 
 /**

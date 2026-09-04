@@ -264,9 +264,15 @@ function hazardLabel(credit: CreditInputs): string {
  * remaining swap (Sorensen–Bollier), valued with the smile vol at the swap's
  * fixed rate (or 70bp normal vol fallback). The profile ends at maturity with
  * zero exposure so the last coupon period carries its default probability.
- * An upfront fee only nets the t = 0 exposure (current PV); the remaining
- * swaps are priced without it (N8-1 – the fee used to enter `parRate` and
- * shift every replication forward).
+ * An upfront fee does not enter the remaining swaps (N8-1 – the fee used to
+ * enter `parRate` and shift every replication forward); while it is
+ * outstanding it is netted (N9-2): the premium date is a grid point, the
+ * exposure before it is the remaining-swap value plus the premium PV c,
+ * V = s·A·(K − S) + c = s·A·(K′ − S) with the shifted strike K′ = K + s·c/A
+ * (s = +1 receiving fixed) – the same μ-shift `cvaGeneric` and `cvaFxForward`
+ * apply –, from the premium date on the plain swap exposure. Until round 9
+ * only the t = 0 point was netted and the trapezoid spread the fee over the
+ * whole first coupon interval (−8.9 % for a fee paid in two days).
  */
 export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
@@ -279,12 +285,14 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
   if (!surface) warnings.push("No swaption vol surface – 70bp normal vol assumed for exposure");
   const profile: ExposurePoint[] = [];
   const weReceiveFixed = fixed.payReceive === "Receive";
+  const sFixed = weReceiveFixed ? 1 : -1;
   let prevT = 0;
   // Exposure at t=0 (current PV)
   const pv0 = priceInterestRateSwap(ctx, swap, ccy).pv;
   profile.push({ date: ctx.valuationDate, years: 0, epe: Math.max(pv0, 0) * fx, ene: Math.max(-pv0, 0) * fx, pdCpty: 0, pdOwn: 0 });
-  for (let i = 0; i < dates.length - 1; i++) {
-    const t = dates[i]!;
+  // N9-2: open premium (PV today, swap currency) nets the exposure until its payment date – a grid point.
+  const premium = openPremium(ctx, swap, reporting, fx);
+  for (const t of exposureGridWithPremium(dates.slice(0, -1), premium?.date, fixed.terminationDate)) {
     const T = yearFraction(ctx.valuationDate, t, "ACT/365F");
     // N8-1: the remaining swap carries no fee – the premium is paid on its date and does not shift the forward.
     const remaining: InterestRateSwap = {
@@ -303,10 +311,13 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
     }
     if (!Number.isFinite(fwd) || annuity <= 0) continue;
     const tenorLeft = yearFraction(t, fixed.terminationDate, "ACT/365F");
+    // Smile vol at the contractual strike (the premium shift below is a cash amount, not a rate view).
     const vol = surface ? swaptionVol(surface, T, tenorLeft, fwd, fixed.rate) : 0.007;
     const isNormal = !surface || surface.volType === "Normal";
     const shift = surface?.shift ?? 0;
-    const opt = (type: "Call" | "Put") => (isNormal ? bachelier(type, fwd, fixed.rate, vol, T) : black76(type, fwd + shift, fixed.rate + shift, vol, T));
+    // Strike shifted by the open premium: V + c = s·A·(K + s·c/A − S).
+    const kEff = premium && premium.date > t ? fixed.rate + (sFixed * premium.pvCcy) / annuity : fixed.rate;
+    const opt = (type: "Call" | "Put") => rateOption(type, fwd, kEff, vol, T, isNormal, shift);
     // Our exposure is positive when swap value to us > 0. If we receive fixed, value rises when rates fall → "receiver" optionality = put on rate.
     const epeUndisc = opt(weReceiveFixed ? "Put" : "Call");
     const eneUndisc = opt(weReceiveFixed ? "Call" : "Put");
@@ -322,7 +333,41 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
     prevT = T;
   }
   appendMaturityPoint(profile, ctx, fixed.terminationDate, prevT, credit);
-  return aggregate(swap.id, reporting, profile, credit, `Swaption-replication (Sorensen–Bollier), smile vol at strike, ${hazardLabel(credit)}`, warnings);
+  return aggregate(
+    swap.id,
+    reporting,
+    profile,
+    credit,
+    `Swaption-replication (Sorensen–Bollier), smile vol at strike${premium ? ", open premium netted until its payment date" : ""}, ${hazardLabel(credit)}`,
+    warnings,
+  );
+}
+
+/** Open upfront premium of a trade (payment date after the valuation date): PV today in the reporting currency and in the trade currency (via `fx`). */
+function openPremium(ctx: MarketContext, trade: Trade, reporting: string, fx: number): { date: SerialDate; pvReporting: number; pvCcy: number } | undefined {
+  const up = trade.upfront;
+  if (!up || up.date <= ctx.valuationDate) return undefined;
+  const leg = upfrontPremiumLeg(ctx, trade, reporting, 99);
+  if (!leg) return undefined;
+  return { date: up.date, pvReporting: leg.pvReporting, pvCcy: leg.pvReporting / fx };
+}
+
+/** Coupon grid plus the premium date (N9-2) when it lies strictly before the maturity – sorted, unique. */
+function exposureGridWithPremium(coupons: SerialDate[], premiumDate: SerialDate | undefined, maturity: SerialDate): SerialDate[] {
+  const set = new Set(coupons);
+  if (premiumDate !== undefined && premiumDate < maturity) set.add(premiumDate);
+  return [...set].sort((a, b) => a - b);
+}
+
+/**
+ * Option on a rate: Bachelier for normal vols, (shifted) Black-76 otherwise;
+ * a shifted strike (premium netting) that leaves the lognormal domain is
+ * valued intrinsically.
+ */
+function rateOption(type: "Call" | "Put", fwd: number, strike: number, vol: number, T: number, isNormal: boolean, shift: number): number {
+  if (isNormal) return bachelier(type, fwd, strike, vol, T);
+  if (strike + shift <= 0 || fwd + shift <= 0) return Math.max((type === "Call" ? 1 : -1) * (fwd - strike), 0);
+  return black76(type, fwd + shift, strike + shift, vol, T);
 }
 
 /** Final profile point at maturity with zero exposure so the last period contributes its PD. */
@@ -366,8 +411,9 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
   const pv0 = priceInterestRateSwap(ctx, swap, ccy).pv;
   profile.push({ date: ctx.valuationDate, years: 0, epe: Math.max(pv0, 0) * fx, ene: Math.max(-pv0, 0) * fx, pdCpty: 0, pdOwn: 0 });
   let prevT = 0;
-  for (let i = 0; i < dates.length - 1; i++) {
-    const t = dates[i]!;
+  // N9-2: open premium nets the exposure until its payment date (grid point, shifted strike K′ = K + s·c/A as in `cvaSwap`).
+  const premium = openPremium(ctx, swap, reporting, fx);
+  for (const t of exposureGridWithPremium(dates.slice(0, -1), premium?.date, maturity)) {
     const T = yearFraction(ctx.valuationDate, t, "ACT/365F");
     const remaining: InterestRateSwap = { ...swap, upfront: undefined, legs: swap.legs.map((l) => ({ ...l, effectiveDate: t })) };
     let fairSpread: number;
@@ -382,10 +428,11 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
     if (!Number.isFinite(fairSpread) || annuity <= 0) continue;
     const tenorLeft = yearFraction(t, maturity, "ACT/365F");
     const spreadVol = credit.basisSpreadVol ?? BASIS_SPREAD_VOL_FRACTION * (surface ? swaptionAtmVol(surface, T, Math.max(tenorLeft, 1 / 12)) : 0.007);
+    const kEff = premium && premium.date > t ? contractSpread + (sLeg0 * premium.pvCcy) / annuity : contractSpread;
     // Value of the remaining swap to us = sLeg0 · annuity · (K − fair spread):
     // receiving leg 0 → positive exposure when the fair spread falls below K (put on the spread), and vice versa.
-    const epeUndisc = bachelier(sLeg0 > 0 ? "Put" : "Call", fairSpread, contractSpread, spreadVol, T);
-    const eneUndisc = bachelier(sLeg0 > 0 ? "Call" : "Put", fairSpread, contractSpread, spreadVol, T);
+    const epeUndisc = bachelier(sLeg0 > 0 ? "Put" : "Call", fairSpread, kEff, spreadVol, T);
+    const eneUndisc = bachelier(sLeg0 > 0 ? "Call" : "Put", fairSpread, kEff, spreadVol, T);
     profile.push({
       date: t,
       years: T,
@@ -397,7 +444,14 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
     prevT = T;
   }
   appendMaturityPoint(profile, ctx, maturity, prevT, credit);
-  return aggregate(swap.id, reporting, profile, credit, `Basis-swaption replication (Bachelier on the tenor-basis spread), ${hazardLabel(credit)}`, warnings);
+  return aggregate(
+    swap.id,
+    reporting,
+    profile,
+    credit,
+    `Basis-swaption replication (Bachelier on the tenor-basis spread)${premium ? ", open premium netted until its payment date" : ""}, ${hazardLabel(credit)}`,
+    warnings,
+  );
 }
 
 /**
@@ -406,8 +460,8 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
  * unpaid upfront premium (N8-2) is netted while it is outstanding: the value
  * at t is V = N·DF_q·(F_T − K) + c with the premium PV c (quote currency), so
  * EPE = N·DF_q·E[(F_T − K′)⁺] with the shifted strike K′ = K − c/(N·DF_q) –
- * the same μ-shift `cvaGeneric` applies; after the premium date the plain
- * forward exposure remains.
+ * the same μ-shift `cvaGeneric` applies; the premium date is a grid point
+ * (R9) from which on the plain forward exposure remains.
  */
 export function cvaFxForward(ctx: MarketContext, fwdTrade: FxForward, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
@@ -430,9 +484,18 @@ export function cvaFxForward(ctx: MarketContext, fwdTrade: FxForward, credit: Cr
   const premiumQuote = premium ? premium.pvReporting / fxQ : 0;
   const pv0 = priceTrade(ctx, fwdTrade, reporting).pv;
   profile.push({ date: ctx.valuationDate, years: 0, epe: Math.max(pv0, 0), ene: Math.max(-pv0, 0), pdCpty: 0, pdOwn: 0 });
+  // Monthly grid plus the premium date (R9) so the netted and the plain exposure are not interpolated across it.
+  const grid: { date: SerialDate; t: number }[] = [];
   for (let i = 1; i <= steps; i++) {
     const t = (T * i) / steps;
-    const date = ctx.valuationDate + Math.round(t * 365.25);
+    grid.push({ date: ctx.valuationDate + Math.round(t * 365.25), t });
+  }
+  if (premium && up!.date < fwdTrade.deliveryDate && !grid.some((g) => g.date === up!.date)) {
+    grid.push({ date: up!.date, t: yearFraction(ctx.valuationDate, up!.date, "ACT/365F") });
+    grid.sort((a, b) => a.date - b.date);
+  }
+  for (const { date, t } of grid) {
+    if (t <= prevT) continue;
     const vol = surface ? fxAtmVol(surface, t) : 0.08;
     const kEff = premium && up!.date > date ? K - premiumQuote / (dfQ * fwdTrade.buyAmount) : K;
     let epe: number;

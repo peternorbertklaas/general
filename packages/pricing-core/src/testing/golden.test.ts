@@ -3,14 +3,16 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { type CurveQuote, bootstrapCurve } from "../curves/bootstrap.js";
 import { flatCurve } from "../curves/curve.js";
-import { QUANTLIB_CROSS_CHECKED_CALENDARS, getCalendar } from "../dates/calendar.js";
+import { QUANTLIB_CROSS_CHECKED_CALENDARS, getCalendar, isBusinessDay } from "../dates/calendar.js";
 import { fromYMD, isWeekend, parseISO, toISO } from "../dates/date.js";
+import { buildSchedule } from "../dates/schedule.js";
 import { makeFxForward } from "../instruments/builders.js";
-import { type CapFloor, type InterestRateSwap, type Swaption } from "../instruments/types.js";
-import { type MarketContext } from "../market/market-context.js";
+import { type CapFloor, type FloatLeg, type InterestRateSwap, type Swaption } from "../instruments/types.js";
+import { type Fixing, type MarketContext, getCurve } from "../market/market-context.js";
 import { SAMPLE_CURVE_IDS, SAMPLE_QUOTES, buildSampleMarket } from "../market/sample-market.js";
 import { bachelierGreeks, black76 } from "../models/black.js";
 import { garmanKohlhagen } from "../models/garman-kohlhagen.js";
+import { projectFloatingRate } from "../pricing/leg-pricer.js";
 import { priceTrade } from "../pricing/price.js";
 import { CDS_PREMIUM_ACCRUAL_PER_YEAR, bootstrapHazardCurve, survivalProbability } from "../xva/cva.js";
 
@@ -635,5 +637,78 @@ describe("golden master – calendars vs QuantLib (N7-4 / N8-4 / N8-5: TARGET / 
     expect(engineHolidays("JP", 2031)).not.toContain("2031-03-20");
     expect(engineHolidays("JP", 2032)).not.toContain("2032-09-23");
     expect(engineHolidays("JP", 2026).length).toBe(19);
+  });
+});
+
+describe("golden master – RFR lockout / lookback compounding vs QuantLib OvernightIndexedCoupon (N8-7 / N9-1)", () => {
+  interface G {
+    inputs: { valuationDate: string; accrualStart: string; accrualEnd: string; fixingHolidays: string[] };
+    expected: { cases: { lockoutDays: number; lookbackDays: number; rate: number }[] };
+    quantlib: { status: string; version?: string; cases: { lockoutDays: number; lookbackDays: number; rate: number; lastFixingDates: string[] }[] };
+  }
+  const g = golden<G>("rfr-lockout-quantlib");
+  const val = parseISO(g.inputs.valuationDate);
+  const start = parseISO(g.inputs.accrualStart);
+  const end = parseISO(g.inputs.accrualEnd);
+  const sifma = getCalendar("US-SIFMA");
+  const fixings: Fixing[] = [];
+  for (let d = start - 10; d <= end; d++)
+    if (isBusinessDay(d, sifma)) fixings.push({ index: "SOFR", date: d, value: 0.04 + 0.0002 * ((((d - start) % 7) + 7) % 7) });
+  const ctx: MarketContext = { ...buildSampleMarket(val), fixings };
+  const leg = (lockoutDays: number, lookbackDays: number): FloatLeg => ({
+    type: "Float",
+    payReceive: "Receive",
+    notional: 1,
+    currency: "USD",
+    effectiveDate: start,
+    terminationDate: end,
+    frequency: "3M",
+    dayCount: "ACT/360",
+    calendar: "US",
+    index: "SOFR",
+    lockoutDays,
+    lookbackDays,
+  });
+  const engineRate = (lockoutDays: number, lookbackDays: number): number => {
+    const l = leg(lockoutDays, lookbackDays);
+    const period = buildSchedule({ ...l, businessDayConvention: "ModifiedFollowing", stub: "ShortFront", paymentLag: 0 }).periods[0]!;
+    expect(period.accrualStart).toBe(start);
+    expect(period.accrualEnd).toBe(end);
+    const proj = projectFloatingRate(ctx, l, period, getCurve(ctx, SAMPLE_CURVE_IDS.usdSofr));
+    expect(proj.isFixed).toBe(true);
+    return proj.rate;
+  };
+
+  it("the file's holiday assumptions match the engine's US-SIFMA calendar (Juneteenth, 03.07.2026, Memorial Day)", () => {
+    expect(g.inputs.fixingHolidays).toEqual(["2026-05-25", "2026-06-19", "2026-07-03"]);
+    for (const iso of g.inputs.fixingHolidays) expect(isBusinessDay(parseISO(iso), sifma), iso).toBe(false);
+    expect(g.quantlib.status).toBe("done");
+    expect(g.quantlib.version ?? "1.43").toMatch(/^1\.\d+/);
+    expect(g.expected.cases.map((c) => [c.lockoutDays, c.lookbackDays])).toEqual([
+      [0, 0],
+      [1, 0],
+      [2, 0],
+      [3, 0],
+      [0, 1],
+      [0, 2],
+    ]);
+  });
+
+  it("lockout 0…3 and lookback 1/2: engine = closed-form manual compounding = QuantLib (1e-12); lockoutDays 1 changes the rate", () => {
+    g.expected.cases.forEach((c, i) => {
+      const rate = engineRate(c.lockoutDays, c.lookbackDays);
+      expectRel(rate, c.rate, `lockout ${c.lockoutDays} lookback ${c.lookbackDays} (manual)`, 1e-12);
+      const q = g.quantlib.cases[i]!;
+      expect([q.lockoutDays, q.lookbackDays]).toEqual([c.lockoutDays, c.lookbackDays]);
+      expectRel(rate, q.rate, `lockout ${c.lockoutDays} lookback ${c.lookbackDays} (QuantLib)`, 1e-12);
+    });
+    // N9-1: the last k fixings are replaced by the fixing of the business day before the window – k = 1 already differs
+    const r = (k: number) => g.expected.cases.find((c) => c.lockoutDays === k && c.lookbackDays === 0)!.rate;
+    expect(r(1)).not.toBeCloseTo(r(0), 8);
+    expect(r(1)).toBeCloseTo(0.04062475392594221, 14); // reviewer: QuantLib lockoutDays 1 = 4.06247539 % (engine round 8: k = 2)
+    expect(r(2)).toBeCloseTo(0.04061196884590121, 14);
+    expect(r(3)).toBeCloseTo(0.04059598697698849, 14);
+    expect(g.quantlib.cases[1]!.lastFixingDates.slice(-2)).toEqual(["2026-07-30", "2026-07-30"]);
+    expect(g.quantlib.cases[2]!.lastFixingDates.slice(-3)).toEqual(["2026-07-29", "2026-07-29", "2026-07-29"]);
   });
 });

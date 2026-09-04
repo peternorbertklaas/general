@@ -63,13 +63,14 @@ git diff test-data/golden                        # review the quantlib blocks, c
 
 What the cross-check computes:
 
-| Case                      | QuantLib objects                                                                                                                                                                                         |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `swap-flat-curve`         | `VanillaSwap` on `FlatForward(0.03, Actual365Fixed, Continuous)`, `NullCalendar`, `Unadjusted` → `NPV`, `fairRate`, leg NPVs                                                                             |
-| `black76-bachelier`       | `blackFormula`, `bachelierBlackFormula`                                                                                                                                                                  |
-| `sample-market-bootstrap` | `PiecewiseLogLinearDiscount` from `OISRateHelper`s on an `OvernightIndex` (TARGET, spot lag 2, payment lag 1, `Annual`)                                                                                  |
-| `cds-hazard-bootstrap`    | `PiecewiseFlatHazardRate` from `SpreadCdsHelper`s (ISDA engine, `Quarterly`, `Actual360` premium, flat 2 % discount, R 40 %)                                                                             |
-| `calendars-quantlib`      | `TARGET()`, `Norway()`, `Sweden()`, `Denmark()`, `Poland()` → `Calendar.holidayList(1.1.–31.12., includeWeekends=False)` for 2024–2032 (N7-4; the file has no `expected` block – it is vendor data only) |
+| Case                      | QuantLib objects                                                                                                                                                                                                                                                                          |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `swap-flat-curve`         | `VanillaSwap` on `FlatForward(0.03, Actual365Fixed, Continuous)`, `NullCalendar`, `Unadjusted` → `NPV`, `fairRate`, leg NPVs                                                                                                                                                              |
+| `black76-bachelier`       | `blackFormula`, `bachelierBlackFormula`                                                                                                                                                                                                                                                   |
+| `sample-market-bootstrap` | `PiecewiseLogLinearDiscount` from `OISRateHelper`s on an `OvernightIndex` (TARGET, spot lag 2, payment lag 1, `Annual`)                                                                                                                                                                   |
+| `cds-hazard-bootstrap`    | `PiecewiseFlatHazardRate` from `SpreadCdsHelper`s (ISDA engine, `Quarterly`, `Actual360` premium, flat 2 % discount, R 40 %)                                                                                                                                                              |
+| `calendars-quantlib`      | `TARGET()`, `Norway()`, `Sweden()`, `Denmark()`, `Poland()` → `Calendar.holidayList(1.1.–31.12., includeWeekends=False)` for 2024–2032 (N7-4; the file has no `expected` block – it is vendor data only)                                                                                  |
+| `rfr-lockout-quantlib`    | `OvernightIndexedCoupon(…, Sofr(), Actual360, lookbackDays, lockoutDays)` + `CompoundingOvernightIndexedCouponPricer` on the SIFMA calendar with synthetic fixings – lockout 0…3, lookback 1/2 (N8-7 / N9-1); `expected` is the closed-form manual compounding, bit-identical to QuantLib |
 
 Expected (and asserted) agreement:
 

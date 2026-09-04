@@ -123,10 +123,12 @@ export interface FloatingRateProjection {
  * curve's first forward without a warning.
  *
  * RFR conventions: lookback (`lookbackDays`, optionally with observation
- * shift) and lockout (`lockoutDays`, N8-7 – the fixing of business day
- * `end − k` on the fixing calendar applies to the last k business days of the
- * period, in the realised part from the fixing history, in the projection as
- * the curve forward of that day's overnight period compounded day by day).
+ * shift) and lockout (`lockoutDays`, N8-7 / N9-1 – the last k business days of
+ * the period (fixing calendar) carry the fixing of the business day **before**
+ * the lockout window, i.e. of `end − (k + 1)`: ISDA 2021 "Compounded with
+ * Lockout", QuantLib `OvernightIndexedCoupon(lockoutDays = k)`; in the
+ * realised part from the fixing history, in the projection as the curve
+ * forward of that day's overnight period compounded day by day).
  */
 export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: SchedulePeriod, projCurve: Curve): FloatingRateProjection {
   const idx = getIndex(leg.index);
@@ -168,17 +170,19 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
   const lookback = leg.lookbackDays ?? 0;
   const obsShift = leg.observationShift ?? false;
   const lockout = leg.lockoutDays ?? 0;
-  // N8-7 lockout: the fixing of the business day `end − lockoutDays` (floored at the accrual start) applies from that
-  // day to the end of the period.
-  const lockoutDate = lockout > 0 ? Math.max(start, addBusinessDays(end, -lockout, cal)) : undefined;
   const periodStarted = start <= val;
   // Fixing-calendar business day whose rate is in effect on `x` (an accrual day on a fixing holiday, e.g. a SOFR
   // period starting on Good Friday, uses the last published fixing).
   const inEffect = (x: SerialDate) => (cal.isHoliday(x) ? addBusinessDays(x, -1, cal) : x);
+  // N8-7 / N9-1 lockout (ISDA 2021, QuantLib `lockoutDays`): the last `lockout` business days of the period – from
+  // `lockoutDate` = end − k on – carry the fixing of the business day before the window, `frozenFixing` = end − (k + 1).
+  // A window covering the whole period freezes it at the fixing in effect on the accrual start.
+  const lockoutDate = lockout > 0 ? Math.max(start, addBusinessDays(end, -lockout, cal)) : undefined;
+  const frozenFixing = lockoutDate !== undefined ? (lockoutDate > start ? addBusinessDays(lockoutDate, -1, cal) : inEffect(start)) : undefined;
   // Observation date for an accrual day d: d shifted back by `lookback` business days.
   const obs = (d: SerialDate) => (lookback > 0 ? addBusinessDays(d, -lookback, cal) : d);
-  // Fixing date whose rate applies to accrual day d (lockout freezes it at the lockout date).
-  const fixingDayOf = (d: SerialDate) => (lockoutDate !== undefined && d >= lockoutDate ? lockoutDate : inEffect(obs(d)));
+  // Fixing date whose rate applies to accrual day d (lockout freezes it at the fixing before the window).
+  const fixingDayOf = (d: SerialDate) => (lockoutDate !== undefined && frozenFixing !== undefined && d >= lockoutDate ? frozenFixing : inEffect(obs(d)));
   let d = start;
   let realisedTo = start;
   // Realised part: daily fixings whose observation date is before the valuation date.
@@ -212,16 +216,17 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
     if (policy === "throw") throw new PricingError("MISSING_FIXING", message, { index: idx.name, fixingDate: missingFixing });
   }
   const isFixed = realisedTo >= end;
-  if (realisedTo < end && lockoutDate !== undefined && lockoutDate < end) {
-    // Projection with lockout: telescoping forward up to the lockout date, then the lockout date's overnight
-    // forward compounded day by day over the frozen tail (the realised loop already covered a lockout date < today).
+  if (realisedTo < end && lockoutDate !== undefined && frozenFixing !== undefined && lockoutDate < end) {
+    // Projection with lockout: telescoping forward up to the first frozen day, then the overnight forward of the
+    // frozen fixing day (the business day before the window) compounded day by day over the frozen tail (the
+    // realised loop already covered a frozen fixing published before today).
     if (realisedTo < lockoutDate) {
       const tauFwd = yearFraction(realisedTo, lockoutDate, idx.dayCount);
       const fwd = projCurve.forwardRate(inEffect(realisedTo), lockoutDate, idx.dayCount);
       compounded *= 1 + fwd * tauFwd;
       sumAvg += fwd * tauFwd;
     }
-    const rLock = projCurve.forwardRate(lockoutDate, addBusinessDays(lockoutDate, 1, cal), idx.dayCount);
+    const rLock = projCurve.forwardRate(frozenFixing, addBusinessDays(frozenFixing, 1, cal), idx.dayCount);
     let x = Math.max(realisedTo, lockoutDate);
     while (x < end) {
       const nx = Math.min(addBusinessDays(x, 1, cal), end);
