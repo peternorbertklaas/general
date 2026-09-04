@@ -135,16 +135,18 @@ describe("App – round 7", () => {
     const rate = screen.getByTestId("add-spot-rate") as HTMLInputElement;
     fireEvent.focus(rate);
     fireEvent.change(rate, { target: { value: "11,62" } });
-    fireEvent.keyDown(rate, { key: "Enter" });
+    fireEvent.blur(rate); // (↵ in the rate field submits since R8-04 – see App.r8.test.tsx)
     fireEvent.change(pairInput, { target: { value: "EURUSD" } });
     expect(screen.getByTestId("add-spot-problem").textContent).toMatch(/bereits im Markt/);
     fireEvent.change(pairInput, { target: { value: "eurnok" } });
     expect(screen.queryByTestId("add-spot-problem")).toBeNull();
     fireEvent.click(screen.getByTestId("add-spot-submit"));
     expect(st().baseMarket.fxSpots.EURNOK).toBeCloseTo(11.62, 6);
-    expect(st().quotes.fxSpots.EURNOK).toBeCloseTo(11.62, 6);
+    // since R8-F2 a "+ Paar" spot is a structural extra (survives import → leave → reload), not a quote edit
+    expect(st().extraSpots.EURNOK).toBeCloseTo(11.62, 6);
+    expect(st().quotes.fxSpots.EURNOK).toBeUndefined();
     expect(screen.getByTestId("fx-spot-row-EURNOK")).toBeInTheDocument();
-    expect(st().undoStack.at(-1)).toMatchObject({ kind: "quotes", label: "Spot EUR/NOK 11,6200 angelegt" });
+    expect(st().undoStack.at(-1)).toMatchObject({ kind: "extras", label: "Spot EUR/NOK 11,6200 angelegt" });
     await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId("add-spot")));
     // + Fläche (swaption cube for NOK): flat 70 bp from the EUR axes
     fireEvent.click(screen.getByTestId("add-vol"));
@@ -163,8 +165,10 @@ describe("App – round 7", () => {
     expect(cube!.currency).toBe("NOK");
     expect(cube!.expiries).toEqual(st().baseMarket.swaptionVols!.EUR!.expiries);
     expect(cube!.atm.flat().every((v) => Math.abs(v - 0.007) < 1e-12)).toBe(true);
-    expect(st().volSurfaces.swaptionVols?.NOK).toBeDefined();
-    expect(st().undoStack.at(-1)).toMatchObject({ kind: "vols", label: "Swaption-Cube NOK angelegt" });
+    // since R8-F2 a "+ Fläche" surface is a structural extra like an added curve
+    expect(st().extraVolSurfaces.swaptionVols?.NOK).toBeDefined();
+    expect(st().volSurfaces.swaptionVols?.NOK).toBeUndefined();
+    expect(st().undoStack.at(-1)).toMatchObject({ kind: "extras", label: "Swaption-Cube NOK angelegt" });
     // the new cube is selected, flagged "angelegt" and removable
     expect(screen.getByTestId("swaption-vol-card").textContent).toMatch(/Swaption-ATM-Vols NOK/);
     expect(screen.getByTestId("swaption-vol-edited").textContent).toBe("angelegt");
@@ -207,7 +211,8 @@ describe("App – round 7", () => {
     fireEvent.click(within(screen.getByRole("group", { name: "Swaption-Cube Währung" })).getByText("NOK"));
     fireEvent.click(screen.getByTestId("swaption-vol-reset"));
     expect(st().baseMarket.swaptionVols?.NOK).toBeUndefined();
-    expect(st().undoStack.at(-1)).toMatchObject({ kind: "vols", label: "Swaption-Vols NOK entfernt" });
+    expect(st().extraVolSurfaces.swaptionVols?.NOK).toBeUndefined();
+    expect(st().undoStack.at(-1)).toMatchObject({ kind: "extras", label: "Swaption-Vols NOK entfernt" });
   });
 
   it("R7-03: after `n s` and after a palette quick entry the focus is on the first editor field; '+ Kurve' returns the focus to tab / button", async () => {

@@ -29,7 +29,17 @@ import {
 } from "../lib/i18n.js";
 import { parseNumberInput } from "../lib/num-parse.js";
 import { hasFxVolSurface } from "../lib/quick-parser.js";
-import { currencyOptions, defaultIndexFor, fxCurrencies, indexOptions, knownPairs } from "../lib/register.js";
+import {
+  currencyOptions,
+  defaultIndexFor,
+  fxCurrencies,
+  indexNamesOf,
+  indexOptions,
+  isRegisteredCurrency,
+  knownPairs,
+  unregisteredCurrencyHint,
+} from "../lib/register.js";
+import { swaptionUnderlyingIndex, swaptionWithUnderlyingIndex } from "../lib/swaption.js";
 import { annuityAmortisation, frequencyMonths, parseSchedulePaste, scheduleValueAt } from "../lib/trade-ops.js";
 import { useTableNav } from "../hooks/useTableNav.js";
 import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
@@ -74,7 +84,7 @@ function Select<T extends string>({
   ariaLabel,
 }: {
   value: T;
-  options: readonly T[] | readonly { v: T; l: string }[];
+  options: readonly T[] | readonly { v: T; l: string; disabled?: boolean }[];
   onChange: (v: T) => void;
   invalid?: boolean;
   ariaLabel?: string;
@@ -85,8 +95,10 @@ function Select<T extends string>({
       {options.map((o) => {
         const v = typeof o === "string" ? o : o.v;
         const l = typeof o === "string" ? o : o.l;
+        // a disabled option is visible but never chosen – e.g. a currency without register entry (Markt R8-1)
+        const disabled = typeof o === "string" ? false : o.disabled;
         return (
-          <option key={v} value={v}>
+          <option key={v} value={v} disabled={disabled || undefined}>
             {l}
           </option>
         );
@@ -95,10 +107,10 @@ function Select<T extends string>({
   );
 }
 
-function Checkbox({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
+function Checkbox({ checked, onChange, label, disabled }: { checked: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean }) {
   return (
     <label className="check">
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} /> {label}
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} /> {label}
     </label>
   );
 }
@@ -198,6 +210,12 @@ export function useRegisterOptions() {
     index: (ccy: string | undefined, current?: string) => indexOptions(ccy, curveIds, current),
     /** Default float index of `ccy` with a curve in the market (conventions → OIS → any). */
     defaultIndex: (ccy: string) => defaultIndexFor(ccy, curveIds),
+    /**
+     * Index a float leg switched to `ccy` takes (Markt R8-1): the curve-backed default, else the conventions' benchmark,
+     * else any registered index of the currency (priced as "Kurve fehlt" with the "+ Kurve" hint) – never the previous
+     * leg's index of another currency: the editor must not build a CZK leg that projects EURIBOR-6M (the core rejects it).
+     */
+    legIndex: (ccy: string, current: string) => defaultIndexFor(ccy, curveIds) ?? defaultIndexFor(ccy) ?? indexNamesOf(ccy)[0] ?? current,
     fxCcy: (...current: (string | undefined)[]) =>
       fxCurrencies(
         fxSpots,
@@ -403,11 +421,40 @@ function LegConventions({ leg, onChange, open, onToggle }: { leg: SwapLeg; onCha
           </Field>
           {ois && (
             <>
-              <Field label="Lookback">
-                <NumInput value={fl.lookbackDays ?? 0} step={1} min={0} unit="Tage" onChange={(v) => onChange({ lookbackDays: Math.max(0, Math.round(v)) })} />
+              <Field label="Lookback" hint={fl.lockoutDays ? "Nicht mit Lockout kombinierbar – Lockout auf 0 setzen" : undefined}>
+                <NumInput
+                  value={fl.lookbackDays ?? 0}
+                  step={1}
+                  min={0}
+                  unit="Tage"
+                  disabled={!!fl.lockoutDays}
+                  onChange={(v) => onChange({ lookbackDays: Math.max(0, Math.round(v)) })}
+                />
               </Field>
               <Field label="Observation-Shift">
-                <Checkbox checked={fl.observationShift ?? false} onChange={(v) => onChange({ observationShift: v })} label="Gewichte aus Beobachtungsperiode" />
+                <Checkbox
+                  checked={fl.observationShift ?? false}
+                  disabled={!!fl.lockoutDays}
+                  onChange={(v) => onChange({ observationShift: v })}
+                  label="Gewichte aus Beobachtungsperiode"
+                />
+              </Field>
+              {/* core R8 (N8-7): ISDA "Compounded with Lockout" – the last n business days freeze the lockout-date rate; excludes lookback / shift */}
+              <Field
+                label="Lockout"
+                hint="ISDA „Compounded with Lockout“: letzte n Geschäftstage zum Satz des Lockout-Tages (2–5 Tage bei SOFR-FRNs); schließt Lookback / Observation-Shift aus"
+              >
+                <NumInput
+                  value={fl.lockoutDays ?? 0}
+                  step={1}
+                  min={0}
+                  unit="Tage"
+                  ariaLabel="Lockout"
+                  onChange={(v) => {
+                    const lockoutDays = Math.max(0, Math.round(v));
+                    onChange(lockoutDays > 0 ? { lockoutDays, lookbackDays: 0, observationShift: false } : { lockoutDays: undefined });
+                  }}
+                />
               </Field>
             </>
           )}
@@ -467,10 +514,13 @@ function AmortisationEditor({
     }
     rowNav.onKeyDown(e);
   };
-  /** Esc inside a notional input returns the focus to its row (capture phase: the input's own Esc handler restores the value and blurs). */
+  /**
+   * Esc / Enter inside a notional input return the focus to its row (capture phase: the input's own handler restores or
+   * commits the value and blurs first – R6-02 / R8-03).
+   */
   const onRowKeyCapture = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
     const target = e.target as HTMLElement;
-    if (e.key !== "Escape" || target.tagName !== "INPUT") return;
+    if ((e.key !== "Escape" && e.key !== "Enter") || target.tagName !== "INPUT") return;
     const tr = target.closest("tr");
     window.setTimeout(() => tr?.focus(), 0);
   };
@@ -659,7 +709,8 @@ function AmortisationEditor({
           </div>
           <div className="muted xs" style={{ marginTop: 4 }}>
             Zweispaltige Tabelle (Datum;Nominal, z. B. aus Excel) mit <kbd>Ctrl</kbd>+<kbd>V</kbd> in die Tabelle einfügen – Datum als tt.mm.jjjj oder ISO.{" "}
-            <kbd>↑</kbd>/<kbd>↓</kbd> Periode · <kbd>↵</kbd> oder <kbd>F2</kbd> Nominal bearbeiten · <kbd>Tab</kbd> verlässt die Tabelle.
+            <kbd>↑</kbd>/<kbd>↓</kbd> Periode · <kbd>↵</kbd> oder <kbd>F2</kbd> Nominal bearbeiten · <kbd>↵</kbd> übernimmt und kehrt zur Zeile zurück ·{" "}
+            <kbd>Esc</kbd> zurück zur Zeile · <kbd>Tab</kbd> verlässt die Tabelle.
           </div>
         </>
       )}
@@ -855,9 +906,7 @@ export function TradeEditor({ trade, onChange }: Props) {
       const setSwapCurrency = (ccy: string) =>
         onChange({
           ...trade,
-          legs: trade.legs.map(
-            (l) => (l.type === "Float" ? { ...l, currency: ccy, index: reg.defaultIndex(ccy) ?? l.index } : { ...l, currency: ccy }) as SwapLeg,
-          ),
+          legs: trade.legs.map((l) => (l.type === "Float" ? { ...l, currency: ccy, index: reg.legIndex(ccy, l.index) } : { ...l, currency: ccy }) as SwapLeg),
         } as Trade);
       const leg0 = trade.legs[0]!;
       return (
@@ -868,7 +917,13 @@ export function TradeEditor({ trade, onChange }: Props) {
               <>
                 <Field
                   label="Währung"
-                  hint={reg.curveCurrencies.includes(leg0.currency) ? undefined : `Keine Diskontkurve für ${leg0.currency} – „+ Kurve“ in der Kurvenansicht`}
+                  hint={
+                    !isRegisteredCurrency(leg0.currency)
+                      ? unregisteredCurrencyHint(leg0.currency)
+                      : reg.curveCurrencies.includes(leg0.currency)
+                        ? undefined
+                        : `Keine Diskontkurve für ${leg0.currency} – „+ Kurve“ in der Kurvenansicht`
+                  }
                 >
                   <Select value={leg0.currency} options={reg.ccy(leg0.currency)} onChange={setSwapCurrency} />
                 </Field>
@@ -973,9 +1028,7 @@ export function TradeEditor({ trade, onChange }: Props) {
                       <Select
                         value={leg.currency}
                         options={reg.ccy(leg.currency)}
-                        onChange={(v) =>
-                          setLeg(i, leg.type === "Float" ? { currency: v, index: reg.defaultIndex(v) ?? (leg as FloatLeg).index } : { currency: v })
-                        }
+                        onChange={(v) => setLeg(i, leg.type === "Float" ? { currency: v, index: reg.legIndex(v, (leg as FloatLeg).index) } : { currency: v })}
                       />
                     </Field>
                     <Field label="Nominal">
@@ -1060,11 +1113,7 @@ export function TradeEditor({ trade, onChange }: Props) {
               />
             </Field>
             <Field label="Währung">
-              <Select
-                value={trade.currency}
-                options={reg.ccy(trade.currency)}
-                onChange={(v) => upd({ currency: v, index: reg.defaultIndex(v) ?? trade.index })}
-              />
+              <Select value={trade.currency} options={reg.ccy(trade.currency)} onChange={(v) => upd({ currency: v, index: reg.legIndex(v, trade.index) })} />
             </Field>
             <Field label="Index">
               <Select value={trade.index} options={reg.index(trade.currency, trade.index)} onChange={(v) => upd({ index: v })} />
@@ -1157,7 +1206,10 @@ export function TradeEditor({ trade, onChange }: Props) {
       const fixed = trade.underlying.legs.find((l): l is FixedLeg => l.type === "Fixed")!;
       const setUnderlying = (patch: LegPatch) =>
         onChange({ ...trade, underlying: { ...trade.underlying, legs: trade.underlying.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } });
-      /** Currency change rebuilds the underlying swap with the market conventions of the new currency (index, frequencies, day counts) – Markt R4-2. */
+      /**
+       * Currency change rebuilds the underlying swap with the market conventions of the new currency (frequencies, day
+       * counts – Markt R4-2) and the curve-backed index of the currency (R8-F1): DKK after "+ Kurve" DKK-DESTR → DESTR.
+       */
       const setCurrency = (ccy: string) => {
         const rebuilt = makeVanillaSwap({
           id: trade.underlying.id,
@@ -1167,9 +1219,12 @@ export function TradeEditor({ trade, onChange }: Props) {
           fixedRate: fixed.rate,
           effectiveDate: fixed.effectiveDate,
           maturity: fixed.terminationDate,
+          index: reg.legIndex(ccy, swaptionUnderlyingIndex(trade) ?? ""),
         });
         onChange({ ...trade, underlying: { ...trade.underlying, legs: rebuilt.legs } });
       };
+      const underlyingIndex = swaptionUnderlyingIndex(trade) ?? "";
+      const setUnderlyingIndex = (index: string) => onChange(swaptionWithUnderlyingIndex(trade, index));
       // Every currency with a discount curve is selectable (R7-02); the label says whether a vol cube exists (Markt R4-2 / R7-2).
       const ccyOptions = [...new Set([...swaptionVolCurrencies, ...reg.curveCurrencies, fixed.currency])].map((c) => ({
         v: c,
@@ -1184,9 +1239,25 @@ export function TradeEditor({ trade, onChange }: Props) {
           {common}
           <Field
             label="Währung"
-            hint="Währungen mit Kurve im Markt (Vol-Cube je Währung in der Marktansicht); der Underlying-Swap folgt den Marktkonventionen der Währung"
+            hint={
+              !isRegisteredCurrency(fixed.currency)
+                ? unregisteredCurrencyHint(fixed.currency)
+                : "Währungen mit Kurve im Markt (Vol-Cube je Währung in der Marktansicht); der Underlying-Swap folgt den Marktkonventionen der Währung, sein Index dem Feld „Underlying-Index“"
+            }
           >
             <Select value={fixed.currency} options={ccyOptions} ariaLabel="Währung" onChange={setCurrency} />
+          </Field>
+          <Field
+            label="Underlying-Index"
+            hint={
+              reg.curveIds.length &&
+              underlyingIndex &&
+              !reg.index(fixed.currency, underlyingIndex).find((o) => o.v === underlyingIndex && !/ohne Kurve|nicht registriert/.test(o.l))
+                ? `Kurve ${fixed.currency}-${underlyingIndex} fehlt im Markt – Index mit Kurve wählen oder in der Kurvenansicht mit „+ Kurve“ anlegen`
+                : "Float-Index des Underlying-Swaps (Indizes mit Kurve zuerst) – der Swap wird mit den Konventionen des Index neu aufgebaut"
+            }
+          >
+            <Select value={underlyingIndex} options={reg.index(fixed.currency, underlyingIndex)} ariaLabel="Underlying-Index" onChange={setUnderlyingIndex} />
           </Field>
           <Field label="Typ">
             <Select
@@ -1518,6 +1589,24 @@ export function TradeEditor({ trade, onChange }: Props) {
                   onChange={(v) => upd({ barrier: { ...trade.barrier!, rebate: v } })}
                 />
               </Field>
+              {trade.barrier.rebate !== undefined && trade.barrier.type.endsWith("Out") && (
+                // core R8 (N7-5): the knock-out rebate convention is part of the trade – at the touch (Haug / QuantLib) or at expiry
+                <Field
+                  label="Rebate-Zahlung"
+                  hint="Knock-out-Rebate bei Berührung (Haug / QuantLib) oder bei Verfall (Reiner–Rubinstein); „Standard“ = bisherige gemischte Konvention"
+                >
+                  <Select
+                    value={trade.barrier.rebateAt ?? "default"}
+                    options={[
+                      { v: "default" as const, l: "Standard (gemischt)" },
+                      { v: "hit" as const, l: "bei Berührung" },
+                      { v: "expiry" as const, l: "bei Verfall" },
+                    ]}
+                    ariaLabel="Rebate-Zahlung"
+                    onChange={(v) => upd({ barrier: { ...trade.barrier!, rebateAt: v === "default" ? undefined : v } })}
+                  />
+                </Field>
+              )}
               <Field
                 label="Barriere-Status"
                 issue={iss("barrierHit")}
@@ -1591,7 +1680,7 @@ export function TradeEditor({ trade, onChange }: Props) {
               value={trade.currency}
               options={reg.ccy(trade.currency)}
               ariaLabel="Währung"
-              onChange={(v) => upd({ currency: v, index: reg.defaultIndex(v) ?? trade.index })}
+              onChange={(v) => upd({ currency: v, index: reg.legIndex(v, trade.index) })}
             />
           </Field>
           <Field label="Index" hint="Referenzzins der FRA-Periode">

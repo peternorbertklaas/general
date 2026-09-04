@@ -8,10 +8,21 @@ import { type RateIndex, SWAP_CONVENTIONS, knownCurrencies, knownIndices } from 
  * everywhere with the same rule: prefer what has a curve in the market.
  */
 
-/** Option of a select: value + German label. */
+/** Option of a select: value + German label; `disabled` for a choice the editor must never build (currency without register entry). */
 export interface RegisterOption {
   v: string;
   l: string;
+  disabled?: boolean;
+}
+
+/** Whether `ccy` has swap conventions in the core register (built in or registered at runtime – Markt R8-1). */
+export function isRegisteredCurrency(ccy: string): boolean {
+  return SWAP_CONVENTIONS[ccy.toUpperCase()] !== undefined;
+}
+
+/** Hint for a currency the market discounts but the register does not know (Markt R8-1). */
+export function unregisteredCurrencyHint(ccy: string): string {
+  return `Für ${ccy} sind keine Swap-Konventionen registriert – in der Kurvenansicht mit „+ Währung“ registrieren (oder Snapshot mit „conventions“/„indices“ importieren); ein Swap in ${ccy} wird sonst nicht gebaut`;
 }
 
 /**
@@ -73,12 +84,20 @@ export function indexNamesOf(ccy: string): string[] {
  * Currency options for an editor select: every currency with a discount curve
  * in the market first, then the remaining registered currencies flagged
  * "(ohne Kurve)", plus `current` (always selectable, even when unknown).
+ * A currency the market discounts but the register does not know (a CZK curve
+ * in an imported snapshot without its `conventions`, Markt R8-1) is listed as
+ * "(nicht registriert)" and disabled – the editor must never build a CZK swap
+ * whose float leg projects EURIBOR-6M.
  */
 export function currencyOptions(discountCurveId: Record<string, string>, current?: string, extra: readonly string[] = []): RegisterOption[] {
   const withCurve = Object.keys(discountCurveId).sort((a, b) => (a === "EUR" ? -1 : b === "EUR" ? 1 : a.localeCompare(b)));
   const rest = [...new Set([...knownCurrencies(), ...extra])].filter((c) => !withCurve.includes(c)).sort();
-  const out: RegisterOption[] = [...withCurve.map((c) => ({ v: c, l: c })), ...rest.map((c) => ({ v: c, l: `${c} (ohne Kurve)` }))];
-  if (current && !out.some((o) => o.v === current)) out.push({ v: current, l: `${current} (ohne Kurve)` });
+  const out: RegisterOption[] = [
+    ...withCurve.map((c) => (isRegisteredCurrency(c) ? { v: c, l: c } : { v: c, l: `${c} (nicht registriert)`, disabled: c !== current })),
+    ...rest.map((c) => ({ v: c, l: `${c} (ohne Kurve)` })),
+  ];
+  if (current && !out.some((o) => o.v === current))
+    out.push({ v: current, l: isRegisteredCurrency(current) ? `${current} (ohne Kurve)` : `${current} (nicht registriert)` });
   return out;
 }
 

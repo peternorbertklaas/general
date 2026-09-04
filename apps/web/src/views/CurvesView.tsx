@@ -28,6 +28,7 @@ import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { INTERPOLATION_DE, translatePricingError } from "../lib/i18n.js";
 import { rateOf } from "../lib/portfolio-io.js";
 import { type ExtraCurve, extraCurveSpec, marketModified, useStore, validateExtraCurve } from "../state/store.js";
+import { AddCurrencyForm } from "./AddCurrencyForm.js";
 
 export { bumpQuote };
 
@@ -97,6 +98,13 @@ interface QuoteSet {
   title: string;
   /** Curve added by the user from quotes (Markt R6-5) – quotes live in `extraCurves`, not in the sample quote set. */
   extra?: ExtraCurve;
+  /** Curve of an imported snapshot outside the sample set (Markt R8-5) – read-only: pillars, chart and meta, no quotes. */
+  snapshot?: boolean;
+}
+
+/** Tab label of a snapshot curve ("NOK-NOWA" → "NOWA", "CZK-CZEONIA" → "CZEONIA", "EUR-ESTR-USDCSA" stays). */
+export function snapshotCurveLabel(id: string): string {
+  return id.replace(/^[A-Z]{3}-/, "").replace(/-(\d+[MWY])$/, " $1");
 }
 
 const QUOTE_SETS: QuoteSet[] = [
@@ -353,9 +361,12 @@ export function CurvesView() {
   const [sel, setSel] = useState(0);
   const [compare, setCompare] = useState<string | null>("EUR-EURIBOR-6M");
   const [adding, setAdding] = useState(false);
-  // Shipped curves plus the curves the user added from quotes (Markt R6-5)
-  const sets: QuoteSet[] = useMemo(
-    () => [
+  const [addingCurrency, setAddingCurrency] = useState(false);
+  const snapshotLabel = s.baseMarket.meta?.label ?? "Snapshot";
+  // Shipped curves, the curves the user added from quotes (Markt R6-5) and – read-only – every further curve of an
+  // imported snapshot (NOK-NOWA, CZK-CZEONIA …, Markt R8-5), so the auditor can inspect the curve a report is based on.
+  const sets: QuoteSet[] = useMemo(() => {
+    const base: QuoteSet[] = [
       ...QUOTE_SETS,
       ...Object.values(s.extraCurves).map((c) => ({
         key: `extra:${c.id}`,
@@ -364,9 +375,19 @@ export function CurvesView() {
         title: `${c.currency} ${c.index} (aus Quotes angelegt)`,
         extra: c,
       })),
-    ],
-    [s.extraCurves],
-  );
+    ];
+    const known = new Set(base.map((q) => q.curveId));
+    const fromSnapshot: QuoteSet[] = Object.values(s.baseMarket.curves)
+      .filter((c) => !known.has(c.id))
+      .map((c) => ({
+        key: `snap:${c.id}`,
+        curveId: c.id,
+        label: snapshotCurveLabel(c.id),
+        title: `${c.id} (aus Snapshot „${snapshotLabel}“ – schreibgeschützt: keine Quotes, Pillars und Forwards aus der Datei)`,
+        snapshot: true,
+      }));
+    return [...base, ...fromSnapshot];
+  }, [s.extraCurves, s.baseMarket.curves, snapshotLabel]);
   const set = sets[Math.min(sel, sets.length - 1)]!;
   const quotes = s.quotes;
   const setQuotes = quotesOf(set, quotes);
@@ -550,11 +571,21 @@ export function CurvesView() {
           }}
         />
       )}
+      {addingCurrency && (
+        <AddCurrencyForm
+          onDone={(ccy) => {
+            setAddingCurrency(false);
+            // the natural next step is a curve in the new currency – land on "+ Kurve" (R7-03 pattern)
+            void focusWhenPresent(ccy ? '[data-testid="add-curve"]' : '[data-testid="add-currency"]');
+          }}
+        />
+      )}
       {imported && (
         <div className="warning row wrap" style={{ gap: 10 }} data-testid="curves-import-note">
           <span>
             Kurven aus importiertem Snapshot „{s.baseMarket.meta?.label ?? "Snapshot"}“ (Bewertungstag {fmtDate(s.valuationDate)}) – die Quote-Tabelle zeigt die
-            Sample-Quotes nur zur Information; Quotes, Interpolation und Turn-of-Year sind nicht editierbar.
+            Sample-Quotes nur zur Information; Quotes, Interpolation und Turn-of-Year sind nicht editierbar. Kurven des Snapshots außerhalb des Sample-Sets
+            stehen als schreibgeschützte Tabs „(aus Snapshot)“ mit Pillars, Forwards und Meta.
           </span>
           <button
             className="btn xs"
@@ -569,22 +600,28 @@ export function CurvesView() {
       )}
       <div className="row wrap toolbar">
         <div className="seg wrap" role="group" aria-label="Kurve">
-          {sets.map((q, i) => (
-            <button
-              key={q.key}
-              className={q === set ? "active" : ""}
-              aria-pressed={q === set}
-              title={q.title}
-              onClick={() => setSel(i)}
-              disabled={!s.baseMarket.curves[q.curveId]}
-              data-testid={q.extra ? `curve-tab-${q.curveId}` : undefined}
-            >
-              {q.label}
-              {q.extra && <span className="dot" aria-label="aus Quotes angelegt" style={{ background: "var(--info)" }} />}
-              {s.interpolation[q.curveId] && <span className="dot warn" aria-label="Interpolation überschrieben" />}
-              {s.turnOfYear[q.curveId] && <span className="dot warn" aria-label="Turn-of-Year gesetzt" />}
-            </button>
-          ))}
+          {sets.map((q, i) => {
+            const locked = imported && q.extra && !s.baseMarket.curves[q.curveId];
+            return (
+              <button
+                key={q.key}
+                className={q === set ? "active" : ""}
+                aria-pressed={q === set}
+                // R8-06: a locked "+ Kurve" tab under an imported snapshot says how it becomes active again
+                title={locked ? `Kurve ${q.curveId} stammt aus „+ Kurve“ und ist im Import-Modus nicht aktiv – nach „Zum Sample-Markt“ wieder aktiv` : q.title}
+                onClick={() => setSel(i)}
+                disabled={!s.baseMarket.curves[q.curveId]}
+                data-testid={q.extra || q.snapshot ? `curve-tab-${q.curveId}` : undefined}
+                data-snapshot={q.snapshot ? "1" : undefined}
+              >
+                {q.label}
+                {q.snapshot && <span className="muted xs"> (aus Snapshot)</span>}
+                {q.extra && <span className="dot" aria-label="aus Quotes angelegt" style={{ background: "var(--info)" }} />}
+                {s.interpolation[q.curveId] && <span className="dot warn" aria-label="Interpolation überschrieben" />}
+                {s.turnOfYear[q.curveId] && <span className="dot warn" aria-label="Turn-of-Year gesetzt" />}
+              </button>
+            );
+          })}
         </div>
         <button
           className="btn xs"
@@ -599,6 +636,15 @@ export function CurvesView() {
           }
         >
           + Kurve
+        </button>
+        <button
+          className="btn xs"
+          onClick={() => setAddingCurrency((v) => !v)}
+          aria-pressed={addingCurrency}
+          data-testid="add-currency"
+          title="Weitere Währung im Register anlegen (Konventionen, OIS-/IBOR-Index, Kalender) – danach „+ Kurve“; wird mit dem Snapshot exportiert"
+        >
+          + Währung
         </button>
         <label className="row" style={{ gap: 6 }}>
           <span className="muted small">Vergleich</span>
@@ -745,6 +791,11 @@ export function CurvesView() {
         <div className="card">
           <h3>
             {set.curveId}{" "}
+            {set.snapshot && (
+              <span className="badge info" title={set.title} data-testid="curve-snapshot-badge">
+                aus Snapshot (schreibgeschützt)
+              </span>
+            )}{" "}
             {set.extra && (
               <>
                 <span className="badge info" title={set.title} data-testid="curve-extra-badge">
@@ -796,10 +847,12 @@ export function CurvesView() {
         </div>
         <div className="card">
           <h3>
-            {imported ? "Sample-Quotes (nur Information – Kurven aus dem Snapshot)" : "Marktquotes (editierbar)"}{" "}
+            {set.snapshot ? "Quotes" : imported ? "Sample-Quotes (nur Information – Kurven aus dem Snapshot)" : "Marktquotes (editierbar)"}{" "}
             <span className="right row wrap" style={{ gap: 8 }}>
               <span className="muted xs">
-                {imported ? (
+                {set.snapshot ? (
+                  "keine Quotes – die Kurve stammt als Stützpunktliste aus dem Snapshot"
+                ) : imported ? (
                   "gesperrt – „Zum Sample-Markt“ macht die Quotes wieder editierbar"
                 ) : (
                   <>
@@ -824,7 +877,14 @@ export function CurvesView() {
               )}
             </span>
           </h3>
-          <div className="table-scroll" style={{ maxHeight: 420 }}>
+          {set.snapshot && (
+            <div className="muted small" data-testid="quotes-snapshot-note">
+              Kurve „{set.curveId}“ ({curve?.currency}) wurde mit dem Snapshot „{snapshotLabel}“ importiert – ohne Bootstrap-Quotes. Stützpunkte, Zero-Sätze und
+              Forwards stehen in der Pillar-Tabelle und im Diagramm; Vergleich mit jeder anderen Kurve der Währung über „Vergleich“. Bearbeiten: Snapshot mit
+              anderen Kurven importieren oder „Zum Sample-Markt“ und die Kurve mit „+ Kurve“ aus Quotes anlegen.
+            </div>
+          )}
+          <div className="table-scroll" style={{ maxHeight: 420 }} hidden={set.snapshot}>
             <table className="grid-table quotes compact" data-testid="quotes-table">
               <thead>
                 <tr>

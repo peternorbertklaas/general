@@ -38,13 +38,17 @@ const TABLE_KEYS: [string, string][] = [
   ["Heatmap-Zelle wählen", "← / → / ↑ / ↓"],
 ];
 const MARKET_KEYS: [string, string][] = [
-  ["Vol-Zelle bearbeiten (Swaption-Cube, FX-Smile, Caplet)", "Tab / Klick · ↑ / ↓ · ↵"],
+  ["Vol-Gitter: Zelle wählen · Wert bearbeiten · ↵ übernimmt und kehrt zur Zelle zurück", "← / → / ↑ / ↓ · ↵ / F2 · Esc"],
+  ["Fixings / FX-Fixings / CDS: Zeile · Feld öffnen · Felder der Zeile wechseln · zurück zur Zeile", "↑ / ↓ · ↵ / F2 · Tab / ⇧Tab · Esc"],
   ["Vol-Änderung rückgängig", "Ctrl+Z"],
-  ["Fläche auf Sample zurücksetzen", "Zurücksetzen"],
+  ["Fläche auf Sample zurücksetzen / angelegte Fläche entfernen", "Zurücksetzen / Entfernen"],
   ["FX-Fixings (MtM-Reset) – Karte „FX-Fixings“", "+ heute aus Spot / + Zeile"],
-  ["Snapshot exportieren / importieren (ersetzt Markt und Bewertungstag, rückgängig)", "Karte „Snapshot“"],
+  ["Snapshot exportieren / importieren (ersetzt Markt und Bewertungstag, rückgängig; Register-Envelope indices/conventions/calendars)", "Karte „Snapshot“"],
   ["Spots, Fixings, FX-Fixings, Vols im Import-Modus = Änderung am Snapshot", "„modifiziert“ · Ctrl+Z"],
   ["Kurve für weitere Währung / Index aus Quotes (Kurvenansicht)", "+ Kurve"],
+  ["Währung registrieren: Konventionen, OIS-/IBOR-Index, Kalender (Kurvenansicht)", "+ Währung / + Kalender"],
+  ["Spot für neues Währungspaar (FX-Spots) – bleibt über Import und Reload", "+ Paar"],
+  ["Vol-Fläche für Währung / Index / Paar ohne Fläche (statt Fallback-Vol, Level 3)", "+ Fläche"],
 ];
 const NUM_KEYS: [string, string][] = [
   ["Schritt ±", "↑ / ↓"],
@@ -107,7 +111,8 @@ export function HotkeyOverlay() {
             <code className="mono">ccs eurusd 5y fixed 3% 10m</code> (Fest gegen Variabel), <code className="mono">imm 2y pay 3% 10m</code>,{" "}
             <code className="mono">fxf eurusd 2m 1.1725 6m ndf</code>, <code className="mono">fxo eurusd put 1.15 3m 9m barrier do 1.05</code>, Daten als{" "}
             <code className="mono">15.03.2027</code> oder <code className="mono">2027-03-15</code>. Unbekannte Wörter, Währungen ohne Kurve und doppelte Beträge
-            werden als Fehler gemeldet – nichts wird still verworfen.
+            werden als Fehler gemeldet – nichts wird still verworfen. Neue Währungen: „+ Währung“ (Register), „+ Kurve“ (Kurven), „+ Paar“ (Spot), „+ Fläche“
+            (Vols) – <code className="mono">irs czk 5y pay 4% 100m</code> bewertet, sobald Register und Kurve vorliegen (auch aus einem API-Snapshot).
           </p>
         </div>
       </div>

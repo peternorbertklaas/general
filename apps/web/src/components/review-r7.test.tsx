@@ -67,9 +67,10 @@ describe("R7-02 – trade editor lists from the register and the market", () => 
     const r = render(<TradeEditor trade={cap} onChange={onChange} />);
     fireEvent.change(screen.getByLabelText("Währung"), { target: { value: "DKK" } });
     expect(onChange.mock.calls[0]![0]).toMatchObject({ currency: "DKK", index: "DESTR" });
-    // a currency without any curve keeps the current index (nothing better to offer) and is selectable
+    // a currency without any curve takes its conventional index (NIBOR-6M, priced as "Kurve fehlt") – never the EUR index:
+    // since round 8 the core rejects a leg whose index belongs to another currency (Markt R8-1)
     fireEvent.change(screen.getByLabelText("Währung"), { target: { value: "NOK" } });
-    expect(onChange.mock.calls[1]![0]).toMatchObject({ currency: "NOK", index: cap.index });
+    expect(onChange.mock.calls[1]![0]).toMatchObject({ currency: "NOK", index: "NIBOR-6M" });
     r.unmount();
     const fra = makeFra({ id: "FRA-X", currency: "EUR", notional: 1e7, payReceive: "Pay", start: "3x6", rate: 0.03, valuationDate: st().valuationDate });
     const onChange2 = vi.fn();

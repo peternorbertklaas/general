@@ -19,6 +19,7 @@ import { DateInput } from "../components/DateInput.js";
 import { EChart, cssVar, negColor, posColor } from "../components/EChart.js";
 import { Term } from "../components/InfoTip.js";
 import { NumInput } from "../components/NumInput.js";
+import { focusWhenPresent } from "../lib/focus.js";
 import { fmtDate, fmtMoney, fmtNum, fmtPct, signClass } from "../lib/format.js";
 import { hedgeDocMarkdown } from "../lib/hedge-doc.js";
 import { TRADE_TYPE_DE, germanizeText, translatePricingError } from "../lib/i18n.js";
@@ -425,6 +426,8 @@ export function HedgeView() {
       return;
     act().removeHedgeRelationship(trade.id);
     act().showToast(`Sicherungsdokumentation ${trade.id} verworfen`, { action: { label: "Rückgängig", run: () => act().undo() } });
+    // R8-05: the "Zurücksetzen" button is gone after the confirmation – the keyboard user continues on "Effektivität testen"
+    void focusWhenPresent('[data-testid="hedge-test"]');
   };
 
   return (

@@ -91,10 +91,12 @@ describe("R7-F1 – the '+ Kurve' spot and the curve survive import → leave �
     const t = st().addTrade(dkkSwap(), { select: false });
     expect(st().results[t.id]?.error).toBeUndefined();
     const pv0 = st().results[t.id]!.result!.pv;
-    // the auditor's snapshot has no DKK curve: while imported the trade cannot be priced – with the repair path in the message
+    // the auditor's snapshot has no DKK curve: while imported the trade cannot be priced – the repair path fits the import mode (R8-06)
     const r = st().importSnapshot(sampleSnapshot());
     expect(r.ok).toBe(true);
-    expect(st().results[t.id]?.error).toMatch(/„\+ Kurve“/);
+    expect(st().results[t.id]?.error).toMatch(
+      /der importierte Snapshot enthält keine DKK-Kurve – Snapshot mit Kurve importieren oder „Zum Sample-Markt“ wechseln/,
+    );
     expect(st().extraCurves["DKK-DESTR"]).toBeDefined(); // kept, not applied
     expect(st().baseMarket.curves["DKK-DESTR"]).toBeUndefined();
     // reload while imported: the added curve is still remembered
@@ -132,7 +134,7 @@ describe("R7-F1 – the '+ Kurve' spot and the curve survive import → leave �
     expect(st().results[t.id]?.error).toBeUndefined();
     expect(st().undo()).toMatch(/Zum Sample-Markt/);
     expect(st().marketSource).toBe("import");
-    expect(st().results[t.id]?.error).toMatch(/„\+ Kurve“/);
+    expect(st().results[t.id]?.error).toMatch(/„Zum Sample-Markt“ wechseln/);
   });
 
   it("errors for missing market data name the repair path: + Kurve for curves / discount curves, + Paar for FX spots", () => {
@@ -142,9 +144,10 @@ describe("R7-F1 – the '+ Kurve' spot and the curve survive import → leave �
     // curve without a spot: the conversion into the reporting currency needs EUR/DKK → "+ Paar" hint
     st().addExtraCurve({ id: "DKK-DESTR", currency: "DKK", index: "DESTR", quotes: OIS });
     expect(st().results[t.id]?.error).toMatch(/Kein FX-Spot für DKKEUR verfügbar – in der Marktansicht unter FX-Spots mit „\+ Paar“ ergänzen/);
-    // "+ Paar" = setFxSpot on a new pair (sample mode: quote set) repairs it
-    expect(st().setFxSpot("EURDKK", 7.46)).toBe(true);
-    expect(st().quotes.fxSpots.EURDKK).toBe(7.46);
+    // "+ Paar" = addExtraSpot on a new pair (sample mode: structural extra, R8-F2) repairs it; the quote set is untouched
+    expect(st().addExtraSpot("EURDKK", 7.46)).toBe(true);
+    expect(st().extraSpots.EURDKK).toBe(7.46);
+    expect(st().quotes.fxSpots.EURDKK).toBeUndefined();
     expect(st().results[t.id]?.error).toBeUndefined();
   });
 });

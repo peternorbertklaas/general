@@ -961,6 +961,10 @@ try {
   await page.locator('[data-testid="hedge-reset"]').click();
   await wait(400);
   check((await page.locator('[data-testid="hedge-verdict-badge"]').count()) === 0, "hedge reset drops the stored test result (R7-06)");
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "hedge-test",
+    "after the confirmed hedge reset the focus is on „Effektivität testen“ (R8-05)",
+  );
   await page.keyboard.press("Control+z");
   await wait(500);
   check((await page.locator('input[aria-label="Hedge Ratio"]').inputValue()) === "50", "undo restores the hedge documentation (R3-F4)");
@@ -1238,6 +1242,109 @@ try {
   await wait(150);
   check((await page.evaluate(() => document.activeElement?.getAttribute("role"))) === "gridcell", "Esc returns to the grid cell (R7-01)");
 
+  // R8-03: ↵ in a grid cell commits the value and returns the focus to the cell (not to body)
+  const activeLabel = () => page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? "");
+  const activeTag = () => page.evaluate(() => document.activeElement?.tagName ?? "");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Control+a");
+  await page.keyboard.type("70");
+  await page.keyboard.press("Enter");
+  await wait(200);
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("role"))) === "gridcell",
+    "↵ in a vol cell commits and returns to the grid cell (R8-03)",
+  );
+  check((await page.locator('[data-testid="swaption-vol-edited"]').count()) === 1, "the keyboard-committed vol edit flags the cube as geändert (R8-03)");
+  await page.keyboard.press("Control+z");
+  await wait(300);
+  check((await page.locator('[data-testid="swaption-vol-edited"]').count()) === 0, "Ctrl+Z reverts the vol edit again");
+  // R8-02: every FX pair keeps exactly one grid tab stop, also after Ctrl+End on the largest surface
+  await page.locator('[data-testid="fx-vol-grid"] [role="gridcell"]').first().focus();
+  await page.keyboard.press("Control+End");
+  const fxPairButtons = await page.locator('[data-testid="fx-vol-pairs"] button').allInnerTexts();
+  const fxStopsPerPair = [];
+  for (const label of fxPairButtons) {
+    await page.locator('[data-testid="fx-vol-pairs"] button', { hasText: label }).click();
+    await wait(80);
+    fxStopsPerPair.push(await page.evaluate(() => document.querySelectorAll('[data-testid="fx-vol-grid"] [role="gridcell"][tabindex="0"]').length));
+  }
+  check(
+    fxStopsPerPair.length >= 3 && fxStopsPerPair.every((n) => n === 1),
+    `every FX-vol surface keeps exactly one grid tab stop after a pair switch (${fxStopsPerPair.join(",")}) (R8-02)`,
+  );
+  await page.locator('[data-testid="fx-vol-pairs"] button').first().click();
+  // R8-01: every control of a fixings row is keyboard-reachable – Tab cycles the row, ↵ commits the value and returns to the row
+  await page.locator('[data-testid="fixings-table"] tbody tr[tabindex="0"]').focus();
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Tab");
+  check(/^Datum Fixing/.test(await activeLabel()), `Tab inside a fixings row moves from the index to the date field (${await activeLabel()}) (R8-01)`);
+  for (let hop = 0; hop < 4 && !/^Wert Fixing/.test(await activeLabel()); hop++) await page.keyboard.press("Tab");
+  check(/^Wert Fixing/.test(await activeLabel()), `Tab reaches the fixing value field (${await activeLabel()}) (R8-01)`);
+  await page.keyboard.press("Control+a");
+  await page.keyboard.type("2,5");
+  await page.keyboard.press("Enter");
+  await wait(300);
+  check((await activeTag()) === "TR", `↵ in the fixing value commits and returns to the row (${await activeTag()}) (R8-01 / R8-03)`);
+  check(
+    (await page.locator('[data-testid="fixings-modified"]').count()) === 1,
+    "a fixing value changed by keyboard only flags the fixings as geändert (R8-01)",
+  );
+  check(
+    (await page.evaluate(() => document.activeElement?.closest('[data-testid="fixings-table"]') !== null)) === true,
+    "the focused row is still inside the fixings table (no remount) (R8-01)",
+  );
+  await page.keyboard.press("Enter");
+  for (let hop = 0; hop < 5 && !/entfernen$/.test(await activeLabel()); hop++) await page.keyboard.press("Tab");
+  check(/^Fixing \d+ entfernen$/.test(await activeLabel()), `Tab reaches the remove button of the row (${await activeLabel()}) (R8-01)`);
+  await page.keyboard.press("Tab");
+  check(/^Index Fixing/.test(await activeLabel()), "Tab after the last control cycles back to the index select (R8-01)");
+  await page.keyboard.press("Shift+Tab");
+  check(/entfernen$/.test(await activeLabel()), "Shift+Tab cycles backwards within the row (R8-01)");
+  await page.keyboard.press("Escape");
+  await wait(150);
+  check((await activeTag()) === "TR", "Esc leaves the control back to the row (R8-01)");
+  await page.keyboard.press("Control+z");
+  await wait(300);
+  check((await page.locator('[data-testid="fixings-modified"]').count()) === 0, "Ctrl+Z reverts the keyboard fixing edit");
+  check(
+    /↵ übernimmt und kehrt zur Zeile zurück/.test(await page.locator('[data-testid="fixings-keys-hint"]').innerText()),
+    "fixings hint documents the ↵ return (R8-03)",
+  );
+
+  // Markt R8-1: "+ Währung" registers a currency in the workstation register – "+ Kurve" then offers it; undo removes it
+  await chord(page, "c");
+  await page.locator('[data-testid="add-currency"]').click();
+  await wait(200);
+  check((await page.locator('[data-testid="add-currency-form"]').count()) === 1, "+ Währung opens the register form (Markt R8-1)");
+  await page.locator('[data-testid="add-currency-code"]').fill("HUF");
+  await page.locator('[data-testid="add-currency-ois"]').fill("HUFONIA");
+  await page.locator('[data-testid="add-currency-ibor"]').fill("BUBOR-6M");
+  check(
+    /2 Indizes HUFONIA, BUBOR-6M · Konventionen HUF/.test(await page.locator('[data-testid="add-currency-preview"]').innerText()),
+    "+ Währung previews the envelope (Markt R8-1)",
+  );
+  await page.locator('[data-testid="add-currency-submit"]').click();
+  await wait(400);
+  check(
+    (await page.locator(".toast", { hasText: "Registriert: 2 Indizes HUFONIA, BUBOR-6M" }).count()) === 1,
+    "+ Währung toast names the registration (Markt R8-1)",
+  );
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "add-curve",
+    "after + Währung the focus is on + Kurve (R7-03 pattern)",
+  );
+  await page.locator('[data-testid="add-curve"]').click();
+  await wait(200);
+  check((await page.locator('[data-testid="add-curve-ccy"] option[value="HUF"]').count()) === 1, "+ Kurve offers the registered currency (Markt R8-1)");
+  await page.locator("button.btn", { hasText: "Abbrechen" }).click();
+  await page.keyboard.press("Control+z");
+  await wait(300);
+  await page.locator('[data-testid="add-curve"]').click();
+  await wait(200);
+  check((await page.locator('[data-testid="add-curve-ccy"] option[value="HUF"]').count()) === 0, "Ctrl+Z removes the registration again (Markt R8-1)");
+  await page.locator("button.btn", { hasText: "Abbrechen" }).click();
+  await chord(page, "m");
+
   // + Kurve (Markt R6-5): a DKK OIS curve from quotes – conventions from the core registry, then a DKK swap via the palette
   // a snapshot of the market *before* the DKK curve – the auditor's file the treasurer imports later (R7-F1)
   const [snapPreDownload] = await Promise.all([page.waitForEvent("download"), page.locator('[data-testid="snapshot-export"]').click()]);
@@ -1294,17 +1401,77 @@ try {
     "currency select lists registered currencies without a curve as such (R7-02)",
   );
   const dkkTradeId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
-  // R7-F1: import a snapshot without the DKK curve → the trade cannot be priced (error names + Kurve) → Zum Sample-Markt → reload → priced again, spot present
+  // R8-05: `d` duplicates the trade and leaves the focus on „Bezeichnung“; the copy is deleted again
+  await page.keyboard.press("d");
+  await wait(500);
+  check((await page.locator(".toast", { hasText: "Dupliziert:" }).count()) === 1, "d duplicates the selected trade");
+  check((await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))) === "Bezeichnung", "after d the focus is on „Bezeichnung“ (R8-05)");
+  await page.keyboard.press("Escape");
+  await wait(100);
+  await page.keyboard.press("Shift+D");
+  await wait(400);
+  check((await page.locator(".toast", { hasText: "Gelöscht:" }).count()) >= 1, "the duplicate is deleted again");
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type(dkkTradeId);
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(400);
+  await page.keyboard.press("Escape");
+  // Markt R8-3: par risk covers the "+ Kurve" curve – no silent zero, the difference note stays the convexity explanation
+  const parCard = page.locator('[data-testid="par-risk-card"]');
+  if ((await parCard.locator("button.collapse-btn[aria-expanded='false']").count()) === 1) await parCard.locator("button.collapse-btn").click();
+  await wait(150);
+  check((await page.locator('[data-testid="par-risk-coverage"]').count()) === 0, "no coverage warning – the added DKK curve carries quotes (Markt R8-3)");
+  await parCard.locator("button.btn.xs", { hasText: "Berechnen" }).click();
+  await page
+    .locator('[data-testid="par-risk"]')
+    .waitFor({ timeout: 15000 })
+    .catch(() => undefined);
+  const parText = await page.locator('[data-testid="par-risk"]').innerText();
+  const parTotal = await page.locator('[data-testid="par-risk"] .kpi .value').first().innerText();
+  check(/DKK-DESTR · Σ/.test(parText) && !/^0 EUR$/.test(parTotal.trim()), `par risk of the DKK swap bumps the added curve (total ${parTotal}) (Markt R8-3)`);
+  check(
+    (await page.locator('[data-testid="par-risk-diff-note"]').innerText()) === "Konvexität der Quotes / Kurvenkopplung",
+    "the difference explanation is shown only when every curve has quotes (Markt R8-3)",
+  );
+  await parCard.locator("button.collapse-btn").click();
+  // R7-F1: import a snapshot without the DKK curve → the trade cannot be priced (error names the snapshot, R8-06) → Zum Sample-Markt → reload → priced again, spot present
   await chord(page, "m");
   await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapPrePath);
   await wait(1200);
   await chord(page, "b");
   const dkkRow = page.locator(`tr[data-id="${dkkTradeId}"]`);
   check((await dkkRow.locator('[data-testid="valuation-error"]').count()) === 1, "DKK trade shows Fehler while the imported snapshot lacks the curve (R7-F1)");
+  const dkkErrTitle = (await dkkRow.locator('[data-testid="valuation-error"]').getAttribute("title")) ?? "";
   check(
-    /\+ Kurve/.test((await dkkRow.locator('[data-testid="valuation-error"]').getAttribute("title")) ?? ""),
-    "the blotter error names the in-app repair path „+ Kurve“ (R7-F1)",
+    /der importierte Snapshot enthält keine DKK-Kurve – Snapshot mit Kurve importieren oder „Zum Sample-Markt“ wechseln/.test(dkkErrTitle) &&
+      !/„\+ Kurve“/.test(dkkErrTitle),
+    `under an imported snapshot the repair hint names the snapshot and „Zum Sample-Markt“, not the locked „+ Kurve“ (${dkkErrTitle.slice(0, 80)}) (R8-06)`,
   );
+  await chord(page, "c");
+  check(
+    /nach „Zum Sample-Markt“ wieder aktiv/.test((await page.locator('[data-testid="curve-tab-DKK-DESTR"]').getAttribute("title")) ?? ""),
+    "the locked extra-curve tab explains how it becomes active again (R8-06)",
+  );
+  // Markt R8-3: in import mode the snapshot curves carry no quotes – the par-risk card says so instead of a zero (EUR trade: 4 curves, 0 with quotes)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("IRS-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(400);
+  const parCardImp = page.locator('[data-testid="par-risk-card"]');
+  if ((await parCardImp.locator("button.collapse-btn[aria-expanded='false']").count()) === 1) await parCardImp.locator("button.collapse-btn").click();
+  await wait(150);
+  check(
+    /Par-Risiko nur für Kurven mit Quotes \(0 von \d+\)/.test(
+      (await page
+        .locator('[data-testid="par-risk-coverage"]')
+        .innerText()
+        .catch(() => "")) ?? "",
+    ),
+    "import mode: par-risk card names curves without quotes instead of a silent zero (Markt R8-3)",
+  );
+  await parCardImp.locator("button.collapse-btn").click();
   await chord(page, "m");
   await page.locator('[data-testid="snapshot-leave"]').click();
   await wait(900);
@@ -1320,19 +1487,17 @@ try {
     (await page.locator(`tr[data-id="${dkkTradeId}"] [data-testid="valuation-error"]`).count()) === 0,
     "DKK trade priced again after import → leave → reload (R7-F1)",
   );
-  // R7-F1 / R7-2: "+ Paar" adds an FX spot for a new pair, "+ Fläche" a swaption cube for the new currency
+  // R7-F1 / R7-2 / R8-04: "+ Paar" adds an FX spot for a new pair (↵ in the rate field submits), "+ Fläche" a swaption cube for the new currency
   await chord(page, "m");
   await page.locator('[data-testid="add-spot"]').click();
   await page.locator('[data-testid="add-spot-pair"]').fill("EURSEK");
   await page.locator('[data-testid="add-spot-rate"]').fill("11,2");
   await page.keyboard.press("Enter");
-  await page.locator('[data-testid="add-spot-submit"]').click();
   await wait(500);
+  check((await page.locator('[data-testid="add-spot-form"]').count()) === 0, "↵ in the + Paar rate field submits the spot (R8-04)");
   check((await page.locator('[data-testid="fx-spot-row-EURSEK"]').count()) === 1, "+ Paar adds the EUR/SEK spot row (R7-F1)");
   check((await page.locator(".toast", { hasText: "Spot EUR/SEK 11,2000 angelegt" }).count()) === 1, "+ Paar toast with Rückgängig (R7-F1)");
-  await page.keyboard.press("Control+z");
-  await wait(500);
-  check((await page.locator('[data-testid="fx-spot-row-EURSEK"]').count()) === 0, "Ctrl+Z removes the added spot again (R7-F1)");
+  check((await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "add-spot", "after ↵-submit the focus is back on + Paar (R8-04)");
   await page.locator('[data-testid="add-vol"]').click();
   await wait(200);
   check((await page.locator('[data-testid="add-vol-ccy"]').inputValue()) === "DKK", "+ Fläche proposes the currency with a curve but no cube (R7-2)");
@@ -1343,17 +1508,72 @@ try {
     "+ Fläche creates and selects the DKK swaption cube (R7-2)",
   );
   check((await page.locator('[data-testid="swaption-vol-edited"]').innerText()) === "angelegt", "the new cube carries the badge angelegt (R7-2)");
+  // R8-F1: the swaption follows the curve-backed index (DESTR) and prices – the preview says so
   await page.keyboard.press("Control+k");
   await page.keyboard.type("swpt dkk 1y5y payer 3% 10m");
   await wait(300);
-  check(!/⚠/.test(await page.locator(".palette .item").first().innerText()), "swaption preview no longer warns about a missing DKK cube (R7-2)");
+  const swptPreview = await page.locator(".palette .item").first().innerText();
+  check(!/⚠/.test(swptPreview), "swaption preview no longer warns about a missing DKK cube (R7-2)");
+  check(
+    /Underlying DESTR \(Kurve vorhanden; CIBOR-6M ohne Kurve\)/.test(swptPreview),
+    `swaption preview names the curve-backed underlying index (${swptPreview.slice(40, 130)}) (R8-F1)`,
+  );
+  await page.keyboard.press("Enter");
+  await wait(800);
+  check((await page.locator('[data-testid="pricing-error"]').count()) === 0, "the DKK swaption prices on DESTR instead of failing on CIBOR-6M (R8-F1)");
+  check(
+    (await page.locator('select[aria-label="Underlying-Index"]').inputValue()) === "DESTR",
+    "swaption editor offers the Underlying-Index field with DESTR (R8-F1)",
+  );
+  const dkkSwptId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
   await page.keyboard.press("Escape");
+  await wait(100);
+  // R8-F2: "+ Paar" spot and "+ Fläche" cube survive import → Zum Sample-Markt → reload; the import toast lists what stays
+  await chord(page, "m");
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapPrePath);
+  await wait(1200);
+  const importToast = (await page.locator(".toast", { hasText: "importiert · ID" }).allInnerTexts()).join(" ");
+  check(
+    /gemerkt, nach „Zum Sample-Markt“ wieder aktiv: .*Kurve DKK-DESTR.*Spot EUR\/SEK.*Swaption-Cube DKK/.test(importToast),
+    `import toast names the kept structural extras (${importToast.slice(0, 160)}) (R8-F2)`,
+  );
+  check(!/verworfen:/.test(importToast), "nothing is reported as discarded when only structural extras exist (R8-F2)");
+  await page.locator('[data-testid="snapshot-leave"]').click();
+  await wait(900);
+  await page.reload({ waitUntil: "networkidle" });
+  await wait(800);
+  await chord(page, "m");
+  check((await page.locator('[data-testid="fx-spot-row-EURSEK"]').count()) === 1, "+ Paar spot survives import → leave → reload (R8-F2)");
+  check(
+    (await page.locator('[aria-label="Swaption-Cube Währung"] button', { hasText: "DKK" }).count()) === 1,
+    "+ Fläche cube survives import → leave → reload (R8-F2)",
+  );
+  await chord(page, "b");
+  check(
+    (await page.locator(`tr[data-id="${dkkSwptId}"] [data-testid="valuation-error"]`).count()) === 0,
+    "DKK swaption priced after import → leave → reload (R8-F2)",
+  );
+  check(
+    !/Level 3|Fallback/.test(await page.locator(`tr[data-id="${dkkSwptId}"]`).innerText()),
+    "DKK swaption without Level-3 fallback after the round trip (R8-F2)",
+  );
+  // clean up the extras: remove the spot and the cube
+  await chord(page, "m");
+  await page.locator('[data-testid="fx-spot-remove-EURSEK"]').click();
+  await wait(400);
+  check((await page.locator('[data-testid="fx-spot-row-EURSEK"]').count()) === 0, "the added spot can be removed at its row (R8-F2)");
+  await page.locator('[aria-label="Swaption-Cube Währung"] button', { hasText: "DKK" }).click();
   await wait(200);
   await page.locator('[data-testid="swaption-vol-reset"]').click();
   await wait(500);
   check((await page.locator('[aria-label="Swaption-Cube Währung"] button', { hasText: "DKK" }).count()) === 0, "Entfernen drops the added cube again (R7-2)");
-  // clean up: delete the DKK trade, remove the curve (spot goes with it) → back to the unmodified sample market
+  // clean up: delete the DKK trades, remove the curve (spot goes with it) → back to the unmodified sample market
   await chord(page, "b");
+  await page.locator(`tr[data-id="${dkkSwptId}"]`).click();
+  await wait(200);
+  await page.keyboard.press("Shift+D");
+  await wait(400);
+  check((await page.locator(".toast", { hasText: `Gelöscht: ${dkkSwptId}` }).count()) === 1, "DKK swaption deleted again");
   await page.locator(`tr[data-id="${dkkTradeId}"]`).click();
   await wait(200);
   await page.keyboard.press("Shift+D");
@@ -1438,6 +1658,144 @@ try {
     /importierten Snapshot/.test(lockState.quoteTitle) && /importierten Snapshot/.test(lockState.selTitle) && /importierten Snapshot/.test(lockState.toyTitle),
     "disabled import-mode controls explain the lock in their title (R6-04)",
   );
+  // Markt R8-5: a snapshot curve outside the sample set gets a read-only tab „(aus Snapshot)“ with pillars and meta
+  const snapDoc = JSON.parse(readFileSync(snapPath, "utf8"));
+  const estrCurve = snapDoc.curves.find((c) => c.id === "EUR-ESTR");
+  const snapNok = {
+    ...snapDoc,
+    curves: [...snapDoc.curves, { ...estrCurve, id: "NOK-NOWA", currency: "NOK" }],
+    discountCurveId: { ...snapDoc.discountCurveId, NOK: "NOK-NOWA" },
+    fxSpots: { ...snapDoc.fxSpots, EURNOK: 11.62 },
+  };
+  const snapNokPath = join(tmpdir(), `deriva-e2e-snapshot-nok-${port}.json`);
+  writeFileSync(snapNokPath, JSON.stringify(snapNok), "utf8");
+  await chord(page, "m");
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapNokPath);
+  await wait(1200);
+  await chord(page, "c");
+  const nokTab = page.locator('[data-testid="curve-tab-NOK-NOWA"]');
+  check((await nokTab.count()) === 1 && (await nokTab.isDisabled()) === false, "snapshot curve NOK-NOWA has an enabled tab in the curves view (Markt R8-5)");
+  check(/\(aus Snapshot\)/.test(await nokTab.innerText()), "the snapshot curve tab is marked „(aus Snapshot)“ (Markt R8-5)");
+  await nokTab.click();
+  await wait(300);
+  check((await page.locator('[data-testid="curve-snapshot-badge"]').count()) === 1, "snapshot curve card carries the read-only badge (Markt R8-5)");
+  check((await page.locator('[data-testid="quotes-snapshot-note"]').count()) === 1, "snapshot curve shows the note instead of a quote table (Markt R8-5)");
+  check((await page.locator('[data-testid="pillar-table"] tbody tr').count()) > 2, "snapshot curve shows its pillars (Markt R8-5)");
+  check((await page.locator(".chart canvas").count()) >= 1, "snapshot curve renders the forwards chart (Markt R8-5)");
+  // Markt R8-1: the API's register envelope (indices / conventions / calendars) reaches the workstation – CZK prices
+  const snapCzk = {
+    ...snapDoc,
+    curves: [...snapDoc.curves, { ...estrCurve, id: "CZK-CZEONIA", currency: "CZK" }],
+    discountCurveId: { ...snapDoc.discountCurveId, CZK: "CZK-CZEONIA" },
+    fxSpots: { ...snapDoc.fxSpots, EURCZK: 24.6 },
+    calendars: [{ id: "CZ", name: "Prag", holidays: ["2027-07-05", "2027-07-06", "2027-09-28", "2027-10-28", "2027-11-17"] }],
+    indices: [
+      {
+        name: "CZEONIA",
+        currency: "CZK",
+        type: "OIS",
+        tenor: "1D",
+        dayCount: "ACT/360",
+        fixingCalendar: "CZ",
+        fixingLag: 0,
+        businessDayConvention: "ModifiedFollowing",
+        endOfMonth: false,
+        curveId: "CZK-CZEONIA",
+      },
+      {
+        name: "PRIBOR-6M",
+        currency: "CZK",
+        type: "IBOR",
+        tenor: "6M",
+        dayCount: "ACT/360",
+        fixingCalendar: "CZ",
+        fixingLag: 2,
+        businessDayConvention: "ModifiedFollowing",
+        endOfMonth: true,
+        curveId: "CZK-PRIBOR-6M",
+      },
+    ],
+    conventions: [
+      {
+        currency: "CZK",
+        fixedFrequency: "1Y",
+        fixedDayCount: "ACT/360",
+        floatIndex: "PRIBOR-6M",
+        floatFrequency: "6M",
+        calendar: "CZ",
+        spotLag: 2,
+        oisIndex: "CZEONIA",
+        oisFixedFrequency: "1Y",
+        oisFixedDayCount: "ACT/360",
+        oisPaymentLag: 2,
+      },
+    ],
+  };
+  const snapCzkPath = join(tmpdir(), `deriva-e2e-snapshot-czk-${port}.json`);
+  writeFileSync(snapCzkPath, JSON.stringify(snapCzk), "utf8");
+  await chord(page, "m");
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapCzkPath);
+  await wait(1200);
+  check(
+    (await page.locator(".toast", { hasText: "registriert: 2 Indizes CZEONIA, PRIBOR-6M · Konventionen CZK · Kalender CZ" }).count()) === 1,
+    "import toast names the registered envelope (Markt R8-1)",
+  );
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("irs czk 5y pay 4% 100m");
+  await wait(300);
+  const czkPreview = await page.locator(".palette .item").first().innerText();
+  check(
+    /Payer-Swap CZK 5Y/.test(czkPreview) && /CZEONIA \(Kurve vorhanden; PRIBOR-6M ohne Kurve\)/.test(czkPreview),
+    `quick entry accepts CZK from the envelope (${czkPreview.slice(0, 100)}) (Markt R8-1)`,
+  );
+  await page.keyboard.press("Enter");
+  await wait(800);
+  check((await page.locator('[data-testid="pricing-error"]').count()) === 0, "the CZK swap is priced on the imported CZK-CZEONIA curve (Markt R8-1)");
+  check(
+    (await page.locator('select[aria-label="Index"]').inputValue()) === "CZEONIA",
+    "editor shows the registered CZEONIA index for the CZK swap (Markt R8-1)",
+  );
+  const czkTradeId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
+  await page.keyboard.press("Escape");
+  await wait(100);
+  // reload while imported: the envelope is re-registered before the market is rebuilt
+  await page.reload({ waitUntil: "networkidle" });
+  await wait(800);
+  await chord(page, "b");
+  check(
+    (await page.locator(`tr[data-id="${czkTradeId}"] [data-testid="valuation-error"]`).count()) === 0,
+    "CZK swap still priced after the reload (envelope re-registered) (Markt R8-1)",
+  );
+  await page.locator(`tr[data-id="${czkTradeId}"]`).click();
+  await wait(200);
+  await page.keyboard.press("Shift+D");
+  await wait(400);
+  // the workstation export carries the envelope
+  const [snapCzkOutDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    (await (await chord(page, "m"), page.locator('[data-testid="snapshot-export"]'))).click(),
+  ]);
+  const snapCzkOutPath = join(tmpdir(), `deriva-e2e-snapshot-czk-out-${port}.json`);
+  await snapCzkOutDownload.saveAs(snapCzkOutPath);
+  const czkOut = JSON.parse(readFileSync(snapCzkOutPath, "utf8"));
+  check(
+    Array.isArray(czkOut.conventions) &&
+      czkOut.conventions.some((c) => c.currency === "CZK") &&
+      czkOut.indices.some((i) => i.name === "CZEONIA") &&
+      czkOut.calendars.some((c) => c.id === "CZ"),
+    "snapshot export carries the register envelope (indices, conventions, calendars) (Markt R8-1)",
+  );
+  // help overlay names the four "+" paths
+  await page.keyboard.press("?");
+  await wait(300);
+  const helpText = await page.locator('[data-testid="hotkey-overlay"]').innerText();
+  check(/\+ Fläche/.test(helpText) && /\+ Paar/.test(helpText) && /\+ Währung/.test(helpText), "help overlay names + Fläche, + Paar and + Währung (R8)");
+  await page.keyboard.press("Escape");
+  await wait(200);
+  // back to the plain snapshot for the rest of the flow
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapPath);
+  await wait(1200);
+  check((await page.locator('[data-testid="snapshot-id"]').innerText()) === snapId0, "plain snapshot re-imported for the remaining checks");
   // R6-F1: an FX-spot edit on the imported market is an override – flagged, undoable, persisted, never a silent id change
   await chord(page, "m");
   const spotInput = page.locator('input[aria-label="Spot EURUSD"]');

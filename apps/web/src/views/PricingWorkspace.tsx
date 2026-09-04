@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
+  type CurveBuildSpec,
   type ParRiskReport,
   type Trade,
   type VegaBucketReport,
@@ -9,6 +10,7 @@ import {
   sampleBootstrapSpecs,
   toCsv,
   toISO,
+  tradeCurrencies,
   vegaBuckets,
 } from "@deriva/pricing-core";
 import { EChart, negColor, posColor } from "../components/EChart.js";
@@ -36,7 +38,7 @@ import {
   parSolveUnavailable,
   tradeTypeBadge,
 } from "../lib/trade-ops.js";
-import { LS_KEYS, deleteWithUndo, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
+import { LS_KEYS, deleteWithUndo, extraCurveSpec, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
 import { StatusBadge } from "./Blotter.js";
 
 const hk = (id: string) => keysText(HOTKEYS.find((h) => h.id === id) ?? { keys: "" });
@@ -72,6 +74,8 @@ export function PricingWorkspace() {
       whatIf: st.whatIf,
       quotes: st.quotes,
       undoStack: st.undoStack,
+      marketSource: st.marketSource,
+      extraCurves: st.extraCurves,
     })),
   );
   const act = useStore.getState;
@@ -100,6 +104,23 @@ export function PricingWorkspace() {
       return [];
     }
   }, [trade, s.market, s.reportingCurrency, customer, vegaDim, fxSmile, r?.error]);
+  /**
+   * Bootstrap specs with quotes (Markt R8-3): the sample curves plus every "+ Kurve" curve in sample mode – the curves of
+   * an imported snapshot carry no quotes, so nothing can be bumped there. `parCoverage` names the trade's curves without a spec.
+   */
+  const parSpecs = useMemo(() => {
+    if (s.marketSource === "import") return {} as Record<string, CurveBuildSpec>;
+    const specs: Record<string, CurveBuildSpec> = { ...sampleBootstrapSpecs(s.valuationDate, s.quotes) };
+    for (const c of Object.values(s.extraCurves)) specs[c.id] = extraCurveSpec(c, s.market.discountCurveId);
+    return specs;
+  }, [s.marketSource, s.valuationDate, s.quotes, s.extraCurves, s.market.discountCurveId]);
+  const parCoverage = useMemo(() => {
+    const ccys = trade ? tradeCurrencies(trade) : [];
+    const relevant = Object.values(s.market.curves)
+      .filter((c) => ccys.includes(c.currency))
+      .map((c) => c.id);
+    return { relevant, missing: relevant.filter((id) => !parSpecs[id]) };
+  }, [trade, s.market.curves, parSpecs]);
 
   if (!trade) {
     return (
@@ -147,7 +168,7 @@ export function PricingWorkspace() {
   const computePar = () => {
     const t0 = performance.now();
     try {
-      const report = parRisk(s.market, trade, s.reportingCurrency, sampleBootstrapSpecs(s.valuationDate, s.quotes));
+      const report = parRisk(s.market, trade, s.reportingCurrency, parSpecs);
       setPar({ tradeId: trade.id, key: parKey, report, ms: performance.now() - t0 });
     } catch (e) {
       act().showToast(`Par-Risiko nicht berechenbar: ${translatePricingError(e)}`);
@@ -498,10 +519,25 @@ export function PricingWorkspace() {
                   )}
                 </span>
               </h3>
+              {parOpen && parCoverage.missing.length > 0 && (
+                <div className="warning" data-testid="par-risk-coverage">
+                  Par-Risiko nur für Kurven mit Quotes ({parCoverage.relevant.length - parCoverage.missing.length} von {parCoverage.relevant.length})
+                  {parCoverage.relevant.length > parCoverage.missing.length ? ` – ohne Quotes: ${parCoverage.missing.join(", ")}` : ""}.{" "}
+                  {s.marketSource === "import"
+                    ? "Die Kurven des importierten Snapshots tragen keine Bootstrap-Quotes – „Zum Sample-Markt“ wechseln oder die Kurve mit „+ Kurve“ aus Quotes anlegen."
+                    : "Kurven ohne Quotes (Snapshot-Kurven) werden nicht gebumpt; eine Summe wäre eine stille Null."}
+                </div>
+              )}
               {parOpen &&
                 (par && par.tradeId === trade.id ? (
-                  <ParRiskPanel report={par.report} zeroDv01={risk?.dv01} ccy={s.reportingCurrency} stale={parStale} />
-                ) : (
+                  <ParRiskPanel
+                    report={par.report}
+                    zeroDv01={risk?.dv01}
+                    ccy={s.reportingCurrency}
+                    stale={parStale}
+                    complete={parCoverage.missing.length === 0}
+                  />
+                ) : parCoverage.relevant.length > 0 && parCoverage.missing.length === parCoverage.relevant.length ? null : (
                   <div className="muted small">
                     Berechnung auf Abruf: jede Bootstrap-Quote wird um +1 bp verschoben und alle abhängigen Kurven neu aufgebaut. Dauert etwa eine Sekunde.
                   </div>
@@ -724,7 +760,20 @@ function VegaHeatmap({ report, ccy }: { report: VegaBucketReport; ccy: string })
   );
 }
 
-function ParRiskPanel({ report, zeroDv01, ccy, stale }: { report: ParRiskReport; zeroDv01: number | undefined; ccy: string; stale: boolean }) {
+function ParRiskPanel({
+  report,
+  zeroDv01,
+  ccy,
+  stale,
+  complete,
+}: {
+  report: ParRiskReport;
+  zeroDv01: number | undefined;
+  ccy: string;
+  stale: boolean;
+  /** Every curve of the trade has quotes – only then is the difference to the zero DV01 a convexity / coupling effect (Markt R8-3). */
+  complete: boolean;
+}) {
   return (
     <div className="stack" data-testid="par-risk">
       {stale && <div className="warning">Eingaben haben sich geändert – Par-Sensitivitäten sind veraltet. Bitte neu berechnen.</div>}
@@ -746,7 +795,9 @@ function ParRiskPanel({ report, zeroDv01, ccy, stale }: { report: ParRiskReport;
           <span className="value" style={{ fontSize: 16 }}>
             {zeroDv01 !== undefined ? fmtMoney(report.total - zeroDv01, ccy) : "–"}
           </span>
-          <span className="sub">Konvexität der Quotes / Kurvenkopplung</span>
+          <span className="sub" data-testid="par-risk-diff-note">
+            {complete ? "Konvexität der Quotes / Kurvenkopplung" : "Kurven ohne Quotes fehlen im Par-Risiko – Differenz nicht als Konvexität deutbar"}
+          </span>
         </div>
       </div>
       <div className="grid cols-2">

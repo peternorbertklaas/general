@@ -24,6 +24,7 @@ import { fmtBp, fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { translateCoreMessage } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
 import { defaultIndexFor } from "../lib/register.js";
+import { exportEnvelope } from "../lib/register-envelope.js";
 import { readSnapshotJson, snapshotErrorText } from "../lib/snapshot-import.js";
 import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, useStore } from "../state/store.js";
 
@@ -31,16 +32,27 @@ import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sam
  * Apply an edited vol surface: structural problems (dimensions, finite vols,
  * sorted expiries – core `validateVolSurfaces`, R5-1) are reported in German
  * before the market is touched; a failed valuation is reported as well.
- * Returns whether the surface was applied.
+ * A surface added with "+ Fläche" in sample mode is a structural extra (R8-F2):
+ * its edits update the extra itself (`structural`), everything else is a vol
+ * override. Returns whether the surface was applied.
  */
-function applyVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface, label: string): boolean {
+function applyVolSurface(
+  kind: VolKind,
+  id: string,
+  surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface,
+  label: string,
+  opts: { structural?: boolean } = {},
+): boolean {
   const act = useStore.getState;
   const problems = validateVolSurfaces({ [kind]: { [id]: surface } });
   if (problems.length) {
     act().showToast(`Vol nicht übernommen – ${translateCoreMessage(problems[0])}`);
     return false;
   }
-  if (!act().setVolSurface(kind, id, surface, label)) {
+  const st = act();
+  const structural = opts.structural ?? (st.marketSource === "sample" && st.extraVolSurfaces[kind]?.[id] !== undefined);
+  const ok = structural ? st.setExtraVolSurface(kind, id, surface, label) : st.setVolSurface(kind, id, surface, label);
+  if (!ok) {
     act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
     return false;
   }
@@ -50,40 +62,92 @@ function applyVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface 
   return true;
 }
 
+/** Enabled controls of a table row in DOM order (select, date, value, remove …). */
+function rowControls(tr: HTMLElement): HTMLElement[] {
+  return Array.from(tr.querySelectorAll<HTMLElement>("input, select, textarea, button")).filter((c) => !c.hasAttribute("disabled"));
+}
+
 /**
  * Roving-tabindex helpers shared by the editable row tables of this view
- * (fixings, FX fixings, CDS quotes – R7-01): the row is the tab stop, `↵`/`F2`
- * focus the first control of the row, `Esc` inside a control returns to the row.
+ * (fixings, FX fixings, CDS quotes – R7-01 / R8-01): the row is the tab stop,
+ * `↵`/`F2` focus the first control of the row, `Tab`/`Shift+Tab` inside a
+ * control cycle through *all* controls of the same row (index, date, value,
+ * remove – nothing is mouse-only any more), `Esc` returns to the row and `↵`
+ * in a control commits the value and returns to the row as well (R8-03).
+ * Exported for the hook test.
  */
-function useRowNav() {
-  const nav = useTableNav({ onEnter: (_i, tr) => tr.querySelector<HTMLElement>("input, select, button")?.focus() });
+export function useRowNav() {
+  const nav = useTableNav({ onEnter: (_i, tr) => rowControls(tr)[0]?.focus() });
   const onKeyDown = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
     const target = e.target as HTMLElement;
     if (e.key === "F2" && target.tagName === "TR") {
       e.preventDefault();
-      target.querySelector<HTMLElement>("input, select, button")?.focus();
+      rowControls(target)[0]?.focus();
       return;
+    }
+    // Tab / Shift+Tab inside a control: next / previous control of the same row, cyclic (R8-01) – Esc leaves to the row.
+    if (e.key === "Tab" && target.tagName !== "TR" && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      const tr = target.closest("tr");
+      const controls = tr ? rowControls(tr) : [];
+      const i = controls.indexOf(target);
+      if (tr && i >= 0 && controls.length > 1) {
+        e.preventDefault();
+        const next = controls[(i + (e.shiftKey ? -1 : 1) + controls.length) % controls.length]!;
+        next.focus();
+        if (next instanceof HTMLInputElement) next.select();
+        return;
+      }
     }
     nav.onKeyDown(e);
   };
-  /** Capture phase: the control's own Esc handler (NumInput / DateInput restore the value) runs afterwards. */
+  /**
+   * Capture phase: the control's own Esc / Enter handler (NumInput / DateInput restore or commit the value and blur)
+   * runs afterwards; the row takes the focus back in the next macrotask (R7-01 / R8-03).
+   */
   const onKeyDownCapture = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
     const target = e.target as HTMLElement;
-    if (e.key !== "Escape" || target.tagName === "TR") return;
+    if ((e.key !== "Escape" && e.key !== "Enter") || target.tagName === "TR") return;
     const tr = target.closest("tr");
-    window.setTimeout(() => tr?.focus(), 0);
+    window.setTimeout(() => {
+      if (tr && document.contains(tr)) tr.focus();
+    }, 0);
   };
   return { tbodyProps: { onKeyDown, onKeyDownCapture, onFocus: nav.onFocus }, rowProps: nav.rowProps };
 }
 
-/** Removal / reset button of a vol-surface card: a surface the sample market does not carry is *removed* (R7-2), a sample surface reset. */
+/** Hint line under the row tables: one tab stop, `↵`/`F2` open, `Tab` cycles the row's controls, `↵` commits and returns (R8-01 / R8-03). */
+function RowKeysHint({ pageSize }: { pageSize?: number }) {
+  return (
+    <>
+      <kbd>↑</kbd>/<kbd>↓</kbd> Zeile{pageSize ? ` · ` : " · "}
+      {pageSize && (
+        <>
+          <kbd>PgUp</kbd>/<kbd>PgDn</kbd> {pageSize} Zeilen ·{" "}
+        </>
+      )}
+      <kbd>↵</kbd> oder <kbd>F2</kbd> bearbeiten · <kbd>Tab</kbd>/<kbd>⇧Tab</kbd> nächstes/vorheriges Feld der Zeile · <kbd>↵</kbd> übernimmt und kehrt zur
+      Zeile zurück · <kbd>Esc</kbd> zurück zur Zeile · von der Zeile aus verlässt <kbd>Tab</kbd> die Tabelle.
+    </>
+  );
+}
+
+/**
+ * Removal / reset button of a vol-surface card: a surface the sample market does not carry is *removed* (R7-2) – a
+ * structural "+ Fläche" surface via `setExtraVolSurface` (R8-F2), an override via `setVolSurface` –, a sample surface reset.
+ */
 function VolCardReset({ kind, id, isNew, testId }: { kind: VolKind; id: string; isNew: boolean; testId: string }) {
   const act = useStore.getState;
   const what = kind === "swaptionVols" ? "Swaption-Vols" : kind === "capletVols" ? "Caplet-Vols" : "FX-Vols";
+  const remove = () => {
+    const st = act();
+    const label = isNew ? `${what} ${id} entfernt` : `${what} ${id} zurückgesetzt`;
+    if (isNew && st.marketSource === "sample" && st.extraVolSurfaces[kind]?.[id] !== undefined) st.setExtraVolSurface(kind, id, undefined, label);
+    else st.setVolSurface(kind, id, undefined, label);
+  };
   return (
     <button
       className="btn ghost xs"
-      onClick={() => act().setVolSurface(kind, id, undefined, isNew ? `${what} ${id} entfernt` : `${what} ${id} zurückgesetzt`)}
+      onClick={remove}
       data-testid={testId}
       title={isNew ? "Angelegte Fläche entfernen (rückgängig über Ctrl+Z)" : "Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"}
     >
@@ -101,12 +165,12 @@ export function expiryLabel(e: number): string {
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
-/** Hint line under every vol grid: one tab stop, arrow keys between cells, Enter / F2 edit (R7-01). */
+/** Hint line under every vol grid: one tab stop, arrow keys between cells, Enter / F2 edit, Enter commits and returns (R7-01 / R8-03). */
 function GridKeysHint() {
   return (
     <div className="muted xs" style={{ marginTop: 4 }}>
-      <kbd>←</kbd>/<kbd>→</kbd>/<kbd>↑</kbd>/<kbd>↓</kbd> Zelle · <kbd>↵</kbd> oder <kbd>F2</kbd> Wert bearbeiten · <kbd>Esc</kbd> zurück zur Zelle ·{" "}
-      <kbd>Tab</kbd> verlässt das Gitter.
+      <kbd>←</kbd>/<kbd>→</kbd>/<kbd>↑</kbd>/<kbd>↓</kbd> Zelle · <kbd>↵</kbd> oder <kbd>F2</kbd> Wert bearbeiten · <kbd>↵</kbd> übernimmt und kehrt zur Zelle
+      zurück · <kbd>Esc</kbd> verwirft und kehrt zur Zelle zurück · <kbd>Tab</kbd> verlässt das Gitter.
     </div>
   );
 }
@@ -117,7 +181,7 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
   const edited = !same(surface, sample);
   const volMin = Math.min(...surface.atm.flat());
   const volMax = Math.max(...surface.atm.flat());
-  const grid = useGridNav();
+  const grid = useGridNav({ rows: surface.expiries.length, cols: surface.tenors.length });
   const setCell = (i: number, j: number, v: number) => {
     const next: SwaptionVolSurface = { ...surface, atm: surface.atm.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
     const label = `Swaption-Vol ${id} ${expiryLabel(surface.expiries[i]!)}×${surface.tenors[j]}Y ${fmtNum(surface.atm[i]![j]! * 1e4, 1)} → ${fmtNum(v * 1e4, 1)} bp`;
@@ -199,7 +263,6 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
 function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVolSurface; keys: string[]; onSelect: (k: string) => void }) {
   const sample = sampleVolSurfaces().fxVols[id];
   const edited = !same(surface, sample);
-  const grid = useGridNav();
   type Row = "atm" | "rr25" | "bf25" | "rr10" | "bf10";
   const ROWS: { k: Row; label: string }[] = [
     { k: "atm", label: "ATM" },
@@ -208,6 +271,8 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
     { k: "rr10", label: "10Δ RR" },
     { k: "bf10", label: "10Δ BF" },
   ];
+  // The active cell is clamped to the current surface: EUR/USD 8×5 → EUR/GBP 6×3 keeps exactly one tab stop (R8-02).
+  const grid = useGridNav({ rows: surface.expiries.length, cols: ROWS.filter((r) => surface[r.k]).length });
   const setCell = (k: Row, i: number, v: number) => {
     const arr = surface[k];
     if (!arr) return;
@@ -295,7 +360,7 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
 function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface }) {
   const sample = sampleVolSurfaces().capletVols[id];
   const edited = !same(surface, sample);
-  const grid = useGridNav();
+  const grid = useGridNav({ rows: surface.expiries.length, cols: surface.strikes.length });
   const setCell = (i: number, j: number, v: number) => {
     const next: CapletVolSurface = { ...surface, vols: surface.vols.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
     const label = `Caplet-Vol ${id} ${expiryLabel(surface.expiries[i]!)} @ ${fmtNum(surface.strikes[j]! * 100, 2)} % ${fmtNum(surface.vols[i]![j]! * 1e4, 0)} → ${fmtNum(v * 1e4, 0)} bp`;
@@ -531,7 +596,8 @@ function AddVolSurfaceForm({ onDone }: { onDone: (kind?: VolKind, id?: string) =
         : built.kind === "capletVols"
           ? `Caplet-Fläche ${built.id}`
           : `FX-Vol-Fläche ${pairLabel(built.id)}`;
-    if (!applyVolSurface(built.kind, built.id, built.surface, `${what} angelegt`)) return;
+    // Sample mode: a structural extra that survives snapshot import → "Zum Sample-Markt" → reload (R8-F2); import mode: an override.
+    if (!applyVolSurface(built.kind, built.id, built.surface, `${what} angelegt`, { structural: useStore.getState().marketSource === "sample" })) return;
     useStore
       .getState()
       .showToast(`${what} angelegt (${copyValues ? `Werte aus ${templateKey}` : `flach ${kind === "fx" ? fmtPct(flatPct, 1) : fmtBp(flatBp, 0)}`})`, {
@@ -724,11 +790,14 @@ function AddFxSpotForm({ onDone }: { onDone: (pair?: string) => void }) {
   const submit = () => {
     if (problem) return;
     const st = useStore.getState();
-    if (!st.setFxSpot(pair, rate, `Spot ${pairLabel(pair)} ${fmtNum(rate, 4)} angelegt`)) {
+    const label = `Spot ${pairLabel(pair)} ${fmtNum(rate, 4)} angelegt`;
+    // Sample mode: a structural extra like an added curve (R8-F2) – survives import → leave → reload; import mode: an override (R6-F1).
+    const ok = st.marketSource === "sample" ? st.addExtraSpot(pair, rate, label) : st.setFxSpot(pair, rate, label);
+    if (!ok) {
       st.showToast("Spot nicht übernommen (Bewertung fehlgeschlagen)");
       return;
     }
-    st.showToast(`Spot ${pairLabel(pair)} ${fmtNum(rate, 4)} angelegt`, { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+    st.showToast(label, { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
     onDone(pair);
   };
   return (
@@ -752,7 +821,13 @@ function AddFxSpotForm({ onDone }: { onDone: (pair?: string) => void }) {
           <option key={p} value={p} />
         ))}
       </datalist>
-      <span style={{ display: "inline-block", width: 110 }}>
+      {/* ↵ in the rate field submits like ↵ in the pair field (R8-04); the NumInput commits first, the bubbling key submits. */}
+      <span
+        style={{ display: "inline-block", width: 110 }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") submit();
+        }}
+      >
         <NumInput
           inline
           value={rate}
@@ -958,7 +1033,7 @@ function FxFixingsEditor() {
         {fxFixings.length > 0 && (
           <>
             {" "}
-            <kbd>↑</kbd>/<kbd>↓</kbd> Zeile · <kbd>↵</kbd>/<kbd>F2</kbd> bearbeiten · <kbd>Esc</kbd> zurück zur Zeile.
+            <RowKeysHint />
           </>
         )}
       </div>
@@ -1287,7 +1362,8 @@ function FixingsEditor() {
               </thead>
               <tbody {...rowNav.tbodyProps}>
                 {visible.slice(0, limit).map(({ f, i }, k, arr) => (
-                  <tr key={`${f.index}-${f.date}-${i}`} style={{ cursor: "default" }} {...rowNav.rowProps(k, arr.length)}>
+                  // stable key = position in the fixings list: changing the index / date of a row must not remount it (R8-01)
+                  <tr key={i} style={{ cursor: "default" }} data-testid={k === 0 ? "fixings-row-first" : undefined} {...rowNav.rowProps(k, arr.length)}>
                     <td>
                       <select
                         className="inline"
@@ -1317,6 +1393,7 @@ function FixingsEditor() {
                           unit="%"
                           tabIndex={-1}
                           ariaLabel={`Wert Fixing ${i + 1}`}
+                          testId={k === 0 ? "fixing-value-first" : undefined}
                           onChange={(v) => setRow(i, { value: v })}
                         />
                       </span>
@@ -1342,9 +1419,8 @@ function FixingsEditor() {
               weitere {Math.min(FIXINGS_PAGE, visible.length - limit)} anzeigen ({visible.length - limit} ausgeblendet)
             </button>
           )}
-          <div className="muted xs" style={{ marginTop: 6 }}>
-            Ein Tabstopp: <kbd>↑</kbd>/<kbd>↓</kbd> Zeile · <kbd>PgUp</kbd>/<kbd>PgDn</kbd> 10 Zeilen · <kbd>↵</kbd> oder <kbd>F2</kbd> bearbeiten ·{" "}
-            <kbd>Esc</kbd> zurück zur Zeile · <kbd>Tab</kbd> verlässt die Tabelle.
+          <div className="muted xs" style={{ marginTop: 6 }} data-testid="fixings-keys-hint">
+            Ein Tabstopp: <RowKeysHint pageSize={10} />
           </div>
         </>
       )}
@@ -1429,6 +1505,9 @@ export function MarketView() {
       fixings: st.fixings,
       importedBase: st.importedBase,
       marketSource: st.marketSource,
+      extraCurves: st.extraCurves,
+      extraSpots: st.extraSpots,
+      extraVolSurfaces: st.extraVolSurfaces,
     })),
   );
   const act = useStore.getState;
@@ -1509,8 +1588,15 @@ export function MarketView() {
               className="btn"
               data-testid="snapshot-export"
               onClick={() => {
-                downloadText(`deriva-market-${toISO(m.valuationDate)}.json`, JSON.stringify(serializeMarket(m), null, 2), "application/json");
-                act().showToast(`Markt-Snapshot exportiert · ID ${snapshotId}`);
+                // The register envelope travels with the file (Markt R8-1): runtime-registered indices, conventions, calendars.
+                const envelope = exportEnvelope();
+                downloadText(
+                  `deriva-market-${toISO(m.valuationDate)}.json`,
+                  JSON.stringify({ ...serializeMarket(m), ...envelope }, null, 2),
+                  "application/json",
+                );
+                const n = (envelope.indices?.length ?? 0) + (envelope.conventions?.length ?? 0) + (envelope.calendars?.length ?? 0);
+                act().showToast(`Markt-Snapshot exportiert · ID ${snapshotId}${n ? ` · Register-Envelope (${n} Einträge)` : ""}`);
               }}
             >
               ⤓ Snapshot exportieren
@@ -1533,9 +1619,12 @@ export function MarketView() {
                       act().showToast(`Import fehlgeschlagen: ${r.error}`, { ms: 8000 });
                       return;
                     }
+                    // The toast names what was discarded and what stays remembered (R8-F2) and what the envelope registered (Markt R8-1).
                     act().showToast(
                       `Snapshot „${r.label}“ importiert · ID ${r.id}${r.dateChanged ? ` · Bewertungstag auf ${fmtDate(r.valuationDate)} gesetzt` : ""}${
-                        r.discardedEdits ? " · vorherige Marktänderungen verworfen (Rückgängig stellt sie wieder her)" : ""
+                        r.registered ? ` · registriert: ${r.registered}` : ""
+                      }${r.discarded.length ? ` · verworfen: ${r.discarded.join(", ")} (Rückgängig stellt sie wieder her)` : ""}${
+                        r.kept.length ? ` · gemerkt, nach „Zum Sample-Markt“ wieder aktiv: ${r.kept.join(", ")}` : ""
                       }`,
                       { ms: 8000, action: { label: "Rückgängig", run: () => useStore.getState().undo() } },
                     );
@@ -1604,7 +1693,7 @@ export function MarketView() {
                 onClick={() => setAddingSpot((v) => !v)}
                 aria-pressed={addingSpot}
                 data-testid="add-spot"
-                title="Spot für ein weiteres Währungspaar anlegen (z. B. EUR/DKK nach „+ Kurve“ ohne Spot) – Quote-Set bzw. Snapshot-Override, rückgängig mit Ctrl+Z"
+                title="Spot für ein weiteres Währungspaar anlegen (z. B. EUR/DKK nach „+ Kurve“ ohne Spot) – im Sample-Markt struktureller Zusatz wie eine Kurve (überlebt Snapshot-Import und Reload), im Import-Modus Override am Snapshot; rückgängig mit Ctrl+Z"
               >
                 + Paar
               </button>
@@ -1623,13 +1712,24 @@ export function MarketView() {
             <table className="grid-table" aria-label="FX-Spots" data-testid="fx-spots-table">
               <tbody>
                 {Object.entries(m.fxSpots).map(([pair, v]) => {
+                  // A "+ Paar" spot of the sample market (R8-F2): removable, its original is the structural value.
+                  const extra = !imported && s.quotes.fxSpots[pair] === undefined && s.extraSpots[pair] !== undefined;
                   const orig = imported
                     ? (s.importedBase?.fxSpots[pair] ?? v)
-                    : ((Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? v) as number);
+                    : ((Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? (extra ? s.extraSpots[pair] : undefined) ?? v) as number);
                   return (
                     <tr key={pair} style={{ cursor: "default" }} data-testid={`fx-spot-row-${pair}`}>
                       <td className="mono">
                         {pair.slice(0, 3)}/{pair.slice(3)}
+                        {extra && (
+                          <span
+                            className="badge info xs"
+                            style={{ marginLeft: 6 }}
+                            title="Mit „+ Paar“ angelegt – bleibt über Snapshot-Import und Reload erhalten"
+                          >
+                            angelegt
+                          </span>
+                        )}
                       </td>
                       <td className="num">
                         <span style={{ display: "inline-block", width: 104 }}>
@@ -1640,6 +1740,23 @@ export function MarketView() {
                             {" "}
                             ●
                           </span>
+                        )}
+                        {extra && (
+                          <button
+                            className="btn ghost danger xs"
+                            style={{ marginLeft: 4 }}
+                            aria-label={`Spot ${pair.slice(0, 3)}/${pair.slice(3)} entfernen`}
+                            title="Angelegten Spot entfernen (rückgängig mit Ctrl+Z)"
+                            data-testid={`fx-spot-remove-${pair}`}
+                            onClick={() => {
+                              if (act().removeExtraSpot(pair))
+                                act().showToast(`Spot ${pair.slice(0, 3)}/${pair.slice(3)} entfernt`, {
+                                  action: { label: "Rückgängig", run: () => useStore.getState().undo() },
+                                });
+                            }}
+                          >
+                            ✕
+                          </button>
                         )}
                       </td>
                     </tr>
@@ -1666,7 +1783,7 @@ export function MarketView() {
           onClick={() => setAddingVol((v) => !v)}
           aria-pressed={addingVol}
           data-testid="add-vol"
-          title="Vol-Fläche für eine Währung / ein Paar ohne Fläche anlegen (Swaption-Cube, Caplet-Fläche, FX-Smile) – sonst bewertet der Kern mit der Fallback-Vol (Level 3)"
+          title="Vol-Fläche für eine Währung / ein Paar ohne Fläche anlegen (Swaption-Cube, Caplet-Fläche, FX-Smile) – sonst bewertet der Kern mit der Fallback-Vol (Level 3); im Sample-Markt struktureller Zusatz (überlebt Snapshot-Import und Reload)"
         >
           + Fläche
         </button>
@@ -1720,7 +1837,8 @@ export function MarketView() {
       <div className="muted xs">
         Vol-Flächen sind Teil des Marktes: Änderungen zählen als „Markt modifiziert“, werden lokal gespeichert, überleben den Stichtagswechsel und sind mit{" "}
         <kbd>Ctrl</kbd>+<kbd>Z</kbd> rückgängig; „Zurücksetzen“ an der Karte oder „Markt zurücksetzen“ stellt den Sample-Markt wieder her. Mit „+ Fläche“
-        angelegte Flächen (neue Währungen / Paare) tragen den Badge „angelegt“ und lassen sich an der Karte entfernen.
+        angelegte Flächen (neue Währungen / Paare) tragen den Badge „angelegt“, lassen sich an der Karte entfernen und bleiben – wie „+ Kurve“ und „+ Paar“ –
+        über einen Snapshot-Import, „Zum Sample-Markt“ und den Reload erhalten.
       </div>
     </div>
   );

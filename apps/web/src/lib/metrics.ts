@@ -31,6 +31,9 @@ const vol: MetricDef["fmt"] = (v, c) => (isFx(c) || Math.abs(v) >= 0.05 ? fmtPct
 export const METRICS: Record<string, MetricDef> = {
   // swaps / FRAs
   parRate: { label: "Par-Satz", fmt: pct4 },
+  // core R8 (N8-1): par rate / fair spread including the upfront premium – only emitted with an `upfront`
+  parRateAllIn: { label: "Par-Satz all-in (inkl. Prämie)", fmt: pct4 },
+  fairSpreadAllIn: { label: "Fairer Spread all-in (inkl. Prämie)", fmt: (v) => fmtBp(v, 1) },
   parRateBase: { label: "Par-Satz (Basis, Staffel konstant)", fmt: pct4 },
   parRateFlat: { label: "Par-Satz (flach)", fmt: pct4 },
   fairSpread: { label: "Fairer Spread", fmt: (v) => fmtBp(v, 1) },
@@ -82,6 +85,8 @@ export const METRICS: Record<string, MetricDef> = {
   deltaPct: { label: "Delta (Spot)", unit: "Anteil Basis-Nominal", fmt: (v) => fmtPct(v, 2), section: "risk" },
   /** Core: PV change (reporting ccy) for +1 % spot – a money amount. */
   deltaAmount: { label: "Delta-Betrag je +1 % Spot", fmt: money, section: "risk" },
+  /** Core R8: premium-adjusted spot delta (fraction of the base notional) – the FX-market hedge ratio when the premium is paid in the base currency. */
+  deltaPremiumAdjusted: { label: "Delta prämienadjustiert", unit: "Anteil Basis-Nominal", fmt: (v) => fmtPct(v, 2), section: "risk" },
   fxDelta: { label: "FX-Delta", unit: "je +1 % Spot", fmt: money, section: "risk" },
   fxDeltaSellCurrency: { label: "FX-Delta Verkaufswährung", unit: "je +1 % Spot", fmt: money, section: "risk" },
   contractRate: { label: "Kontraktkurs", fmt: num4 },
@@ -131,6 +136,11 @@ const TEXT_METRICS: Record<string, { label: string; values?: Record<string, stri
   mtmReset: { label: "MtM-Reset", values: { yes: "ja", no: "nein" } },
   volConverted: { label: "Vol-Quotierung umgerechnet (Normal ↔ Lognormal)", values: { yes: "ja", no: "nein" } },
   deliveryConvention: { label: "Lieferkonvention", values: { standard: "Standard (Spot-Lag)", "non-standard": "abweichend" } },
+  // core R8 (N7-5): when a knock-out rebate is paid – at the touch, at expiry, or the round-7 mixture (default)
+  rebateAt: {
+    label: "Rebate-Zahlung",
+    values: { hit: "bei Berührung (Haug / QuantLib)", expiry: "bei Verfall (Reiner–Rubinstein)", default: "Standard (gemischt – Konvention im Trade setzen)" },
+  },
   // core R6 (N6-5): knock state of a barrier option – recorded on the trade (`barrier.hit`) or derived from spot / fixing
   barrierState: {
     label: "Barriere-Status",
@@ -275,6 +285,8 @@ export const METRIC_DEFINITIONS: Record<string, string> = {
   ifrs13:
     "IFRS 13 Fair-Value-Hierarchie: Level 1 = notierte Preise, Level 2 = beobachtbare Inputs (OTC-Vanillas auf Kurven/Vols), Level 3 = wesentliche nicht beobachtbare Inputs (z. B. Vol-Override, Extrapolation).",
   parRate: "Par-Satz: Festsatz, bei dem der Swap einen Barwert von null hat.",
+  parRateAllIn:
+    "Par-Satz all-in: Festsatz, bei dem Swap und Upfront-Prämie zusammen einen Barwert von null haben (der Par-Satz selbst gilt für den Swap ohne Prämie).",
   parRateBase:
     "Par-Satz (Basis): Kupon der ersten offenen Periode, der den Barwert auf null bringt, wobei alle Stufen der Kuponstaffel (r_i − r_0) konstant bleiben.",
   parRateFlat: "Par-Satz (flach): der einheitliche Kupon, der die gesamte Kuponstaffel ersetzt und den Barwert auf null bringt.",

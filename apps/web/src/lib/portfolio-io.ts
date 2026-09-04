@@ -327,7 +327,8 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     type: "CCS",
     label: "Cross-Currency-Swap",
     // `collateral`: CSA currency (empty = market default – quote currency; `none` = unsecured), Markt R5-3.
-    // Header names follow the API CSV (Markt R7-5): domesticNotional, fixedRate, domesticPayReceive, effectiveDate, collateralCurrency.
+    // Header names follow the API CSV (Markt R7-5): domesticNotional, fixedRate, domesticPayReceive, effectiveDate, collateralCurrency;
+    // the spread carries an explicit `bp` suffix (Markt R8-4) so the API reads the same unit (`-20` alone is a decimal there).
     headers: { notional: "domesticNotional", rate: "fixedRate", direction: "domesticPayReceive", start: "effectiveDate", collateral: "collateralCurrency" },
     columns: [
       "type",
@@ -354,7 +355,7 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
       "USD-Finanzierung",
       "EURUSD",
       "10000000",
-      "-20",
+      "-20 bp",
       "",
       "1,17",
       "Receive",
@@ -394,7 +395,8 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
   BASIS: {
     type: "BASIS",
     label: "Tenor-Basis-Swap",
-    // `spread` in bp on the receive leg (values ≥ 1 are bp, smaller ones decimals).
+    // `spread` on the receive leg with unit: `5 bp`, `0,05 %` or a decimal (`0,0005`); a bare number ≥ 1 is read as bp (Markt R8-4:
+    // the template writes the explicit `bp` suffix, which the API reads identically).
     columns: ["type", "id", "name", "counterparty", "book", "currency", "notional", "receiveIndex", "payIndex", "spread", "start", "maturity", "status"],
     example: [
       "BASIS",
@@ -406,7 +408,7 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
       "10000000",
       "EURIBOR-3M",
       "EURIBOR-6M",
-      "5",
+      "5 bp",
       "2026-09-07",
       "5Y",
       "Live",
@@ -595,10 +597,12 @@ const HEADER_ALIASES: Record<string, CsvColumn> = {
   ab: "from",
   "imm-start": "from",
   immstart: "from",
-  // API column names of the swap templates
+  // API column names of the swap / swaption / FRA templates (Markt R8-4: both vocabularies import)
+  fixedrate: "rate",
+  payerreceiver: "direction",
+  end: "maturity",
   payreceive: "direction",
   "pay/receive": "direction",
-  fixedrate: "rate",
   barriertype: "barrierType",
   barriere: "barrierType",
   barrierlevel: "barrierLevel",
@@ -650,6 +654,18 @@ function num(s: string | undefined, scale = 1): number | undefined {
   if (s === undefined || s.trim() === "") return undefined;
   const p = parseNumberInput(s, scale);
   return p ? p.value : undefined;
+}
+
+/**
+ * Spread cell → decimal (Markt R8-4): `-20 bp` / `0,05 %` via suffix (the API vocabulary), otherwise the web heuristic –
+ * a bare number with |x| ≥ 1 is bp, a smaller one a decimal (`-0,002`).
+ */
+export function spreadOf(s: string | undefined): number | undefined {
+  if (s === undefined || s.trim() === "") return undefined;
+  const p = parseNumberInput(s, 1);
+  if (!p) return undefined;
+  if (p.unit === "%" || p.unit === "bp") return p.value;
+  return Math.abs(p.value) >= 1 ? p.value / 1e4 : p.value;
 }
 
 /** Rate cell → decimal: "3,10 %" / "310bp" via suffix; plain numbers ≥ 0.5 are percent, smaller ones decimals. */
@@ -902,8 +918,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     if (receiveIndex === payIndex) throw new Error("Empfangs- und Zahlindex müssen sich unterscheiden");
     if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
     const maturity = maturityOf(rec.maturity);
-    const spreadRaw = num(rec.spread);
-    const spread = spreadRaw === undefined ? 0 : Math.abs(spreadRaw) >= 1 ? spreadRaw / 1e4 : spreadRaw;
+    const spread = spreadOf(rec.spread) ?? 0;
     const t = makeBasisSwap({
       id,
       counterparty: common.counterparty,
@@ -936,12 +951,35 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     return { ...t, ...common, name: common.name ?? t.name } as Trade;
   }
   if (type === "FXF" || type === "FXFORWARD" || type === "FORWARD") {
-    const buyCcy = (rec.buyCurrency ?? "").toUpperCase();
-    const sellCcy = (rec.sellCurrency ?? "").toUpperCase();
-    const buyAmount = num(rec.buyAmount);
-    const sellAmount = num(rec.sellAmount);
+    let buyCcy = (rec.buyCurrency ?? "").toUpperCase();
+    let sellCcy = (rec.sellCurrency ?? "").toUpperCase();
+    let buyAmount = num(rec.buyAmount);
+    let sellAmount = num(rec.sellAmount);
     const delivery = dateOf(rec.deliveryDate ?? rec.maturity, valuationDate, "deliveryDate");
-    if (!/^[A-Z]{3}$/.test(buyCcy) || !/^[A-Z]{3}$/.test(sellCcy)) throw new Error("Kauf-/Verkaufswährung fehlt");
+    // API vocabulary (Markt R8-4): `pair`, signed `baseAmount` (positive = buy the base currency) and all-in `rate` → buy / sell legs.
+    if (!buyCcy && !sellCcy && rec.pair) {
+      const pair = rec.pair.toUpperCase().replace(/[^A-Z]/g, "");
+      if (!/^[A-Z]{6}$/.test(pair)) throw new Error("Währungspaar fehlt (z. B. EURUSD)");
+      const baseAmount = num(rec.baseAmount ?? rec.notional);
+      const rate = num(rec.rate);
+      if (baseAmount === undefined || baseAmount === 0) throw new Error("Basisbetrag fehlt (Spalte „baseAmount“, positiv = Basiswährung kaufen)");
+      if (rate === undefined || rate <= 0) throw new Error("Kurs fehlt (Spalte „rate“)");
+      const base = pair.slice(0, 3);
+      const quote = pair.slice(3);
+      if (baseAmount > 0) {
+        buyCcy = base;
+        buyAmount = baseAmount;
+        sellCcy = quote;
+        sellAmount = baseAmount * rate;
+      } else {
+        sellCcy = base;
+        sellAmount = -baseAmount;
+        buyCcy = quote;
+        buyAmount = -baseAmount * rate;
+      }
+    }
+    if (!/^[A-Z]{3}$/.test(buyCcy) || !/^[A-Z]{3}$/.test(sellCcy))
+      throw new Error("Kauf-/Verkaufswährung fehlt (Spalten „buyCurrency“/„sellCurrency“ oder API-Form „pair“, „baseAmount“, „rate“)");
     if (buyCcy === sellCcy) throw new Error("Kauf- und Verkaufswährung müssen sich unterscheiden");
     if (buyAmount === undefined || sellAmount === undefined) throw new Error("Kauf-/Verkaufsbetrag fehlt");
     if (delivery === undefined) throw new Error("Lieferdatum fehlt");
@@ -1016,14 +1054,15 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     if (!/^[A-Z]{6}$/.test(pair)) throw new Error("Währungspaar fehlt (z. B. EURUSD)");
     const notional = num(rec.notional);
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
-    const spreadRaw = num(rec.spread);
-    const spread = spreadRaw === undefined ? 0 : Math.abs(spreadRaw) >= 1 ? spreadRaw / 1e4 : spreadRaw;
+    const spread = spreadOf(rec.spread) ?? 0;
     const fixedRate = rateOf(rec.rate);
     const fxSpot = num(rec.fxSpot) ?? opts?.fxSpots?.[pair];
     if (fxSpot === undefined || fxSpot <= 0) throw new Error("FX-Spot fehlt (Spalte „fxSpot“, z. B. 1,17)");
-    if (!rec.maturity) throw new Error("Laufzeit fehlt (z. B. 5Y)");
-    const tenor = rec.maturity.trim().toUpperCase();
-    if (!/^\d+[DWMY]$/.test(tenor)) throw new Error(`Laufzeit „${rec.maturity}“ nicht lesbar (Tenor, z. B. 5Y)`);
+    // `maturity` (web template) or `tenor` (API template, Markt R8-4) – both name the swap tenor
+    const tenorRaw = rec.tenor ?? rec.maturity;
+    if (!tenorRaw) throw new Error("Laufzeit fehlt (Spalte „maturity“ oder „tenor“, z. B. 5Y)");
+    const tenor = tenorRaw.trim().toUpperCase();
+    if (!/^\d+[DWMY]$/.test(tenor)) throw new Error(`Laufzeit „${tenorRaw}“ nicht lesbar (Tenor, z. B. 5Y)`);
     const dir = (rec.direction ?? "Receive").toLowerCase();
     const t = makeCrossCurrencySwap({
       id,
@@ -1045,7 +1084,9 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     const rate = rateOf(rec.rate);
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
     if (rate === undefined) throw new Error("Festsatz fehlt");
-    const period = (rec.period ?? "").trim();
+    // `period` (web) or `start` as period "3x9" (API vocabulary, Markt R8-4); otherwise start / maturity (`end`) dates
+    const startRaw = (rec.start ?? "").trim();
+    const period = (rec.period ?? "").trim() || (/^\d{1,2}\s*[xX×]\s*\d{1,2}$/.test(startRaw) ? startRaw : "");
     const dir = (rec.direction ?? "Pay").toLowerCase();
     const payReceive = /^(rec|receive|receiver|r|erhalten|empf)/.test(dir) ? "Receive" : "Pay";
     const base = {
@@ -1060,7 +1101,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     let t: Trade;
     if (/^\d{1,2}\s*[xX×]\s*\d{1,2}$/.test(period)) t = makeFra({ ...base, start: period.replace(/\s+/g, "").toLowerCase(), valuationDate });
     else {
-      const startDate = dateOf(rec.start, valuationDate, "start");
+      const startDate = dateOf(startRaw || undefined, valuationDate, "start");
       const endDate = dateOf(rec.maturity, startDate ?? valuationDate, "maturity");
       if (startDate === undefined || endDate === undefined) throw new Error("FRA-Periode fehlt (z. B. „3x6“ oder Start- und Enddatum)");
       if (endDate <= startDate) throw new Error("FRA: Ende muss nach dem Start liegen");

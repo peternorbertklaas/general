@@ -5,6 +5,7 @@
  * schema: undefined", "Cannot convert undefined or null to object").
  */
 import { type MarketSnapshotJson } from "@deriva/pricing-core";
+import { type WorkstationSnapshotJson, envelopeOf, validateEnvelope } from "./register-envelope.js";
 
 const SCHEMA = "deriva.market/1";
 const EXPECT = "erwartet wird ein Export aus „Snapshot exportieren“ der Marktansicht oder GET /api/market/snapshot";
@@ -20,9 +21,11 @@ const fail = (msg: string): never => {
  * Parse the text of a snapshot file. Throws `SnapshotImportError` with a German
  * message for malformed JSON, a missing / unknown schema and missing or
  * mistyped required fields; optional collections default to empty so the core
- * never trips over `undefined`.
+ * never trips over `undefined`. The register envelope (`indices`, `conventions`,
+ * `calendars` – Markt R8-1) is checked structurally and kept on the result, so
+ * `loadSnapshot` can register it before the market is deserialised.
  */
-export function readSnapshotJson(text: string): MarketSnapshotJson {
+export function readSnapshotJson(text: string): WorkstationSnapshotJson {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text) as unknown;
@@ -65,6 +68,10 @@ export function readSnapshotJson(text: string): MarketSnapshotJson {
         return fail(`Snapshot fehlerhaft – Kurve „${cur.id}“: jeder Stützpunkt braucht „date“ (JJJJ-MM-TT) und „df“ (Zahl)`);
     }
   });
+  for (const key of ["indices", "conventions", "calendars"])
+    if (o[key] !== undefined && o[key] !== null && !Array.isArray(o[key])) return fail(`Snapshot fehlerhaft – Feld „${key}“ muss eine Liste sein`);
+  const envelopeProblem = validateEnvelope(envelopeOf(o));
+  if (envelopeProblem) return fail(envelopeProblem);
   // Optional collections default to empty – the core and the market view iterate over them.
   return {
     ...(o as unknown as MarketSnapshotJson),

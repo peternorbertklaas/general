@@ -281,10 +281,16 @@ const CORE_MESSAGES: Rule[] = [
   { re: /^expiryDate must be on or before deliveryDate$/, to: () => "Verfall muss vor oder am Lieferdatum liegen" },
   { re: /^Schedule with stub=None does not divide evenly.*$/, to: () => "Laufzeit ist ohne Stub nicht durch die Frequenz teilbar" },
   // Missing market data name the in-app repair path (R7-F1 / R7-F2): "+ Kurve" in the curves view, "+ Paar" in the FX-spot table.
+  // (The two curve messages are context-aware – see `curveRepairMessage` / R8-06 – and handled before this table.)
   { re: /^Curve not found in market context: (.+)$/, to: (m) => `Kurve ${m[1]} nicht im Markt-Snapshot – in der Kurvenansicht mit „+ Kurve“ anlegen` },
   {
     re: /^No discount curve configured for (\w+)$/,
     to: (m) => `Keine Diskontkurve für ${m[1]} konfiguriert – in der Kurvenansicht mit „+ Kurve“ eine ${m[1]}-Kurve anlegen`,
+  },
+  // Register (Markt R8-1): the core's registration errors name the entry – the entry label is added by the caller.
+  {
+    re: /^register(?:RateIndex|SwapConventions)\(([^)]*)\): (.+)$/,
+    to: (m) => `${m[1]}: ${translateRegisterDetail(m[2]!)}`,
   },
   {
     re: /^FX spot not available for (\w+)$/,
@@ -295,6 +301,12 @@ const CORE_MESSAGES: Rule[] = [
   { re: /^Invalid frequency: (.+)$/, to: (m) => `Ungültige Frequenz: ${m[1]}` },
   { re: /^Invalid (?:ISO )?date: (.+)$/, to: (m) => `Ungültiges Datum: ${m[1]}` },
   { re: /^Unknown rate index: (.+)$/, to: (m) => `Unbekannter Zinsindex: ${m[1]}` },
+  // core R8 (Markt R8-1): a floating leg / FRA / cap must be denominated in its index's currency
+  {
+    re: /^(.*?):? ?currency (\w+) does not match the currency (\w+) of index (\S+) – .*$/,
+    to: (m) =>
+      `${m[1] ? `${m[1].replace(/^Invalid trade[^:]*:\s*/, "")}: ` : ""}Währung ${m[2]} passt nicht zur Währung ${m[3]} des Index ${m[4]} – ein ${m[2]}-Float-Leg braucht einen ${m[2]}-Index (in der Kurvenansicht mit „+ Währung“ registrieren)`,
+  },
   { re: /^Unknown calendar: (.+)$/, to: (m) => `Unbekannter Kalender: ${m[1]}` },
   { re: /^Unknown day count convention: (.+)$/, to: (m) => `Unbekannte Tageszählung: ${m[1]}` },
   { re: /^Swaption underlying must have a fixed leg$/, to: () => "Swaption-Underlying benötigt ein Festzins-Leg" },
@@ -547,10 +559,88 @@ function quotationDe(q: string): string {
   return shift ? `Lognormal (Shift ${shift[1]!.replace(".", ",")})` : "Lognormal";
 }
 
+/** German detail of a core register / validator problem ("unknown calendar "CZ" (register it with registerCalendar first)"). */
+export function translateRegisterDetail(detail: string): string {
+  const rules: [RegExp, (m: RegExpMatchArray) => string][] = [
+    [
+      /^(?:\w+: )?unknown calendar (".*?")( \(register it with registerCalendar first\))?$/,
+      (m) => `unbekannter Kalender ${m[1]} – im Envelope unter „calendars“ mitliefern oder mit „+ Kalender“ anlegen`,
+    ],
+    [/^(?:\w+: )?unknown day count (.+)$/, (m) => `unbekannte Tageszählung ${m[1]}`],
+    [/^definition must be an object$/, () => "Definition muss ein Objekt sein"],
+    [/^conventions must be an object$/, () => "Konventionen müssen ein Objekt sein"],
+    [/^\w+ must be an object \{ id, holidays\[\] \}$/, () => "Kalender muss ein Objekt { id, holidays[] } sein"],
+    [/^\w+\.id must be a non-empty string without whitespace$/, () => "Kalender-ID fehlt oder enthält Leerzeichen"],
+    [/^\w+\.id (".*?") is a built-in calendar.*$/, (m) => `Kalender ${m[1]} ist im Kern eingebaut und kann nicht ersetzt werden`],
+    [/^\w+\.name must be a string$/, () => "„name“ muss ein Text sein"],
+    [/^\w+\.holidays must be an array of ISO dates$/, () => "„holidays“ muss eine Liste von Daten JJJJ-MM-TT sein"],
+    [/^\w+\.holidays\[(\d+)\] must be an ISO date \(YYYY-MM-DD\), got (.+)$/, (m) => `Feiertag Nr. ${Number(m[1]) + 1} (${m[2]}) ist kein Datum JJJJ-MM-TT`],
+    [/^\w+\.holidays\[(\d+)\] (".*?") is not a valid calendar date$/, (m) => `Feiertag Nr. ${Number(m[1]) + 1} (${m[2]}) ist kein gültiges Datum`],
+    [/^\w+\.weekendsAreHolidays must be a boolean$/, () => "„weekendsAreHolidays“ muss true oder false sein"],
+    [/^unknown businessDayConvention (.+)$/, (m) => `unbekannte Business-Day-Convention ${m[1]}`],
+    [/^endOfMonth must be a boolean$/, () => "„endOfMonth“ muss true oder false sein"],
+    [/^type must be "IBOR" or "OIS"$/, () => "„type“ muss „IBOR“ oder „OIS“ sein"],
+    [/^currency (\w+) does not match (\w+)$/, (m) => `Währung ${m[1]} passt nicht zu ${m[2]}`],
+    [/^(\w+) (".*?") is not a registered index.*$/, (m) => `${m[1]} ${m[2]} ist kein registrierter Index – zuerst registrieren („indices“ / „+ Währung“)`],
+    [/^(\w+) (\S+) belongs to (\w+), not (\w+)$/, (m) => `${m[1]} ${m[2]} gehört zu ${m[3]}, nicht zu ${m[4]}`],
+    [/^(\w+) (\S+) must be an OIS index$/, (m) => `${m[1]} ${m[2]} muss ein OIS-Index sein`],
+    [
+      /^(\S+) is a built-in index and cannot be replaced.*$/,
+      (m) => `${m[1]} ist im Kern eingebaut und kann nicht ersetzt werden – Variante unter neuem Namen registrieren`,
+    ],
+    [/^currency must be a 3-letter code$/, () => "Währung muss ein 3-Buchstaben-Code sein"],
+    [/^name must be a non-empty string without whitespace$/, () => "Name fehlt oder enthält Leerzeichen"],
+    [/^(\w+) must match .* \(got (.+)\)$/, (m) => `${m[1]} ${m[2]} ist keine gültige Frequenz (z. B. 1Y, 6M, ZC)`],
+    [/^IBOR tenor must be like "3M" \(got (.+)\)$/, (m) => `IBOR-Tenor ${m[1]} ungültig (z. B. 3M)`],
+    [/^overnight indices use tenor "1D"$/, () => "Overnight-Indizes haben den Tenor „1D“"],
+    [/^fixingLag must be a non-negative integer$/, () => "Fixing-Lag muss eine ganze Zahl ≥ 0 sein"],
+    [/^spotLag and oisPaymentLag must be non-negative integers$/, () => "Spot-Lag und OIS-Zahlungs-Lag müssen ganze Zahlen ≥ 0 sein"],
+    [/^curveId missing$/, () => "Kurven-ID fehlt"],
+  ];
+  for (const [re, to] of rules) {
+    const m = detail.match(re);
+    if (m) return to(m);
+  }
+  return detail;
+}
+
+/**
+ * Context for message translation (R8-06): the repair hint of a missing curve
+ * depends on where the market comes from – "+ Kurve" is locked while an imported
+ * snapshot is the base market, so the hint names the snapshot instead; a
+ * swaption additionally offers the "Underlying-Index" field of its editor.
+ */
+export interface MessageContext {
+  marketSource?: "sample" | "import";
+  tradeType?: string;
+}
+
+/** Context-aware German text for the two "curve missing" core messages, `undefined` for every other message. */
+function curveRepairMessage(s: string, ctx: MessageContext | undefined): string | undefined {
+  const curve = /^Curve not found in market context: (.+)$/.exec(s);
+  const disc = /^No discount curve configured for (\w+)$/.exec(s);
+  if (!curve && !disc) return undefined;
+  const ccy = disc ? disc[1]! : /^[A-Z]{3}/.exec(curve![1]!)?.[0];
+  const head = curve ? `Kurve ${curve[1]} nicht im Markt-Snapshot` : `Keine Diskontkurve für ${ccy} konfiguriert`;
+  if (ctx?.marketSource === "import")
+    return `${head} – der importierte Snapshot enthält keine ${ccy ? `${ccy}-` : ""}Kurve – Snapshot mit Kurve importieren oder „Zum Sample-Markt“ wechseln`;
+  const swaption = ctx?.tradeType === "Swaption" ? " oder im Editor den Underlying-Index wechseln" : "";
+  return curve
+    ? `${head} – in der Kurvenansicht mit „+ Kurve“ anlegen${swaption}`
+    : `${head} – in der Kurvenansicht mit „+ Kurve“ eine ${ccy}-Kurve anlegen${swaption}`;
+}
+
 /** Translate a core (English) warning/error into German; unknown messages are passed through. */
 export function translateCoreMessage(msg: string | undefined | null): string {
+  return translateCoreMessageIn(msg, undefined);
+}
+
+/** `translateCoreMessage` with a context (market source, trade type) – the repair hints of missing curves follow it (R8-06). */
+export function translateCoreMessageIn(msg: string | undefined | null, ctx: MessageContext | undefined): string {
   if (!msg) return "";
   const s = msg.trim();
+  const repair = curveRepairMessage(s, ctx);
+  if (repair) return repair;
   for (const r of CORE_MESSAGES) {
     const m = s.match(r.re);
     if (m) return r.to(m);
@@ -617,16 +707,16 @@ export const WARNING_PREFIXES_DE: Record<string, string> = {
  * message. A detail that already starts with the headline ("Ungültiges Datum:
  * 2026-13-45" for `INVALID_DATE`) is not prefixed a second time (R5-06).
  */
-export function translatePricingError(e: unknown): string {
+export function translatePricingError(e: unknown, ctx?: MessageContext): string {
   if (isPricingError(e)) {
     const head = PRICING_ERROR_CODES_DE[e.code] ?? e.code;
-    const detail = translateCoreMessage(e.message);
+    const detail = translateCoreMessageIn(e.message, ctx);
     if (!detail || detail === head) return head;
     if (detail.toLowerCase().startsWith(head.toLowerCase())) return detail;
     return `${head}: ${detail}`;
   }
-  if (e instanceof Error) return translateCoreMessage(e.message);
-  return translateCoreMessage(String(e));
+  if (e instanceof Error) return translateCoreMessageIn(e.message, ctx);
+  return translateCoreMessageIn(String(e), ctx);
 }
 
 /** German trade-type labels – single source is the core (`TRADE_TYPE_LABELS_DE`), re-exported as a string map for free-text lookups. */

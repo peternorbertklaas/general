@@ -21,6 +21,7 @@ import {
 } from "@deriva/pricing-core";
 import { fmtDate, fmtNum } from "./format.js";
 import { defaultIndexFor, indexHasCurve, indexNamesOf, normaliseIndexToken } from "./register.js";
+import { swaptionWithUnderlyingIndex } from "./swaption.js";
 import { ccsCollateralCurrency } from "./templates.js";
 
 /**
@@ -777,8 +778,15 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       if (!expiry || !tenor) return fail("Format: swpt [usd] 1y5y payer 3% 10m [cash]");
       const noCurve = noCurveError(ccy, opts);
       if (noCurve) return noCurve;
+      // The underlying swap follows the same curve-backed index rule as the swap branch (R8-F1): "swpt dkk …" after
+      // "+ Kurve" DKK-DESTR projects DESTR instead of the conventional CIBOR-6M without a curve.
+      const chosen = chooseIndex(ccy, opts);
+      if ("ok" in chosen) return chosen;
       const trade = {
-        ...makeSwaption({ currency: ccy, notional: notional.value, payerReceiver: pr, strike: strike ?? 0.03, expiry, tenor, valuationDate, settlement }),
+        ...swaptionWithUnderlyingIndex(
+          makeSwaption({ currency: ccy, notional: notional.value, payerReceiver: pr, strike: strike ?? 0.03, expiry, tenor, valuationDate, settlement }),
+          chosen.index,
+        ),
         name: `${pr}-Swaption ${ccy} ${expiry}×${tenor}${settlement === "Cash" ? " (Cash)" : ""}`,
       };
       // A currency without a vol cube in the market prices on the core's fallback vol (Level 3) – say so in the preview.
@@ -788,7 +796,9 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
         trade,
         description: `${pr}-Swaption ${ccy} ${expiry}x${tenor} @ ${fmtNum((strike ?? 0.03) * 100, 3)} % · Nominal ${fmtNum(notional.value, 0)}${
           settlement === "Cash" ? " · Barausgleich" : settlement === "Physical" ? " · physisch" : ""
-        }${noCube ? ` · ⚠ kein Swaption-Vol-Cube für ${ccy} (Fallback-Vol, Level 3 – in der Marktansicht mit „+ Fläche“ anlegen)` : ""}`,
+        }${chosen.note ? chosen.note.replace(" · ", " · Underlying ") : ""}${
+          noCube ? ` · ⚠ kein Swaption-Vol-Cube für ${ccy} (Fallback-Vol, Level 3 – in der Marktansicht mit „+ Fläche“ anlegen)` : ""
+        }`,
       };
     }
     if (["fxf", "fxfwd", "forward"].includes(cmd)) {

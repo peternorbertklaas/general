@@ -9,7 +9,7 @@ import { ValuationDatePopover } from "./components/ValuationDatePopover.js";
 import { HOTKEYS, VIEW_HOTKEYS, keyList, keyTokens, keysText, primaryKeys, type HotkeyDef, type ViewId } from "./hotkeys/keymap.js";
 import { isTextEntry, useHotkeys } from "./hotkeys/useHotkeys.js";
 import { blotterCsv, buildBlotterRows, readBlotterColumns } from "./lib/blotter-export.js";
-import { focusEditorField } from "./lib/focus.js";
+import { focusEditorField, focusWhenPresent } from "./lib/focus.js";
 import { fmtDate, fmtMs } from "./lib/format.js";
 import { copyText, indicationText } from "./lib/indication.js";
 import { downloadPortfolioReport } from "./lib/portfolio-export.js";
@@ -283,7 +283,11 @@ export function App() {
         case "duplicate": {
           if (!needTrade()) break;
           const c = st.duplicateSelected();
-          if (c) st.showToast(`Dupliziert: ${c.id}`, { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+          if (c) {
+            st.showToast(`Dupliziert: ${c.id}`, { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+            // R8-05: the focus follows the copy – "Bezeichnung" in the pricing workspace, the new blotter row elsewhere
+            void (useStore.getState().view === "pricing" ? focusEditorField() : focusWhenPresent(`tr[data-id="${c.id}"]`));
+          }
           break;
         }
         case "delete":
