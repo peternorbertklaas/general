@@ -289,9 +289,12 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
   };
   const isCsv = (req: { headers: { "content-type"?: string } }) => (req.headers["content-type"] ?? "").toLowerCase().startsWith("text/csv");
 
+  /** `?dryRun=1|true` → validate and price without storing (Markt R7 note); `0|false` = a real import. */
+  const isDryRun = (v: string | undefined) => v === "1" || v === "true";
+
   app.post<{
     Body: { trades: Trade[]; mode?: "create" | "upsert" };
-    Querystring: { reportingCurrency?: string; type?: CsvTradeType; mode?: "create" | "upsert" };
+    Querystring: { reportingCurrency?: string; type?: CsvTradeType; mode?: "create" | "upsert"; dryRun?: string };
   }>(
     "/api/trades/import",
     {
@@ -300,10 +303,11 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
         operationId: "importTrades",
         tags: ["trades"],
         summary:
-          "Batch-Import als JSON-Array oder CSV (`content-type: text/csv` + `?type=`). Jeder Trade wird validiert und probeweise bewertet; Ergebnis je Trade/Zeile",
+          "Batch-Import als JSON-Array oder CSV (`content-type: text/csv` + `?type=`). Jeder Trade wird validiert und probeweise bewertet; Ergebnis je Trade/Zeile; `?dryRun=1` prüft und bewertet, ohne zu speichern",
         description:
           "JSON: `{ trades: Trade[], mode? }` – a schema violation anywhere in the array fails the whole request (400). " +
           "CSV (`content-type: text/csv`, declared as a second request-body media type): one column template per `?type=` (eleven templates: the seven trade types plus `FxSwap`, `BasisSwap`, `AmortisingSwap`, `ImmSwap`); rows are mapped through the core builders (market-standard conventions) and every built trade is checked against the `Trade` schema – a row that cannot be mapped or whose trade violates the schema (e.g. an `id` with spaces) is reported as `rejected` with `code: CSV_ROW_INVALID` and its `row` number while the other rows proceed; only a header lacking a required column (or a missing `?type=`) is a 400 `CSV_INVALID`. `?mode=` selects create (default) or upsert. " +
+          "`?dryRun=1` (JSON and CSV) runs the identical validation and probe valuation but stores nothing: the response carries `dryRun: true` and every `results[].status` says what a real import would do (`imported` = would be stored, `skipped` = id exists in create mode, `rejected`), without `version`; the compute and store budgets are checked as for a real import. Unknown query parameters answer 400 `VALIDATION_ERROR` (a mistyped `dryrun` is not silently a real import). " +
           "Compute bounds apply per trade, per request and to the store (400 `TOO_MANY_PERIODS`, 413 `PERIOD_BUDGET_EXCEEDED`, 413 `STORE_BUDGET_EXCEEDED` when the book would exceed `MAX_STORE_PERIODS` estimated coupon periods – every row counts, existing ids are netted).\n\n" +
           csvTemplatesMarkdown(),
         body: {
@@ -323,7 +327,15 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
                 "CSV only: column template of every row (`BasisSwap`, `AmortisingSwap`, `ImmSwap` build `InterestRateSwap` trades; the templates are documented in the operation description)",
             },
             mode: { type: "string", enum: ["create", "upsert"], description: "CSV only (JSON bodies carry `mode` in the body): default create" },
+            dryRun: {
+              type: "string",
+              enum: ["1", "true", "0", "false"],
+              description:
+                "`1`/`true`: validate and price every trade / row exactly as an import would, but store nothing (response `dryRun: true`, statuses = what a real import would do, no `version`)",
+            },
           },
+          // A mistyped flag (`dryrun`, `upsert`) must not silently turn a validation run into a real import.
+          additionalProperties: false,
         },
         response: responses(
           {
@@ -335,8 +347,12 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
                 imported: { type: "integer" },
                 skipped: { type: "integer" },
                 rejected: { type: "integer" },
+                dryRun: {
+                  type: "boolean",
+                  description: "`true` when `?dryRun=1` – nothing was stored, the counters and statuses describe what a real import would do",
+                },
                 results: arrayResponse(
-                  "Per trade / CSV row: { id?, row? (CSV, 1-based data row), status: imported|skipped|rejected, version?, pv?, warnings?, reason?, code? }",
+                  "Per trade / CSV row: { id?, row? (CSV, 1-based data row), status: imported|skipped|rejected, version? (absent on a dry run), pv?, warnings?, reason?, code? }",
                 ),
               },
             },
@@ -377,7 +393,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
           const results: ImportResult[] = rejected
             .map((r): ImportResult => ({ row: r.row, status: "rejected", reason: r.reason, code: "CSV_ROW_INVALID" }))
             .sort((a, b) => (a.row ?? 0) - (b.row ?? 0));
-          return reply.send({ total: results.length, imported: 0, skipped: 0, rejected: results.length, results });
+          return reply.send({ total: results.length, imported: 0, skipped: 0, rejected: results.length, dryRun: isDryRun(req.query.dryRun), results });
         }
         req.body = { trades, mode: req.query.mode };
       },
@@ -386,12 +402,15 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       const m = ctx.market.get();
       const mode = req.body.mode ?? "create";
       const reporting = req.query.reportingCurrency ?? "EUR";
+      const dryRun = isDryRun(req.query.dryRun);
       const rows = req.csvImport?.rows;
       const results: ImportResult[] = datesToSerial(req.body.trades).map((t, i) => {
         const row = rows ? { row: rows[i] } : {};
         try {
           if (mode === "create" && ctx.trades.get(t.id)) return { id: t.id, ...row, status: "skipped", reason: "exists" };
           const p = priceTrade(m, t, reporting);
+          // Dry run: same validation and probe valuation, nothing stored (status = what the real import would do).
+          if (dryRun) return { id: t.id, ...row, status: "imported", pv: p.pv, warnings: p.warnings };
           const stored = ctx.trades.upsert(t);
           return { id: t.id, ...row, status: "imported", version: stored.version, pv: p.pv, warnings: p.warnings };
         } catch (e) {
@@ -404,15 +423,16 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       const imported = results.filter((r) => r.status === "imported").length;
       ctx.audit.append({
         actor: "api",
-        action: "trade.import",
+        action: dryRun ? "trade.import.dryRun" : "trade.import",
         subject: "batch",
-        details: { total: results.length, imported, ...(rows ? { format: "csv", type: req.query.type } : {}) },
+        details: { total: results.length, imported, dryRun, ...(rows ? { format: "csv", type: req.query.type } : {}) },
       });
       return {
         total: results.length,
         imported,
         skipped: results.filter((r) => r.status === "skipped").length,
         rejected: results.filter((r) => r.status === "rejected").length,
+        dryRun,
         results,
       };
     },

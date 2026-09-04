@@ -878,6 +878,22 @@ export const marketPutSchema = {
       propertyNames: currencyPair,
     },
     missingFixingPolicy: { type: "string", enum: ["curve", "throw"], description: "Umgang mit fehlenden historischen Fixings" },
+    discountCurveId: {
+      type: "object",
+      description:
+        'Discount-curve mapping per currency (`{ NOK: "NOK-NOWA" }`, Markt R7-3) – merged into the snapshot\'s `discountCurveId`; the curve must exist in the market (422 `CURVE_NOT_FOUND`) and be denominated in that currency (400 `INVALID_REQUEST`). `POST /api/market/curves` sets the mapping automatically for the first curve of a currency.',
+      propertyNames: currency,
+      additionalProperties: { type: "string", minLength: 1, maxLength: 64 },
+      maxProperties: 100,
+    },
+    collateralDiscountCurveId: {
+      type: "object",
+      description:
+        'Collateral (CSA) discount-curve mapping keyed `${ccy}|${collateralCcy}` (`{ "EUR|USD": "EUR-ESTR-USDCSA" }`) – merged into the snapshot\'s `collateralDiscountCurveId`; the curve must exist (422 `CURVE_NOT_FOUND`)',
+      propertyNames: { type: "string", pattern: "^[A-Z]{3}\\|[A-Z]{3}$" },
+      additionalProperties: { type: "string", minLength: 1, maxLength: 64 },
+      maxProperties: 100,
+    },
   },
   additionalProperties: false,
 } as const;
@@ -887,16 +903,29 @@ export const bootstrapBodySchema = {
   required: ["spec"],
   properties: {
     valuationDate: isoDate,
+    isDiscountCurve: {
+      type: "boolean",
+      description:
+        '`POST /api/market/curves` only: make the bootstrapped curve the discount curve of its currency (`discountCurveId[currency]`). Default (omitted): the mapping is set when the currency has no discount curve yet – the first curve of a new currency becomes its discount curve, as in the workstation\'s "+ Kurve" (Markt R7-3); `false` never sets it, `true` also replaces an existing mapping. Ignored by `POST /api/market/bootstrap`.',
+    },
     spec: {
       type: "object",
       required: ["id", "currency", "index", "quotes"],
       properties: {
         id: { type: "string", minLength: 1, maxLength: 64 },
         currency,
-        index: rateIndex,
+        index: {
+          ...rateIndex,
+          description:
+            'Floating-rate index the curve projects, e.g. "EURIBOR-6M", "ESTR", "SOFR", "NOWA" – any registered index (`GET /api/market` lists `currencies` and `indices`; further indices and currencies are registered with `POST /api/market/indices` / `POST /api/market/conventions`). An unregistered name answers 422 `UNKNOWN_INDEX`.',
+        },
         interpolation: { type: "string", enum: [...INTERPOLATIONS] },
         dayCount,
-        discountCurveId: { type: "string", maxLength: 64 },
+        discountCurveId: {
+          type: "string",
+          maxLength: 64,
+          description: "Curve id used for discounting during the bootstrap (dual-curve); not the snapshot mapping – see `isDiscountCurve`",
+        },
         referenceCurveIds: { type: "array", items: { type: "string", maxLength: 64 }, maxItems: 50 },
         spotLag: { type: "integer", minimum: 0, maximum: 5 },
         turnOfYear: {
@@ -1071,6 +1100,102 @@ export const fromTemplateBodySchema = {
 // ---------------------------------------------------------------------------
 const idMap = { type: "object", additionalProperties: { type: "string", maxLength: 64 }, maxProperties: 100 } as const;
 
+// ---------------------------------------------------------------------------
+// Index / convention register (Markt R6-5 rest, R7): `POST /api/market/indices|conventions`, snapshot `indices`/`conventions`
+// ---------------------------------------------------------------------------
+const indexName = {
+  type: "string",
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$",
+  description: 'Index name without whitespace, e.g. "PRIBOR-6M", "CZEONIA" (stored upper-cased)',
+} as const;
+
+/** `RateIndex` of the core (`registerRateIndex`), ISO/JSON shape – the body of `POST /api/market/indices` and the items of a snapshot's `indices`. */
+export const rateIndexSchema = {
+  $id: "RateIndex",
+  title: "RateIndex",
+  type: "object",
+  description:
+    "Floating-rate index definition (core `RateIndex`): registered at runtime with `POST /api/market/indices`; the index can then be used in curve specs (`POST /api/market/bootstrap|curves`), swap legs, builders and CSV imports. Built-in indices (`EURIBOR-*`, `ESTR`, `SOFR`, `SONIA`, `SARON`, `TONA`, `NIBOR-*`, `NOWA`, `STIBOR-*`, `SWESTR`, `CIBOR-*`, `DESTR`, `WIBOR-*`, `POLONIA`) cannot be replaced (400 `INVALID_CURVE_SPEC`): their definition enters every valuation without appearing in the snapshot id – register a desk-specific variant under its own name instead.",
+  required: ["name", "currency", "type", "tenor", "dayCount", "fixingCalendar", "fixingLag", "businessDayConvention", "endOfMonth", "curveId"],
+  properties: {
+    name: indexName,
+    currency,
+    type: { type: "string", enum: ["IBOR", "OIS"], description: "IBOR = forward-looking term rate, OIS = compounded overnight rate" },
+    tenor: { type: "string", pattern: "^([1-9]\\d{0,2}[DWMY])$", description: 'Index tenor: "1M" … "12M" (IBOR), "1D" for overnight indices' },
+    dayCount,
+    fixingCalendar: { ...calendar, description: 'Fixing calendar id (registered calendar, e.g. "TARGET", "US", "UK", "NO", "TARGET+US")' },
+    fixingLag: { type: "integer", minimum: 0, maximum: 10, description: "Fixing lag in business days (2 for EURIBOR, 0 for €STR/SOFR)" },
+    businessDayConvention: { type: "string", enum: [...BUSINESS_DAY_CONVENTIONS] },
+    endOfMonth: { type: "boolean" },
+    curveId: {
+      type: "string",
+      minLength: 1,
+      maxLength: 64,
+      description: 'Projection curve id in the market, e.g. "CZK-PRIBOR-6M" – bootstrap it with `POST /api/market/curves`',
+    },
+  },
+  additionalProperties: false,
+} as const;
+export const rateIndexRef = { $ref: "RateIndex#" } as const;
+
+/** `SwapConventions` of the core (`registerSwapConventions`) – the body of `POST /api/market/conventions` and the items of a snapshot's `conventions`. */
+export const swapConventionsSchema = {
+  $id: "SwapConventions",
+  title: "SwapConventions",
+  type: "object",
+  description:
+    "Vanilla-swap and OIS conventions of a currency (core `SwapConventions`): fixed leg vs the currency's benchmark float index plus the OIS conventions for discount-curve bootstrapping. Registering makes the currency known (`GET /api/market` `currencies`): curves can be bootstrapped and swaps built in it. Both indices must be registered and belong to the currency (400 `INVALID_CURVE_SPEC` otherwise). Conventions of a built-in currency may be overridden (they only shape builder defaults and bootstrap schedules, both visible in the trade / the curve nodes).",
+  required: [
+    "currency",
+    "fixedFrequency",
+    "fixedDayCount",
+    "floatIndex",
+    "floatFrequency",
+    "calendar",
+    "spotLag",
+    "oisIndex",
+    "oisFixedFrequency",
+    "oisFixedDayCount",
+    "oisPaymentLag",
+  ],
+  properties: {
+    currency,
+    fixedFrequency: frequency,
+    fixedDayCount: dayCount,
+    floatIndex: { ...rateIndex, description: "Benchmark float index of the vanilla swap (registered, same currency)" },
+    floatFrequency: frequency,
+    calendar: { ...calendar, description: 'Payment / schedule calendar id, e.g. "TARGET", "NO", "TARGET+US"' },
+    spotLag: { type: "integer", minimum: 0, maximum: 5, description: "Spot lag in business days" },
+    oisIndex: { ...rateIndex, description: "Overnight index (registered, same currency, type OIS)" },
+    oisFixedFrequency: frequency,
+    oisFixedDayCount: dayCount,
+    oisPaymentLag: { type: "integer", minimum: 0, maximum: 10, description: "Payment lag of the OIS legs in business days" },
+  },
+  additionalProperties: false,
+} as const;
+export const swapConventionsRef = { $ref: "SwapConventions#" } as const;
+
+/** Response of `POST /api/market/indices` / `/conventions`. */
+export const registerResponseSchema = (kind: "index" | "conventions") =>
+  ({
+    type: "object",
+    required: ["registered", "replaced", kind],
+    properties: {
+      registered: { type: "boolean", description: "Always `true` on 200/201" },
+      replaced: {
+        type: "boolean",
+        description: "`true` (200) when a runtime-registered entry of the same name / currency was replaced, `false` (201) for a new entry",
+      },
+      [kind]: kind === "index" ? rateIndexRef : swapConventionsRef,
+      currencies: { type: "array", items: { type: "string" }, description: "`knownCurrencies()` after the call" },
+      snapshotId: {
+        type: "string",
+        description: "Active snapshot id – unchanged by a registration (the register is not part of the snapshot id; see ADR-027)",
+      },
+    },
+    additionalProperties: true,
+  }) as const;
+
 export const marketSnapshotSchema = {
   $id: "MarketSnapshot",
   title: "MarketSnapshot",
@@ -1172,6 +1297,20 @@ export const marketSnapshotSchema = {
         additionalProperties: false,
       },
     },
+    indices: {
+      type: "array",
+      maxItems: 200,
+      items: rateIndexRef,
+      description:
+        "API envelope extension (ADR-027, not part of the core's `deriva.market/1` and not of the snapshot id): floating-rate indices registered at runtime via `POST /api/market/indices` – exported by `GET /api/market/snapshot` when present, re-registered on import before the market is replaced (built-in names → 400 `INVALID_CURVE_SPEC`). Omitted when nothing was registered, so an untouched export equals the core's `serializeMarket` output.",
+    },
+    conventions: {
+      type: "array",
+      maxItems: 100,
+      items: swapConventionsRef,
+      description:
+        "API envelope extension (ADR-027): swap conventions registered at runtime via `POST /api/market/conventions` (new currencies such as CZK/HUF, or overrides of built-in currencies) – exported when present, re-registered on import after `indices`.",
+    },
   },
   additionalProperties: false,
 } as const;
@@ -1267,11 +1406,11 @@ export const errorResponseSchema = {
       // `examples` (the full code list) is added to the OpenAPI document by `openApiTransform` – @fastify/swagger would collapse it to a single `example`.
       description:
         "Machine-readable code (stable; the complete list is in `examples`). " +
-        "422 domain errors of the pricing core: INVALID_TRADE (semantically invalid trade), NON_FINITE_PV, MISSING_RATE, MISSING_FIXING (policy `throw`), NO_DISCOUNT_CURVE, CURVE_NOT_FOUND, NO_FX_SPOT, UNKNOWN_INDEX, UNKNOWN_CALENDAR, UNSUPPORTED_TRADE_TYPE, " +
+        "422 domain errors of the pricing core: INVALID_TRADE (semantically invalid trade), NON_FINITE_PV, MISSING_RATE, MISSING_FIXING (policy `throw`), NO_DISCOUNT_CURVE (currency without a discount-curve mapping – set it with `POST /api/market/curves` (first curve of a currency) or `PUT /api/market { discountCurveId }`), CURVE_NOT_FOUND (also 422 when `PUT /api/market { discountCurveId }` names a curve that is not in the market), NO_FX_SPOT, UNKNOWN_INDEX (a floating-rate index that is not registered – `GET /api/market` lists the registered `currencies` and `indices`; further indices are registered with `POST /api/market/indices`, further currencies with `POST /api/market/conventions`), UNKNOWN_CALENDAR, UNSUPPORTED_TRADE_TYPE, " +
         'INVALID_FREQUENCY (frequency that is not a positive tenor, e.g. "7Q"), UNKNOWN_DAYCOUNT (day count outside the supported conventions), ' +
         "VOL_MODEL_INCOMPATIBLE (requested option model cannot be fed from the vol surface – e.g. Black on a non-positive forward or strike without shift), " +
         "INVALID_CREDIT_CURVE (CDS quotes imply a negative hazard rate; `details.pillar`; avoid with `floorHazard`), INVALID_TIMESTAMP (non-ISO-8601 timestamp: 400 on snapshot import, 422 from the EMIR export), " +
-        "INVALID_VOL_SURFACE (a stored vol surface is structurally unusable at pricing time – `details.problems`; 400 when `deserializeMarket` rejects a snapshot / `designationSnapshot`; the API's own pre-check answers VOL_SURFACE_INVALID first), INVALID_SNAPSHOT (400: unsupported snapshot `schema` or malformed `fxFixings` entry), INVALID_CURVE_SPEC (bootstrap specification unusable: malformed FX pair, missing reference curve, circular dependency), INVALID_HEDGE_RELATIONSHIP (hedge relationship structurally inconsistent: FX pair without the hedged currency, non-positive hedge ratio, amortisation without schedule / loan rate), NUMERICAL_FAILURE (root search or implied-vol solve did not converge), DOMAIN_ERROR (plain core error without code). " +
+        "INVALID_VOL_SURFACE (a stored vol surface is structurally unusable at pricing time – `details.problems`; 400 when `deserializeMarket` rejects a snapshot / `designationSnapshot`; the API's own pre-check answers VOL_SURFACE_INVALID first), INVALID_SNAPSHOT (400: unsupported snapshot `schema` or malformed `fxFixings` entry), INVALID_CURVE_SPEC (bootstrap specification unusable: malformed FX pair, missing reference curve, circular dependency; 400 on `POST /api/market/indices` / `/conventions` and on snapshot `indices`/`conventions` when a definition is invalid – unknown day count / calendar, wrong tenor for the type, indices of another currency – or names a built-in index, which cannot be replaced), INVALID_HEDGE_RELATIONSHIP (hedge relationship structurally inconsistent: FX pair without the hedged currency, non-positive hedge ratio, amortisation without schedule / loan rate), NUMERICAL_FAILURE (root search or implied-vol solve did not converge), DOMAIN_ERROR (plain core error without code). " +
         "400: VALIDATION_ERROR (request body, query, params or headers violate the JSON schema – `validation[]` carries the Ajv errors), INVALID_JSON (body is not valid JSON or is empty with `content-type: application/json`), INVALID_TRADE (programming error while pricing, reported as invalid trade), INVALID_DATE (a date that does not exist, e.g. `2027-02-30`; `details.input`), INVALID_TENOR (unparsable tenor string; `details.input`), TOO_MANY_PERIODS (estimated coupon periods of one leg – or of a hedged item's schedule – above the bound), " +
         "INVALID_REQUEST (semantically invalid request outside the schema, e.g. no trades for a portfolio par-risk run), ID_MISMATCH (body `id` differs from the path id), INVALID_QUERY_MAP (`uti`/`transactionPrice` map malformed or above 4 kB – use the POST body), CSV_INVALID (CSV import: unparsable file / header / missing `?type=`), SNAPSHOT_MALFORMED, VOL_SURFACE_INVALID (a swaption / caplet / FX vol surface in `PUT /api/market`, a snapshot or a `designationSnapshot` is structurally inconsistent – grid rows ≠ expiries, row length ≠ tenors / strikes, FX vectors ≠ expiries, axes not strictly increasing, key ≠ currency / pair; `problems[]` names each path); " +
         "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request), STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods) and PAYLOAD_TOO_LARGE (body above the 5 MB limit); 415 UNSUPPORTED_MEDIA_TYPE (request body with a content-type other than `application/json` – `text/plain`, `application/xml`, … – or `text/csv` on any route but the import route); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED (also on unknown routes); 500 INTERNAL_ERROR. " +
@@ -1401,16 +1540,24 @@ export const riskReportSchema = {
   additionalProperties: true,
 } as const;
 
+/** Strong trade ETag as emitted by `tradeEtag` (`lib/store.ts`): `"<version>-<hash>"` including the quotes (N5-03, N7-02). */
+export const TRADE_ETAG_PATTERN = '^"\\d+-[0-9a-f]+"$';
+
 export const storedTradeSchema = {
   type: "object",
-  description: "Stored trade with version and weak ETag.",
+  description: "Stored trade with version and strong ETag (same value as the `ETag` header).",
   required: ["trade", "createdAt", "updatedAt", "version", "etag"],
   properties: {
     trade: tradeRef,
     createdAt: { type: "string" },
     updatedAt: { type: "string" },
     version: { type: "integer" },
-    etag: { type: "string", description: 'Weak ETag `W/"<version>-<hash>"`' },
+    etag: {
+      type: "string",
+      pattern: TRADE_ETAG_PATTERN,
+      description:
+        'Strong ETag `"<version>-<hash>"` (quotes included; identical to the `ETag` header). Send it unchanged in `If-Match` – a weak validator (`W/"…"`) never matches under RFC 9110 §13.1.1 and answers 412.',
+    },
     pricing: anyObject("Present with `?price=1`: { pv, currency, analytics, warnings } or { pv: null, error, code }"),
   },
   additionalProperties: true,

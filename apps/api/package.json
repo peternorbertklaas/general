@@ -5,6 +5,9 @@
   "description": "DERIVA REST API – Pricing, Kurven, Marktdaten, Trades, Szenarien (Fastify + OpenAPI)",
   "type": "module",
   "main": "./dist/server.js",
+  "engines": {
+    "node": ">=22.22"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.build.json",

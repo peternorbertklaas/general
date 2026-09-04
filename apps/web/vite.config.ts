@@ -50,8 +50,9 @@ export default defineConfig(({ mode }) => ({
       reporter: ["text-summary", "lcov"],
       include: ["src/**/*.{ts,tsx}"],
       exclude: ["src/**/*.test.{ts,tsx}", "src/main.tsx", "src/test/**", "src/sw/**"],
-      // ADR-026 (N4-07): thresholds ≈ 5–15 points below the measured values. Measured R6 on vitest 5 / v8 (statements are
-      // counted separately from lines since the toolchain upgrade): lines 80 / statements 77 / branches 71 / functions 68.
+      // ADR-026 (N4-07): thresholds 2–3 points below the measured values (functions wider because lazy/SW glue is
+      // excluded). Measured R7 on vitest 5 / v8 (statements are counted separately from lines since the toolchain
+      // upgrade): lines 81.1 / statements 78.3 / branches 72.4 / functions 70.2.
       thresholds: { lines: 78, functions: 50, branches: 68, statements: 75 },
     },
   },

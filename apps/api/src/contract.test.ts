@@ -309,6 +309,8 @@ describe("N-08 OpenAPI contract", () => {
         "portfolioReport",
         "priceTrade",
         "pricePortfolio",
+        "registerConventions",
+        "registerIndex",
         "replaceCurve",
         "runScenarios",
         "scenarioGrid",

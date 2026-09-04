@@ -472,9 +472,11 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "FxFixing",
     "MasterAgreementRef",
     "PortfolioReport",
+    "RateIndex",
     "ReportPerspective",
     "SampleMarketQuotes",
     "ScenarioDefinition",
+    "SwapConventions",
     "SuitabilityInputs",
     "Trade",
     "ValuationGovernance",
@@ -508,6 +510,12 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "marketSnapshotId",
     "knownCurrencies",
     "knownIndices",
+    // Register (Markt R6-5 rest, ADR-027): runtime indices / conventions, sample fixings for the valuation-date rebuild (R7-4)
+    "registerRateIndex",
+    "registerSwapConventions",
+    "isBuiltInIndex",
+    "getSwapConventions",
+    "sampleFixings",
     // Builders
     "makeVanillaSwap",
     "makeCapFloor",
@@ -727,7 +735,7 @@ describe("R4-5 vol surfaces via PUT /api/market and the CSV request body in the 
     await app2.close();
   });
 
-  it("OpenAPI: POST /api/trades/import declares application/json and text/csv request bodies; 41 operations", () => {
+  it("OpenAPI: POST /api/trades/import declares application/json and text/csv request bodies; 43 operations", () => {
     const doc = app.swagger() as unknown as {
       paths: Record<
         string,
@@ -739,7 +747,7 @@ describe("R4-5 vol surfaces via PUT /api/market and the CSV request body in the 
     expect(content["text/csv"]!.schema.type).toBe("string");
     expect(content["text/csv"]!.schema.description).toMatch(/\?type=/);
     const ops = Object.values(doc.paths).flatMap((methods) => Object.values(methods).map((op) => op.operationId));
-    expect(ops).toHaveLength(41);
+    expect(ops).toHaveLength(43);
     expect(ops).toContain("emirValuationsPost");
     // `PUT /api/market` documents the three vol-surface fields.
     const put = doc.paths["/api/market"]!.put!.requestBody!.content["application/json"]!.schema as { properties: Record<string, unknown> };

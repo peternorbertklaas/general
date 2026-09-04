@@ -156,7 +156,7 @@ Rollen: **Berater** (Firmenkunden-Sales), **Treasurer** (Kunde), **Risk** (Markt
 
 - **US-9.1** ✅ Als Entwickler möchte ich ein pnpm-Monorepo mit `packages/pricing-core`, `apps/api`, `apps/web`, strikter TypeScript-Konfiguration und gemeinsamer Basis.
 - **US-9.2** ✅ Als Entwickler möchte ich Unit-/Integrationstests (Vitest) für Daten, Modelle, Pricer, API und UI mit Referenzwerten (Haug, Hull, Paritäten, Round-Trips).
-- **US-9.3** ✅ Als Entwickler möchte ich CI (GitHub Actions, Node 20/22): Install, Core-Build, Typecheck, Lint, Prettier-Check, Tests mit Coverage (Core/API/Web), `pnpm audit`, Builds, E2E auf `main`/`claude/**` und PRs; Dependabot, CODEOWNERS, PR-/Issue-Templates, `.editorconfig`.
+- **US-9.3** ✅ Als Entwickler möchte ich CI (GitHub Actions, Node 22/24): Install, Core-Build, Typecheck, Lint, Prettier-Check, Tests mit Coverage (Core/API/Web), `pnpm audit`, Builds, E2E auf `main`/`claude/**` und PRs; Dependabot, CODEOWNERS, PR-/Issue-Templates, `.editorconfig`.
 - **US-9.4** ✅ Als Architekt möchte ich Architecture Decision Records für Stack, Kernbibliothek, Datumsmodell, Modelle, Marktdaten, Persistenz, API-Datumsformat, UI-Hotkeys.
 - **US-9.5** ✅ Als Entwickler möchte ich eine README mit Quickstart, Hotkey-Übersicht und API-Beispielen.
 - **US-9.9** ✅ Als Nutzer möchte ich, dass ein Fehler in einer Ansicht (Error Boundary je View/Inspector) nicht die ganze Workstation stoppt, sondern lokal mit „Erneut versuchen" angezeigt wird; Reports sollen über ein Druck-Stylesheet sauber ausgedruckt werden.

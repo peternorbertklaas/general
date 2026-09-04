@@ -6,7 +6,12 @@ import {
   type FxFixing,
   type InterpolatedCurve,
   type MarketContext,
+  type RateIndex,
+  type SwapConventions,
   bootstrapCurve,
+  getSwapConventions,
+  isBuiltInIndex,
+  isPricingError,
   knownCurrencies,
   knownIndices,
   parseISO,
@@ -14,9 +19,19 @@ import {
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
-import { sendError } from "../lib/errors.js";
+import { apiErrorCode, sendError } from "../lib/errors.js";
 import { volSurfacePlausibilityWarnings, volSurfaceProblems } from "../lib/vol-surfaces.js";
-import { arrayResponse, bootstrapBodySchema, marketPutSchema, objectResponse, responses, responsesWithoutBody } from "../schemas.js";
+import {
+  arrayResponse,
+  bootstrapBodySchema,
+  marketPutSchema,
+  objectResponse,
+  rateIndexRef,
+  registerResponseSchema,
+  responses,
+  responsesWithoutBody,
+  swapConventionsRef,
+} from "../schemas.js";
 
 function curveSummary(c: Curve, valuationDate: number) {
   const ic = c as InterpolatedCurve;
@@ -65,12 +80,25 @@ const curveIdParams = { type: "object", required: ["id"], properties: { id: { ty
 
 type BootstrapBody = {
   valuationDate?: string;
+  /** `POST /api/market/curves`: set `discountCurveId[currency]` to the new curve (default: only when the currency has none yet, R7-3). */
+  isDiscountCurve?: boolean;
   spec: Omit<BootstrapSpec, "discountCurve" | "referenceCurves" | "turnOfYear"> & {
     discountCurveId?: string;
     referenceCurveIds?: string[];
     turnOfYear?: { date: string; bp: number; days?: number }[];
   };
 };
+
+/** Registered swap conventions per currency (`GET /api/market` `conventions`). */
+function conventionsByCurrency(): Record<string, SwapConventions> {
+  return Object.fromEntries(knownCurrencies().map((ccy) => [ccy, getSwapConventions(ccy)]));
+}
+
+/** Core `INVALID_CURVE_SPEC` (or another `PricingError`) of a register call → 400 with the catalogued code; anything else is re-thrown. */
+function registerFailure(reply: Parameters<typeof sendError>[0], req: { id: string }, e: unknown) {
+  if (!isPricingError(e)) throw e;
+  return sendError(reply, req, 400, apiErrorCode(e.code, "INVALID_CURVE_SPEC"), e.message, e.details ? { details: e.details } : {});
+}
 
 /**
  * Resolve an API bootstrap body against the market: curve ids → curve objects
@@ -126,7 +154,10 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
                   "Currencies with registered swap conventions (`knownCurrencies()` of the core: G5 plus NOK/SEK/DKK/PLN, Markt R6-5) – a curve can be bootstrapped and a swap built in each of them; a discount curve exists only for those listed in `discountCurveId`",
               },
               indices: arrayResponse(
-                "Registered floating-rate indices `{ name, currency, type, tenor, dayCount, fixingCalendar, curveId }` (`knownIndices()`)",
+                "Registered floating-rate indices `{ name, currency, type, tenor, dayCount, fixingCalendar, curveId }` (`knownIndices()` – built-in plus those registered with `POST /api/market/indices`)",
+              ),
+              conventions: objectResponse(
+                "Registered swap conventions per currency (`SwapConventions`: fixed / float leg, calendar, spot lag, OIS conventions) – built-in plus those registered with `POST /api/market/conventions`",
               ),
             },
             additionalProperties: true,
@@ -158,6 +189,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
           fixingCalendar: ix.fixingCalendar,
           curveId: ix.curveId,
         })),
+        conventions: conventionsByCurrency(),
       };
     },
   );
@@ -270,13 +302,23 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       schema: {
         operationId: "replaceCurve",
         tags: ["market"],
-        summary: "Kurve bootstrappen und im Snapshot ersetzen",
+        summary: "Kurve bootstrappen und im Snapshot ersetzen (erste Kurve einer Währung wird deren Diskontkurve, `isDiscountCurve` steuert es explizit)",
+        description:
+          "Bootstraps the curve and stores it under `spec.id`. Discount-curve mapping (Markt R7-3, same rule as the workstation's \"+ Kurve\"): when the curve's currency has no `discountCurveId` yet – a newly registered currency such as NOK or CZK – the new curve becomes its discount curve, so swaps in that currency price without `NO_DISCOUNT_CURVE`; `isDiscountCurve: true` forces the mapping (also over an existing one), `false` suppresses it. The response reports `discountCurveSet`; `PUT /api/market { discountCurveId }` changes the mapping later.",
         body: bootstrapBodySchema,
         response: responses(
           {
             200: {
               ...curveSummarySchema,
-              properties: { ...curveSummarySchema.properties, mergedQuotes: arrayResponse("Quotes dropped by pillarMergeToleranceDays") },
+              properties: {
+                ...curveSummarySchema.properties,
+                mergedQuotes: arrayResponse("Quotes dropped by pillarMergeToleranceDays"),
+                discountCurveSet: { type: "boolean", description: "`true` when this call set `discountCurveId[currency]` to the new curve" },
+                discountCurveId: {
+                  type: "string",
+                  description: "Discount curve of the curve's currency after the call (absent when the currency still has none)",
+                },
+              },
             },
           },
           400,
@@ -288,15 +330,121 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       const m = ctx.market.get();
       const { valuationDate, spec } = resolveBootstrap(m, req.body);
       const res = bootstrapCurve(valuationDate, spec);
-      ctx.market.set({ ...m, curves: { ...m.curves, [res.curve.id]: res.curve } });
+      const ccy = res.curve.currency;
+      const setDiscount = req.body.isDiscountCurve ?? m.discountCurveId[ccy] === undefined;
+      const discountCurveId = setDiscount ? { ...m.discountCurveId, [ccy]: res.curve.id } : m.discountCurveId;
+      ctx.market.set({ ...m, curves: { ...m.curves, [res.curve.id]: res.curve }, discountCurveId });
       const tracked = ctx.market.setCurveQuotes(res.curve.id, spec.quotes);
       ctx.audit.append({
         actor: "api",
         action: "curve.replace",
         subject: res.curve.id,
-        details: { quotes: spec.quotes.length, merged: res.mergedQuotes?.length ?? 0, parRiskTracked: tracked, snapshotId: ctx.market.snapshotId() },
+        details: {
+          quotes: spec.quotes.length,
+          merged: res.mergedQuotes?.length ?? 0,
+          parRiskTracked: tracked,
+          discountCurveSet: setDiscount,
+          snapshotId: ctx.market.snapshotId(),
+        },
       });
-      return { ...curveSummary(res.curve, valuationDate), mergedQuotes: datesToIso(res.mergedQuotes ?? []) };
+      return {
+        ...curveSummary(res.curve, valuationDate),
+        mergedQuotes: datesToIso(res.mergedQuotes ?? []),
+        discountCurveSet: setDiscount,
+        ...(discountCurveId[ccy] ? { discountCurveId: discountCurveId[ccy] } : {}),
+      };
+    },
+  );
+
+  app.post<{ Body: RateIndex }>(
+    "/api/market/indices",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "registerIndex",
+        tags: ["market"],
+        summary: "Floating-Rate-Index zur Laufzeit registrieren (weitere Währungen/Indizes ohne Codeänderung; eingebaute Indizes nicht ersetzbar)",
+        description:
+          "Registers a floating-rate index in the core's register (`registerRateIndex`, validated: 3-letter currency, `type`, tenor `<n>M|W|Y` for IBOR / `1D` for OIS, known day count, registered calendar, non-negative fixing lag, curve id) so that `POST /api/market/bootstrap|curves`, swap legs, builders and CSV imports accept it. 201 for a new name, 200 when a runtime-registered index of the same name is replaced. A built-in index (`isBuiltInIndex`) cannot be replaced – 400 `INVALID_CURVE_SPEC` with `details.builtIn: true` – because its definition enters every valuation without appearing in the snapshot id; register a desk variant under its own name. Invalid definitions answer 400 `INVALID_CURVE_SPEC`. The register is process-wide and not part of the snapshot id; registrations are audited (`register.index`) and exported in the API snapshot envelope (`indices`, ADR-027).",
+        body: rateIndexRef,
+        response: responses(
+          {
+            201: { ...registerResponseSchema("index"), description: "Index registered (new name)" },
+            200: { ...registerResponseSchema("index"), description: "Runtime-registered index of the same name replaced" },
+          },
+          400,
+        ),
+      },
+    },
+    async (req, reply) => {
+      if (isBuiltInIndex(req.body.name)) {
+        return sendError(
+          reply,
+          req,
+          400,
+          "INVALID_CURVE_SPEC",
+          `${req.body.name.toUpperCase()} is a built-in index and cannot be replaced (its definition enters every valuation without a trace in the snapshot id) – register the variant under its own name, e.g. ${req.body.name.toUpperCase()}-DESK`,
+          { details: { index: req.body.name.toUpperCase(), builtIn: true } },
+        );
+      }
+      let result: { index: RateIndex; replaced: boolean };
+      try {
+        result = ctx.registry.registerIndex(req.body);
+      } catch (e) {
+        return registerFailure(reply, req, e);
+      }
+      ctx.audit.append({
+        actor: "api",
+        action: "register.index",
+        subject: result.index.name,
+        details: { replaced: result.replaced, definition: result.index as unknown as Record<string, unknown>, snapshotId: ctx.market.snapshotId() },
+      });
+      return reply
+        .status(result.replaced ? 200 : 201)
+        .send({ registered: true, replaced: result.replaced, index: result.index, currencies: knownCurrencies(), snapshotId: ctx.market.snapshotId() });
+    },
+  );
+
+  app.post<{ Body: SwapConventions }>(
+    "/api/market/conventions",
+    {
+      config: { marketHeader: true },
+      schema: {
+        operationId: "registerConventions",
+        tags: ["market"],
+        summary: "Swap-/OIS-Konventionen einer Währung registrieren (macht eine neue Währung bootstrap- und handelbar)",
+        description:
+          "Registers the vanilla-swap and OIS conventions of a currency (`registerSwapConventions`): afterwards the currency is listed in `GET /api/market` `currencies`, curves can be bootstrapped (`POST /api/market/curves` – the first one becomes the discount curve) and swaps, FRAs and FX trades built in it (builders, CSV import). Both indices must be registered (`POST /api/market/indices`) and belong to the currency, frequencies follow the leg pattern, day counts and calendar must be known – otherwise 400 `INVALID_CURVE_SPEC`. 201 for a new currency, 200 when existing conventions (runtime-registered or built-in) are replaced – built-in conventions may be overridden because they only shape builder defaults and bootstrap schedules, both visible in the trade / the curve nodes. Audited (`register.conventions`), exported in the API snapshot envelope (`conventions`, ADR-027).",
+        body: swapConventionsRef,
+        response: responses(
+          {
+            201: { ...registerResponseSchema("conventions"), description: "Conventions registered (new currency)" },
+            200: { ...registerResponseSchema("conventions"), description: "Existing conventions of the currency replaced" },
+          },
+          400,
+        ),
+      },
+    },
+    async (req, reply) => {
+      let result: { conventions: SwapConventions; replaced: boolean };
+      try {
+        result = ctx.registry.registerConventions(req.body);
+      } catch (e) {
+        return registerFailure(reply, req, e);
+      }
+      ctx.audit.append({
+        actor: "api",
+        action: "register.conventions",
+        subject: result.conventions.currency,
+        details: { replaced: result.replaced, definition: result.conventions as unknown as Record<string, unknown>, snapshotId: ctx.market.snapshotId() },
+      });
+      return reply.status(result.replaced ? 200 : 201).send({
+        registered: true,
+        replaced: result.replaced,
+        conventions: result.conventions,
+        currencies: knownCurrencies(),
+        snapshotId: ctx.market.snapshotId(),
+      });
     },
   );
 
@@ -311,6 +459,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       swaptionVols?: MarketContext["swaptionVols"];
       capletVols?: MarketContext["capletVols"];
       fxVols?: MarketContext["fxVols"];
+      discountCurveId?: Record<string, string>;
+      collateralDiscountCurveId?: Record<string, string>;
     };
   }>(
     "/api/market",
@@ -320,10 +470,12 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         operationId: "updateMarket",
         tags: ["market"],
         summary:
-          "Spots/Fixings/FX-Fixings/Spot-Daten/Fixing-Policy/Vol-Flächen setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut; Vol-Flächen je Key ersetzt, ohne kompletten Snapshot; strukturell geprüft → 400 VOL_SURFACE_INVALID)",
+          "Spots/Fixings/FX-Fixings/Spot-Daten/Fixing-Policy/Vol-Flächen/Diskontkurven-Zuordnung setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut, Beispiel-Fixings folgen dem Stichtag; Vol-Flächen je Key ersetzt, ohne kompletten Snapshot; strukturell geprüft → 400 VOL_SURFACE_INVALID)",
         description:
           "Vol surfaces are validated structurally before the market is touched (Markt R5-1): grid rows = expiries, row length = tenors / strikes, FX vectors = expiries, axes strictly increasing, finite non-negative quotes, key = `currency` / `currency-index` / `pair`. A malformed surface answers 400 `VOL_SURFACE_INVALID` with `problems[]` and leaves the market unchanged – it can no longer be stored and fail every later swaption valuation. " +
-          "Structurally sound but implausible surfaces (numbers that do not fit the declared `volType` – a Lognormal cube of normal-sized numbers, a Normal surface of lognormal-sized ones – or degenerate all-zero / constant grids, Markt R6-4) are stored and answered 200 with `warnings[]` (`VOL_IMPLAUSIBLE:` per surface); every valuation reading such a surface repeats the warning.",
+          "Structurally sound but implausible surfaces (numbers that do not fit the declared `volType` – a Lognormal cube of normal-sized numbers, a Normal surface of lognormal-sized ones – or degenerate all-zero / constant grids, Markt R6-4) are stored and answered 200 with `warnings[]` (`VOL_IMPLAUSIBLE:` per surface); every valuation reading such a surface repeats the warning. " +
+          "`discountCurveId` / `collateralDiscountCurveId` (Markt R7-3) merge into the snapshot's mappings after the curves are checked: a curve id that is not in the market answers 422 `CURVE_NOT_FOUND`, a discount curve in another currency than its key 400 `INVALID_REQUEST`; nothing is applied on a failed check. " +
+          "`valuationDate` rebuilds the sample market for the new date: the sample fixings follow it (`sampleFixings(valuationDate)` up to the day before, as in the workstation – Markt R7-4), fixings loaded via this route or a snapshot import are kept and win over a regenerated sample fixing of the same index and date; FX fixings, spots, spot dates, credit data and the fixing policy survive as before.",
         body: marketPutSchema,
         response: responses(
           {
@@ -332,6 +484,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
               properties: {
                 valuationDate: { type: "string" },
                 snapshotId: { type: "string" },
+                discountCurveId: objectResponse("Discount curve id per currency after the update"),
+                collateralDiscountCurveId: objectResponse("Collateral discount curve ids keyed `${ccy}|${collateralCcy}` after the update"),
                 fxSpots: objectResponse("Spot per pair"),
                 fixings: arrayResponse("{ index, date, value }[]"),
                 fxFixings: arrayResponse("{ pair, date, rate }[] – FX fixings for MtM-reset notionals"),
@@ -365,7 +519,31 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       // Plausibility (R6-4) is a warning, not a rejection: the surface is stored, the response and every valuation say so.
       const warnings = volSurfacePlausibilityWarnings(req.body);
       let m = ctx.market.get();
+      // Discount-curve mappings (R7-3) are checked against the market *before* anything is applied.
+      for (const [ccy, curveId] of Object.entries(req.body.discountCurveId ?? {})) {
+        const curve = m.curves[curveId];
+        if (!curve)
+          return sendError(reply, req, 422, "CURVE_NOT_FOUND", `discountCurveId.${ccy}: curve ${curveId} is not in the market`, {
+            details: { currency: ccy, curveId },
+          });
+        if (curve.currency !== ccy) {
+          return sendError(reply, req, 400, "INVALID_REQUEST", `discountCurveId.${ccy}: curve ${curveId} is denominated in ${curve.currency}, not ${ccy}`, {
+            details: { currency: ccy, curveId, curveCurrency: curve.currency },
+          });
+        }
+      }
+      for (const [key, curveId] of Object.entries(req.body.collateralDiscountCurveId ?? {})) {
+        if (!m.curves[curveId]) {
+          return sendError(reply, req, 422, "CURVE_NOT_FOUND", `collateralDiscountCurveId.${key}: curve ${curveId} is not in the market`, {
+            details: { key, curveId },
+          });
+        }
+      }
       if (req.body.valuationDate) m = ctx.market.rebuild(parseISO(req.body.valuationDate));
+      if (req.body.discountCurveId) m = { ...m, discountCurveId: { ...m.discountCurveId, ...req.body.discountCurveId } };
+      if (req.body.collateralDiscountCurveId) {
+        m = { ...m, collateralDiscountCurveId: { ...(m.collateralDiscountCurveId ?? {}), ...req.body.collateralDiscountCurveId } };
+      }
       if (req.body.fxSpots) m = { ...m, fxSpots: { ...m.fxSpots, ...req.body.fxSpots } };
       if (req.body.fxSpotDates) {
         const fxSpotDates = Object.fromEntries(Object.entries(req.body.fxSpotDates).map(([k, v]) => [k, parseISO(v)]));
@@ -403,6 +581,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
           spots: Object.keys(req.body.fxSpots ?? {}),
           fixings: req.body.fixings?.length ?? 0,
           fxFixings: req.body.fxFixings?.length ?? 0,
+          discountCurveId: req.body.discountCurveId ?? {},
+          collateralDiscountCurveId: req.body.collateralDiscountCurveId ?? {},
           snapshotId,
         },
       });
@@ -412,6 +592,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       return {
         valuationDate: toISO(m.valuationDate),
         snapshotId,
+        discountCurveId: m.discountCurveId,
+        collateralDiscountCurveId: m.collateralDiscountCurveId ?? {},
         fxSpots: m.fxSpots,
         fixings: datesToIso(m.fixings),
         fxFixings: datesToIso(m.fxFixings ?? []),

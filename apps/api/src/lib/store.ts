@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import {
   type CurveQuote,
+  type Fixing,
   type MarketContext,
+  type RateIndex,
   type SampleMarketQuotes,
+  type SwapConventions,
   type Trade,
   SAMPLE_CURVE_IDS,
   SAMPLE_QUOTES,
   advance,
   buildSampleMarket,
   getCalendar,
+  knownCurrencies,
+  knownIndices,
   makeCapFloor,
   makeFxForward,
   makeFxOption,
@@ -16,6 +21,9 @@ import {
   makeVanillaSwap,
   marketSnapshotId,
   parseISO,
+  registerRateIndex,
+  registerSwapConventions,
+  sampleFixings,
   stableStringify,
 } from "@deriva/pricing-core";
 
@@ -91,7 +99,7 @@ export class MarketStore implements MarketRepository {
     const fresh = buildSampleMarket(valuationDate, { ...this.quotes, fxSpots: { ...this.quotes.fxSpots, ...prev.fxSpots } });
     this.ctx = {
       ...fresh,
-      fixings: prev.fixings ?? fresh.fixings,
+      fixings: rebuiltFixings(prev, fresh),
       // FX fixings of past MtM-reset dates are history, not sample-market data – they survive a valuation-date change.
       ...(prev.fxFixings ? { fxFixings: prev.fxFixings } : {}),
       credit: prev.credit ?? fresh.credit,
@@ -99,6 +107,59 @@ export class MarketStore implements MarketRepository {
       ...(prev.missingFixingPolicy ? { missingFixingPolicy: prev.missingFixingPolicy } : {}),
     };
     return this.ctx;
+  }
+}
+
+const fixingKey = (f: Fixing) => `${f.index.toUpperCase()}@${f.date}`;
+
+/**
+ * Fixings after a valuation-date rebuild (Markt R7-4): the sample fixings follow the new date
+ * (`sampleFixings(valuationDate)` – one per TARGET business day up to the day before, exactly what
+ * `buildSampleMarket` generates and what the workstation shows), while fixings the user loaded via
+ * `PUT /api/market { fixings }` or a snapshot import are history and survive. A user fixing is every
+ * previous fixing that was not part of the previous date's sample set (same index, date and value);
+ * it wins over a regenerated sample fixing of the same index and date. Before round 7 the rebuild
+ * kept the old sample fixings, so the API reported `MISSING_FIXING` for periods the UI valued cleanly.
+ */
+export function rebuiltFixings(prev: MarketContext, fresh: MarketContext): Fixing[] {
+  const prevSample = new Set(sampleFixings(prev.valuationDate).map((f) => `${fixingKey(f)}=${f.value}`));
+  const user = (prev.fixings ?? []).filter((f) => !prevSample.has(`${fixingKey(f)}=${f.value}`));
+  const userKeys = new Set(user.map(fixingKey));
+  return [...(fresh.fixings ?? []).filter((f) => !userKeys.has(fixingKey(f))), ...user];
+}
+
+/**
+ * Runtime register of floating-rate indices and swap conventions (Markt R6-5 rest, ADR-027). The core
+ * register is process-wide (`registerRateIndex` / `registerSwapConventions` mutate `RATE_INDICES` /
+ * `SWAP_CONVENTIONS`); this store remembers what was registered through the API so the snapshot
+ * export can carry it (`indices` / `conventions` of the API envelope) and an import re-registers it.
+ * Built-in indices cannot be replaced (the core throws `INVALID_CURVE_SPEC`, N7-7); conventions of a
+ * built-in currency may be overridden and are exported like any other registration.
+ */
+export class RegisterStore {
+  private indices = new Map<string, RateIndex>();
+  private conventions = new Map<string, SwapConventions>();
+  /** Register (validated by the core – throws `PricingError("INVALID_CURVE_SPEC")`); `replaced` = the name was already registered at runtime. */
+  registerIndex(def: RateIndex): { index: RateIndex; replaced: boolean } {
+    const replaced = knownIndices().some((ix) => ix.name === def.name.toUpperCase());
+    const index = registerRateIndex(def);
+    this.indices.set(index.name, index);
+    return { index, replaced };
+  }
+  /** Register conventions (validated by the core); `replaced` = the currency already had conventions (runtime or built-in). */
+  registerConventions(conv: SwapConventions): { conventions: SwapConventions; replaced: boolean } {
+    const replaced = knownCurrencies().includes(conv.currency.toUpperCase());
+    const conventions = registerSwapConventions(conv);
+    this.conventions.set(conventions.currency, conventions);
+    return { conventions, replaced };
+  }
+  /** Indices registered through this API instance (sorted by name). */
+  listIndices(): RateIndex[] {
+    return [...this.indices.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  /** Conventions registered through this API instance (sorted by currency). */
+  listConventions(): SwapConventions[] {
+    return [...this.conventions.values()].sort((a, b) => a.currency.localeCompare(b.currency));
   }
 }
 

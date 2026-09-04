@@ -6,7 +6,7 @@
   "license": "MIT",
   "packageManager": "pnpm@10.33.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.22"
   },
   "scripts": {
     "build": "pnpm --filter @deriva/pricing-core run build && pnpm --filter @deriva/api run build && pnpm --filter @deriva/web run build",

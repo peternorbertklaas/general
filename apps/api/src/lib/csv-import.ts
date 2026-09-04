@@ -143,7 +143,8 @@ export const CSV_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     example: ["EURUSD", "10.000.000", "2026-09-07", "5Y", "CCS-CSV-1", "", "CPTY-A", "", "", "1,17", "", "-20 bp", "", "Receive", "3M", ""],
     notes:
       "exactly one of `fxSpot` / `foreignNotional` is required and fixes the foreign leg; `spread` decimal, `%` or `bp` (default 0); `fixedRate` makes the domestic leg fixed. " +
-      "`collateralCurrency`: ISO code of the CSA currency, empty = market default (USD when one leg is USD, else the quote currency of the pair), `none` (also `unbesichert`, `ohne`) = explicitly uncollateralised – both legs on their own OIS curves, the built trade carries no `collateralCurrency` (same semantics as the web template's `collateral` column).",
+      "`collateralCurrency`: ISO code of the CSA currency, empty = market default (USD when one leg is USD, else the quote currency of the pair), `none` (also `unbesichert`, `ohne`) = explicitly uncollateralised – both legs on their own OIS curves, the built trade carries no `collateralCurrency` (same semantics as the web template's `collateral` column). " +
+      "Column aliases (Markt R7-5 – the workstation's older CCS template): `notional` → `domesticNotional`, `start` → `effectiveDate`, `maturity` → `tenor`, `rate` / `fixed rate` → `fixedRate`, `direction` / `payReceive` → `domesticPayReceive`, `collateral` / `csa` → `collateralCurrency`; a file exported by the workstation imports unchanged, and the workstation's template now carries these API names.",
   },
   FRA: {
     type: "FRA",
@@ -226,6 +227,13 @@ const ALIASES: Record<string, string> = {
   ccy: "currency",
   nominal: "notional",
   betrag: "notional",
+  // Identity aliases: let the generic column names reach the vocabulary rules below (`notional` → `domesticNotional`
+  // / `baseAmount`, `payReceive` → `domesticPayReceive` / `payerReceiver`, `rate` → `fixedRate`) – the workstation's
+  // older CCS template used them (Markt R7-5).
+  notional: "notional",
+  payreceive: "payReceive",
+  rate: "rate",
+  maturity: "maturity",
   richtung: "payReceive",
   direction: "payReceive",
   payrec: "payReceive",
@@ -299,6 +307,7 @@ function canonicalColumn(header: string, template: CsvTemplate): string | undefi
   if (alias === "start" && known.includes("effectiveDate")) return "effectiveDate";
   if (alias === "maturity" && known.includes("tenor")) return "tenor";
   if (alias === "fixedRate" && known.includes("rate")) return "rate";
+  if (alias === "rate" && known.includes("fixedRate")) return "fixedRate";
   if (alias === "fixedRate" && known.includes("strike")) return "strike";
   if (alias === "expiry" && known.includes("expiryDate")) return "expiryDate";
   if (alias === "notional" && known.includes("domesticNotional")) return "domesticNotional";

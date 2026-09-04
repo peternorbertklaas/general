@@ -10,7 +10,7 @@ import Fastify, { LogController, type FastifyInstance, type FastifyServerOptions
 import { toISO } from "@deriva/pricing-core";
 import { classifyError, sendError } from "./lib/errors.js";
 import { type ComputeLimits, defaultLimits, registerComputeLimits } from "./lib/limits.js";
-import { AuditLog, MarketStore, TradeStore, samplePortfolio } from "./lib/store.js";
+import { AuditLog, MarketStore, RegisterStore, TradeStore, samplePortfolio } from "./lib/store.js";
 import { registerAuditRoutes } from "./routes/audit.js";
 import { registerHedgeRoutes } from "./routes/hedge.js";
 import { registerDocumentRoutes } from "./routes/documents.js";
@@ -26,7 +26,9 @@ import {
   errorResponseSchema,
   fromTemplateBranchSchemas,
   marketSnapshotSchema,
+  rateIndexSchema,
   responsesUnlimited,
+  swapConventionsSchema,
   tradeSchema,
   tradeVariantSchemas,
 } from "./schemas.js";
@@ -66,6 +68,8 @@ export interface AppOptions {
 export interface AppContext {
   market: MarketStore;
   trades: TradeStore;
+  /** Indices / swap conventions registered at runtime through the API (snapshot `indices`/`conventions`, ADR-027). */
+  registry: RegisterStore;
   audit: AuditLog;
   version: string;
   limits: ComputeLimits;
@@ -202,6 +206,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   const ctx: AppContext = {
     market: new MarketStore(),
     trades: new TradeStore(),
+    registry: new RegisterStore(),
     audit: new AuditLog(),
     version: readVersion(),
     limits: { ...defaultLimits(), ...opts.limits },
@@ -286,6 +291,9 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   for (const s of tradeVariantSchemas) app.addSchema(s);
   for (const s of fromTemplateBranchSchemas) app.addSchema(s);
   app.addSchema(tradeSchema);
+  // Register entries (referenced by the snapshot envelope's `indices` / `conventions`, ADR-027) before the snapshot schema.
+  app.addSchema(rateIndexSchema);
+  app.addSchema(swapConventionsSchema);
   app.addSchema(marketSnapshotSchema);
   app.addSchema(errorResponseSchema);
 
