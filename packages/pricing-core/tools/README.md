@@ -63,12 +63,13 @@ git diff test-data/golden                        # review the quantlib blocks, c
 
 What the cross-check computes:
 
-| Case                      | QuantLib objects                                                                                                             |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `swap-flat-curve`         | `VanillaSwap` on `FlatForward(0.03, Actual365Fixed, Continuous)`, `NullCalendar`, `Unadjusted` → `NPV`, `fairRate`, leg NPVs |
-| `black76-bachelier`       | `blackFormula`, `bachelierBlackFormula`                                                                                      |
-| `sample-market-bootstrap` | `PiecewiseLogLinearDiscount` from `OISRateHelper`s on an `OvernightIndex` (TARGET, spot lag 2, payment lag 1, `Annual`)      |
-| `cds-hazard-bootstrap`    | `PiecewiseFlatHazardRate` from `SpreadCdsHelper`s (ISDA engine, `Quarterly`, `Actual360` premium, flat 2 % discount, R 40 %) |
+| Case                      | QuantLib objects                                                                                                                                                                                         |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `swap-flat-curve`         | `VanillaSwap` on `FlatForward(0.03, Actual365Fixed, Continuous)`, `NullCalendar`, `Unadjusted` → `NPV`, `fairRate`, leg NPVs                                                                             |
+| `black76-bachelier`       | `blackFormula`, `bachelierBlackFormula`                                                                                                                                                                  |
+| `sample-market-bootstrap` | `PiecewiseLogLinearDiscount` from `OISRateHelper`s on an `OvernightIndex` (TARGET, spot lag 2, payment lag 1, `Annual`)                                                                                  |
+| `cds-hazard-bootstrap`    | `PiecewiseFlatHazardRate` from `SpreadCdsHelper`s (ISDA engine, `Quarterly`, `Actual360` premium, flat 2 % discount, R 40 %)                                                                             |
+| `calendars-quantlib`      | `TARGET()`, `Norway()`, `Sweden()`, `Denmark()`, `Poland()` → `Calendar.holidayList(1.1.–31.12., includeWeekends=False)` for 2024–2032 (N7-4; the file has no `expected` block – it is vendor data only) |
 
 Expected (and asserted) agreement:
 
@@ -80,6 +81,9 @@ Expected (and asserted) agreement:
   the business-day-adjusted coupon schedule. Largest difference at 1Y: QuantLib
   168.10 bp vs engine 168.56 bp for 100 bp / R 40 % (QuantLib's own later pillars of
   a flat 100 bp curve are 168.57 bp); the round-4 ACT/365F accrual gave 166.67 bp;
+- calendars (N7-4): **weekday holidays identical per calendar and year** 2024–2032
+  for TARGET / NO / SE / DK / PL, except the documented `knownEngineOnly` dates
+  (PL 24.12. from 2025, a statutory holiday QuantLib 1.43 does not have yet);
 - sample bootstrap: **DF ratios between neighbouring pillars 1e-12** (identical
   schedules, calendar, stub rule, payment lag and interpolation), **absolute pillar
   DFs within 5e-8 – uniformly +1.87·10⁻⁸** on every pillar. The uniform factor is

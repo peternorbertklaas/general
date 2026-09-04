@@ -3,7 +3,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { type CurveQuote, bootstrapCurve } from "../curves/bootstrap.js";
 import { flatCurve } from "../curves/curve.js";
-import { parseISO, toISO } from "../dates/date.js";
+import { getCalendar } from "../dates/calendar.js";
+import { fromYMD, isWeekend, parseISO, toISO } from "../dates/date.js";
 import { makeFxForward } from "../instruments/builders.js";
 import { type CapFloor, type InterestRateSwap, type Swaption } from "../instruments/types.js";
 import { type MarketContext } from "../market/market-context.js";
@@ -526,5 +527,61 @@ describe("golden master – sample-market €STR OIS bootstrap (calendar, paymen
     const ctx = buildSampleMarket(val);
     const c = ctx.curves[SAMPLE_CURVE_IDS.eurOis]!;
     for (const p of g.expected.pillars) expectRel(c.df(parseISO(p.date)), p.df, `sample DF ${p.tenor}`, 1e-9);
+  });
+});
+
+describe("golden master – calendars vs QuantLib (N7-4: TARGET / NO / SE / DK / PL weekday holidays 2024–2032)", () => {
+  interface G {
+    inputs: { years: number[]; calendars: Record<string, string> };
+    knownEngineOnly: Record<string, { reason: string; dates: string[] }>;
+    quantlib: { status: string; version?: string; holidays: Record<string, Record<string, string[]>> };
+  }
+  const g = golden<G>("calendars-quantlib");
+
+  /** Weekday holidays of the engine calendar `id` in `year`, ISO, ascending. */
+  function engineHolidays(id: string, year: number): string[] {
+    const cal = getCalendar(id);
+    const out: string[] = [];
+    for (let d = fromYMD(year, 1, 1); d <= fromYMD(year, 12, 31); d++) if (!isWeekend(d) && cal.isHoliday(d)) out.push(toISO(d));
+    return out;
+  }
+
+  it("the block was generated with QuantLib 1.43 and covers 2024–2032", () => {
+    expect(g.quantlib.status).toBe("done");
+    expect(g.quantlib.version ?? "1.43").toMatch(/^1\.\d+/);
+    expect(g.inputs.years).toEqual([2024, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032]);
+    expect(Object.keys(g.quantlib.holidays).sort()).toEqual(["DK", "NO", "PL", "SE", "TARGET"]);
+  });
+
+  it("every engine calendar reproduces QuantLib's weekday holidays year by year; the only differences are the documented engine-only dates", () => {
+    for (const [id, perYear] of Object.entries(g.quantlib.holidays)) {
+      const engineOnly = new Set(g.knownEngineOnly[id]?.dates ?? []);
+      for (const y of g.inputs.years) {
+        const ql = perYear[String(y)]!;
+        const engine = engineHolidays(id, y);
+        const missing = ql.filter((d) => !engine.includes(d));
+        const extra = engine.filter((d) => !ql.includes(d) && !engineOnly.has(d));
+        expect(missing, `${id} ${y}: QuantLib holidays missing in the engine`).toEqual([]);
+        expect(extra, `${id} ${y}: engine holidays unknown to QuantLib`).toEqual([]);
+      }
+    }
+  });
+
+  it("N7-4 regressions: DK Friday after Ascension and NO Christmas Eve are holidays, NO New Year's Eve stays a business day (as in QuantLib), PL keeps 24.12. from 2025", () => {
+    expect(g.quantlib.holidays.DK!["2026"]).toContain("2026-05-15");
+    expect(engineHolidays("DK", 2026)).toContain("2026-05-15");
+    expect(g.quantlib.holidays.NO!["2026"]).toContain("2026-12-24");
+    expect(engineHolidays("NO", 2026)).toContain("2026-12-24");
+    expect(g.quantlib.holidays.NO!["2026"]).not.toContain("2026-12-31");
+    expect(engineHolidays("NO", 2026)).not.toContain("2026-12-31");
+    // Store Bededag (4th Friday after Easter) is gone from 2024 in both: 2024-04-26 is a business day.
+    expect(g.quantlib.holidays.DK!["2024"]).not.toContain("2024-04-26");
+    expect(engineHolidays("DK", 2024)).not.toContain("2024-04-26");
+    // Poland: the engine is ahead of QuantLib 1.43 (statutory holiday from 2025) – documented in the golden file.
+    expect(g.knownEngineOnly.PL!.dates).toEqual(["2025-12-24", "2026-12-24", "2027-12-24", "2029-12-24", "2030-12-24", "2031-12-24", "2032-12-24"]);
+    expect(g.knownEngineOnly.PL!.reason).toMatch(/Dz\.U\. 2024 poz\. 1965/);
+    expect(engineHolidays("PL", 2025)).toContain("2025-12-24");
+    expect(engineHolidays("PL", 2024)).not.toContain("2024-12-24");
+    expect(g.quantlib.holidays.PL!["2025"]).not.toContain("2025-12-24");
   });
 });

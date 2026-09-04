@@ -251,10 +251,10 @@ describe("Markt R6-4 – vol plausibility warnings", () => {
     expect(w3).toContainEqual(expect.stringMatching(/^VOL_IMPLAUSIBLE: capletVols\.EUR-EURIBOR-6M has \d+ of \d+ normal vols above 1000 bp \(max 5000 bp\)/));
     expect(w3).toContainEqual(expect.stringMatching(/^VOL_IMPLAUSIBLE: capletVols\.EUR-EURIBOR-6M: median normal vol 5000 bp is above 500 bp/));
     const w4 = volSurfaceWarnings({ fxVols: { EURUSD: { ...eurusd, atm: eurusd.atm.map(() => 4) } } });
-    expect(w4).toEqual([expect.stringMatching(/^VOL_IMPLAUSIBLE: fxVols\.EURUSD has \d+ of \d+ lognormal vols above 300 %/)]);
-    // per-value bounds alone: a single 0.05 % point on an otherwise normal-looking lognormal smile
-    const w5 = volSurfaceWarnings({ fxVols: { EURUSD: { ...eurusd, atm: eurusd.atm.map((v, i) => (i === 0 ? 0.0005 : v)) } } });
-    expect(w5).toEqual([expect.stringMatching(/^VOL_IMPLAUSIBLE: fxVols\.EURUSD has 1 of \d+ lognormal vols below 0\.10 % \(min 0\.05 %\)/)]);
+    expect(w4).toEqual([expect.stringMatching(/^VOL_IMPLAUSIBLE: fxVols\.EURUSD has \d+ of \d+ FX vols above 300 %/)]);
+    // per-value bounds alone: a single 0.03 % point on an otherwise normal-looking smile (FX floor 0.05 % since N7-6)
+    const w5 = volSurfaceWarnings({ fxVols: { EURUSD: { ...eurusd, atm: eurusd.atm.map((v, i) => (i === 0 ? 0.0003 : v)) } } });
+    expect(w5).toEqual([expect.stringMatching(/^VOL_IMPLAUSIBLE: fxVols\.EURUSD has 1 of \d+ FX vols below 0\.05 % \(min 0\.03 %\)/)]);
     // a single legitimate zero (R5 boundary case) is not a warning; a structurally broken surface is skipped here
     expect(volSurfaceWarnings({ fxVols: { EURUSD: { ...eurusd, atm: eurusd.atm.map((v, i) => (i === 0 ? 0 : v)) } } })).toEqual([]);
     expect(volSurfaceWarnings({ swaptionVols: { EUR: { ...eurCube, atm: [[0.005]] } } })).toEqual([]);
@@ -292,7 +292,10 @@ describe("Markt R6-4 – vol plausibility warnings", () => {
       payReceive: "Receive" as const,
     };
     const tinyFx: MarketContext = { ...ctx, fxVols: { ...ctx.fxVols, EURUSD: { ...eurusd, atm: eurusd.atm.map(() => 0.0007) } } };
-    expect(priceTrade(tinyFx, fxo, "USD").warnings.some((w) => w.startsWith(VOL_IMPLAUSIBLE_PREFIX) && w.includes("lognormal vols below 0.10 %"))).toBe(true);
+    // N7-6: 0.07 % everywhere is a 1/100-scaled import (median rule, FX wording), not a pegged pair
+    expect(
+      priceTrade(tinyFx, fxo, "USD").warnings.some((w) => w.startsWith(VOL_IMPLAUSIBLE_PREFIX) && w.includes("median FX vol 0.07 % is below 0.20 %")),
+    ).toBe(true);
     // the plausible sample market prices without the warning and the snapshot validation is unaffected
     expect(priceTrade(ctx, fxo, "USD").warnings.some((w) => w.startsWith(VOL_IMPLAUSIBLE_PREFIX))).toBe(false);
     expect(validateMarket(zeroCube)).toEqual([]);

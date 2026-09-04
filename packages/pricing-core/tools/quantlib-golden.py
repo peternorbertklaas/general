@@ -791,6 +791,59 @@ def ql_cds_check():  # pragma: no cover
     }
 
 
+# --------------------------------------------------------------------------
+# J. Calendar cross-check (Quant R7, N7-4): weekday holidays of the rule-based
+#    engine calendars vs QuantLib's calendars, 2024–2032. Pure vendor data –
+#    there is no closed form; the file is only meaningful with QuantLib.
+# --------------------------------------------------------------------------
+CALENDAR_YEARS = list(range(2024, 2033))
+# engine calendar id → QuantLib constructor
+CALENDARS_QL = {
+    "TARGET": "TARGET",
+    "NO": "Norway",
+    "SE": "Sweden",
+    "DK": "Denmark",
+    "PL": "Poland",
+}
+# Documented, intentional differences (engine right, vendor lagging): the engine keeps these holidays.
+KNOWN_ENGINE_ONLY = {
+    "PL": {
+        "reason": "Christmas Eve (24.12.) is a statutory public holiday in Poland from 2025 (Act of 6 December 2024, Dz.U. 2024 poz. 1965); QuantLib 1.43 `Poland` does not include it yet.",
+        "dates": [dt.date(y, 12, 24).isoformat() for y in CALENDAR_YEARS if y >= 2025 and dt.date(y, 12, 24).weekday() < 5],
+    }
+}
+
+
+def golden_calendars() -> None:
+    """Weekday holidays per calendar and year from QuantLib
+    (`Calendar.holidayList(from, to, includeWeekends=False)`), ISO dates. The engine
+    test (`src/testing/golden.test.ts`) lists every weekday holiday of its rule-based
+    calendar over the same years and requires set equality except for the
+    `knownEngineOnly` dates (engine ahead of the vendor: PL 24.12. from 2025)."""
+    holidays = {}
+    if HAVE_QL:
+        for cal_id, ctor in CALENDARS_QL.items():
+            cal = getattr(ql, ctor)()
+            per_year = {}
+            for y in CALENDAR_YEARS:
+                lst = ql.Calendar.holidayList(cal, ql.Date(1, 1, y), ql.Date(31, 12, y), False)
+                per_year[str(y)] = [x.ISO() for x in lst]
+            holidays[cal_id] = per_year
+    payload = {
+        "case": "calendars-quantlib",
+        "description": "Weekday holidays 2024–2032 of the rule-based engine calendars TARGET / NO (Oslo) / SE (Stockholm) / DK (Copenhagen) / PL (Warsaw) cross-checked against QuantLib's TARGET / Norway / Sweden / Denmark / Poland calendars (Quant R7, N7-4: DK Friday after Ascension, NO Christmas Eve).",
+        "derivation": golden_calendars.__doc__.strip(),
+        "inputs": {"years": CALENDAR_YEARS, "calendars": CALENDARS_QL},
+        "knownEngineOnly": KNOWN_ENGINE_ONLY,
+        "quantlib": (
+            {"status": "done", "version": ql.__version__, "engine": "Calendar.holidayList(includeWeekends=False)", "holidays": holidays}
+            if HAVE_QL
+            else {"status": "pending", "note": "QuantLib not installed when the file was generated; run tools/quantlib-golden.py with the QuantLib Python bindings to fill in the holiday lists."}
+        ),
+    }
+    write("calendars-quantlib.json", payload)
+
+
 if __name__ == "__main__":
     print("QuantLib available:", HAVE_QL)
     golden_swap()
@@ -802,4 +855,5 @@ if __name__ == "__main__":
     golden_cap()
     golden_sample_bootstrap()
     golden_cds()
+    golden_calendars()
     sys.exit(0)

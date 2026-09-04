@@ -297,19 +297,45 @@ function checkCalendar(id: unknown, what: string, def: unknown): void {
   }
 }
 
+/** Names of the indices shipped with the engine (frozen at module load, N7-7). */
+const BUILT_IN_INDEX_NAMES: ReadonlySet<string> = new Set(Object.keys(RATE_INDICES));
+
+/** True when `name` (any case) is one of the indices shipped with the engine (`EURIBOR-6M`, `SOFR`, `NIBOR-6M`, …). */
+export function isBuiltInIndex(name: string): boolean {
+  return BUILT_IN_INDEX_NAMES.has(String(name).toUpperCase());
+}
+
 /**
- * Register (or replace) a floating-rate index at runtime. Validates the
- * definition (3-letter currency, type, tenor "<n>M|W|Y" for IBOR / "1D" for
- * OIS, known day count, registered calendar, non-negative integer fixing lag,
- * curve id) and raises `PricingError("INVALID_CURVE_SPEC")` otherwise. The
- * name is stored upper-cased, exactly as `getIndex` looks it up; after the
- * call the index can be used in curve specs (`bootstrapCurves`), swap legs and
- * builders. Returns the stored definition.
+ * Register a floating-rate index at runtime (or replace one registered at
+ * runtime). Validates the definition (3-letter currency, type, tenor "<n>M|W|Y"
+ * for IBOR / "1D" for OIS, known day count, registered calendar, non-negative
+ * integer fixing lag, curve id) and raises `PricingError("INVALID_CURVE_SPEC")`
+ * otherwise. The name is stored upper-cased, exactly as `getIndex` looks it up;
+ * after the call the index can be used in curve specs (`bootstrapCurves`), swap
+ * legs and builders. Returns the stored definition.
+ *
+ * Built-in indices cannot be replaced (N7-7, `INVALID_CURVE_SPEC`): an index
+ * definition (day count, fixing calendar / lag, projection curve) enters the
+ * valuation of every trade referencing the name without appearing in the trade
+ * or in the market snapshot, so a redefined `EURIBOR-6M` would change PVs
+ * (10Y payer −104 453.86 → −69 635.91 with ACT/365F) while `marketSnapshotId`,
+ * `inputsHash` and `reportHash` stay identical. Register a desk-specific
+ * variant under its own name instead (`EURIBOR-6M-ACT365`) and reference it
+ * from the trade. `registerSwapConventions` may still override a built-in
+ * currency's conventions: they only shape builder defaults and bootstrap
+ * schedules, both of which are visible in the trade / the curve nodes.
  */
 export function registerRateIndex(def: RateIndex): RateIndex {
   const what = `registerRateIndex(${isStr(def?.name) ? def.name : "?"})`;
   if (!def || typeof def !== "object") invalid(what, "definition must be an object", def);
   if (!isStr(def.name) || /\s/.test(def.name)) invalid(what, "name must be a non-empty string without whitespace", def);
+  if (isBuiltInIndex(def.name)) {
+    invalid(
+      what,
+      `${def.name.toUpperCase()} is a built-in index and cannot be replaced (valuations would change without a trace in the snapshot id); register the variant under a new name`,
+      def,
+    );
+  }
   if (!isStr(def.currency) || !/^[A-Za-z]{3}$/.test(def.currency)) invalid(what, "currency must be a 3-letter code", def);
   if (def.type !== "IBOR" && def.type !== "OIS") invalid(what, 'type must be "IBOR" or "OIS"', def);
   if (def.type === "OIS" ? def.tenor !== "1D" : !/^[1-9]\d{0,2}[MWY]$/i.test(String(def.tenor))) {

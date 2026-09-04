@@ -223,24 +223,35 @@ export const VOL_IMPLAUSIBLE_PREFIX = "VOL_IMPLAUSIBLE:";
 
 /**
  * Plausibility thresholds (decimal vols). Per value: lognormal /
- * shifted-lognormal and FX vols must lie in [0.1 %, 300 %], normal
- * (basis-point) vols in [0.1 bp, 1000 bp]; exact zeros are tolerated
- * individually (a legitimate boundary value, R5) but a surface consisting only
- * of zeros is degenerate. Per surface: the median decides whether the numbers
- * fit the declared quotation – a Lognormal surface with median < 1 % looks
- * like normal (bp) numbers, a Normal surface with median > 500 bp like
- * lognormal numbers (the reviewer's probe: `volType: "Lognormal"` on a cube of
- * 0.0097 valued a swaption at ≈ 0 without a signal).
+ * shifted-lognormal IR vols must lie in [0.1 %, 300 %], normal (basis-point)
+ * vols in [0.1 bp, 1000 bp], FX vols in [0.05 %, 300 %]; exact zeros are
+ * tolerated individually (a legitimate boundary value, R5) but a surface
+ * consisting only of zeros is degenerate. Per surface: the median decides
+ * whether the numbers fit the declared quotation – a Lognormal IR surface with
+ * median < 1 % looks like normal (bp) numbers, a Normal surface with median
+ * > 500 bp like lognormal numbers (the reviewer's probe: `volType: "Lognormal"`
+ * on a cube of 0.0097 valued a swaption at ≈ 0 without a signal).
+ *
+ * FX surfaces (N7-6) have no `volType` – they are always lognormal decimals –
+ * and pegged / managed pairs quote genuinely small vols (EURDKK in ERM II
+ * ±2.25 %: ATM 0.3–1 %; USDHKD band: 0.3–1.6 %), so the 1 % median rule
+ * produced false alarms. The FX median floor is 0.2 %: a pegged surface passes,
+ * a surface imported at 1/100 scale (EURUSD 7 % → 0.07 %, USDJPY 10 % → 0.1 %)
+ * is still caught, and the message speaks of scaling, not of a `volType`.
  */
 export const VOL_PLAUSIBILITY = {
   lognormalMin: 0.001,
   lognormalMax: 3,
   normalMin: 0.00001,
   normalMax: 0.1,
-  /** Median below this on a Lognormal surface → quotation suspicious. */
+  /** Median below this on a Lognormal IR surface → quotation suspicious. */
   lognormalMedianMin: 0.01,
   /** Median above this on a Normal surface → quotation suspicious. */
   normalMedianMax: 0.05,
+  /** FX surfaces (N7-6): per-value floor – short-dated vols of pegged pairs sit around 0.1–0.3 %. */
+  fxMin: 0.0005,
+  /** FX surfaces (N7-6): median below this → import scaled by 1/100 (pegged pairs stay above it). */
+  fxMedianMin: 0.002,
 } as const;
 
 function median(values: number[]): number {
@@ -253,46 +264,61 @@ function fmtVol(v: number, normal: boolean): string {
   return normal ? `${(v * 1e4).toFixed(v * 1e4 < 1 ? 2 : 0)} bp` : `${(v * 100).toFixed(v * 100 < 1 ? 2 : 0)} %`;
 }
 
-/** `VOL_IMPLAUSIBLE:` messages for a flat list of vols in the quotation `volType` (Lognormal unless "Normal"). */
-function implausibleVols(values: number[], volType: unknown, path: string): string[] {
+/**
+ * `VOL_IMPLAUSIBLE:` messages for a flat list of vols in the quotation `volType`
+ * (Lognormal unless "Normal"); `fx` marks an FX surface (lognormal without a
+ * `volType`, pegged-pair thresholds and scaling-oriented wording, N7-6).
+ */
+function implausibleVols(values: number[], volType: unknown, path: string, fx = false): string[] {
   const finite = values.filter(isNum);
   if (finite.length === 0) return [];
   if (finite.every((v) => v === 0)) return [`${VOL_IMPLAUSIBLE_PREFIX} ${path} is degenerate – every vol is 0 (options are valued at intrinsic value only)`];
-  const normal = volType === "Normal";
-  const min = normal ? VOL_PLAUSIBILITY.normalMin : VOL_PLAUSIBILITY.lognormalMin;
+  const normal = !fx && volType === "Normal";
+  const min = fx ? VOL_PLAUSIBILITY.fxMin : normal ? VOL_PLAUSIBILITY.normalMin : VOL_PLAUSIBILITY.lognormalMin;
   const max = normal ? VOL_PLAUSIBILITY.normalMax : VOL_PLAUSIBILITY.lognormalMax;
+  const medianMin = fx ? VOL_PLAUSIBILITY.fxMedianMin : VOL_PLAUSIBILITY.lognormalMedianMin;
   const out: string[] = [];
   const high = finite.filter((v) => v > max);
   const low = finite.filter((v) => v > 0 && v < min);
-  const quotation = normal ? "normal" : "lognormal";
+  const quotation = fx ? "FX" : normal ? "normal" : "lognormal";
   const med = median(finite.filter((v) => v > 0));
   if (normal && med > VOL_PLAUSIBILITY.normalMedianMax) {
     out.push(
       `${VOL_IMPLAUSIBLE_PREFIX} ${path}: median normal vol ${fmtVol(med, true)} is above ${fmtVol(VOL_PLAUSIBILITY.normalMedianMax, true)} – the numbers look like lognormal vols; check the volType of the import`,
     );
-  } else if (!normal && med > 0 && med < VOL_PLAUSIBILITY.lognormalMedianMin) {
+  } else if (fx && med > 0 && med < medianMin) {
     out.push(
-      `${VOL_IMPLAUSIBLE_PREFIX} ${path}: median lognormal vol ${fmtVol(med, false)} is below ${fmtVol(VOL_PLAUSIBILITY.lognormalMedianMin, false)} – the numbers look like normal (bp) vols; check the volType of the import`,
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path}: median FX vol ${fmtVol(med, false)} is below ${fmtVol(medianMin, false)} – FX vols are lognormal decimals (0.08 = 8 %); the numbers look scaled by 1/100, check the scaling of the import (pegged pairs such as EURDKK quote 0.3–1 %)`,
+    );
+  } else if (!normal && !fx && med > 0 && med < medianMin) {
+    out.push(
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path}: median lognormal vol ${fmtVol(med, false)} is below ${fmtVol(medianMin, false)} – the numbers look like normal (bp) vols; check the volType of the import`,
     );
   }
   if (high.length) {
     out.push(
-      `${VOL_IMPLAUSIBLE_PREFIX} ${path} has ${high.length} of ${finite.length} ${quotation} vols above ${fmtVol(max, normal)} (max ${fmtVol(Math.max(...high), normal)}) – check the volType / quotation of the import`,
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path} has ${high.length} of ${finite.length} ${quotation} vols above ${fmtVol(max, normal)} (max ${fmtVol(Math.max(...high), normal)}) – ${fx ? "FX vols are lognormal decimals (0.08 = 8 %); check the scaling of the import" : "check the volType / quotation of the import"}`,
     );
   }
   if (low.length) {
     out.push(
-      `${VOL_IMPLAUSIBLE_PREFIX} ${path} has ${low.length} of ${finite.length} ${quotation} vols below ${fmtVol(min, normal)} (min ${fmtVol(Math.min(...low), normal)}) – ${normal ? "normal vols are decimals of the rate (0.0070 = 70 bp)" : "lognormal vols are decimals (0.20 = 20 %); normal numbers on a Lognormal surface collapse option values"}`,
+      `${VOL_IMPLAUSIBLE_PREFIX} ${path} has ${low.length} of ${finite.length} ${quotation} vols below ${fmtVol(min, normal)} (min ${fmtVol(Math.min(...low), normal)}) – ${
+        fx
+          ? "FX vols are lognormal decimals (0.08 = 8 %); check the scaling of the import"
+          : normal
+            ? "normal vols are decimals of the rate (0.0070 = 70 bp)"
+            : "lognormal vols are decimals (0.20 = 20 %); normal numbers on a Lognormal surface collapse option values"
+      }`,
     );
   }
   return out;
 }
 
-function surfaceVolValues(s: object): { values: number[]; volType: unknown } {
+function surfaceVolValues(s: object): { values: number[]; volType: unknown; fx: boolean } {
   const x = s as { atm?: unknown; vols?: unknown; volType?: unknown; tenors?: unknown; strikes?: unknown; pair?: unknown };
-  if ("pair" in x) return { values: Array.isArray(x.atm) ? (x.atm as number[]) : [], volType: "Lognormal" };
+  if ("pair" in x) return { values: Array.isArray(x.atm) ? (x.atm as number[]) : [], volType: undefined, fx: true };
   const grid = "strikes" in x ? x.vols : x.atm;
-  return { values: Array.isArray(grid) ? ((grid as unknown[]).flat() as number[]) : [], volType: x.volType };
+  return { values: Array.isArray(grid) ? ((grid as unknown[]).flat() as number[]) : [], volType: x.volType, fx: false };
 }
 
 /**
@@ -309,8 +335,8 @@ export function volSurfaceWarnings(input: VolSurfacesInput): string[] {
     if (!coll || typeof coll !== "object" || Array.isArray(coll)) return;
     for (const [key, s] of Object.entries(coll)) {
       if (!s || typeof s !== "object" || problems(s, key).length) continue;
-      const { values, volType } = surfaceVolValues(s);
-      out.push(...implausibleVols(values, volType, `${name}.${key}`));
+      const { values, volType, fx } = surfaceVolValues(s);
+      out.push(...implausibleVols(values, volType, `${name}.${key}`, fx));
     }
   };
   each(input.swaptionVols, "swaptionVols", swaptionSurfaceProblems);
@@ -331,8 +357,8 @@ export function surfaceVolWarnings(s: SwaptionVolSurface | CapletVolSurface | Fx
   let w = plausibility.get(s);
   if (!w) {
     const kind = "pair" in s ? "FX vol surface" : "strikes" in s ? "caplet surface" : "swaption surface";
-    const { values, volType } = surfaceVolValues(s);
-    w = implausibleVols(values, volType, `${kind} ${s.id}`);
+    const { values, volType, fx } = surfaceVolValues(s);
+    w = implausibleVols(values, volType, `${kind} ${s.id}`, fx);
     plausibility.set(s, w);
   }
   return w;

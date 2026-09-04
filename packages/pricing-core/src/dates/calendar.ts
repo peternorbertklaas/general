@@ -237,7 +237,12 @@ function midsummerEve(y: number): SerialDate {
   return d;
 }
 
-/** Norway (Oslo) – Markt R6-5; rule-based approximation, override with a feed via `registerCalendarHolidays("NO", …)`. */
+/**
+ * Norway (Oslo) – Markt R6-5; rule-based approximation, override with a feed via
+ * `registerCalendarHolidays("NO", …)`. Christmas Eve is a bank holiday (Oslo
+ * Børs / NIBOR fixing calendar, QuantLib `Norway`) since round 7 (N7-4); New
+ * Year's Eve is a business day in both (QuantLib 1.43 has no 31.12.).
+ */
 class NorwayCalendar extends RuleCalendar {
   readonly name = "NO";
   protected holidaysInYear(y: number): SerialDate[] {
@@ -251,6 +256,7 @@ class NorwayCalendar extends RuleCalendar {
       fromYMD(y, 5, 17), // Constitution Day
       easter + 39, // Ascension
       easter + 50, // Whit Monday
+      fromYMD(y, 12, 24), // Christmas Eve (N7-4)
       fromYMD(y, 12, 25),
       fromYMD(y, 12, 26),
     ];
@@ -279,7 +285,14 @@ class SwedenCalendar extends RuleCalendar {
   }
 }
 
-/** Denmark (Copenhagen) – Markt R6-5; rule-based approximation (Great Prayer Day abolished from 2024). */
+/**
+ * Denmark (Copenhagen) – Markt R6-5; rule-based approximation. Store Bededag
+ * (General Prayer Day, 4th Friday after Easter) was abolished as a public
+ * holiday from 2024 (Act of 28.02.2023) – both this calendar and QuantLib 1.43
+ * (`Denmark`) drop it from 2024. The Friday after Ascension is a Danish bank
+ * holiday (Danish Bankers' Association; QuantLib "Day after Ascension") and
+ * is included since round 7 (N7-4).
+ */
 class DenmarkCalendar extends RuleCalendar {
   readonly name = "DK";
   protected holidaysInYear(y: number): SerialDate[] {
@@ -289,8 +302,9 @@ class DenmarkCalendar extends RuleCalendar {
       easter - 3, // Maundy Thursday
       easter - 2,
       easter + 1,
-      ...(y < 2024 ? [easter + 26] : []), // Store Bededag
+      ...(y < 2024 ? [easter + 26] : []), // Store Bededag (abolished from 2024)
       easter + 39, // Ascension
+      easter + 40, // Friday after Ascension (bank holiday, N7-4)
       easter + 50, // Whit Monday
       fromYMD(y, 6, 5), // Constitution Day
       fromYMD(y, 12, 24),
@@ -301,7 +315,12 @@ class DenmarkCalendar extends RuleCalendar {
   }
 }
 
-/** Poland (Warsaw, NBP settlement) – Markt R6-5; rule-based approximation (Christmas Eve a public holiday from 2025). */
+/**
+ * Poland (Warsaw, NBP settlement) – Markt R6-5; rule-based approximation.
+ * Christmas Eve is a statutory public holiday from 2025 (Act of 06.12.2024,
+ * Dz.U. 2024 poz. 1965); QuantLib 1.43 (`Poland`) does not yet include it – the
+ * engine keeps it (documented difference in the calendar cross-check golden).
+ */
 class PolandCalendar extends RuleCalendar {
   readonly name = "PL";
   protected holidaysInYear(y: number): SerialDate[] {

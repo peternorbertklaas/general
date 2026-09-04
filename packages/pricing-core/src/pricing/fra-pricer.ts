@@ -6,6 +6,7 @@ import { PricingError } from "../errors.js";
 import { type ForwardRateAgreement, type PricingResult } from "../instruments/types.js";
 import { type MarketContext, getCurve, getDiscountCurve, getFixing } from "../market/market-context.js";
 import { fxToReporting, missingFixingMessage } from "./leg-pricer.js";
+import { upfrontPremiumLeg } from "./upfront.js";
 
 /**
  * FRA with ISDA-style settlement at the start date: payoff discounted over the
@@ -13,7 +14,8 @@ import { fxToReporting, missingFixingMessage } from "./leg-pricer.js";
  * rate (receive F − K). When the index fixing date (start − fixing lag on the
  * index calendar) has passed and a fixing is loaded, the fixing replaces the
  * curve forward; a missing published fixing produces a `MISSING_FIXING:`
- * warning and the curve forward is used.
+ * warning and the curve forward is used. An `upfront` fee is honoured as a
+ * `Premium` cashflow in its own last leg (`upfrontPremiumLeg`, N7-8).
  */
 export function priceFra(ctx: MarketContext, trade: ForwardRateAgreement, reportingCurrency?: string): PricingResult {
   const reporting = reportingCurrency ?? trade.currency;
@@ -45,7 +47,9 @@ export function priceFra(ctx: MarketContext, trade: ForwardRateAgreement, report
   const df = settle > val ? disc.df(settle) : 0;
   const amount = (sign * trade.notional * (fwd - trade.fixedRate) * tau) / (1 + fwd * tau);
   const fx = fxToReporting(ctx, trade.currency, reporting, trade.collateralCurrency);
-  const pv = amount * df * fx;
+  // N7-8: an upfront fee on a FRA is a `Premium` cashflow in its own (last) leg, not silently ignored.
+  const upfront = upfrontPremiumLeg(ctx, trade, reporting, 1);
+  const pv = amount * df * fx + (upfront?.pvReporting ?? 0);
   if (settle <= val) warnings.push("FRA already settled");
   return {
     tradeId: trade.id,
@@ -59,7 +63,7 @@ export function priceFra(ctx: MarketContext, trade: ForwardRateAgreement, report
         legType: `FRA ${trade.index}`,
         currency: trade.currency,
         pv: amount * df,
-        pvReporting: pv,
+        pvReporting: amount * df * fx,
         cashflows: [
           {
             legIndex: 0,
@@ -80,6 +84,7 @@ export function priceFra(ctx: MarketContext, trade: ForwardRateAgreement, report
           },
         ],
       },
+      ...(upfront ? [upfront.leg] : []),
     ],
     analytics: { forwardRate: fwd, fixedRate: trade.fixedRate, accrualFactor: tau, isFixed: isFixed ? "yes" : "no" },
     details: { fixingDate: toISO(fixingDate), settlementDate: toISO(settle) },

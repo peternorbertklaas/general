@@ -17,7 +17,12 @@ export interface TradeBase {
   tradeDate?: SerialDate;
   /** Collateral currency (CSA) – selects discount curve. Undefined = uncollateralised. */
   collateralCurrency?: string;
-  /** Premium/upfront paid (positive = we pay) on `upfrontDate`. */
+  /**
+   * Premium / upfront fee paid (positive = we pay) on `date`, honoured by every
+   * pricer as a `Premium` cashflow leg (N6-1 / N7-8). A premium already settled
+   * (date ≤ valuation date) needs no FX spot or curve of its currency (N7-1);
+   * the premium currency counts as a trade currency for FX delta / DV01 (N7-3).
+   */
   upfront?: { amount: number; currency: string; date: SerialDate };
   tags?: string[];
   /**
@@ -205,6 +210,11 @@ export interface FxOption extends TradeBase {
    * `undefined` = unknown – the pricer then derives the state from today's
    * spot (alive option) or the expiry fixing (expired option) and raises a
    * `BARRIER_STATE_UNKNOWN:` warning whenever that derivation decides the value.
+   * `rebate` (quote currency per unit base notional): once the knock state is
+   * decided (flag, spot beyond the barrier, expiry fixing) a knock-out rebate
+   * and the rebate of a never-touched knock-in are paid on the delivery date
+   * (rebate·DF, N7-2 / N7-5); a live option below the barrier carries the
+   * Reiner–Rubinstein at-hit rebate.
    */
   barrier?: { type: BarrierType; level: number; rebate?: number; hit?: boolean };
   digital?: { payoutCurrency: string; payout: number };
@@ -250,9 +260,10 @@ export interface Cashflow {
   accrued?: number;
   /**
    * Cashflow class. `"Premium"` is the upfront premium / fee of a trade
-   * (`TradeBase.upfront`, N6-1): every pricer that honours an upfront reports
-   * it as its own leg (`legType: "Upfront premium"`, last leg, `legIndex` =
-   * number of economic legs) with a single cashflow `amount = −upfront.amount`
+   * (`TradeBase.upfront`, N6-1): every pricer (all eight trade types since
+   * N7-8 – FRAs, FX forwards and FX swaps included) reports it as its own leg
+   * (`legType: "Upfront premium"`, last leg, `legIndex` = number of economic
+   * legs) with a single cashflow `amount = −upfront.amount`
    * (positive = we receive), `discountFactor` = DF of the premium currency on
    * the payment date, or 0 once the premium date is on or before the valuation
    * date (settled, no longer part of the PV) – so the premium is visible in

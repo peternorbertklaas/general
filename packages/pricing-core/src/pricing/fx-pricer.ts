@@ -39,7 +39,8 @@ export const SETTLES_TODAY_PREFIX = "SETTLES_TODAY:";
  * exchange – both amounts count at the today rate (DF 1), the fair rate is
  * the value-today rate `fxRateAtValuationDate` and a `SETTLES_TODAY:` warning
  * is raised; a leg delivered *before* the valuation date is excluded (PV 0)
- * with the "already delivered" warning.
+ * with the "already delivered" warning. `priceFxForward` / `priceFxSwap`
+ * honour an `upfront` fee as a `Premium` leg after the exchange legs (N7-8).
  */
 function forwardLeg(
   ctx: MarketContext,
@@ -149,13 +150,15 @@ export function priceFxForward(ctx: MarketContext, trade: FxForward, reportingCu
   const deltaSell = sellIsForeign ? r.legs[1]!.pvReporting * 0.01 : 0;
   const primaryCcy = buyIsForeign ? trade.buyCurrency : trade.sellCurrency;
   const spotDate = fxSpotDate(ctx, trade.buyCurrency, trade.sellCurrency);
+  // N7-8: an upfront fee on a forward is a `Premium` cashflow in its own (last) leg, not silently ignored.
+  const upfront = upfrontPremiumLeg(ctx, trade, reporting, 2);
   return {
     tradeId: trade.id,
     tradeType: "FxForward",
     valuationDate: ctx.valuationDate,
     currency: reporting,
-    pv: r.pv,
-    legs: r.legs,
+    pv: r.pv + (upfront?.pvReporting ?? 0),
+    legs: upfront ? [...r.legs, upfront.leg] : r.legs,
     analytics: {
       contractRate,
       fairForward: r.fair,
@@ -196,13 +199,15 @@ export function priceFxSwap(ctx: MarketContext, trade: FxSwap, reportingCurrency
   const far = forwardLeg(ctx, trade.farLeg, 2, reporting, trade.collateralCurrency, "FX swap far leg");
   // Express the far leg's fair forward in the near leg's quotation (buy ccy per sell ccy).
   const farFair = trade.farLeg.buyCurrency === trade.nearLeg.buyCurrency ? far.fair : 1 / far.fair;
+  // N7-8: an upfront fee on an FX swap is a `Premium` cashflow in its own (last) leg, not silently ignored.
+  const upfront = upfrontPremiumLeg(ctx, trade, reporting, 4);
   return {
     tradeId: trade.id,
     tradeType: "FxSwap",
     valuationDate: ctx.valuationDate,
     currency: reporting,
-    pv: near.pv + far.pv,
-    legs: [...near.legs, ...far.legs],
+    pv: near.pv + far.pv + (upfront?.pvReporting ?? 0),
+    legs: [...near.legs, ...far.legs, ...(upfront ? [upfront.leg] : [])],
     analytics: {
       nearFairForward: near.fair,
       farFairForward: farFair,
@@ -265,6 +270,8 @@ interface SettledPayoff {
   spotDelta: number;
   /** Knock state of a barrier option (undefined for vanillas / digitals). */
   barrierState?: BarrierState;
+  /** How the value arose: exercised (forward position / digital payout), a barrier rebate, or nothing. */
+  outcome: "exercised" | "rebate" | "none";
 }
 
 /**
@@ -276,19 +283,24 @@ interface SettledPayoff {
  * delta; asset-or-nothing: one unit of base per payout, delta DF_f). Barriers
  * take the knock state from `barrier.hit` when recorded (N6-5) and otherwise
  * from the fixing (no path monitoring between the trade date and the fixing
- * is available): a knocked-out option is worth its rebate (paid on the
- * delivery date), a knocked-in option that was never triggered is worth 0. No
- * vega, gamma, theta or rho remain.
+ * is available): a knocked-out option is worth its rebate, and – N7-2 – so is
+ * a knock-in option whose barrier was never touched (the knock-in rebate is
+ * paid at expiry when the option did not knock in, Reiner–Rubinstein term E,
+ * exactly as the live model values it); both rebates are paid on the delivery
+ * date (rebate·DF_q). No vega, gamma, theta or rho remain.
  */
 function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: number, dfQ: number, scalePayout: number): SettledPayoff {
   const sign = trade.optionType === "Call" ? 1 : -1;
   const dfF = spot > 0 ? (dfQ * forward) / spot : dfQ;
   const itm = sign * (sFix - trade.strike) > 0;
-  const exercised: SettledPayoff = itm ? { premiumPerUnit: sign * (forward - trade.strike) * dfQ, spotDelta: sign * dfF } : { premiumPerUnit: 0, spotDelta: 0 };
+  const nothing: SettledPayoff = { premiumPerUnit: 0, spotDelta: 0, outcome: "none" };
+  const exercised: SettledPayoff = itm ? { premiumPerUnit: sign * (forward - trade.strike) * dfQ, spotDelta: sign * dfF, outcome: "exercised" } : nothing;
   if (trade.digital) {
     const payoutInBase = trade.digital.payoutCurrency.toUpperCase() === splitPair(trade.pair).base;
-    if (!itm) return { premiumPerUnit: 0, spotDelta: 0 };
-    return payoutInBase ? { premiumPerUnit: scalePayout * dfF * spot, spotDelta: scalePayout * dfF } : { premiumPerUnit: scalePayout * dfQ, spotDelta: 0 };
+    if (!itm) return nothing;
+    return payoutInBase
+      ? { premiumPerUnit: scalePayout * dfF * spot, spotDelta: scalePayout * dfF, outcome: "exercised" }
+      : { premiumPerUnit: scalePayout * dfQ, spotDelta: 0, outcome: "exercised" };
   }
   if (trade.barrier) {
     const b = trade.barrier;
@@ -296,7 +308,9 @@ function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: num
     const isOut = b.type.endsWith("Out");
     const barrierState: BarrierState = touched ? (isOut ? "knocked-out" : "knocked-in") : "alive";
     if (isOut ? !touched : touched) return { ...exercised, barrierState };
-    return isOut ? { premiumPerUnit: (b.rebate ?? 0) * dfQ, spotDelta: 0, barrierState } : { premiumPerUnit: 0, spotDelta: 0, barrierState };
+    // Knocked out, or knock-in never triggered: the rebate (if any) is paid on the delivery date (N7-2 / N7-5).
+    const rebate = (b.rebate ?? 0) * dfQ;
+    return { premiumPerUnit: rebate, spotDelta: 0, barrierState, outcome: rebate !== 0 ? "rebate" : "none" };
   }
   return exercised;
 }
@@ -336,6 +350,18 @@ function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: num
  * derived from today's spot (alive) or the expiry fixing (expired) and, when
  * that derivation decides the value, a `BARRIER_STATE_UNKNOWN:` warning is
  * raised instead of a silent 0 / vanilla.
+ *
+ * Rebate convention (N7-2 / N7-5): a barrier whose knock state is decided –
+ * `hit: true`, today's spot at or beyond the barrier (continuous barrier: a
+ * touch), or the expiry fixing of an expired option – is valued identically on
+ * all three paths: knock-out → rebate·DF_q(delivery) with Greeks 0
+ * (`greeksMethod: "settled-payoff"`), knock-in → the vanilla (analytic Greeks);
+ * a knock-in that was never touched pays its rebate at expiry (settled on the
+ * delivery date, rebate·DF_q). Only a live option whose spot has not reached
+ * the barrier carries the Reiner–Rubinstein at-hit rebate (Haug Tab. 4-13, the
+ * QuantLib `AnalyticBarrierEngine` convention, term F). Before round 7 the
+ * spot-beyond path returned the undiscounted rebate (three values for one
+ * state) and the expired knock-in dropped its rebate.
  *
  * Upfront premium (N6-1): reported as a `Premium` cashflow in its own last leg
  * (`upfrontPremiumLeg`), no longer a silent PV deduction.
@@ -430,11 +456,17 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
         );
       }
       const fixingNote = fixing !== undefined ? `expiry fixing ${sFix}` : "today's spot as proxy for the expiry fixing";
+      const outcomeNote =
+        settled.outcome === "exercised"
+          ? "exercised, valued as the forward position at the strike"
+          : settled.outcome === "rebate"
+            ? `not exercised – ${barrierState === "knocked-out" ? "knocked out" : "barrier never touched"}, rebate ${trade.barrier?.rebate} per unit base paid on ${toISO(trade.deliveryDate)}`
+            : "not exercised / knocked out";
       if (lifecycle === "expires-today") {
         warnings.push(`${EXPIRES_TODAY_PREFIX} FX option expires on the valuation date ${toISO(val)} – intrinsic value on ${fixingNote}, no time value`);
       } else {
         warnings.push(
-          `${EXPIRED_PREFIX} FX option expired ${toISO(trade.expiryDate)} – settlement pending until ${toISO(trade.deliveryDate)}: settled payoff on ${fixingNote} (${settled.premiumPerUnit !== 0 ? "exercised, valued as the forward position at the strike" : "not exercised / knocked out"}), no vega, gamma or theta`,
+          `${EXPIRED_PREFIX} FX option expired ${toISO(trade.expiryDate)} – settlement pending until ${toISO(trade.deliveryDate)}: settled payoff on ${fixingNote} (${outcomeNote}), no vega, gamma or theta`,
         );
         if (fixing === undefined) {
           warnings.push(
@@ -466,33 +498,34 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
       const b = trade.barrier;
       const isOut = b.type.endsWith("Out");
       const knockedState: BarrierState = isOut ? "knocked-out" : "knocked-in";
-      if (b.hit === true) {
-        // N6-5: the knock has been observed – no barrier optionality is left.
+      // N6-5 / N7-5: the knock is decided when it was recorded (`hit: true`) or when today's spot is at / beyond the
+      // barrier (continuous barrier: a touch) – both paths value the knocked option identically.
+      const knocked = b.hit === true || beyondBarrier(b, spot);
+      if (knocked) {
         barrierState = knockedState;
         if (isOut) {
           // Rebate valued as a payment on the delivery date (same convention as the expired path, `settledPayoff`).
           premiumPerUnit = (b.rebate ?? 0) * dfQ;
           greeks = { spotDelta: 0, ...noGreeks };
           greeksMethod = "settled-payoff";
-          warnings.push(
-            `Barrier ${b.type} ${b.level} knocked out (barrier.hit) – ${b.rebate ? `rebate ${b.rebate} per unit base valued as a payment on ${toISO(trade.deliveryDate)}` : "no rebate, PV 0"}, no optionality left`,
-          );
+        }
+        // Knocked in → the vanilla (Garman–Kohlhagen value and analytic Greeks already computed above).
+        const valuedAs = isOut
+          ? `${b.rebate ? `rebate ${b.rebate} per unit base valued as a payment on ${toISO(trade.deliveryDate)}` : "no rebate, PV 0"}, no optionality left`
+          : `valued as the vanilla ${trade.optionType}`;
+        if (b.hit === true) {
+          warnings.push(`Barrier ${b.type} ${b.level} ${isOut ? "knocked out" : "knocked in"} (barrier.hit) – ${valuedAs}`);
         } else {
-          // Knocked in → the vanilla (Garman–Kohlhagen value and analytic Greeks already computed above).
-          warnings.push(`Barrier ${b.type} ${b.level} knocked in (barrier.hit) – valued as the vanilla ${trade.optionType}`);
+          // N6-5: the state is derived from today's spot – say so instead of a silent 0 / vanilla.
+          warnings.push(
+            `${BARRIER_STATE_UNKNOWN_PREFIX} spot ${spot} is ${b.type.startsWith("Up") ? "at or above" : "at or below"} the ${b.type} barrier ${b.level} – valued as ${isOut ? "knocked out" : "knocked in"} on today's spot (${valuedAs})${b.hit === false ? " although barrier.hit is false (continuous barrier: a spot beyond the level is a touch)" : "; set barrier.hit to record the knock state"}`,
+          );
         }
       } else {
         const priceFn = (i: FxOptionInputs) => fxBarrier({ ...i, barrier: b.level, barrierType: b.type, rebate: b.rebate });
         premiumPerUnit = priceFn(inputs);
         greeks = fxExoticGreeks(priceFn, inputs, { barrier: b.level });
         greeksMethod = "finite-difference";
-        if (beyondBarrier(b, spot)) {
-          // N6-5: Reiner–Rubinstein treats a spot at/beyond the barrier as knocked – say so instead of a silent 0 / vanilla.
-          barrierState = knockedState;
-          warnings.push(
-            `${BARRIER_STATE_UNKNOWN_PREFIX} spot ${spot} is ${b.type.startsWith("Up") ? "at or above" : "at or below"} the ${b.type} barrier ${b.level} – valued as ${isOut ? `knocked out (${b.rebate ? "rebate" : "PV 0"})` : "knocked in (vanilla)"} on today's spot${b.hit === false ? " although barrier.hit is false (continuous barrier: a spot beyond the level is a touch)" : "; set barrier.hit to record the knock state"}`,
-          );
-        }
       }
     } else if (trade.digital) {
       const priceFn = (i: FxOptionInputs) => fxDigital(i, payoutInBase) * scalePayout;

@@ -21,6 +21,13 @@ export const UPFRONT_LEG_TYPE = "Upfront premium";
  * appended as the **last** leg with `legIndex` = number of economic legs, so
  * consumers reading `legs[0]` (hedge intrinsic value, EMIR annuity) are not
  * affected. Returns `undefined` when the trade has no upfront.
+ *
+ * Market data needed (N7-1): a settled premium (date ≤ valuation date) needs
+ * neither the discount curve nor an FX spot of its currency – its PV is 0 in
+ * every currency, so a historical USD option premium or arrangement fee prices
+ * on an EUR-only snapshot exactly as before round 6. An unsettled premium in a
+ * currency other than the reporting currency needs the FX spot
+ * (`PricingError("NO_FX_SPOT")` otherwise) and the currency's discount curve.
  */
 export function upfrontPremiumLeg(
   ctx: MarketContext,
@@ -32,7 +39,8 @@ export function upfrontPremiumLeg(
   if (!up) return undefined;
   const settled = up.date <= ctx.valuationDate;
   const df = settled ? 0 : getDiscountCurve(ctx, up.currency, trade.collateralCurrency).df(up.date);
-  const fx = fxToReporting(ctx, up.currency, reporting, trade.collateralCurrency);
+  // Settled → PV 0: the conversion factor is irrelevant and must not require an FX spot (N7-1).
+  const fx = settled ? 1 : fxToReporting(ctx, up.currency, reporting, trade.collateralCurrency);
   const cf: Cashflow = {
     legIndex,
     legType: UPFRONT_LEG_TYPE,

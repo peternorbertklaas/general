@@ -96,6 +96,7 @@ export {
   SWAP_CONVENTIONS,
   getIndex,
   getSwapConventions,
+  isBuiltInIndex,
   knownCurrencies,
   knownIndices,
   registerRateIndex,

@@ -298,7 +298,8 @@ export function computeRisk(
   if (opts.vega ?? true) {
     if (trade.type === "Swaption" && ctx.swaptionVols) {
       for (const [k, s] of Object.entries(ctx.swaptionVols)) {
-        if (!tradeCurrencies(trade).includes(s.currency)) continue;
+        // Economic currencies only: a foreign-currency premium carries no vol exposure (N7-3).
+        if (!tradeCurrencies(trade, { upfront: false }).includes(s.currency)) continue;
         const shift = s.volType === "Normal" ? BP : 0.01;
         const u = priceTrade({ ...ctx, swaptionVols: { ...ctx.swaptionVols, [k]: shiftSwaptionSurface(s, shift) } }, trade, reportingCurrency).pv;
         vega[`swaption:${k}`] = u - base.pv;
@@ -622,7 +623,7 @@ export function vegaBuckets(ctx: MarketContext, trade: Trade, reportingCurrency:
   const base = priceTrade(ctx, trade, reportingCurrency).pv;
   if (trade.type === "Swaption" && ctx.swaptionVols) {
     for (const [k, s] of Object.entries(ctx.swaptionVols)) {
-      if (!tradeCurrencies(trade).includes(s.currency)) continue;
+      if (!tradeCurrencies(trade, { upfront: false }).includes(s.currency)) continue;
       const shift = s.volType === "Normal" ? BP : 0.01;
       const reprice = (shifted: SwaptionVolSurface) =>
         priceTrade({ ...ctx, swaptionVols: { ...ctx.swaptionVols, [k]: shifted } }, trade, reportingCurrency).pv - base;

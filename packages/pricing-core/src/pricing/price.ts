@@ -441,8 +441,16 @@ export function pricePortfolio(ctx: MarketContext, trades: Trade[], reportingCur
   return { results, total, currency: reportingCurrency };
 }
 
-/** Currencies a trade references (for risk / scenario scoping). */
-export function tradeCurrencies(trade: Trade): string[] {
+/**
+ * Currencies a trade references (for risk / scenario scoping): the currencies
+ * of its economic legs plus – since round 7 (N7-3) – the currency of an
+ * upfront premium / fee, so that `computeRisk` reports the FX delta and the
+ * discount-curve DV01 of a USD premium in an EUR book (`fxDelta.USDEUR`,
+ * `dv01ByCurve["USD-SOFR"]`) and `parRisk` targets that currency's curves.
+ * Pass `{ upfront: false }` for the economic currencies only (vol-surface
+ * scoping: a premium carries no optionality).
+ */
+export function tradeCurrencies(trade: Trade, opts: { upfront?: boolean } = {}): string[] {
   const set = new Set<string>();
   switch (trade.type) {
     case "InterestRateSwap":
@@ -469,5 +477,7 @@ export function tradeCurrencies(trade: Trade): string[] {
       set.add(trade.pair.slice(3, 6).toUpperCase());
       break;
   }
+  // N7-3: the premium currency comes last so the economic-leg order is unchanged for existing consumers.
+  if ((opts.upfront ?? true) && trade.upfront) set.add(trade.upfront.currency.toUpperCase());
   return [...set];
 }

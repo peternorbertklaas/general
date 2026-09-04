@@ -274,11 +274,13 @@ describe("N6-5 – barrier.hit flag and BARRIER_STATE_UNKNOWN warning", () => {
     expect(out.warnings.filter((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX))).toHaveLength(1);
     expect(out.warnings[0]).toContain("at or above the UpOut barrier 1.15");
     expect(out.analytics.barrierState).toBe("knocked-out");
-    expect(out.pv).toBeCloseTo(1e7 * 0.01, 6); // rebate at the hit (Reiner–Rubinstein, no flag)
+    // N7-5: the knocked-out rebate is paid on the delivery date on every path (R6 returned the undiscounted 100 000 here).
+    expect(out.pv).toBeCloseTo(1e7 * 0.01 * getDiscountCurve(ctx, "USD").df(VAL + 182), 6);
+    expect(out.analytics.greeksMethod).toBe("settled-payoff");
     const inn = priceTrade(ctx, barrierCall({ type: "UpIn", level: 1.15 }), "USD");
     expect(inn.pv).toBeCloseTo(vanilla.pv, 6);
     expect(inn.analytics.barrierState).toBe("knocked-in");
-    expect(inn.warnings.some((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX) && w.includes("knocked in (vanilla)"))).toBe(true);
+    expect(inn.warnings.some((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX) && w.includes("valued as the vanilla Call"))).toBe(true);
     // spot inside the barrier: no warning, state alive
     const far = priceTrade(ctx, barrierCall({ type: "UpOut", level: 1.25 }), "USD");
     expect(far.warnings.some((w) => w.startsWith(BARRIER_STATE_UNKNOWN_PREFIX))).toBe(false);

@@ -584,7 +584,7 @@ function conventionLines(trade: Trade): string[] {
   const legs = legsOf(trade);
   if (legs.length === 0)
     return [
-      "Tageszählung, Geschäftstagekonvention und Kalender gemäß ISDA-Definitionen (TARGET2, US, UK, CH, JP – regelbasiert, in Produktion durch Feiertagsfeeds überschreibbar).",
+      "Tageszählung, Geschäftstagekonvention und Kalender gemäß ISDA-Definitionen (TARGET2, US, UK, CH, JP, NO, SE, DK, PL – regelbasiert, gegen QuantLib abgeglichen, in Produktion durch Feiertagsfeeds überschreibbar).",
     ];
   const parts = legs.map((l, i) => {
     const kind =
@@ -592,7 +592,7 @@ function conventionLines(trade: Trade): string[] {
     return `Leg ${i + 1} (${l.payReceive === "Receive" ? "Empfang" : "Zahlung"}, ${kind}): ${l.frequency}, ${l.dayCount}, ${bdcLabelDe(l.businessDayConvention)}, Kalender ${l.calendar}, ${stubLabelDe(l.stub)}${l.endOfMonth ? ", EOM-Roll" : ""}${l.roll === "IMM" ? ", IMM-Roll" : ""}${l.paymentLag ? `, Zahlungsverzug ${l.paymentLag} GT` : ""}`;
   });
   return [
-    `Konventionen gemäß ISDA-Definitionen (regelbasierte Kalender TARGET2/US/UK/CH/JP, in Produktion durch Feiertagsfeeds überschreibbar): ${parts.join("; ")}.`,
+    `Konventionen gemäß ISDA-Definitionen (regelbasierte Kalender TARGET2/US/UK/CH/JP/NO/SE/DK/PL, gegen QuantLib abgeglichen, in Produktion durch Feiertagsfeeds überschreibbar): ${parts.join("; ")}.`,
   ];
 }
 
@@ -730,7 +730,7 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
           ? `Lebenszyklus: Option bereits abgewickelt (Lieferung ${formatDateDe(trade.deliveryDate)} vor dem Bewertungstag) – Barwert 0, keine Sensitivitäten, im EMIR-Bewertungsexport mit Wert 0 und Delta 0.`
           : lifecycle === "alive"
             ? undefined
-            : `Lebenszyklus: ${lifecycle === "expires-today" ? "Ausübungstag = Bewertungstag" : `Option am ${formatDateDe(trade.expiryDate)} verfallen, Abwicklung am ${formatDateDe(trade.deliveryDate)} noch offen`} – Ausübungs- bzw. Barrier-Entscheid am FX-Fixing des Verfalltags (${pricing.warnings.some((w) => w.startsWith("MISSING_FX_FIXING")) ? "kein Fixing geladen: heutiger Spot als Näherung, Warnung MISSING_FX_FIXING" : "geladenes Fixing bzw. heutiger Kurs"})${trade.barrier ? (trade.barrier.hit !== undefined ? `; Knock-Zustand laut Geschäft (barrier.hit = ${trade.barrier.hit ? "berührt" : "nicht berührt"})` : "; Knock-Zustand nur aus dem Verfall-Fixing abgeleitet, Touch-Ereignisse vor dem Verfall nicht beobachtet (Warnung BARRIER_STATE_UNKNOWN)") : ""}; ausgeübte Option = Terminposition zum Strike mit Lieferung am Abwicklungstag (physische Lieferung), Digital = fester Auszahlungsbetrag, ausgeknockte Barrier = Rebate; keine Vega-, Gamma- oder Theta-Sensitivität mehr, Delta der Terminposition${lifecycle === "settles-today" ? "; Abwicklung am Bewertungstag als Value-Today-Austausch undiskontiert (SETTLES_TODAY)" : ""}.`;
+            : `Lebenszyklus: ${lifecycle === "expires-today" ? "Ausübungstag = Bewertungstag" : `Option am ${formatDateDe(trade.expiryDate)} verfallen, Abwicklung am ${formatDateDe(trade.deliveryDate)} noch offen`} – Ausübungs- bzw. Barrier-Entscheid am FX-Fixing des Verfalltags (${pricing.warnings.some((w) => w.startsWith("MISSING_FX_FIXING")) ? "kein Fixing geladen: heutiger Spot als Näherung, Warnung MISSING_FX_FIXING" : "geladenes Fixing bzw. heutiger Kurs"})${trade.barrier ? (trade.barrier.hit !== undefined ? `; Knock-Zustand laut Geschäft (barrier.hit = ${trade.barrier.hit ? "berührt" : "nicht berührt"})` : "; Knock-Zustand nur aus dem Verfall-Fixing abgeleitet, Touch-Ereignisse vor dem Verfall nicht beobachtet (Warnung BARRIER_STATE_UNKNOWN)") : ""}; ausgeübte Option = Terminposition zum Strike mit Lieferung am Abwicklungstag (physische Lieferung), Digital = fester Auszahlungsbetrag, ausgeknockte Knock-out- bzw. nie berührte Knock-in-Barrier = Rebate (auf das Lieferdatum diskontiert); keine Vega-, Gamma- oder Theta-Sensitivität mehr, Delta der Terminposition${lifecycle === "settles-today" ? "; Abwicklung am Bewertungstag als Value-Today-Austausch undiskontiert (SETTLES_TODAY)" : ""}.`;
       return [
         `${kind}: Garman-Kohlhagen${barrierNote}; Forward am Spot-Datum verankert (${base}${quote}: T+${lag} auf dem Paar-Kalender${base !== "USD" && quote !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Datum ${spotDateDe(pricing.details.spotDate)}` : ""}), Diskontierung bis Lieferdatum ${formatDateDe(trade.deliveryDate)}, Vol-Zeit bis Ausübung ${formatDateDe(trade.expiryDate)}; ${smile}${vol}; ${greeks}.`,
         ...(lifecycleLine ? [lifecycleLine] : []),
