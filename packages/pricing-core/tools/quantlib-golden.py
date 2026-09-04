@@ -15,6 +15,8 @@ INDEPENDENTLY of the TypeScript engine:
   checked in and read by `src/testing/golden.test.ts`.
 
 Run:  python3 tools/quantlib-golden.py        (from packages/pricing-core)
+With QuantLib (the checked-in files were generated with QuantLib 1.43):
+      pip install --target /some/dir QuantLib && PYTHONPATH=/some/dir python3 tools/quantlib-golden.py
 """
 from __future__ import annotations
 
@@ -171,7 +173,7 @@ def ql_swap_check(rate, notional, fixed_rate, dates):  # pragma: no cover
     index = ql.IborIndex("EURIBOR12M", ql.Period("12M"), 0, ql.EURCurrency(), cal, ql.Unadjusted, False, ql.Actual360(), curve)
     swap = ql.VanillaSwap(ql.VanillaSwap.Payer, notional, sched, fixed_rate, ql.Thirty360(ql.Thirty360.European), sched, index, 0.0, ql.Actual360())
     swap.setPricingEngine(ql.DiscountingSwapEngine(curve))
-    return {"npv": swap.NPV(), "fairRate": swap.fairRate(), "fixedLegNPV": swap.fixedLegNPV(), "floatingLegNPV": swap.floatingLegNPV()}
+    return {"version": ql.__version__, "npv": swap.NPV(), "fairRate": swap.fairRate(), "fixedLegNPV": swap.fixedLegNPV(), "floatingLegNPV": swap.floatingLegNPV()}
 
 
 # --------------------------------------------------------------------------
@@ -253,6 +255,7 @@ def golden_black_bachelier() -> None:
     }
     if HAVE_QL:  # pragma: no cover
         payload["quantlib"] = {
+            "version": ql.__version__,
             "black76Call": ql.blackFormula(ql.Option.Call, k, f, sd),
             "bachelierAtm": annuity * ql.bachelierBlackFormula(ql.Option.Call, fb, fb, volb * math.sqrt(tb)),
         }
@@ -635,7 +638,12 @@ def ql_sample_bootstrap_check():  # pragma: no cover
     curve.enableExtrapolation()
     return {
         "status": "done",
+        "version": ql.__version__,
         "engine": "PiecewiseLogLinearDiscount / OISRateHelper (paymentLag 1, Annual, ModifiedFollowing, TARGET)",
+        # QuantLib has no spot node: the 0→spot stub is the log-linear segment 0 → 1W pillar (continuous at the 1W
+        # zero), the engine's spot node is 1/(1 + r_1W·τ_spot) (simple interest) – a uniform factor 1 + 1.87e-8 on
+        # every pillar DF, DF ratios between pillars identical (see test-data/golden/README.md).
+        "stubConvention": "no spot node; DF(spot) log-linear between t=0 and the 1W pillar",
         "pillars": [{"date": ql.Date.to_date(d_).isoformat(), "df": curve.discount(d_)} for d_ in curve.dates()],
     }
 

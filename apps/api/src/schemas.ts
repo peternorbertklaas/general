@@ -720,11 +720,113 @@ export const gridBodySchema = {
   additionalProperties: false,
 } as const;
 
+// Vol surfaces (shared by the snapshot schema and `PUT /api/market`, R4-5): plain data of the core's
+// `SwaptionVolSurface` / `CapletVolSurface` / `FxVolSurface`, keyed like `MarketContext.*Vols`.
+const volType = { type: "string", enum: ["Normal", "Lognormal", "ShiftedLognormal"] } as const;
+const numberVector = { type: "array", items: { type: "number" }, maxItems: 200 } as const;
+const numberGrid = { type: "array", items: numberVector, maxItems: 200 } as const;
+export const swaptionVolsSchema = {
+  type: "object",
+  maxProperties: 50,
+  additionalProperties: {
+    type: "object",
+    required: ["id", "currency", "volType", "expiries", "tenors", "atm"],
+    properties: {
+      id: { type: "string", maxLength: 64 },
+      currency,
+      volType,
+      shift: { type: "number", minimum: 0, maximum: 1 },
+      expiries: numberVector,
+      tenors: numberVector,
+      atm: numberGrid,
+      sabr: {
+        type: "object",
+        additionalProperties: {
+          type: "object",
+          required: ["beta", "rho", "nu"],
+          properties: {
+            beta: { type: "number", minimum: 0, maximum: 1 },
+            rho: { type: "number", minimum: -1, maximum: 1 },
+            nu: { type: "number", minimum: 0 },
+            shift: { type: "number" },
+          },
+          additionalProperties: true,
+        },
+      },
+    },
+    additionalProperties: false,
+  },
+} as const;
+export const capletVolsSchema = {
+  type: "object",
+  maxProperties: 50,
+  additionalProperties: {
+    type: "object",
+    required: ["id", "currency", "index", "volType", "expiries", "strikes", "vols"],
+    properties: {
+      id: { type: "string", maxLength: 64 },
+      currency,
+      index: rateIndex,
+      volType,
+      shift: { type: "number", minimum: 0, maximum: 1 },
+      expiries: numberVector,
+      strikes: numberVector,
+      vols: numberGrid,
+    },
+    additionalProperties: false,
+  },
+} as const;
+export const fxVolsSchema = {
+  type: "object",
+  maxProperties: 100,
+  additionalProperties: {
+    type: "object",
+    required: ["id", "pair", "expiries", "atm", "rr25", "bf25"],
+    properties: {
+      id: { type: "string", maxLength: 64 },
+      pair: currencyPair,
+      expiries: numberVector,
+      atm: numberVector,
+      rr25: numberVector,
+      bf25: numberVector,
+      rr10: numberVector,
+      bf10: numberVector,
+      atmConvention: { type: "string", enum: ["DeltaNeutral", "Forward"] },
+      deltaConvention: { type: "string", enum: ["Spot", "Forward", "PremiumAdjustedSpot", "PremiumAdjustedForward"] },
+      smileInterpolation: { type: "string", enum: ["linear", "cubic"] },
+      strangleType: { type: "string", enum: ["Smile", "Broker"] },
+    },
+    additionalProperties: false,
+  },
+} as const;
+
+/** `MarketContext.fxFixings` in snapshot form (`{ pair, date, rate }`): FX fixing of a past MtM-reset date. */
+export const fxFixingsSchema = {
+  type: "array",
+  maxItems: 100000,
+  items: {
+    type: "object",
+    required: ["pair", "date", "rate"],
+    properties: { pair: currencyPair, date: isoDate, rate: { type: "number", exclusiveMinimum: 0 } },
+    additionalProperties: false,
+  },
+} as const;
+
 export const marketPutSchema = {
   type: "object",
+  description:
+    "Partial market update: every field is optional and merged into the active snapshot (spots and vol surfaces per key, fixings appended, `valuationDate` rebuilds the sample market). Vol surfaces (`swaptionVols`/`capletVols`/`fxVols`) replace the surface under the same key – an IPV process can push one broker vol surface without round-tripping the whole snapshot.",
   properties: {
     valuationDate: isoDate,
     fxSpots: { type: "object", additionalProperties: { type: "number", exclusiveMinimum: 0 }, propertyNames: currencyPair },
+    fxFixings: {
+      ...fxFixingsSchema,
+      description:
+        "Historical FX fixings `{ pair, date, rate }` for the notional resets of MtM cross-currency swaps – appended to the market's fixings (a fixing for the same pair and date replaces the stored one); without a fixing for a past reset date the valuation warns `MISSING_FX_FIXING:`",
+    },
+    swaptionVols: { ...swaptionVolsSchema, description: "Swaption vol cubes keyed by currency (`EUR`) – replaces the cube under each given key" },
+    capletVols: { ...capletVolsSchema, description: "Caplet vol surfaces keyed by index (`EUR-EURIBOR-6M`) – replaces the surface under each given key" },
+    fxVols: { ...fxVolsSchema, description: "FX vol surfaces keyed by pair (`EURUSD`) – replaces the surface under each given key" },
     fixings: {
       type: "array",
       maxItems: 10000,
@@ -933,9 +1035,6 @@ export const fromTemplateBodySchema = {
 // ---------------------------------------------------------------------------
 // Market snapshot (`deriva.market/1`)
 // ---------------------------------------------------------------------------
-const volType = { type: "string", enum: ["Normal", "Lognormal", "ShiftedLognormal"] } as const;
-const numberVector = { type: "array", items: { type: "number" }, maxItems: 200 } as const;
-const numberGrid = { type: "array", items: numberVector, maxItems: 200 } as const;
 const idMap = { type: "object", additionalProperties: { type: "string", maxLength: 64 }, maxProperties: 100 } as const;
 
 export const marketSnapshotSchema = {
@@ -1021,80 +1120,14 @@ export const marketSnapshotSchema = {
         additionalProperties: false,
       },
     },
-    swaptionVols: {
-      type: "object",
-      maxProperties: 50,
-      additionalProperties: {
-        type: "object",
-        required: ["id", "currency", "volType", "expiries", "tenors", "atm"],
-        properties: {
-          id: { type: "string", maxLength: 64 },
-          currency,
-          volType,
-          shift: { type: "number", minimum: 0, maximum: 1 },
-          expiries: numberVector,
-          tenors: numberVector,
-          atm: numberGrid,
-          sabr: {
-            type: "object",
-            additionalProperties: {
-              type: "object",
-              required: ["beta", "rho", "nu"],
-              properties: {
-                beta: { type: "number", minimum: 0, maximum: 1 },
-                rho: { type: "number", minimum: -1, maximum: 1 },
-                nu: { type: "number", minimum: 0 },
-                shift: { type: "number" },
-              },
-              additionalProperties: true,
-            },
-          },
-        },
-        additionalProperties: false,
-      },
+    fxFixings: {
+      ...fxFixingsSchema,
+      description:
+        "Historical FX fixings `{ pair, date, rate }` for MtM-reset notionals of cross-currency swaps (core `MarketContext.fxFixings`, part of the snapshot id)",
     },
-    capletVols: {
-      type: "object",
-      maxProperties: 50,
-      additionalProperties: {
-        type: "object",
-        required: ["id", "currency", "index", "volType", "expiries", "strikes", "vols"],
-        properties: {
-          id: { type: "string", maxLength: 64 },
-          currency,
-          index: rateIndex,
-          volType,
-          shift: { type: "number", minimum: 0, maximum: 1 },
-          expiries: numberVector,
-          strikes: numberVector,
-          vols: numberGrid,
-        },
-        additionalProperties: false,
-      },
-    },
-    fxVols: {
-      type: "object",
-      maxProperties: 100,
-      additionalProperties: {
-        type: "object",
-        required: ["id", "pair", "expiries", "atm", "rr25", "bf25"],
-        properties: {
-          id: { type: "string", maxLength: 64 },
-          pair: currencyPair,
-          expiries: numberVector,
-          atm: numberVector,
-          rr25: numberVector,
-          bf25: numberVector,
-          rr10: numberVector,
-          bf10: numberVector,
-          atmConvention: { type: "string", enum: ["DeltaNeutral", "Forward"] },
-          deltaConvention: { type: "string", enum: ["Spot", "Forward", "PremiumAdjustedSpot", "PremiumAdjustedForward"] },
-          smileInterpolation: { type: "string", enum: ["linear", "cubic"] },
-          strangleType: { type: "string", enum: ["Smile", "Broker"] },
-        },
-        additionalProperties: false,
-      },
-    },
+    swaptionVols: swaptionVolsSchema,
+    capletVols: capletVolsSchema,
+    fxVols: fxVolsSchema,
     credit: {
       type: "object",
       maxProperties: 1000,
@@ -1117,7 +1150,8 @@ export const marketSnapshotRef = { $ref: "MarketSnapshot#" } as const;
 /**
  * Machine-readable error codes of the API (`ErrorResponse.code`), by origin.
  * `core` mirrors the pricing core's `PricingErrorCode` union (a `PricingError`
- * thrown while pricing → 422; `INVALID_TIMESTAMP` → 400 on snapshot import),
+ * thrown while pricing → 422; `INVALID_DATE`/`INVALID_TENOR` always and
+ * `INVALID_TIMESTAMP` on snapshot import → 400, being client-input errors),
  * `api` are raised by the API layer itself. `WARNING_PREFIXES` are not errors:
  * they prefix entries of `PricingResult.warnings[]` / `HazardCurve.warnings[]`
  * on a 200 response.
@@ -1140,19 +1174,36 @@ export const API_ERROR_CODES = {
     "VOL_MODEL_INCOMPATIBLE",
     "INVALID_CREDIT_CURVE",
     "INVALID_TIMESTAMP",
+    "INVALID_DATE",
+    "INVALID_TENOR",
   ],
   api: [
     "DOMAIN_ERROR",
+    "INVALID_REQUEST",
+    "ID_MISMATCH",
+    "INVALID_QUERY_MAP",
+    "NOT_FOUND",
+    "CONFLICT",
     "CSV_INVALID",
     "CSV_ROW_INVALID",
     "SNAPSHOT_MALFORMED",
     "SNAPSHOT_INVALID",
     "PERIOD_BUDGET_EXCEEDED",
+    "STORE_BUDGET_EXCEEDED",
     "PRECONDITION_FAILED",
     "PRECONDITION_REQUIRED",
+    "RATE_LIMITED",
+    "INTERNAL_ERROR",
   ],
 } as const;
-export const WARNING_PREFIXES = ["MISSING_FIXING", "VOL_TYPE_CONVERTED", "HAZARD_FLOORED"] as const;
+export const WARNING_PREFIXES = [
+  "MISSING_FIXING",
+  "MISSING_FX_FIXING",
+  "SETTLES_TODAY",
+  "COLLATERAL_CURVE_MISSING",
+  "VOL_TYPE_CONVERTED",
+  "HAZARD_FLOORED",
+] as const;
 
 export const errorResponseSchema = {
   $id: "ErrorResponse",
@@ -1172,9 +1223,11 @@ export const errorResponseSchema = {
         'INVALID_FREQUENCY (frequency that is not a positive tenor, e.g. "7Q"), UNKNOWN_DAYCOUNT (day count outside the supported conventions), ' +
         "VOL_MODEL_INCOMPATIBLE (requested option model cannot be fed from the vol surface – e.g. Black on a non-positive forward or strike without shift), " +
         "INVALID_CREDIT_CURVE (CDS quotes imply a negative hazard rate; `details.pillar`; avoid with `floorHazard`), INVALID_TIMESTAMP (non-ISO-8601 timestamp: 400 on snapshot import, 422 from the EMIR export), DOMAIN_ERROR (plain core error without code). " +
-        "400: INVALID_TRADE (programming error while pricing, reported as invalid trade), TOO_MANY_PERIODS (estimated coupon periods of one leg above the bound), CSV_INVALID (CSV import: unparsable file / header), SNAPSHOT_MALFORMED; 413 PERIOD_BUDGET_EXCEEDED; 412 PRECONDITION_FAILED; 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED. " +
-        "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID and INTERNAL_ERROR. " +
-        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0).",
+        "400: INVALID_TRADE (programming error while pricing, reported as invalid trade), INVALID_DATE (a date that does not exist, e.g. `2027-02-30`), INVALID_TENOR (unparsable tenor string), TOO_MANY_PERIODS (estimated coupon periods of one leg above the bound), " +
+        "INVALID_REQUEST (semantically invalid request outside the schema, e.g. no trades for a portfolio par-risk run), ID_MISMATCH (body `id` differs from the path id), INVALID_QUERY_MAP (`uti`/`transactionPrice` map malformed or above 4 kB – use the POST body), CSV_INVALID (CSV import: unparsable file / header / missing `?type=`), SNAPSHOT_MALFORMED; " +
+        "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request) and STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED; 500 INTERNAL_ERROR. " +
+        "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID and INTERNAL_ERROR (pricing failed for reasons that are not the trade's). " +
+        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0).",
     },
     details: { type: "object", additionalProperties: true, description: "Structured context of a PricingError (trade id, curve id, …)" },
     requestId: { type: "string" },
@@ -1189,9 +1242,17 @@ export const errorRef = { $ref: "ErrorResponse#" } as const;
 
 /** Common error responses shared by every route (rate limit, internal error). */
 const commonErrors = {
-  429: { ...errorRef, description: "Rate limit exceeded (600/min per client)" },
-  500: { ...errorRef, description: "Internal server error (generic message, details logged server-side)" },
+  429: {
+    ...errorRef,
+    description:
+      "Rate limit exceeded (default 600/min per client IP; the key is `request.ip`, which is the `X-Forwarded-For` client only when the server runs with `TRUST_PROXY` – see SECURITY.md)",
+  },
+  500: { ...errorRef, description: "Internal server error (generic message, `code: INTERNAL_ERROR`, details logged server-side)" },
 } as const;
+/** Response map for routes exempt from the rate limit (health probes): success + generic 500, no 429. */
+export function responsesUnlimited(success: Record<number, unknown>): Record<number, unknown> {
+  return { ...success, 500: commonErrors[500] };
+}
 
 type ErrorStatus = 400 | 404 | 409 | 412 | 413 | 422 | 428;
 const ERROR_DESCRIPTIONS: Record<ErrorStatus, string> = {
@@ -1361,10 +1422,15 @@ export const portfolioReportSchema = {
   additionalProperties: true,
 } as const;
 
+/** ITS (EU) 2022/1860 value formats (Table 2): boolean fields, field 31 Cleared, field 30 Clearing obligation. */
+export const EMIR_BOOLEAN = ["TRUE", "FLSE"] as const;
+export const EMIR_CLEARED = ["Y", "N", "I"] as const;
+export const EMIR_CLEARING_OBLIGATION = ["TRUE", "FLSE", "UKWN"] as const;
+
 export const emirRecordSchema = {
   type: "object",
   description:
-    "EMIR-Refit valuation record (ITS (EU) 2022/1860 Table 2: 21 valuation amount, 22 valuation currency, 23 valuation timestamp, 24 valuation method, 25 delta, 26 collateral portfolio indicator; 30 clearing obligation, 31 cleared; clearing member from Table 1).",
+    "EMIR-Refit valuation record (ITS (EU) 2022/1860 Table 2: 21 valuation amount, 22 valuation currency, 23 valuation timestamp, 24 valuation method, 25 delta, 26 collateral portfolio indicator; 30 clearing obligation, 31 cleared; clearing member from Table 1). Value formats follow the ITS: booleans `TRUE`/`FLSE`, cleared `Y`/`N`/`I`, clearing obligation `TRUE`/`FLSE`/`UKWN`.",
   properties: {
     uti: { type: "string", description: "From `?uti=` map, else the trade's `uti`" },
     tradeId: { type: "string" },
@@ -1380,17 +1446,80 @@ export const emirRecordSchema = {
     },
     valuationMethod: { type: "string", enum: ["MTMA", "MTMO", "CCPV"], description: "Field 24" },
     delta: num("Field 25 – delta of the position (options / collateralised trades)"),
-    collateralPortfolioIndicator: { type: "string", enum: ["TRUE", "FALSE"], description: "Field 26" },
-    cleared: { type: "string", enum: ["TRUE", "FALSE"], description: "Field 31 – from the trade's `cleared`" },
+    collateralPortfolioIndicator: { type: "string", enum: [...EMIR_BOOLEAN], description: "Field 26 – ITS boolean format `TRUE` / `FLSE`" },
+    cleared: {
+      type: "string",
+      enum: [...EMIR_CLEARED],
+      description:
+        "Field 31 – ITS format `Y` (cleared) / `N` (not cleared) / `I` (intent to clear); from the trade's `cleared` (`I` is not produced: the trade model has no intent flag yet)",
+    },
     clearingObligation: {
       type: "string",
-      enum: ["Y", "N", "N/A"],
+      enum: [...EMIR_CLEARING_OBLIGATION],
       description:
-        "Field 30 – from the trade's `clearingObligation` (true → Y, false → N), else the reporter default `?clearingObligation=`; N/A when neither is given – never derived from `cleared`",
+        "Field 30 – ITS format `TRUE` / `FLSE` / `UKWN`; from the trade's `clearingObligation` (true → TRUE, false → FLSE), else the reporter default `clearingObligation`; UKWN when neither is given – never derived from `cleared`",
     },
     clearingMember: { type: "string", description: "Table 1 – the trade's `clearingMember`" },
   },
   additionalProperties: true,
+} as const;
+
+/**
+ * Body of `POST /api/emir/valuations` (N4-06): the same options as the GET query, with the
+ * trade-id maps as JSON objects instead of URL-encoded JSON strings. The GET variant stays for
+ * small maps (≤ 4 kB per map – Node's 16 kB header limit would otherwise answer 431 before the
+ * route runs); reporting data (UTIs, transaction prices) belongs in a body, which is also never
+ * written to the request log.
+ */
+export const emirValuationsBodySchema = {
+  type: "object",
+  properties: {
+    format: { type: "string", enum: ["json", "csv"] },
+    reportingCurrency: currency,
+    asOf: { ...isoDateTime, description: "Reporter's valuation time (field 23) when the snapshot has no `meta.snapshotTime`; default EoD 17:00 UTC" },
+    timestamp: { ...isoDateTime, description: "Explicit valuation timestamp (field 23), overrides snapshot time and `asOf`" },
+    method: {
+      type: "string",
+      enum: ["MTMA", "MTMO", "CCPV"],
+      description: "Valuation method (field 24) for all records, default MTMO (MTMA with `transactionPrice`)",
+    },
+    uti: {
+      type: "object",
+      maxProperties: 5000,
+      propertyNames: tradeId,
+      additionalProperties: { type: "string", pattern: "^[A-Za-z0-9]{1,52}$" },
+      description: "Trade id → UTI (overrides the trade's own `uti`)",
+    },
+    transactionPrice: {
+      type: "object",
+      maxProperties: 5000,
+      propertyNames: tradeId,
+      additionalProperties: { type: "number" },
+      description: "Trade id → observable transaction price; those trades report MTMA unless `method` is given",
+    },
+    clearingObligation: {
+      type: "boolean",
+      description: "Reporter default for field 30 (Art. 4 EMIR) applied to trades without their own `clearingObligation`; omitted → UKWN",
+    },
+    intentToClear: {
+      type: "boolean",
+      description: "Field 31 `I` (intent to clear) for trades that are not (yet) cleared but will be submitted for clearing; cleared trades stay `Y`",
+    },
+  },
+  additionalProperties: false,
+} as const;
+
+/**
+ * OpenAPI request body for the CSV variant of `POST /api/trades/import`. Validation runs on the
+ * JSON shape (the CSV `preValidation` maps rows to `{ trades, mode }` first), so this entry is
+ * added to the document by `openApiTransform`, not to the route's validation schema.
+ */
+export const csvRequestBody = {
+  schema: {
+    type: "string",
+    description:
+      "CSV document: header row plus one trade per row; `?type=` selects the column template (see the operation description), `?mode=upsert` replaces existing ids. Separator `;`/`,`/tab, German or plain numbers, dates ISO or DD.MM.YYYY.",
+  },
 } as const;
 
 export const csvResponse = { type: "string", description: "CSV (Semikolon, Dezimalkomma, UTF-8-BOM) als Download" } as const;

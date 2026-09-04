@@ -70,6 +70,7 @@ describe("golden master – flat-curve vanilla swap", () => {
       fixedCashflows: Cf[];
       floatCashflows: Cf[];
     };
+    quantlib: { npv: number; fairRate: number; fixedLegNPV: number; floatingLegNPV: number };
   }
   const g = golden<G>("swap-flat-curve");
   const val = parseISO(g.inputs.valuationDate);
@@ -136,6 +137,16 @@ describe("golden master – flat-curve vanilla swap", () => {
     check(0, g.expected.fixedCashflows);
     check(1, g.expected.floatCashflows);
   });
+  it("QuantLib VanillaSwap cross-check (R4-4) agrees with the closed form and the engine to 1e-9", () => {
+    const q = g.quantlib;
+    expectRel(q.npv, g.expected.pv, "QuantLib NPV vs closed form", 1e-9);
+    expectRel(q.fairRate, g.expected.parRate, "QuantLib fair rate vs closed form", 1e-12);
+    expectRel(q.fixedLegNPV, g.expected.pvFixed, "QuantLib fixed leg", 1e-12);
+    expectRel(q.floatingLegNPV, g.expected.pvFloat, "QuantLib float leg", 1e-12);
+    const res = priceTrade(ctx, swap, "EUR");
+    expectRel(res.pv, q.npv, "engine PV vs QuantLib", 1e-9);
+    expectRel(res.analytics.parRate as number, q.fairRate, "engine par rate vs QuantLib", 1e-9);
+  });
 });
 
 describe("golden master – €STR OIS compounding", () => {
@@ -200,8 +211,15 @@ describe("golden master – Black-76 / Bachelier closed forms", () => {
       black76: { undiscountedCall: number; capletValue: number; put: number };
       bachelier: { atmPayer: number; atmClosedForm: number; delta: number; vega: number };
     };
+    quantlib: { black76Call: number; bachelierAtm: number };
   }
   const g = golden<G>("black76-bachelier");
+  it("QuantLib blackFormula / bachelierBlackFormula cross-check (R4-4) agrees to 1e-13", () => {
+    expectRel(g.quantlib.black76Call, g.expected.black76.undiscountedCall, "QuantLib Black-76", 1e-13);
+    expectRel(g.quantlib.bachelierAtm, g.expected.bachelier.atmPayer, "QuantLib Bachelier", 1e-13);
+    const b = g.inputs.black76;
+    expectRel(black76("Call", b.forward, b.strike, b.vol, b.timeToExpiry), g.quantlib.black76Call, "engine vs QuantLib Black-76", 1e-13);
+  });
   it("Hull caplet and ATM Bachelier swaption", () => {
     const b = g.inputs.black76;
     const call = black76("Call", b.forward, b.strike, b.vol, b.timeToExpiry);
@@ -386,7 +404,7 @@ describe("golden master – sample-market €STR OIS bootstrap (calendar, paymen
       pillars: { tenor: string; rate: number; accrualEnd: string; date: string; time: number; df: number; zero: number; method: "closed-form" | "bisection" }[];
       closedFormPillars: string[];
     };
-    quantlib?: { status?: string };
+    quantlib: { status: string; version?: string; engine: string; pillars: { date: string; df: number }[] };
   }
   const g = golden<G>("sample-market-bootstrap");
   const val = parseISO(g.inputs.valuationDate);
@@ -394,8 +412,43 @@ describe("golden master – sample-market €STR OIS bootstrap (calendar, paymen
   it("the JSON quotes are the sample-market quotes (no silent drift between reference and engine inputs)", () => {
     expect(g.inputs.quotes).toEqual(SAMPLE_QUOTES.eurOis);
     expect(g.expected.closedFormPillars).toEqual(["1W", "1M", "3M", "6M", "9M", "1Y"]);
-    // QuantLib block: pending until the script is run with the bindings (documented in tools/README.md)
-    expect(g.quantlib?.status ?? "pending").toMatch(/pending|done/);
+  });
+
+  it("QuantLib cross-check (R4-4): PiecewiseLogLinearDiscount / OISRateHelper reproduces every pillar DF within 5e-8 – a uniform factor from the 0→spot stub convention – and every DF ratio between pillars within 1e-12", () => {
+    // The block is checked in (tools/quantlib-golden.py run with QuantLib 1.43, see test-data/golden/README.md).
+    expect(g.quantlib.status).toBe("done");
+    expect(g.quantlib.version ?? "1.43").toMatch(/^1\.\d+/);
+    expect(g.quantlib.engine).toContain("PiecewiseLogLinearDiscount");
+    const ql = new Map(g.quantlib.pillars.map((p) => [p.date, p.df]));
+    // QuantLib's curve has a t = 0 node and no spot node: 1 + 18 pillars on the same dates as the engine.
+    expect(ql.get(g.inputs.valuationDate)).toBe(1);
+    expect(g.quantlib.pillars).toHaveLength(g.expected.pillars.length + 1);
+    const rel = g.expected.pillars.map((p) => {
+      const q = ql.get(p.date);
+      expect(q, `QuantLib pillar ${p.date}`).toBeDefined();
+      return q! / p.df - 1;
+    });
+    for (const r of rel) expect(Math.abs(r)).toBeLessThan(5e-8);
+    // Uniform: the spread of the relative differences is at machine precision …
+    expect(Math.max(...rel) - Math.min(...rel)).toBeLessThan(1e-12);
+    // … and equals the stub effect exactly: the engine's spot node DF = 1/(1 + r_1W·τ_s) (simple interest over
+    // the 4 days to spot) versus QuantLib's log-linear segment 0 → 1W pillar (no spot node, i.e. continuous
+    // compounding at the 1W zero), ln DF_QL − ln DF_engine = ln(1 + r_1W·τ_s) − (τ_s/τ_1W)·ln(1 + r_1W·τ_1W)
+    // ≈ (r²/2)·τ_s·(τ_1W − τ_s) = 1.87e-8 (τ_s = 4/360, τ_1W = 7/360, r_1W = 2.01 %).
+    const r1w = (g.inputs.quotes[0] as { rate: number }).rate;
+    const tauS = 4 / 360;
+    const tau1w = 7 / 360;
+    const stub = Math.log(1 + r1w * tauS) - (tauS / tau1w) * Math.log(1 + r1w * tau1w);
+    expect(Math.abs(rel[0]! - stub)).toBeLessThan(1e-10);
+    expect(Math.abs(stub - ((r1w * r1w) / 2) * tauS * (tau1w - tauS))).toBeLessThan(1e-11);
+    // Forward structure identical: DF ratios between neighbouring pillars agree to 1e-12.
+    for (let i = 1; i < g.expected.pillars.length; i++) {
+      const a = g.expected.pillars[i - 1]!;
+      const b = g.expected.pillars[i]!;
+      const ratioQl = ql.get(b.date)! / ql.get(a.date)!;
+      const ratioExp = b.df / a.df;
+      expect(Math.abs(ratioQl / ratioExp - 1), `DF ratio ${a.tenor}→${b.tenor}`).toBeLessThan(1e-12);
+    }
   });
 
   it("standalone bootstrap reproduces the spot node and every pillar DF (closed form ≤ 1Y, bisection > 1Y) and reprices all quotes", () => {

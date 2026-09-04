@@ -58,7 +58,7 @@ describe("N3-01 compute bounds", () => {
     expect(tradeLegPeriods({ type: "FRA" })).toEqual([1]);
     expect(tradeLegPeriods(null)).toEqual([]);
     const limits = defaultLimits();
-    expect(limits).toEqual({ maxPeriodsPerLeg: 1200, maxPeriodsPerRequest: 20_000, maxWeightedPeriodsPerRequest: 500_000 });
+    expect(limits).toEqual({ maxPeriodsPerLeg: 1200, maxPeriodsPerRequest: 20_000, maxWeightedPeriodsPerRequest: 500_000, maxStorePeriods: 200_000 });
     expect(assertTradeWithinLimits(swap("1M", 50), limits)).toBe(1200);
     expect(() => assertTradeWithinLimits(swap("1D", 100), limits)).toThrow(/TOO_MANY_PERIODS|coupon periods exceed/);
     expect(() => assertBudget(20_001, 1, 100, limits)).toThrow(/budget/);
@@ -137,7 +137,9 @@ describe("N3-01 compute bounds", () => {
     const tiny = await buildApp({ logger: false, limits: { maxPeriodsPerRequest: 10 } });
     expect((await tiny.inject({ method: "POST", url: "/api/scenarios", payload: {} })).statusCode).toBe(413);
     expect((await tiny.inject({ method: "POST", url: "/api/report/portfolio", payload: {} })).statusCode).toBe(413);
-    expect((await tiny.inject({ method: "GET", url: "/api/trades?price=1" })).statusCode).toBe(200);
+    // Since R4 (N4-01) the GET valuation routes price the store under the same budget.
+    expect((await tiny.inject({ method: "GET", url: "/api/trades?price=1" })).statusCode).toBe(413);
+    expect((await tiny.inject({ method: "GET", url: "/api/trades" })).statusCode).toBe(200);
     await tiny.close();
     expect((await post("/api/scenarios", {})).statusCode).toBe(200);
     // The document advertises the budget.
@@ -165,7 +167,8 @@ describe("N3-01 compute bounds", () => {
     const fst = classifyError(Object.assign(new Error("too large"), { statusCode: 413, code: "FST_ERR_CTP_BODY_TOO_LARGE" }));
     expect(fst.status).toBe(413);
     expect(fst.code).toBeUndefined();
-    expect(classifyError(Object.assign(new Error("boom"), { statusCode: 500, code: "SOMETHING" })).code).toBeUndefined();
+    // A 5xx never leaks its internal code; since R4 (N4-05) the envelope carries the catalogued INTERNAL_ERROR instead.
+    expect(classifyError(Object.assign(new Error("boom"), { statusCode: 500, code: "SOMETHING" })).code).toBe("INTERNAL_ERROR");
   });
 });
 
@@ -341,17 +344,18 @@ describe("N3-09 clearing obligation is an explicit trade field", () => {
       clearingObligation: string;
     }[];
     const by = (id: string) => recs.find((r) => r.tradeId === id)!;
-    expect(by("VOL-CLR")).toMatchObject({ cleared: "TRUE", clearingObligation: "N" });
-    expect(by("MUST-CLR")).toMatchObject({ cleared: "FALSE", clearingObligation: "Y" });
-    expect(by("CLR-ONLY")).toMatchObject({ cleared: "TRUE", clearingObligation: "N/A" });
-    expect(by("IRS-0002")).toMatchObject({ cleared: "FALSE", clearingObligation: "N/A" });
+    // Values in the ITS (EU) 2022/1860 formats since R4 (N4-08): cleared Y/N, clearing obligation TRUE/FLSE/UKWN.
+    expect(by("VOL-CLR")).toMatchObject({ cleared: "Y", clearingObligation: "FLSE" });
+    expect(by("MUST-CLR")).toMatchObject({ cleared: "N", clearingObligation: "TRUE" });
+    expect(by("CLR-ONLY")).toMatchObject({ cleared: "Y", clearingObligation: "UKWN" });
+    expect(by("IRS-0002")).toMatchObject({ cleared: "N", clearingObligation: "UKWN" });
     // Reporter default for trades without the flag; explicit trade flags win.
     const dflt = (await app2.inject({ method: "GET", url: "/api/emir/valuations?clearingObligation=true" })).json() as typeof recs;
-    expect(dflt.find((r) => r.tradeId === "CLR-ONLY")!.clearingObligation).toBe("Y");
-    expect(dflt.find((r) => r.tradeId === "VOL-CLR")!.clearingObligation).toBe("N");
+    expect(dflt.find((r) => r.tradeId === "CLR-ONLY")!.clearingObligation).toBe("TRUE");
+    expect(dflt.find((r) => r.tradeId === "VOL-CLR")!.clearingObligation).toBe("FLSE");
     expect((await app2.inject({ method: "GET", url: "/api/emir/valuations?clearingObligation=maybe" })).statusCode).toBe(400);
     const csv = (await app2.inject({ method: "GET", url: "/api/emir/valuations?format=csv" })).body;
-    expect(csv.split("\n").some((l) => l.includes("CLR-ONLY") && l.includes(";N/A;"))).toBe(true);
+    expect(csv.split("\n").some((l) => l.includes("CLR-ONLY") && l.includes(";Y;UKWN;"))).toBe(true);
     const doc = JSON.stringify(app2.swagger());
     expect(doc).toContain("field 30");
     expect(doc).not.toContain("derived: cleared");

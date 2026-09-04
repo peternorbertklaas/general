@@ -2,6 +2,7 @@ import { type FastifyInstance } from "fastify";
 import { type Trade, type VegaBucketOptions, parRisk, parRiskPortfolio, sampleBootstrapSpecs, vegaBuckets } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
+import { sendError } from "../lib/errors.js";
 import { arrayResponse, parRiskPortfolioBodySchema, responses, tradeRef } from "../schemas.js";
 
 const currency = { type: "string", pattern: "^[A-Z]{3}$" } as const;
@@ -118,10 +119,8 @@ export async function registerExtendedRiskRoutes(app: FastifyInstance, ctx: AppC
     async (req, reply) => {
       const m = ctx.market.get();
       const trades = req.body.useStore || !req.body.trades ? ctx.trades.list().map((t) => t.trade) : datesToSerial(req.body.trades);
-      if (trades.length === 0)
-        return reply.status(400).send({ error: "No trades given (body.trades or useStore=true with a non-empty store)", statusCode: 400, requestId: req.id });
-      if (trades.length > 200)
-        return reply.status(400).send({ error: "At most 200 trades per par-risk portfolio request", statusCode: 400, requestId: req.id });
+      if (trades.length === 0) return sendError(reply, req, 400, "INVALID_REQUEST", "No trades given (body.trades or useStore=true with a non-empty store)");
+      if (trades.length > 200) return sendError(reply, req, 400, "INVALID_REQUEST", "At most 200 trades per par-risk portfolio request");
       const specs = sampleBootstrapSpecs(m.valuationDate, ctx.market.getQuotes());
       const res = parRiskPortfolio(m, trades, req.body.reportingCurrency ?? "EUR", specs, { curveIds: req.body.curveIds, bumpBp: req.body.bumpBp });
       return datesToIso(res);

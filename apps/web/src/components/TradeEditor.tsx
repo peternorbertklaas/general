@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import {
   type BusinessDayConvention,
   type CrossCurrencySwap,
@@ -11,10 +12,21 @@ import {
   buildSchedule,
   getIndex,
   linearAmortisation,
+  makeVanillaSwap,
 } from "@deriva/pricing-core";
 import { parseDateInput } from "../lib/date-parse.js";
 import { fmtBp, fmtDate, fmtMoney, fmtPct } from "../lib/format.js";
-import { BARRIER_DE, CAPFLOOR_DE, CASH_CONVENTION_DE, MODEL_DE, OPTION_TYPE_DE, PAYER_RECEIVER_DE, SETTLEMENT_DE, optionsFrom } from "../lib/i18n.js";
+import {
+  BARRIER_DE,
+  CAPFLOOR_DE,
+  CASH_CONVENTION_DE,
+  MODEL_DE,
+  OPTION_TYPE_DE,
+  PAYER_RECEIVER_DE,
+  SETTLEMENT_DE,
+  optionsFrom,
+  translateCoreMessage,
+} from "../lib/i18n.js";
 import { parseNumberInput } from "../lib/num-parse.js";
 import { annuityAmortisation, frequencyMonths, parseSchedulePaste, scheduleValueAt } from "../lib/trade-ops.js";
 import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
@@ -599,6 +611,11 @@ function AmortisationEditor({
 export function TradeEditor({ trade, onChange }: Props) {
   const customerMode = useStore((s) => s.customerMode);
   const valuationDate = useStore((s) => s.valuationDate);
+  /** Currencies with a swaption vol cube in the market (currency choice of the swaption editor, Markt R4-2). */
+  const swaptionVolCurrencies = useStore(useShallow((s) => Object.keys(s.baseMarket.swaptionVols ?? {})));
+  /** Core warnings of the current valuation – e.g. `COLLATERAL_CURVE_MISSING:` for a CSA without a collateral curve (Markt R4-1). */
+  const pricingWarnings = useStore(useShallow((s) => s.results[trade.id]?.result?.warnings ?? []));
+  const collateralCurveMissing = pricingWarnings.find((w) => w.startsWith("COLLATERAL_CURVE_MISSING"));
   const [convOpen, toggleConv] = useConventionsOpen();
   const issues = useMemo(() => validateTrade(trade), [trade]);
   const iss = (field: string) => issueFor(issues, field);
@@ -638,6 +655,18 @@ export function TradeEditor({ trade, onChange }: Props) {
           checked={trade.cleared ?? false}
           onChange={(v) => upd({ cleared: v, clearingMember: v ? trade.clearingMember : undefined })}
           label="zentral gecleart (Art. 4 EMIR)"
+        />
+      </Field>
+      <Field label="Clearingpflicht" hint="EMIR-Feld 30 (TRUE / FLSE / UKWN) – unabhängig vom tatsächlichen Clearing (Feld 31: Y / N)">
+        <Select
+          value={trade.clearingObligation === undefined ? "UKWN" : trade.clearingObligation ? "TRUE" : "FLSE"}
+          options={[
+            { v: "UKWN" as const, l: "nicht bestimmt (UKWN)" },
+            { v: "TRUE" as const, l: "ja – clearingpflichtig (TRUE)" },
+            { v: "FLSE" as const, l: "nein (FLSE)" },
+          ]}
+          ariaLabel="Clearingpflicht"
+          onChange={(v) => upd({ clearingObligation: v === "UKWN" ? undefined : v === "TRUE" })}
         />
       </Field>
       {trade.cleared && (
@@ -705,6 +734,15 @@ export function TradeEditor({ trade, onChange }: Props) {
           trade.type === "CrossCurrencySwap" && !trade.collateralCurrency
             ? "ohne CSA keine Xccy-Basis – jedes Leg wird auf seiner eigenen OIS-Kurve diskontiert"
             : "Diskontkurve nach Besicherung"
+        }
+        issue={
+          collateralCurveMissing && trade.collateralCurrency
+            ? {
+                field: "collateralCurrency",
+                level: "warn",
+                msg: `Für die gewählte CSA-Währung ${trade.collateralCurrency} existiert keine Collateral-Kurve – Diskontierung auf der eigenen OIS-Kurve, Cross-Currency-Basis nicht gepreist (${translateCoreMessage(collateralCurveMissing)})`,
+              }
+            : undefined
         }
       >
         <Select
@@ -1034,9 +1072,29 @@ export function TradeEditor({ trade, onChange }: Props) {
       const fixed = trade.underlying.legs.find((l): l is FixedLeg => l.type === "Fixed")!;
       const setUnderlying = (patch: LegPatch) =>
         onChange({ ...trade, underlying: { ...trade.underlying, legs: trade.underlying.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } });
+      /** Currency change rebuilds the underlying swap with the market conventions of the new currency (index, frequencies, day counts) – Markt R4-2. */
+      const setCurrency = (ccy: string) => {
+        const rebuilt = makeVanillaSwap({
+          id: trade.underlying.id,
+          currency: ccy,
+          notional: fixed.notional,
+          payReceiveFixed: fixed.payReceive,
+          fixedRate: fixed.rate,
+          effectiveDate: fixed.effectiveDate,
+          maturity: fixed.terminationDate,
+        });
+        onChange({ ...trade, underlying: { ...trade.underlying, legs: rebuilt.legs } });
+      };
+      const ccyOptions = [...new Set([...swaptionVolCurrencies, fixed.currency])].map((c) => ({
+        v: c,
+        l: swaptionVolCurrencies.includes(c) ? `${c} (Vol-Cube)` : `${c} (ohne Vol-Cube – Fallback-Vol)`,
+      }));
       return (
         <div className="form">
           {common}
+          <Field label="Währung" hint="Währungen mit Swaption-Vol-Cube im Markt; der Underlying-Swap folgt den Marktkonventionen der Währung">
+            <Select value={fixed.currency} options={ccyOptions} ariaLabel="Währung" onChange={setCurrency} />
+          </Field>
           <Field label="Typ">
             <Select
               value={trade.payerReceiver}

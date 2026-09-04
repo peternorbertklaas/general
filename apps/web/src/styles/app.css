@@ -207,6 +207,9 @@ button.link:hover {
 }
 .topbar .crumb {
   color: var(--fg-2);
+  margin: 0;
+  font-size: inherit;
+  font-weight: 400;
   white-space: nowrap;
 }
 .topbar .grow {
@@ -1354,9 +1357,10 @@ select.inline {
 }
 
 /* ---------- Documents ---------- */
-.doc .doc-head h1 {
+.doc .doc-head h2 {
   margin: 0 0 4px;
   font-size: var(--fs-xl);
+  font-weight: 600;
 }
 .doc .doc-section {
   margin-top: 12px;
@@ -1453,15 +1457,38 @@ select.inline {
     -webkit-appearance: none;
     font-family: var(--font-mono);
   }
+  /* Unit directly next to the value ("50 %"), selects wide enough for their option text (R4-08) */
+  .input-unit {
+    display: inline-flex;
+    width: auto;
+    gap: 3px;
+  }
   .input-unit .unit {
     position: static;
-    margin-left: 4px;
+    margin-left: 0;
     color: #333;
+    flex: 0 0 auto;
   }
   .input-unit input {
     padding-right: 0 !important;
+    width: 10ch !important;
+    field-sizing: content;
+    flex: 0 0 auto;
+    min-width: 0;
+  }
+  /* Wider form cells on paper and no flex stretch: a select is as wide as its option text ("Variabel verzinster Kredit"). */
+  .form {
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  }
+  .field select,
+  select.inline {
+    align-self: flex-start;
     width: auto !important;
-    flex: 0 1 auto;
+    max-width: none !important;
+    min-width: 0;
+    overflow: visible;
+    text-overflow: clip;
+    field-sizing: content;
   }
   .num-input {
     text-align: left !important;
@@ -1799,7 +1826,7 @@ datalist {
     margin: 0;
     padding: 0;
   }
-  body.print-doc .doc-head h1 {
+  body.print-doc .doc-head h2 {
     color: #111 !important;
     font-size: 18px;
     margin-top: 0;
@@ -1924,6 +1951,26 @@ table.grid-table tbody tr[data-hist] .neg {
 .heat .cell.edited .num-input,
 td.vol-cell.edited .num-input {
   border-color: var(--warn);
+}
+/* Vol grids (caplet surface): the input never grows beyond its cell – value readable, click hits its own cell (R4-01) */
+table.vol-grid {
+  table-layout: fixed;
+  width: 100%;
+}
+table.vol-grid td.vol-cell {
+  padding: 2px 3px;
+}
+table.vol-grid td.vol-cell .num-input.inline,
+td.vol-cell .num-input.inline {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 2px 4px;
+}
+/* Curves toolbar: the Turn-of-Year label stays on one line (R4-09) */
+.toolbar .toy-label {
+  white-space: nowrap;
 }
 /* Blotter toolbar: compact mode (icon buttons, filter popover) below 1400 px (R3-09 / N-12) */
 .popover.filters {

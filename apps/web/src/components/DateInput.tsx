@@ -24,7 +24,9 @@ export interface DateInputProps {
  * one day (⇧ one month, ⌥ one year) and a calendar-free popover of presets
  * (▾ button or Alt+↓). Invalid text is flagged and never committed; `Esc`
  * restores the value the field had when it received focus (R3-10). The presets
- * popover is a registered popover layer (Esc / click outside / focus return, R3-02).
+ * popover is a registered popover layer (Esc / click outside / focus return,
+ * R3-02) that keeps the edit session open: opening it never commits the typed
+ * draft, `Esc` closes it and a second `Esc` discards the draft (R4-04).
  */
 export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, testId, disabled }: DateInputProps) {
   const valuationDate = useStore((s) => s.valuationDate);
@@ -38,15 +40,25 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
   const [open, setOpen] = useState(false);
   const initial = useRef(value);
   const cancelling = useRef(false);
+  /** Set while the presets popover owns the focus: the blur must not commit and the returning focus must keep the draft. */
+  const presets = useRef(false);
+  /** True between closing the popover and the focus returning to the input – the draft is still shown meanwhile. */
+  const [resuming, setResuming] = useState(false);
   const listId = useId();
   const formatted = formatDateInput(value);
   const refDate = base ?? valuationDate;
+  const editing = focused || open || resuming;
 
   useEffect(() => {
-    if (!focused) setText(formatted);
-  }, [formatted, focused]);
+    if (!editing) setText(formatted);
+  }, [formatted, editing]);
 
-  usePopover(open, () => setOpen(false), { anchor: wrap, panel, restoreTo: ref });
+  const closePresets = () => {
+    presets.current = true; // focus returns to the input → keep the draft
+    setResuming(true);
+    setOpen(false);
+  };
+  usePopover(open, closePresets, { anchor: wrap, panel, restoreTo: ref });
 
   const commit = (raw: string): boolean => {
     const d = parseDateInput(raw, { base: refDate, current: value });
@@ -69,7 +81,7 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
   };
   const pick = (input: string) => {
     commit(input);
-    setOpen(false);
+    closePresets();
   };
   const cancel = () => {
     cancelling.current = true;
@@ -78,6 +90,18 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
     setText(formatDateInput(v));
     setBad(false);
     ref.current?.blur();
+  };
+  const togglePresets = () => {
+    if (open) closePresets();
+    else {
+      if (!focused) {
+        // opened via ▾ without focus: start an edit session so Esc can restore this value
+        initial.current = value;
+        setText(formatted);
+      }
+      presets.current = true;
+      setOpen(true);
+    }
   };
 
   return (
@@ -89,7 +113,7 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
         autoComplete="off"
         spellCheck={false}
         className={`mono ${inline ? "inline" : ""}`}
-        value={focused ? text : formatted}
+        value={editing ? text : formatted}
         aria-label={label}
         aria-invalid={invalid || bad || undefined}
         aria-haspopup="listbox"
@@ -98,8 +122,16 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
         data-testid={testId}
         disabled={disabled}
         placeholder="tt.mm.jjjj · 10y · +6m"
-        title="Datum (tt.mm.jjjj, ISO), Tenor ab Bewertungstag (10y, 6m) oder relativ (+6m, -1y); ↑/↓ Tag, ⇧ Monat, ⌥ Jahr; Alt+↓ Vorlagen; Esc verwirft die Eingabe"
+        title="Datum (tt.mm.jjjj, ISO), Tenor ab Bewertungstag (10y, 6m) oder relativ (+6m, -1y); ↑/↓ Tag, ⇧ Monat, ⌥ Jahr; Alt+↓ Vorlagen (Esc schließt, zweites Esc verwirft)"
         onFocus={() => {
+          if (presets.current) {
+            // focus comes back from the presets popover – the draft stays a draft
+            presets.current = false;
+            setResuming(false);
+            setFocused(true);
+            return;
+          }
+          setResuming(false);
           initial.current = value;
           cancelling.current = false;
           setText(formatted);
@@ -111,6 +143,8 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
             cancelling.current = false;
             return;
           }
+          // The presets popover took the focus: no commit, the typed text remains a draft (R4-04).
+          if (presets.current || open) return;
           if (!commit(text)) setText(formatted);
           setBad(false);
         }}
@@ -124,7 +158,7 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
             if (commit(text)) ref.current?.blur();
           } else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && e.altKey) {
             e.preventDefault();
-            setOpen((o) => !o);
+            togglePresets();
           } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
             e.preventDefault();
             step(e.key === "ArrowUp" ? 1 : -1, e.shiftKey ? "m" : e.altKey ? "y" : "d");
@@ -141,9 +175,10 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
           className="date-presets-btn"
           aria-label="Datums-Vorlagen"
           aria-expanded={open}
-          title="Vorlagen (Tenor ab Bewertungstag, relativ, Monats-/Jahresende)"
+          title="Vorlagen (Tenor ab Bewertungstag, relativ, Monats-/Jahresende) – die Eingabe bleibt Entwurf"
           tabIndex={-1}
-          onClick={() => setOpen((o) => !o)}
+          onMouseDown={(e) => e.preventDefault()} // keep the focus in the input – no blur commit (R4-04)
+          onClick={togglePresets}
         >
           ▾
         </button>
@@ -167,7 +202,8 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
             );
           })}
           <span className="muted xs" style={{ flexBasis: "100%" }}>
-            Tenor ab Bewertungstag · <kbd>+6m</kbd> relativ zum Feld · <kbd>me</kbd>/<kbd>je</kbd> Monats-/Jahresende · <kbd>Esc</kbd> schließt
+            Tenor ab Bewertungstag · <kbd>+6m</kbd> relativ zum Feld · <kbd>me</kbd>/<kbd>je</kbd> Monats-/Jahresende · <kbd>Esc</kbd> schließt, zweites{" "}
+            <kbd>Esc</kbd> verwirft die Eingabe
           </span>
         </div>
       )}

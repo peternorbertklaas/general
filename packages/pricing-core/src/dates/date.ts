@@ -5,6 +5,8 @@
  * avoids all timezone/DST pitfalls of JS `Date` and makes comparisons and
  * differences trivial integer arithmetic.
  */
+import { PricingError } from "../errors.js";
+
 export type SerialDate = number;
 
 export type TenorUnit = "D" | "W" | "M" | "Y";
@@ -25,13 +27,18 @@ export function toYMD(d: SerialDate): { year: number; month: number; day: number
   return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate() };
 }
 
+/**
+ * Parse `YYYY-MM-DD` (a trailing time part is ignored). Throws
+ * `PricingError("INVALID_DATE")` for a malformed string or a day that does not
+ * exist in the calendar (`2027-02-30`) – a client-input error (N4-03).
+ */
 export function parseISO(iso: string): SerialDate {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso.trim());
-  if (!m) throw new Error(`Invalid ISO date: ${iso}`);
+  if (!m) throw new PricingError("INVALID_DATE", `Invalid ISO date: ${iso}`, { input: iso });
   const y = Number(m[1]);
   const mo = Number(m[2]);
   const d = Number(m[3]);
-  if (mo < 1 || mo > 12 || d < 1 || d > daysInMonth(y, mo)) throw new Error(`Invalid date: ${iso}`);
+  if (mo < 1 || mo > 12 || d < 1 || d > daysInMonth(y, mo)) throw new PricingError("INVALID_DATE", `Invalid date: ${iso}`, { input: iso });
   return fromYMD(y, mo, d);
 }
 
@@ -89,7 +96,7 @@ export function isEndOfMonth(d: SerialDate): boolean {
  * Parse a tenor string. Money-market aliases are mapped to business-day
  * tenors from today: ON = 1D, TN = 2D (tomorrow → next), SN = 3D (spot →
  * next, assuming a T+2 spot lag; for T+0/T+1 currencies pass the explicit
- * day count instead).
+ * day count instead). Throws `PricingError("INVALID_TENOR")` otherwise (N4-03).
  */
 export function parseTenor(t: string | Tenor): Tenor {
   if (typeof t !== "string") return t;
@@ -98,7 +105,7 @@ export function parseTenor(t: string | Tenor): Tenor {
     if (/^\s*(ON|O\/N)\s*$/i.test(t)) return { n: 1, unit: "D" };
     if (/^\s*(TN|T\/N)\s*$/i.test(t)) return { n: 2, unit: "D" };
     if (/^\s*(SN|S\/N)\s*$/i.test(t)) return { n: 3, unit: "D" };
-    throw new Error(`Invalid tenor: ${t}`);
+    throw new PricingError("INVALID_TENOR", `Invalid tenor: ${t}`, { input: t });
   }
   return { n: Number(m[1]), unit: m[2]!.toUpperCase() as TenorUnit };
 }

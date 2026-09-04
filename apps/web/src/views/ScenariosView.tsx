@@ -3,7 +3,7 @@ import { useShallow } from "zustand/react/shallow";
 import { HISTORICAL_SCENARIOS, STANDARD_SCENARIOS, runScenarios, scenarioGrid } from "@deriva/pricing-core";
 import { EChart, negColor, posColor } from "../components/EChart.js";
 import { NumInput } from "../components/NumInput.js";
-import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
+import { useTableNav } from "../hooks/useTableNav.js";
 import { fmtCompact, fmtMoney, fmtNum, fmtSigned, signClass } from "../lib/format.js";
 import { EMPTY_SCENARIO_FORM, buildCustomScenario, describeScenario, type CustomScenarioForm } from "../lib/scenarios.js";
 import { LS_KEYS, readLocal, useStore, writeLocal } from "../state/store.js";
@@ -221,7 +221,7 @@ export function ScenariosView() {
           <h3>
             Szenario-Tabelle{" "}
             <span className="right muted xs">
-              <kbd>↑</kbd>/<kbd>↓</kbd> · <kbd>y</kbd> kopieren
+              <kbd>↑</kbd>/<kbd>↓</kbd> · <kbd>y</kbd> <kbd>y</kbd> kopieren
             </span>
           </h3>
           <div className="table-scroll" style={{ maxHeight: 400 }}>
@@ -234,12 +234,18 @@ export function ScenariosView() {
                   <th className="num">%</th>
                 </tr>
               </thead>
-              <tbody onKeyDown={tableNav.onKeyDown}>
-                {out.results.flatMap((r) => {
+              <tbody onKeyDown={tableNav.onKeyDown} onFocus={tableNav.onFocus}>
+                {out.results.flatMap((r, ri) => {
                   const hist = isHist(r.scenario.id);
                   const open = expanded === r.scenario.id;
                   const rows = [
-                    <tr key={r.scenario.id} {...navRowProps()} style={{ cursor: "default" }} title={r.scenario.description} data-hist={hist || undefined}>
+                    <tr
+                      key={r.scenario.id}
+                      {...tableNav.rowProps(ri, out.results.length)}
+                      style={{ cursor: "default" }}
+                      title={r.scenario.description}
+                      data-hist={hist || undefined}
+                    >
                       <td>
                         {hist && r.scenario.description && (
                           <button
@@ -362,9 +368,17 @@ export function ScenariosView() {
                 ))}
               </tr>
             </thead>
-            <tbody onKeyDown={tradeNav.onKeyDown}>
+            <tbody onKeyDown={tradeNav.onKeyDown} onFocus={tradeNav.onFocus}>
               {trades.map((t, ti) => (
-                <tr key={t.id} onClick={() => act().select(t.id)} className={t.id === s.selectedId ? "selected" : ""} {...navRowProps(t.id === s.selectedId)}>
+                <tr
+                  key={t.id}
+                  onClick={() => act().select(t.id)}
+                  className={t.id === s.selectedId ? "selected" : ""}
+                  {...tradeNav.rowProps(ti, trades.length, {
+                    selected: t.id === s.selectedId,
+                    active: trades.some((x) => x.id === s.selectedId) ? t.id === s.selectedId : undefined,
+                  })}
+                >
                   <td className="mono ellipsis" title={t.id} style={{ maxWidth: 160 }}>
                     {t.id}
                   </td>

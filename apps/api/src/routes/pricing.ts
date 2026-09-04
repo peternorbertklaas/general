@@ -24,6 +24,7 @@ import {
   yearFraction,
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
+import { sendError } from "../lib/errors.js";
 import { safeFilename } from "../lib/store.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import {
@@ -332,9 +333,7 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
       const m = ctx.market.get();
       const valuationDate = req.body.valuationDate ? parseISO(req.body.valuationDate) : m.valuationDate;
       const discount = req.body.discountCurveId ? m.curves[req.body.discountCurveId] : undefined;
-      if (req.body.discountCurveId && !discount) {
-        return reply.status(404).send({ error: `Curve ${req.body.discountCurveId} not found`, statusCode: 404, requestId: req.id });
-      }
+      if (req.body.discountCurveId && !discount) return sendError(reply, req, 404, "NOT_FOUND", `Curve ${req.body.discountCurveId} not found`);
       const curve = bootstrapHazardCurve(req.body.quotes, req.body.recovery, valuationDate, discount, { floorHazard: req.body.floorHazard });
       // Label each pillar with the quote whose maturity (same ACT/365F time as the core) produced it.
       const quoteTimes = req.body.quotes.map((q) => ({ tenor: q.tenor, t: yearFraction(valuationDate, addTenor(valuationDate, q.tenor), "ACT/365F") }));

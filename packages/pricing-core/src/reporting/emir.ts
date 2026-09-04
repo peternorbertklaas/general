@@ -25,7 +25,14 @@ import { csvCell } from "./valuation-report.js";
  * `clearingObligation` flag (or `opts.clearingObligation`); it is **not**
  * derived from `cleared` – the Art. 4 obligation depends on counterparty
  * classification, product class and thresholds, not on whether the trade was
- * (voluntarily) cleared. Unknown → "N/A".
+ * (voluntarily) cleared. Unknown → "UKWN".
+ *
+ * Value formats (N4-08) follow the ITS Table 2 validation rules verbatim so an
+ * export passes trade-repository validation: booleans are `TRUE` / `FLSE`
+ * (field 26 collateral portfolio indicator, field 30 clearing obligation with
+ * `UKWN` for "not determined"), field 31 cleared is `Y` / `N` / `I` (intent to
+ * clear). The trade input stays boolean (`cleared`, `clearingObligation`);
+ * `opts.intentToClear` selects `I`.
  */
 export interface EmirValuationRecord {
   uti?: string;
@@ -44,14 +51,34 @@ export interface EmirValuationRecord {
   valuationMethod: "MTMA" | "MTMO" | "CCPV";
   /** Field 25. */
   delta?: number;
-  /** Field 26. */
-  collateralPortfolioIndicator: "TRUE" | "FALSE";
-  /** Field 31 – centrally cleared; "FALSE" when the trade does not say otherwise. */
-  cleared: "TRUE" | "FALSE";
-  /** Field 30 – clearing obligation from the trade / options; "N/A" when not determined (never derived from `cleared`). */
-  clearingObligation: "Y" | "N" | "N/A";
+  /** Field 26 – ITS boolean format `TRUE` / `FLSE` (N4-08). */
+  collateralPortfolioIndicator: EmirBoolean;
+  /**
+   * Field 31 – cleared: `Y` (centrally cleared), `N` (not cleared), `I`
+   * (intent to clear, `opts.intentToClear` on a not-yet-cleared trade).
+   * `N` when the trade does not say otherwise.
+   */
+  cleared: EmirCleared;
+  /**
+   * Field 30 – clearing obligation: `TRUE` / `FLSE` from the trade's
+   * `clearingObligation` (or `opts.clearingObligation`), `UKWN` when not
+   * determined (never derived from `cleared`, N3-09).
+   */
+  clearingObligation: EmirClearingObligation;
   /** Table 1 field – clearing member, informational. */
   clearingMember?: string;
+}
+
+/** ITS (EU) 2022/1860 boolean value format (`FLSE`, not `FALSE`). */
+export type EmirBoolean = "TRUE" | "FLSE";
+/** Field 31 value set: cleared / not cleared / intent to clear. */
+export type EmirCleared = "Y" | "N" | "I";
+/** Field 30 value set: obligation applies / does not apply / unknown. */
+export type EmirClearingObligation = "TRUE" | "FLSE" | "UKWN";
+
+/** Boolean → ITS format (`TRUE` / `FLSE`). */
+export function emirBoolean(v: boolean): EmirBoolean {
+  return v ? "TRUE" : "FLSE";
 }
 
 export interface EmirRecordOptions {
@@ -71,6 +98,8 @@ export interface EmirRecordOptions {
   transactionPrice?: number;
   /** Clearing obligation (field 30) when the trade does not carry `clearingObligation`. */
   clearingObligation?: boolean;
+  /** Field 31 `I` (intent to clear) for a trade that is not (yet) cleared but will be submitted for clearing. */
+  intentToClear?: boolean;
 }
 
 /** Normalise an ISO-8601 date-time to `YYYY-MM-DDThh:mm:ssZ` (UTC); a bare date is completed to the EoD convention. */
@@ -117,9 +146,9 @@ export function emirValuationRecord(ctx: MarketContext, trade: Trade, pricing: P
     valuationTimestamp: emirValuationTimestamp(ctx, opts),
     valuationMethod: opts.method ?? (opts.transactionPrice !== undefined ? "MTMA" : "MTMO"),
     delta: opts.delta ?? emirDelta(trade, pricing),
-    collateralPortfolioIndicator: trade.collateralCurrency ? "TRUE" : "FALSE",
-    cleared: cleared ? "TRUE" : "FALSE",
-    clearingObligation: obligation === undefined ? "N/A" : obligation ? "Y" : "N",
+    collateralPortfolioIndicator: emirBoolean(Boolean(trade.collateralCurrency)),
+    cleared: cleared ? "Y" : opts.intentToClear ? "I" : "N",
+    clearingObligation: obligation === undefined ? "UKWN" : emirBoolean(obligation),
     clearingMember: trade.clearingMember,
   };
 }
@@ -243,8 +272,8 @@ export function emirCsv(records: EmirValuationRecord[], sep = ";", opts: { decim
     r.valuationMethod,
     r.delta !== undefined ? r.delta.toFixed(6) : "",
     r.collateralPortfolioIndicator,
-    r.cleared ?? "FALSE",
-    r.clearingObligation ?? "N/A",
+    r.cleared ?? "N",
+    r.clearingObligation ?? "UKWN",
     r.clearingMember ?? "",
   ]);
   return (opts.bom ? "﻿" : "") + [[...EMIR_CSV_HEADER], ...rows].map((r) => r.map((c) => csvCell(c, sep, opts.decimalComma ?? false)).join(sep)).join("\n");

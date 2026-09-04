@@ -50,6 +50,20 @@ export function tradesToJson(trades: Trade[]): string {
   return JSON.stringify(datesToIso(trades), null, 2);
 }
 
+/**
+ * German message for a failed JSON import (R4-F1): a `SyntaxError` of `JSON.parse`
+ * becomes "Datei ist kein gültiges DERIVA-JSON (Zeile x, Spalte y) …" instead of
+ * the raw engine text; other errors keep their (translated) message.
+ */
+export function jsonImportError(e: unknown): string {
+  if (e instanceof SyntaxError) {
+    const m = /line (\d+) column (\d+)/i.exec(e.message);
+    const where = m ? ` (Zeile ${m[1]}, Spalte ${m[2]})` : "";
+    return `Datei ist kein gültiges DERIVA-JSON${where} – erwartet wird ein Export aus „Portfolio als JSON“ oder „Portfolio-Report (JSON)“`;
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
 export function tradesFromJson(text: string): Trade[] {
   const parsed = JSON.parse(text) as unknown;
   const list = Array.isArray(parsed)
@@ -57,7 +71,7 @@ export function tradesFromJson(text: string): Trade[] {
     : parsed && typeof parsed === "object" && Array.isArray((parsed as { trades?: unknown }).trades)
       ? (parsed as { trades: unknown[] }).trades
       : null;
-  if (!list) throw new Error("JSON muss ein Array von Trades enthalten");
+  if (!list) throw new Error("Datei enthält keine Trade-Liste – erwartet wird ein Array von Trades oder ein Objekt mit „trades“ (Export „Portfolio als JSON“)");
   return datesFromIso(list) as Trade[];
 }
 

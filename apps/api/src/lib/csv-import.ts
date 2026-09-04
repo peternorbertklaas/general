@@ -25,6 +25,7 @@ import {
   makeVanillaSwap,
   parseISO,
 } from "@deriva/pricing-core";
+import { describeRowError } from "./errors.js";
 
 export const CSV_TRADE_TYPES = ["InterestRateSwap", "FxForward", "CapFloor", "Swaption", "FxOption", "CrossCurrencySwap", "FRA"] as const;
 export type CsvTradeType = (typeof CSV_TRADE_TYPES)[number];
@@ -474,7 +475,8 @@ export function csvToTrades(text: string, type: CsvTradeType, valuationDate: num
       out.trades.push({ ...built, ...extras } as Trade);
       out.rows.push(rowNo);
     } catch (e) {
-      out.rejected.push({ row: rowNo, reason: e instanceof Error ? e.message : String(e) });
+      // Builder / parser messages are user-facing; a programming error inside a builder is not (N4-05).
+      out.rejected.push({ row: rowNo, reason: describeRowError(e) });
     }
   });
   return out;

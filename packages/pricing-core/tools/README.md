@@ -12,28 +12,28 @@ of the TypeScript engine** with the Python standard library (closed forms on fla
 curves; for the sample-market bootstrap an independent re-implementation of the
 €STR OIS par conditions with the TARGET calendar, see the `derivation` field of the
 JSON). `src/testing/golden.test.ts` reproduces every case with the engine at 1e-6
-relative tolerance.
+relative tolerance (tighter for the bootstrap) and asserts the `quantlib` blocks.
 
 ```sh
 cd packages/pricing-core
-python3 tools/quantlib-golden.py          # regenerates all JSON files
+python3 tools/quantlib-golden.py          # regenerates all JSON files (quantlib blocks only with the bindings)
+npx prettier --write test-data            # the script writes plain json.dump output
 npx vitest run src/testing/golden.test.ts
 ```
 
-### QuantLib cross-check (optional, currently pending)
+### QuantLib cross-check (done – QuantLib 1.43)
 
 When the QuantLib Python bindings are importable the script adds a `quantlib`
-block with the vendor values next to the closed-form `expected` values (the
-TypeScript test compares against `expected` only, so CI never needs QuantLib).
-QuantLib was **not** installed when the checked-in files were generated; the
-blocks are therefore absent (flat-curve cases) or marked `"status": "pending"`
-(`sample-market-bootstrap.json`). To fill them in:
+block with the vendor values (and the QuantLib `version`) next to the closed-form
+`expected` values. The checked-in files were generated **with QuantLib 1.43**
+(review R4-4); `golden.test.ts` asserts the blocks, CI itself never needs QuantLib.
+To refresh them (no virtualenv needed – install into a scratch directory):
 
 ```sh
-python3 -m venv .venv && . .venv/bin/activate
-pip install QuantLib            # wheels for CPython 3.9–3.13 on Linux/macOS/Windows
-python3 tools/quantlib-golden.py
-git diff test-data/golden       # review the quantlib blocks, commit
+pip install --target /tmp/pyql QuantLib          # wheels for CPython 3.9–3.13 on Linux/macOS/Windows
+PYTHONPATH=/tmp/pyql python3 tools/quantlib-golden.py
+npx prettier --write test-data
+git diff test-data/golden                        # review the quantlib blocks, commit
 ```
 
 What the cross-check computes:
@@ -44,10 +44,19 @@ What the cross-check computes:
 | `black76-bachelier`       | `blackFormula`, `bachelierBlackFormula`                                                                                      |
 | `sample-market-bootstrap` | `PiecewiseLogLinearDiscount` from `OISRateHelper`s on an `OvernightIndex` (TARGET, spot lag 2, payment lag 1, `Annual`)      |
 
-Expected agreement: flat-curve cases to ~1e-12 (identical formulas); the sample
-bootstrap to ~1e-9 in the discount factors as long as QuantLib's OIS helper uses
-the same schedule conventions (annual fixed/float legs with a short front stub for
-the 18M quote, telescoping €STR compounding, pillar on the last payment date).
-Differences beyond that point to a convention mismatch (payment lag, stub or
-end-of-month rule), not to a numerical problem – document them in
-`test-data/golden/README.md` instead of loosening the tolerance.
+Expected (and asserted) agreement:
+
+- flat-curve swap, Black-76, Bachelier: 1e-13 relative (identical formulas);
+- sample bootstrap: **DF ratios between neighbouring pillars 1e-12** (identical
+  schedules, calendar, stub rule, payment lag and interpolation), **absolute pillar
+  DFs within 5e-8 – uniformly +1.87·10⁻⁸** on every pillar. The uniform factor is
+  the 0→spot stub convention, not a numerical or convention problem: the engine
+  has an explicit spot node DF = 1/(1 + r_1W·τ_spot) (simple interest over the 4
+  days to spot), QuantLib has no spot node and interpolates log-linearly from
+  t = 0 to the 1W pillar (continuous compounding at the 1W zero);
+  ln DF_QL − ln DF_engine = ln(1 + r·τ_s) − (τ_s/τ_1W)·ln(1 + r·τ_1W) ≈ (r²/2)·τ_s·(τ_1W − τ_s).
+  The test checks this identity to 1e-10 (details in `test-data/golden/README.md`).
+
+A pillar-dependent difference would point to a convention mismatch (payment lag,
+stub or end-of-month rule) – document it in `test-data/golden/README.md` instead of
+loosening the tolerance.

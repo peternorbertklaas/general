@@ -60,22 +60,53 @@ function parseRate(s: string): number | undefined {
 }
 
 const TENOR = /^\d+(?:d|w|m|y)$/i;
-const DATE = /^\d{4}-\d{2}-\d{2}$/;
+/** ISO date "2027-03-15" or German date "15.03.2027" / "15.03.27" (R4-06). */
+const DATE_ISO = /^\d{4}-\d{2}-\d{2}$/;
+const DATE_DE = /^\d{1,2}\.\d{1,2}\.(?:\d{2}|\d{4})$/;
+const DATE = { test: (t: string) => DATE_ISO.test(t) || DATE_DE.test(t) };
 /** FRA period "3x6" (months from the spot date). */
 const FRA_PERIOD = /^(\d{1,2})x(\d{1,2})$/i;
 /** Step-up coupon list "2.5/3.0/3.5" (percent, one rate per year). */
 const STEP_LIST = /^-?\d+(?:[.,]\d+)?(?:\/-?\d+(?:[.,]\d+)?)+$/;
 
+/** Serial date of an ISO / German date token (undefined for impossible dates such as 31.02.). */
+function parseDateToken(tok: string): number | undefined {
+  if (DATE_ISO.test(tok)) {
+    try {
+      const d = parseISO(tok);
+      return toISO(d) === tok ? d : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const m = /^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})$/.exec(tok);
+  if (!m) return undefined;
+  const y = m[3]!.length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+  const iso = `${y}-${m[2]!.padStart(2, "0")}-${m[1]!.padStart(2, "0")}`;
+  try {
+    const d = parseISO(iso);
+    return toISO(d) === iso ? d : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseDateOrTenor(tok: string, from: number): number | undefined {
-  if (DATE.test(tok)) return parseISO(tok);
+  if (DATE.test(tok)) return parseDateToken(tok);
   if (TENOR.test(tok)) return advance(from, tok.toUpperCase(), getCalendar("TARGET"));
   return undefined;
 }
 
-/** Trade-name fragment of a date / tenor token: ISO dates become TT.MM.JJJJ (R3-11), tenors stay ("9M"). */
+/** Trade-name fragment of a date / tenor token: ISO and German dates become TT.MM.JJJJ (R3-11 / R4-06), tenors stay ("9M"). */
 export function dateLabel(tok: string): string {
-  return DATE.test(tok) ? fmtDate(parseISO(tok)) : tok.toUpperCase();
+  if (DATE.test(tok)) {
+    const d = parseDateToken(tok);
+    return d !== undefined ? fmtDate(d) : tok;
+  }
+  return tok.toUpperCase();
 }
+
+const DATE_HINT = "Datum als 15.03.2027 oder 2027-03-15";
 
 /** Plain price token (strike / forward rate): "1.15", "1,1725" or – for JPY-style pairs – "175" (R3-5b). */
 const PRICE = /^\d+(?:[.,]\d+)?$/;
@@ -185,6 +216,8 @@ export function extractCounterparty(toks: string[]): { toks: string[]; counterpa
 export interface QuickEntryOptions {
   /** Market FX spots ("EURUSD" → 1.17) – fix the foreign notional of a cross-currency swap when no rate is typed. */
   fxSpots?: Record<string, number>;
+  /** Currencies with a swaption vol cube in the market – a swaption in another currency is flagged in the preview (Markt R4-2). */
+  swaptionVolCurrencies?: string[];
 }
 
 export function parseQuickEntry(input: string, valuationDate: number, opts: QuickEntryOptions = {}): ParseResult {
@@ -255,8 +288,10 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       if (!pair || !amtTok || !dateTok) return { ok: false, error: "Format: fxs eurusd 1m 1.1625 1.18 1y" };
       const nearRate = rates[0] ? Number(rates[0].replace(",", ".")) : 1;
       const farRate = rates[1] ? Number(rates[1].replace(",", ".")) : nearRate;
+      const farDate = parseDateOrTenor(dateTok, spot);
+      if (farDate === undefined) return { ok: false, error: `Ungültiges Datum „${dateTok}“ – ${DATE_HINT}` };
       const trade = {
-        ...makeFxSwap({ pair, baseAmount: parseAmount(amtTok)!, nearRate, farRate, nearDate: spot, farDate: parseDateOrTenor(dateTok, spot)! }),
+        ...makeFxSwap({ pair, baseAmount: parseAmount(amtTok)!, nearRate, farRate, nearDate: spot, farDate }),
         name: `FX-Swap ${pair.slice(0, 3)}/${pair.slice(3)} ${dateLabel(dateTok)}`,
       };
       return { ok: true, trade, description: `FX-Swap ${pair} ${amtTok} @ ${fmtNum(nearRate, 4)}/${fmtNum(farRate, 4)} · Far ${dateTok}` };
@@ -462,31 +497,45 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       };
     }
     if (["swpt", "swaption"].includes(cmd)) {
+      // swpt [ccy] <expiry>x<tenor> payer|receiver <strike%> [notional]   e.g. "swpt usd 1y5y payer 3.5% 10m" (Markt R4-2)
       let expiry: string | undefined;
       let tenor: string | undefined;
       let pr: "Payer" | "Receiver" = "Payer";
       let strike: number | undefined;
       let notional = 10_000_000;
+      let ccy = "EUR";
       for (const t of rest) {
+        const tl = t.toLowerCase();
         const m = /^(\d+[ymd])x?(\d+[ymd])$/i.exec(t);
         if (m) {
           expiry = m[1]!.toUpperCase();
           tenor = m[2]!.toUpperCase();
-        } else if (["payer", "pay", "p"].includes(t.toLowerCase())) pr = "Payer";
-        else if (["receiver", "rec", "r"].includes(t.toLowerCase())) pr = "Receiver";
+        } else if (/^[a-z]{3}$/i.test(t) && CCYS.has(tl)) ccy = t.toUpperCase();
+        else if (["payer", "pay", "p"].includes(tl)) pr = "Payer";
+        else if (["receiver", "rec", "r"].includes(tl)) pr = "Receiver";
         else if (/%$/.test(t) || (strike === undefined && /^\d+(?:[.,]\d+)?$/.test(t) && Number(t.replace(",", ".")) < 20 && !/[km]$/i.test(t)))
           strike = parseRate(t);
+        else if (/^[a-z]{3}$/i.test(t))
+          return { ok: false, error: `Unbekannte Währung „${t.toUpperCase()}“ – verfügbar: ${[...CCYS].map((c) => c.toUpperCase()).join(", ")}` };
         else {
           const amt = parseAmount(t);
           if (amt !== undefined) notional = amt;
         }
       }
-      if (!expiry || !tenor) return { ok: false, error: "Format: swpt 1y5y payer 3% 10m" };
+      if (!expiry || !tenor) return { ok: false, error: "Format: swpt [usd] 1y5y payer 3% 10m" };
       const trade = {
-        ...makeSwaption({ currency: "EUR", notional, payerReceiver: pr, strike: strike ?? 0.03, expiry, tenor, valuationDate }),
-        name: `${pr}-Swaption ${expiry}×${tenor}`,
+        ...makeSwaption({ currency: ccy, notional, payerReceiver: pr, strike: strike ?? 0.03, expiry, tenor, valuationDate }),
+        name: `${pr}-Swaption ${ccy} ${expiry}×${tenor}`,
       };
-      return { ok: true, trade, description: `${pr}-Swaption ${expiry}x${tenor} @ ${fmtNum((strike ?? 0.03) * 100, 3)} % · Nominal ${fmtNum(notional, 0)}` };
+      // A currency without a vol cube in the market prices on the core's fallback vol (Level 3) – say so in the preview.
+      const noCube = opts.swaptionVolCurrencies && !opts.swaptionVolCurrencies.includes(ccy);
+      return {
+        ok: true,
+        trade,
+        description: `${pr}-Swaption ${ccy} ${expiry}x${tenor} @ ${fmtNum((strike ?? 0.03) * 100, 3)} % · Nominal ${fmtNum(notional, 0)}${
+          noCube ? ` · ⚠ kein Swaption-Vol-Cube für ${ccy} (Fallback-Vol, Level 3)` : ""
+        }`,
+      };
     }
     if (["fxf", "fxfwd", "forward"].includes(cmd)) {
       const pair = rest.find((t) => /^[a-z]{6}$/i.test(t))?.toUpperCase();
@@ -494,8 +543,9 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       const amtTok = amtIdx >= 0 ? rest[amtIdx] : undefined;
       const dateTok = rest.find((t, i) => i !== amtIdx && (DATE.test(t) || TENOR.test(t)));
       const rateTok = rest.find((t) => t !== amtTok && t !== dateTok && PRICE.test(t));
-      if (!pair || !amtTok || !dateTok) return { ok: false, error: "Format: fxf eurusd 2m 1.1725 2027-03-15" };
-      const delivery = parseDateOrTenor(dateTok, spot)!;
+      if (!pair || !amtTok || !dateTok) return { ok: false, error: `Format: fxf eurusd 2m 1.1725 15.03.2027 (${DATE_HINT} oder Tenor)` };
+      const delivery = parseDateOrTenor(dateTok, spot);
+      if (delivery === undefined) return { ok: false, error: `Ungültiges Datum „${dateTok}“ – ${DATE_HINT}` };
       const rate = rateTok ? Number(rateTok.replace(",", ".")) : undefined;
       if (rate !== undefined) {
         const bad = priceImplausible(rate, pair, opts);
@@ -506,7 +556,11 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
         ...makeFxForward({ pair, baseAmount: base, rate: rate ?? 1, deliveryDate: delivery }),
         name: `${base < 0 ? "Verkauf" : "Kauf"} ${pair.slice(0, 3)}/${pair.slice(3)} ${dateLabel(dateTok)}`,
       };
-      return { ok: true, trade, description: `FX-Forward ${pair} ${amtTok} @ ${rate === undefined ? "fair" : fmtNum(rate, 4)} · Lieferung ${dateTok}` };
+      return {
+        ok: true,
+        trade,
+        description: `FX-Forward ${pair} ${amtTok} @ ${rate === undefined ? "fair" : fmtNum(rate, 4)} · Lieferung ${dateLabel(dateTok)}`,
+      };
     }
     if (["fxo", "fxopt", "option"].includes(cmd)) {
       const pair = rest.find((t) => /^[a-z]{6}$/i.test(t))?.toUpperCase();
@@ -517,11 +571,12 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       const dateTok = rest.find((t, i) => i !== amtIdx && (DATE.test(t) || TENOR.test(t)));
       // Strikes may lack decimals for JPY-style pairs ("fxo eurjpy call 175 1m 6m", R3-5b); plausibility against the spot.
       const strikeTok = rest.find((t) => t !== amtTok && t !== dateTok && t !== typeTok && PRICE.test(t));
-      if (!pair || !typeTok || !strikeTok || !dateTok) return { ok: false, error: "Format: fxo eurusd put 1.15 3m 2027-06-15" };
+      if (!pair || !typeTok || !strikeTok || !dateTok) return { ok: false, error: `Format: fxo eurusd put 1.15 3m 15.06.2027 (${DATE_HINT} oder Tenor)` };
       const strike = Number(strikeTok.replace(",", "."));
       const badStrike = priceImplausible(strike, pair, opts);
       if (badStrike) return { ok: false, error: badStrike.replace(/^Kurs/, "Strike") };
-      const expiry = parseDateOrTenor(dateTok, valuationDate)!;
+      const expiry = parseDateOrTenor(dateTok, valuationDate);
+      if (expiry === undefined) return { ok: false, error: `Ungültiges Datum „${dateTok}“ – ${DATE_HINT}` };
       const isCall = /^c/i.test(typeTok);
       const trade = {
         ...makeFxOption({
@@ -552,12 +607,14 @@ export const QUICK_ENTRY_EXAMPLES = [
   "cap 5y 3% 8m",
   "collar 7y 3.5/1.5 6m",
   "swpt 1y5y payer 3% 10m",
-  "fxf eurusd -2m 1.1725 2027-03-15",
+  "swpt usd 1y5y payer 3.5% 10m",
+  "fxf eurusd -2m 1.1725 15.03.2027",
   "fxo eurusd put 1.15 3m 9m",
   "basis 5y 3m/6m 5bp 10m",
   "amort 10y pay 3.1% 10m",
   "fxs eurusd 1m 1.1625 1.18 1y",
   "ccs eurusd 5y -20bp 10m mtm",
+  "ccs eurusd 5y fixed 3% 10m",
   "fra 3x6 pay 2.2% 10m",
   "irs 5y pay 2.5% 10m step 2.5/3.0/3.5",
   "irs 5y rec 2.4% 5m @Landesbank",
@@ -569,14 +626,6 @@ export function parseValuationDateCommand(input: string): string | undefined {
   if (!m) return undefined;
   const tok = m[1]!.toLowerCase();
   if (tok === "heute" || tok === "today") return new Date().toISOString().slice(0, 10);
-  let iso: string | undefined;
-  if (DATE.test(tok)) iso = tok;
-  const de = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(tok);
-  if (de) iso = `${de[3]}-${de[2]!.padStart(2, "0")}-${de[1]!.padStart(2, "0")}`;
-  if (!iso) return undefined;
-  try {
-    return toISO(parseISO(iso)) === iso ? iso : undefined;
-  } catch {
-    return undefined;
-  }
+  const d = parseDateToken(tok);
+  return d === undefined ? undefined : toISO(d);
 }

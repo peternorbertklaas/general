@@ -370,6 +370,75 @@ export const SAMPLE_GBP_CAPLET_VOLS: CapletVolSurface = {
   ],
 };
 
+/** Scale a vol matrix by `k`, rounded to 0.1 bp (indicative surfaces derived from a reference cube). */
+function scaleVols(m: readonly (readonly number[])[], k: number): number[][] {
+  return m.map((row) => row.map((v) => Math.round(v * k * 1e5) / 1e5));
+}
+
+/**
+ * CHF SARON swaption cube (normal vols, indicative; Markt R4-4). CHF normal
+ * vols run well below GBP/USD (lower rate level, SNB regime) – the cube is the
+ * GBP shape scaled to ≈ 55–65 bp; SABR smile parameters with a 2 % shift
+ * (negative-rate history). Keyed `CHF`.
+ */
+export const SAMPLE_CHF_SWAPTION_VOLS: SwaptionVolSurface = {
+  id: "CHF-SWAPTION-NORMAL",
+  currency: "CHF",
+  volType: "Normal",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  tenors: [1, 2, 3, 5, 7, 10, 15, 20, 30],
+  atm: scaleVols(SAMPLE_GBP_SWAPTION_VOLS.atm, 0.7),
+  sabr: {
+    "1x5": { beta: 0.5, rho: -0.1, nu: 0.35, shift: 0.02 },
+    "5x5": { beta: 0.5, rho: -0.15, nu: 0.3, shift: 0.02 },
+    "10x10": { beta: 0.5, rho: -0.2, nu: 0.25, shift: 0.02 },
+  },
+};
+
+/**
+ * JPY TONA swaption cube (normal vols, indicative; Markt R4-4): the lowest
+ * normal vols of the G5 (≈ 40–50 bp), GBP shape scaled; 2 % SABR shift. Keyed `JPY`.
+ */
+export const SAMPLE_JPY_SWAPTION_VOLS: SwaptionVolSurface = {
+  id: "JPY-SWAPTION-NORMAL",
+  currency: "JPY",
+  volType: "Normal",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  tenors: [1, 2, 3, 5, 7, 10, 15, 20, 30],
+  atm: scaleVols(SAMPLE_GBP_SWAPTION_VOLS.atm, 0.52),
+  sabr: {
+    "1x5": { beta: 0.5, rho: -0.1, nu: 0.4, shift: 0.02 },
+    "5x5": { beta: 0.5, rho: -0.15, nu: 0.33, shift: 0.02 },
+    "10x10": { beta: 0.5, rho: -0.2, nu: 0.28, shift: 0.02 },
+  },
+};
+
+/**
+ * CHF SARON caplet surface (normal vols on the 3M compounded SARON forward,
+ * indicative; Markt R4-4). Strike grid around the low CHF rate level (0–3 %),
+ * vols ≈ 45–65 bp. Keyed `CHF-SARON`.
+ */
+export const SAMPLE_CHF_CAPLET_VOLS: CapletVolSurface = {
+  id: "CHF-SARON-CAPLET-NORMAL",
+  currency: "CHF",
+  index: "SARON",
+  volType: "Normal",
+  expiries: [0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  strikes: [0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04],
+  vols: scaleVols(SAMPLE_GBP_CAPLET_VOLS.vols, 0.7),
+};
+
+/** JPY TONA caplet surface (normal vols, indicative; Markt R4-4), strikes 0–3 %, vols ≈ 35–50 bp. Keyed `JPY-TONA`. */
+export const SAMPLE_JPY_CAPLET_VOLS: CapletVolSurface = {
+  id: "JPY-TONA-CAPLET-NORMAL",
+  currency: "JPY",
+  index: "TONA",
+  volType: "Normal",
+  expiries: [0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  strikes: [0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04],
+  vols: scaleVols(SAMPLE_GBP_CAPLET_VOLS.vols, 0.52),
+};
+
 /**
  * Sample FX surfaces (R3-8): every surface declares its ATM and delta
  * convention explicitly. Market convention (Reiswich–Wystup 2010, Clark 2011,
@@ -509,8 +578,21 @@ export function buildSampleMarket(valuationDate: SerialDate = parseISO("2026-09-
     fixings: [],
     // Surfaces keyed the way the pricers look them up: swaption cubes by currency, caplet
     // surfaces by `${ccy}-${index}` (fallback `${ccy}`), FX surfaces by pair (either quotation).
-    swaptionVols: { EUR: SAMPLE_EUR_SWAPTION_VOLS, USD: SAMPLE_USD_SWAPTION_VOLS, GBP: SAMPLE_GBP_SWAPTION_VOLS },
-    capletVols: { "EUR-EURIBOR-6M": SAMPLE_EUR_CAPLET_VOLS, "USD-SOFR": SAMPLE_USD_CAPLET_VOLS, "GBP-SONIA": SAMPLE_GBP_CAPLET_VOLS },
+    // Every currency with a discount curve has an IR vol cube and a caplet surface (Markt R4-4: CHF/JPY at Level 2).
+    swaptionVols: {
+      EUR: SAMPLE_EUR_SWAPTION_VOLS,
+      USD: SAMPLE_USD_SWAPTION_VOLS,
+      GBP: SAMPLE_GBP_SWAPTION_VOLS,
+      CHF: SAMPLE_CHF_SWAPTION_VOLS,
+      ...(hasJpy ? { JPY: SAMPLE_JPY_SWAPTION_VOLS } : {}),
+    },
+    capletVols: {
+      "EUR-EURIBOR-6M": SAMPLE_EUR_CAPLET_VOLS,
+      "USD-SOFR": SAMPLE_USD_CAPLET_VOLS,
+      "GBP-SONIA": SAMPLE_GBP_CAPLET_VOLS,
+      "CHF-SARON": SAMPLE_CHF_CAPLET_VOLS,
+      ...(hasJpy ? { "JPY-TONA": SAMPLE_JPY_CAPLET_VOLS } : {}),
+    },
     fxVols: {
       EURUSD: SAMPLE_EURUSD_VOLS,
       EURGBP: SAMPLE_EURGBP_VOLS,

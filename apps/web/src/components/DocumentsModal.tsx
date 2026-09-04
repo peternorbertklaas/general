@@ -29,7 +29,8 @@ import { NumInput } from "./NumInput.js";
 
 export type { DocKind };
 
-const INTERNAL_ROW = /marge|margin|ertrag der bank|bankmarge|deckungsbeitrag|interne/i;
+/** Internal rows hidden in customer documents: margins and the bilateral (CVA/DVA) view – the customer sees the risk-free value and the initial market value only (R4-10). */
+const INTERNAL_ROW = /marge|margin|ertrag der bank|bankmarge|deckungsbeitrag|interne|\bCVA\b|\bDVA\b|bilateral/i;
 const REQUIRED_ROW = /anfänglicher (negativer )?marktwert|initial market value|kosten|einstiegskosten/i;
 
 /** Marker line for documents generated under an active what-if (stress) market (R3-F1). */
@@ -535,8 +536,9 @@ export function DocumentBody({ doc, whatIfLabel: wi }: { doc: GeneratedDocument;
           ⚠ Stress-Markt: {whatIfDocMarker(wi)}. Die ausgewiesenen Barwerte beruhen auf verschobenen Marktdaten – nicht an Kunden weitergeben.
         </div>
       )}
+      {/* Heading hierarchy: the app keeps its single h1 ("DERIVA"); a document title is an h2, its sections h3 (R4-10). */}
       <div className="doc-head">
-        <h1>{doc.title}</h1>
+        <h2>{doc.title}</h2>
         <div className="muted small">{doc.subtitle}</div>
       </div>
       {doc.sections.map((sec) => (
@@ -548,7 +550,7 @@ export function DocumentBody({ doc, whatIfLabel: wi }: { doc: GeneratedDocument;
             </p>
           ))}
           {sec.rows && sec.rows.length > 0 && (
-            <table className="grid-table doc-rows">
+            <table className="grid-table doc-rows" aria-label={sec.heading}>
               <tbody>
                 {sec.rows.map(([k, v], i) => (
                   <tr key={`${k}-${i}`} style={{ cursor: "default" }}>

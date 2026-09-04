@@ -127,7 +127,12 @@ export function useHotkeys(handler: HotkeyHandler, opts: HotkeyOptions = {}) {
       if (timer.current) window.clearTimeout(timer.current);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.isComposing || e.defaultPrevented) return;
+      if (e.isComposing) return;
+      if (e.defaultPrevented) {
+        // A component consumed the key (e.g. the table copies on the second `y`) – that ends any pending chord (R4-02).
+        if (pending.current) clearPending();
+        return;
+      }
       const filter = optsRef.current.filter ?? (() => true);
       const editing = isTextEntry(e.target);
       const interactive = !editing && isEditable(e.target);

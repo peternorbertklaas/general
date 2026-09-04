@@ -1,7 +1,10 @@
 /**
- * Domain error codes of the pricing core. API layers map `PricingError` to a
- * 4xx response with `{ code, message }`; programming errors (TypeError,
- * RangeError) are deliberately not wrapped so they surface as 500s.
+ * Domain error codes of the pricing core. The API maps a `PricingError` to its
+ * error envelope `{ error, code, statusCode, requestId, details? }` – 422 for
+ * domain errors raised while pricing, 400 for client-input codes
+ * (`INVALID_DATE`, `INVALID_TENOR`, `INVALID_TIMESTAMP` on import, `TOO_MANY_PERIODS`).
+ * Programming errors (TypeError, RangeError) are deliberately not wrapped so
+ * they are reported as an invalid request without leaking internals.
  */
 export type PricingErrorCode =
   | "INVALID_TRADE"
@@ -25,7 +28,11 @@ export type PricingErrorCode =
   /** CDS quotes imply a negative hazard rate or are otherwise unusable for the hazard bootstrap (R3-3). */
   | "INVALID_CREDIT_CURVE"
   /** A timestamp string (e.g. `meta.snapshotTime`) is not ISO-8601 (N3-03). */
-  | "INVALID_TIMESTAMP";
+  | "INVALID_TIMESTAMP"
+  /** A date string is not `YYYY-MM-DD` or names a day that does not exist (`2027-02-30`); raised by `parseISO` (N4-03). */
+  | "INVALID_DATE"
+  /** A tenor string is not `<n><D|W|M|Y>` (or ON/TN/SN); raised by `parseTenor` (N4-03). */
+  | "INVALID_TENOR";
 
 /** Domain error of the pricing core with a stable machine-readable `code`. */
 export class PricingError extends Error {

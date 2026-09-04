@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import {
   type CapletVolSurface,
+  type FxFixing,
   type FxVolSurface,
   type HedgeRelationship,
   type InterpolationMethod,
@@ -114,6 +115,7 @@ export type UndoEntry =
   | { kind: "quotes"; quotes: SampleMarketQuotes; label: string; at: number }
   | { kind: "market"; interpolation: Record<string, InterpolationMethod>; turnOfYear: Record<string, TurnOfYear>; label: string; at: number }
   | { kind: "vols"; volSurfaces: VolSurfaces; label: string; at: number }
+  | { kind: "fxFixings"; fxFixings: FxFixing[]; label: string; at: number }
   | { kind: "hedge"; tradeId: string; relationship: HedgeRelationship | undefined; label: string; at: number };
 
 export interface RestoreInfo {
@@ -157,6 +159,8 @@ interface AppState {
   cdsCurves: Record<string, CdsQuote[]>;
   /** Edited vol surfaces (swaption cubes, caplet surfaces, FX smiles) overriding the sample market (persisted, R3-4). */
   volSurfaces: VolSurfaces;
+  /** Historical FX fixings for MtM-reset notionals (pair, date, rate) – part of the market, persisted, undoable (core R4-1). */
+  fxFixings: FxFixing[];
   baseMarket: MarketContext;
   market: MarketContext;
   whatIf: WhatIf;
@@ -247,6 +251,8 @@ interface AppState {
   /** Override one vol surface (undoable, marks the market as modified); `undefined` restores the sample surface. */
   setVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface | undefined, label: string): boolean;
   resetVolSurfaces(): void;
+  /** Replace the FX fixings (undoable, marks the market as modified); an empty list removes them all. */
+  setFxFixings(next: FxFixing[], label: string): boolean;
   repriceAll(): void;
   /**
    * Risk report from the cache, computed on demand *without* writing to the
@@ -346,12 +352,31 @@ export function volSurfaceCount(v: VolSurfaces | undefined): number {
   return Object.keys(v.swaptionVols ?? {}).length + Object.keys(v.capletVols ?? {}).length + Object.keys(v.fxVols ?? {}).length;
 }
 
-/** Quotes, spots, interpolation overrides, turn-of-year jumps or vol surfaces differ from the sample market (N-23, R3-4). */
+/** Quotes, spots, interpolation overrides, turn-of-year jumps, vol surfaces or FX fixings differ from the sample market (N-23, R3-4). */
 export function marketModified(
-  s: Pick<AppState, "quotes" | "interpolation"> & { turnOfYear?: Record<string, TurnOfYear>; volSurfaces?: VolSurfaces },
+  s: Pick<AppState, "quotes" | "interpolation"> & { turnOfYear?: Record<string, TurnOfYear>; volSurfaces?: VolSurfaces; fxFixings?: FxFixing[] },
 ): boolean {
   return (
-    quotesModified(s.quotes) || Object.keys(s.interpolation).length > 0 || Object.keys(s.turnOfYear ?? {}).length > 0 || volSurfaceCount(s.volSurfaces) > 0
+    quotesModified(s.quotes) ||
+    Object.keys(s.interpolation).length > 0 ||
+    Object.keys(s.turnOfYear ?? {}).length > 0 ||
+    volSurfaceCount(s.volSurfaces) > 0 ||
+    (s.fxFixings?.length ?? 0) > 0
+  );
+}
+
+/** Persisted / imported FX fixings: 6-letter pair, serial date, positive rate. */
+export function isPlausibleFxFixing(v: unknown): v is FxFixing {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.pair === "string" &&
+    /^[A-Z]{6}$/.test(o.pair) &&
+    typeof o.date === "number" &&
+    Number.isFinite(o.date) &&
+    typeof o.rate === "number" &&
+    Number.isFinite(o.rate) &&
+    o.rate > 0
   );
 }
 
@@ -382,8 +407,10 @@ export function buildMarket(
   interpolation: Record<string, InterpolationMethod>,
   turnOfYear: Record<string, TurnOfYear> = {},
   volSurfaces: VolSurfaces = {},
+  fxFixings: FxFixing[] = [],
 ): MarketContext {
-  const built = withVolSurfaces(buildSampleMarket(date, quotes), volSurfaces);
+  const sample = buildSampleMarket(date, quotes);
+  const built = withVolSurfaces(fxFixings.length ? { ...sample, fxFixings } : sample, volSurfaces);
   const overrides = Object.keys(interpolation).filter((id) => id in built.curves);
   // A turn-of-year jump only makes sense while the date lies ahead of the valuation date.
   const toys = Object.entries(turnOfYear).filter(([id, t]) => id in built.curves && t.date > date && t.bp !== 0);
@@ -528,6 +555,7 @@ export interface PersistedSlice {
   turnOfYear?: Record<string, TurnOfYear>;
   cdsCurves?: Record<string, CdsQuote[]>;
   volSurfaces?: VolSurfaces;
+  fxFixings?: FxFixing[];
   valuationDate: number;
   reportingCurrency: string;
   view: ViewId;
@@ -583,14 +611,27 @@ export const useStore = create<AppState>()(
         const entry: UndoEntry = { kind: "vols", volSurfaces: JSON.parse(JSON.stringify(volSurfaces)) as VolSurfaces, label, at: now };
         set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
       };
+      /** Push an FX-fixings snapshot for undo (core R4-1); consecutive edits within 1 s are coalesced. */
+      const pushFxFixingsUndo = (label: string) => {
+        const { undoStack, fxFixings } = get();
+        const last = undoStack[undoStack.length - 1];
+        const now = Date.now();
+        if (last && last.kind === "fxFixings" && now - last.at < 1000) {
+          set({ undoStack: [...undoStack.slice(0, -1), { ...last, label, at: now }] });
+          return;
+        }
+        const entry: UndoEntry = { kind: "fxFixings", fxFixings: fxFixings.map((f) => ({ ...f })), label, at: now };
+        set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
+      };
       const rebuildMarket = (
         date: number,
         quotes: SampleMarketQuotes,
         interpolation = get().interpolation,
         turnOfYear: Record<string, TurnOfYear> = get().turnOfYear,
         volSurfaces: VolSurfaces = get().volSurfaces,
+        fxFixings: FxFixing[] = get().fxFixings,
       ): MarketContext => {
-        const built = buildMarket(date, quotes, interpolation, turnOfYear, volSurfaces);
+        const built = buildMarket(date, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
         const fixings = get().baseMarket.fixings;
         return fixings && fixings.length > 0 ? { ...built, fixings } : built;
       };
@@ -601,6 +642,7 @@ export const useStore = create<AppState>()(
         turnOfYear: {},
         cdsCurves: {},
         volSurfaces: {},
+        fxFixings: [],
         baseMarket: initialMarket,
         market: initialMarket,
         whatIf: { ratesBp: 0, fxPct: 0, volBp: 0 },
@@ -798,6 +840,17 @@ export const useStore = create<AppState>()(
             }
             return entry.label;
           }
+          if (entry.kind === "fxFixings") {
+            set({ undoStack: undoStack.slice(0, -1) });
+            try {
+              const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, get().volSurfaces, entry.fxFixings);
+              set({ fxFixings: entry.fxFixings });
+              get().setMarket(base);
+            } catch {
+              return null;
+            }
+            return entry.label;
+          }
           if (entry.kind === "hedge") {
             const next = { ...get().hedgeRelationships };
             if (entry.relationship) next[entry.tradeId] = entry.relationship;
@@ -897,7 +950,8 @@ export const useStore = create<AppState>()(
         setMarket: (baseMarket) => {
           const market = applyWhatIf(baseMarket, get().whatIf);
           const { results, ms } = priceAll(market, get().trades, get().reportingCurrency);
-          set({ baseMarket, market, results, lastPricingMs: ms, riskCache: {} });
+          // The FX fixings travel with the market (snapshot import/export) – keep the persisted slice in sync.
+          set({ baseMarket, market, results, lastPricingMs: ms, riskCache: {}, fxFixings: (baseMarket.fxFixings ?? []).filter(isPlausibleFxFixing) });
         },
         setQuotes: (quotes, label) => {
           try {
@@ -974,6 +1028,18 @@ export const useStore = create<AppState>()(
           set({ volSurfaces: {} });
           get().setMarket(base);
         },
+        setFxFixings: (next, label) => {
+          const fxFixings = next.filter(isPlausibleFxFixing).map((f) => ({ pair: f.pair.toUpperCase(), date: f.date, rate: f.rate }));
+          try {
+            const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, get().volSurfaces, fxFixings);
+            pushFxFixingsUndo(label);
+            set({ fxFixings });
+            get().setMarket(base);
+            return true;
+          } catch {
+            return false;
+          }
+        },
         setCdsCurve: (counterparty, quotes) => {
           const cdsCurves = { ...get().cdsCurves };
           if (quotes === undefined || quotes.length === 0) delete cdsCurves[counterparty];
@@ -1006,9 +1072,16 @@ export const useStore = create<AppState>()(
           try {
             const d = parseISO(iso);
             if (!Number.isFinite(d)) return false;
+            const before = get().valuationDate;
             const baseMarket = rebuildMarket(d, get().quotes);
             set({ valuationDate: d, reportStamp: null, reportKey: null });
             get().setMarket(baseMarket);
+            // A stored turn-of-year jump that the new valuation date has overtaken no longer acts on the curve (R4-09).
+            const overtaken = Object.entries(get().turnOfYear).filter(([, t]) => t.bp !== 0 && t.date <= d && t.date > before);
+            for (const [curveId, t] of overtaken) {
+              const [y, m, day] = toISO(t.date).split("-");
+              get().showToast(`Turn-of-Year ${curveId} (${day}.${m}.${y}) liegt jetzt vor dem Bewertungstag – inaktiv`);
+            }
             return true;
           } catch {
             return false;
@@ -1052,6 +1125,7 @@ export const useStore = create<AppState>()(
             turnOfYear: {},
             cdsCurves: {},
             volSurfaces: {},
+            fxFixings: [],
             trades,
             baseMarket,
             market,
@@ -1082,6 +1156,7 @@ export const useStore = create<AppState>()(
         turnOfYear: s.turnOfYear,
         cdsCurves: s.cdsCurves,
         volSurfaces: s.volSurfaces,
+        fxFixings: s.fxFixings,
         valuationDate: s.valuationDate,
         reportingCurrency: s.reportingCurrency,
         view: s.view,
@@ -1111,9 +1186,10 @@ export const useStore = create<AppState>()(
             for (const [k, v] of Object.entries(p.cdsCurves)) if (isPlausibleCdsCurve(v) && v.length > 0) cdsCurves[k] = v;
           }
           const volSurfaces = plausibleVolSurfaces(p.volSurfaces);
+          const fxFixings = Array.isArray(p.fxFixings) ? p.fxFixings.filter(isPlausibleFxFixing) : [];
           const valuationDate = typeof p.valuationDate === "number" && Number.isFinite(p.valuationDate) ? p.valuationDate : current.valuationDate;
           const view = VIEW_IDS.includes(p.view as ViewId) ? (p.view as ViewId) : current.view;
-          const baseMarket = buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces);
+          const baseMarket = buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
           const reportingCurrency =
             typeof p.reportingCurrency === "string" && reportingCurrencies(baseMarket).includes(p.reportingCurrency)
               ? p.reportingCurrency
@@ -1132,6 +1208,7 @@ export const useStore = create<AppState>()(
             turnOfYear,
             cdsCurves,
             volSurfaces,
+            fxFixings,
             valuationDate,
             reportingCurrency,
             view,
@@ -1144,7 +1221,7 @@ export const useStore = create<AppState>()(
             results,
             lastPricingMs: ms,
             selectedId,
-            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear, volSurfaces }) },
+            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear, volSurfaces, fxFixings }) },
           };
         } catch {
           return current;

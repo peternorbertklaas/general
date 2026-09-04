@@ -19,6 +19,18 @@ export interface Fixing {
 }
 
 /**
+ * Historical FX fixing (R4-1): the rate of `pair` ("EURUSD" = 1 EUR in USD)
+ * observed on `date`. Used for the notional resets of mark-to-market
+ * cross-currency swaps whose reset date lies on or before the valuation date;
+ * `getFxFixing` also serves the inverse quotation (1 / rate).
+ */
+export interface FxFixing {
+  pair: string;
+  date: SerialDate;
+  rate: number;
+}
+
+/**
  * Policy for historical fixings that are required but not loaded.
  * - "curve" (default): estimate with the first available curve forward and
  *   emit a `MISSING_FIXING:` warning.
@@ -44,7 +56,9 @@ export interface MarketContext {
   /** Optional explicit spot dates per pair (default: T+2 / T+1 on the pair calendar). */
   fxSpotDates?: Record<string, SerialDate>;
   fixings?: Fixing[];
-  /** How to treat missing historical fixings (default "curve"). */
+  /** Historical FX fixings for MtM-reset notionals (pair, date, rate); see `getFxFixing`. */
+  fxFixings?: FxFixing[];
+  /** How to treat missing historical fixings (default "curve"); also governs missing FX reset fixings. */
   missingFixingPolicy?: MissingFixingPolicy;
   swaptionVols?: Record<string, SwaptionVolSurface>;
   capletVols?: Record<string, CapletVolSurface>;
@@ -105,6 +119,67 @@ export function getFixing(ctx: MarketContext, index: string, date: SerialDate): 
     fixingIndexCache.set(fixings, map);
   }
   return map.get(fixingKey(index, date));
+}
+
+/** Per-array lookup index for FX fixings (cached on the array identity, like `getFixing`). */
+const fxFixingIndexCache = new WeakMap<FxFixing[], Map<string, number>>();
+
+/** Normalise "eur/usd", "EURUSD" → "EURUSD". */
+export function normalizeFxPair(pair: string): string {
+  return pair.replace("/", "").toUpperCase();
+}
+
+/**
+ * Historical FX fixing of `pair` on `date` (R4-1). The direct quotation wins;
+ * when only the inverse pair is loaded its reciprocal is returned. Undefined
+ * when no fixing is loaded for that date.
+ */
+export function getFxFixing(ctx: MarketContext, pair: string, date: SerialDate): number | undefined {
+  const fixings = ctx.fxFixings;
+  if (!fixings || fixings.length === 0) return undefined;
+  let map = fxFixingIndexCache.get(fixings);
+  if (!map) {
+    map = new Map<string, number>();
+    for (const f of fixings) map.set(`${normalizeFxPair(f.pair)}|${f.date}`, f.rate);
+    fxFixingIndexCache.set(fixings, map);
+  }
+  const p = normalizeFxPair(pair);
+  if (p.length !== 6) return undefined;
+  const direct = map.get(`${p}|${date}`);
+  if (direct !== undefined) return direct;
+  const inverse = map.get(`${p.slice(3)}${p.slice(0, 3)}|${date}`);
+  return inverse !== undefined && inverse !== 0 ? 1 / inverse : undefined;
+}
+
+/**
+ * True when discounting `currency` under a CSA in `collateralCcy` uses a
+ * dedicated collateral curve: either the two currencies coincide (cash
+ * collateral in the leg currency – the currency's own OIS curve is the CSA
+ * curve) or a `${currency}|${collateralCcy}` mapping exists (Markt R4-1).
+ */
+export function hasCollateralCurve(ctx: MarketContext, currency: string, collateralCcy: string): boolean {
+  if (currency.toUpperCase() === collateralCcy.toUpperCase()) return true;
+  return ctx.collateralDiscountCurveId?.[`${currency}|${collateralCcy}`] !== undefined;
+}
+
+/**
+ * `COLLATERAL_CURVE_MISSING:` warnings for every currency of a collateralised
+ * trade that has no collateral-specific discount curve in the market and is
+ * therefore discounted on its own standard curve (Markt R4-1). Empty when the
+ * trade is uncollateralised or every currency has a CSA curve.
+ */
+export function collateralCurveWarnings(ctx: MarketContext, currencies: Iterable<string>, collateralCcy: string | undefined): string[] {
+  if (!collateralCcy) return [];
+  const out: string[] = [];
+  for (const ccy of currencies) {
+    if (hasCollateralCurve(ctx, ccy, collateralCcy)) continue;
+    const fallback = ctx.discountCurveId[ccy];
+    out.push(
+      `COLLATERAL_CURVE_MISSING: no ${ccy} discount curve for collateral in ${collateralCcy} (collateralDiscountCurveId "${ccy}|${collateralCcy}"); ` +
+        `${fallback ? `discounted on ${fallback}` : "no discount curve"} – cross-currency basis not priced`,
+    );
+  }
+  return out;
 }
 
 export function withCurves(ctx: MarketContext, curves: Record<string, Curve>): MarketContext {

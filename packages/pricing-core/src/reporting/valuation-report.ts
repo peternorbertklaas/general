@@ -17,7 +17,7 @@ import {
 } from "../instruments/labels.js";
 import { embeddedOptionLegs, tradeMaturityDate } from "../instruments/trade-dates.js";
 import { type FloatLeg, type PricingResult, type SwapLeg, type Trade } from "../instruments/types.js";
-import { type MarketContext, getDiscountCurve } from "../market/market-context.js";
+import { type MarketContext, getDiscountCurve, hasCollateralCurve, normalizeFxPair } from "../market/market-context.js";
 import { fxSpotLag } from "../market/fx-spot.js";
 import { serializeCurve } from "../market/snapshot.js";
 import { isNonLocalInterpolation } from "../math/interpolation.js";
@@ -203,6 +203,14 @@ export function ifrs13Level(ctx: MarketContext, trade: Trade, pricing: PricingRe
       `Volatilitätstyp der beobachtbaren Fläche weicht vom gewählten Modell ${model} ab – Volatilitäten per Preisäquivalenz je Forward/Strike/Laufzeit konvertiert (beobachtbare Inputs, Level 2 mit Hinweis)`,
     );
   }
+  if (pricing.warnings.some((w) => w.startsWith("COLLATERAL_CURVE_MISSING"))) {
+    hints.push(
+      `Besicherung in ${trade.collateralCurrency ?? "?"} ohne Collateral-Kurve im Marktkontext – Diskontierung auf der Standard-OIS-Kurve der Währung (Cross-Currency-Basis nicht gepreist; beobachtbare Inputs, Level 2 mit Hinweis)`,
+    );
+  }
+  if (pricing.warnings.some((w) => w.startsWith("MISSING_FX_FIXING"))) {
+    hints.push("MtM-Reset ohne FX-Fixing für einen vergangenen Reset-Termin – heutiger Kurs als Näherung (Fixing nachladen)");
+  }
   if (reasons.length) {
     return {
       level: 3,
@@ -284,6 +292,12 @@ export function marketSnapshotId(ctx: MarketContext, opts: MarketSnapshotIdOptio
   const fixings = (ctx.fixings ?? [])
     .map((f) => ({ index: f.index.toUpperCase(), date: f.date, value: f.value }))
     .sort((a, b) => (a.index < b.index ? -1 : a.index > b.index ? 1 : a.date - b.date));
+  // FX fixings (R4-1) enter the id only when present, so snapshots without them keep their ids.
+  const fxFixings = ctx.fxFixings?.length
+    ? ctx.fxFixings
+        .map((f) => ({ pair: normalizeFxPair(f.pair), date: f.date, rate: f.rate }))
+        .sort((a, b) => (a.pair < b.pair ? -1 : a.pair > b.pair ? 1 : a.date - b.date))
+    : undefined;
   return hashString(
     stableStringify({
       schema: "deriva.market/1",
@@ -295,6 +309,7 @@ export function marketSnapshotId(ctx: MarketContext, opts: MarketSnapshotIdOptio
       fxSpots: ctx.fxSpots,
       fxSpotDates: ctx.fxSpotDates,
       fixings,
+      fxFixings,
       swaptionVols: ctx.swaptionVols,
       capletVols: ctx.capletVols,
       fxVols: ctx.fxVols,
@@ -518,8 +533,16 @@ function curveLines(ctx: MarketContext, trade: Trade): string[] {
       projection.push(`${name}: unbekannter Index`);
     }
   }
+  // Markt R4-1: a CSA is only a CSA curve when the market has one for the currency; otherwise say so.
+  const csa = trade.collateralCurrency;
+  const withoutCsaCurve = csa ? [...ccys].filter((c) => !hasCollateralCurve(ctx, c, csa)) : [];
+  const csaText = !csa
+    ? "OIS-Kurve (unbesichert / Standard-Diskontkurve)"
+    : withoutCsaCurve.length === 0
+      ? `CSA-Kurve (Besicherung in ${csa})`
+      : `Standard-Diskontkurve – Besicherung in ${csa} vereinbart, aber für ${withoutCsaCurve.join(", ")} keine Collateral-Kurve im Marktkontext (COLLATERAL_CURVE_MISSING: Diskontierung auf der eigenen OIS-Kurve, Cross-Currency-Basis nicht gepreist)`;
   lines.push(
-    `Multi-Curve-Framework: Diskontierung je Währung mit der ${trade.collateralCurrency ? `CSA-Kurve (Besicherung in ${trade.collateralCurrency})` : "OIS-Kurve (unbesichert / Standard-Diskontkurve)"} – ${discount.join(", ")}` +
+    `Multi-Curve-Framework: Diskontierung je Währung mit der ${csaText} – ${discount.join(", ")}` +
       (projection.length ? `; Projektion der Forwards mit indexspezifischen Kurven – ${projection.join(", ")}.` : "."),
   );
   for (const id of tradeCurveIds(ctx, trade)) {
@@ -572,6 +595,12 @@ function fixingLines(ctx: MarketContext, trade: Trade, pricing: PricingResult): 
   lines.push(
     `Fixings: historische Fixings aus dem Marktkontext (${ctx.fixings?.length ?? 0} geladen); fehlende Fixings ${policy === "throw" ? "führen zum Abbruch der Bewertung (Policy „throw“)" : "werden mit dem ersten Kurven-Forward gleicher Länge ab Bewertungstag geschätzt und als MISSING_FIXING gemeldet (Policy „curve“)"}; in dieser Bewertung ${missing === 0 ? "kein fehlendes Fixing" : `${missing} fehlende(s) Fixing(s)`}.`,
   );
+  if (trade.type === "CrossCurrencySwap" && trade.mtmReset) {
+    const missingFx = pricing.warnings.filter((w) => w.startsWith("MISSING_FX_FIXING:")).length;
+    lines.push(
+      `FX-Fixings (MtM-Reset): ${ctx.fxFixings?.length ?? 0} historische FX-Fixings geladen; für Reset-Termine bis zum Bewertungstag wird das FX-Fixing des Reset-Termins verwendet, für die erste Periode ohne Fixing das kontraktuelle Nominal; fehlende Fixings ${policy === "throw" ? "führen zum Abbruch der Bewertung (Policy „throw“)" : "werden mit dem heutigen Kurs genähert und als MISSING_FX_FIXING gemeldet (Policy „curve“)"}; in dieser Bewertung ${missingFx === 0 ? "kein fehlendes FX-Fixing" : `${missingFx} fehlende(s) FX-Fixing(s)`}.`,
+    );
+  }
   for (const l of floats) {
     let idxType: "IBOR" | "OIS" | undefined;
     try {
@@ -607,7 +636,7 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
       ];
     case "CrossCurrencySwap":
       return [
-        `Cross-Currency-Swap mit Nominalaustausch${a.mtmReset === "yes" ? " und MtM-Reset (Nominal des resettenden Legs aus Spot-Date-verankerten Forward-FX-Kursen)" : ""}; jede Seite auf ihrer Diskontkurve; Umrechnung in die Reporting-Währung zum auf den Bewertungstag angepassten Spot.`,
+        `Cross-Currency-Swap mit Nominalaustausch${a.mtmReset === "yes" ? " und MtM-Reset: Nominal des resettenden Legs je Periode = Gegen-Nominal × FX-Kurs am Reset-Termin (adjustierter Periodenbeginn) – historisches FX-Fixing für Reset-Termine bis zum Bewertungstag, Spot-Date-verankerter Forward-FX-Kurs für zukünftige Termine; Nominaldifferenzen werden am Periodenende ausgetauscht" : ""}; jede Seite auf ihrer Diskontkurve; Umrechnung in die Reporting-Währung zum auf den Bewertungstag angepassten Spot.`,
       ];
     case "FRA":
       return [
@@ -656,7 +685,7 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
       const q = trade.type === "FxForward" ? trade.sellCurrency : trade.nearLeg.sellCurrency;
       const lag = fxSpotLag(b, q);
       return [
-        `FX-Forward über Zinsparität mit Spot-Date-Anker (${b}${q}: T+${lag} auf dem Paar-Kalender${b !== "USD" && q !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${spotDateDe(pricing.details.spotDate)}` : ""}): F = S · [DF_Basis(T)/DF_Basis(t_s)] / [DF_Quote(T)/DF_Quote(t_s)]; Barwert = diskontierte Zahlungsströme beider Währungen, umgerechnet zum auf den Bewertungstag angepassten Spot S·DF_Quote(t_s)/DF_Basis(t_s).`,
+        `FX-Forward über Zinsparität mit Spot-Date-Anker (${b}${q}: T+${lag} auf dem Paar-Kalender${b !== "USD" && q !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${spotDateDe(pricing.details.spotDate)}` : ""}): F = S · [DF_Basis(T)/DF_Basis(t_s)] / [DF_Quote(T)/DF_Quote(t_s)]; Barwert = diskontierte Zahlungsströme beider Währungen, umgerechnet zum auf den Bewertungstag angepassten Spot S·DF_Quote(t_s)/DF_Basis(t_s). Settlement-Konvention: ein Leg mit Lieferung am Bewertungstag (Value Today) geht undiskontiert zum Heute-Kurs in den Barwert ein (fairer Kurs = Heute-Kurs, Warnung SETTLES_TODAY); vor dem Bewertungstag gelieferte Legs sind ausgeschlossen.`,
         `FX-Delta-Betrag: Barwertänderung in der Reporting-Währung bei +1 % Spot der Kaufwährung ${b} gegen ${q} (linear: ±Barwert des Legs in der bewegten Währung × 1 %); eine Delta-Quote wird für lineare FX-Geschäfte nicht ausgewiesen (Delta ±1).`,
       ];
     }
@@ -762,7 +791,10 @@ function staticMethodology(trade: Trade): string[] {
     case "InterestRateSwap":
       return [...common, "Barwert = Summe diskontierter fixer und projizierter variabler Cashflows; Par-Satz und fairer Spread analytisch aus Annuität."];
     case "CrossCurrencySwap":
-      return [...common, "Cross-Currency-Swap mit Nominalaustausch; MtM-Reset über Forward-FX aus Diskontkurven; Umrechnung in Reporting-Währung zum Spot."];
+      return [
+        ...common,
+        "Cross-Currency-Swap mit Nominalaustausch; MtM-Reset: Nominal je Periode = Gegen-Nominal × FX-Fixing am Reset-Termin (zukünftige Termine: Forward-FX aus Diskontkurven); Umrechnung in Reporting-Währung zum Spot.",
+      ];
     case "FRA":
       return [...common, "FRA mit Settlement am Startdatum und Abdiskontierung über die FRA-Periode (ISDA)."];
     case "CapFloor":
@@ -779,7 +811,7 @@ function staticMethodology(trade: Trade): string[] {
     case "FxSwap":
       return [
         ...common,
-        "FX-Forward über Zinsparität mit Spot-Date-Anker (T+2, T+1 für z. B. USDCAD): F = S · [DF_Basis(T)/DF_Basis(t_s)] / [DF_Quote(T)/DF_Quote(t_s)]; Barwert = diskontierte Zahlungsströme beider Währungen, umgerechnet zum auf den Bewertungstag angepassten Spot.",
+        "FX-Forward über Zinsparität mit Spot-Date-Anker (T+2, T+1 für z. B. USDCAD): F = S · [DF_Basis(T)/DF_Basis(t_s)] / [DF_Quote(T)/DF_Quote(t_s)]; Barwert = diskontierte Zahlungsströme beider Währungen, umgerechnet zum auf den Bewertungstag angepassten Spot; Legs mit Lieferung am Bewertungstag als Value-Today-Austausch zum Heute-Kurs (SETTLES_TODAY), davor gelieferte Legs ausgeschlossen.",
       ];
     case "FxOption":
       return [

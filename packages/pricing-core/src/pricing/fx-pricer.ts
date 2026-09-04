@@ -26,16 +26,40 @@ export function fxForwardRate(ctx: MarketContext, base: string, quote: string, d
   return (spot * (dB.df(date) / dB.df(ts))) / (dQ.df(date) / dQ.df(ts));
 }
 
+/** Warning prefix for an FX leg that settles on the valuation date (valued as a value-today exchange, R4-2). */
+export const SETTLES_TODAY_PREFIX = "SETTLES_TODAY:";
+
+/**
+ * One FX exchange (a forward or one leg of an FX swap). Settlement
+ * convention (R4-2): a leg delivering *after* the valuation date is
+ * discounted; a leg delivering *on* the valuation date is a value-today
+ * exchange – both amounts count at the today rate (DF 1), the fair rate is
+ * the value-today rate `fxRateAtValuationDate` and a `SETTLES_TODAY:` warning
+ * is raised; a leg delivered *before* the valuation date is excluded (PV 0)
+ * with the "already delivered" warning.
+ */
 function forwardLeg(
   ctx: MarketContext,
   leg: Omit<FxForward, "type" | "id">,
   legIndex: number,
   reporting: string,
-  collateral?: string,
-): { legs: LegResult[]; pv: number; fair: number; points: number; spot: number } {
+  collateral: string | undefined,
+  label: string,
+): { legs: LegResult[]; pv: number; fair: number; points: number; spot: number; warnings: string[] } {
   const val = ctx.valuationDate;
-  const dfBuy = leg.deliveryDate > val ? getDiscountCurve(ctx, leg.buyCurrency, collateral).df(leg.deliveryDate) : 0;
-  const dfSell = leg.deliveryDate > val ? getDiscountCurve(ctx, leg.sellCurrency, collateral).df(leg.deliveryDate) : 0;
+  const settlesToday = leg.deliveryDate === val;
+  const delivered = leg.deliveryDate < val;
+  const dfOf = (ccy: string) => (delivered ? 0 : settlesToday ? 1 : getDiscountCurve(ctx, ccy, collateral).df(leg.deliveryDate));
+  const dfBuy = dfOf(leg.buyCurrency);
+  const dfSell = dfOf(leg.sellCurrency);
+  const warnings: string[] = [];
+  if (settlesToday) {
+    warnings.push(
+      `${SETTLES_TODAY_PREFIX} ${label} settles on the valuation date ${toISO(val)} – valued as a value-today exchange at the today rate (not discounted)`,
+    );
+  } else if (delivered) {
+    warnings.push(`${label} already delivered (${toISO(leg.deliveryDate)}) – excluded from the PV`);
+  }
   // PVs are discounted to today → convert with the today rate (spot adjusted to the valuation date).
   const fxBuy = fxRateAtValuationDate(ctx, leg.buyCurrency, reporting, collateral);
   const fxSell = fxRateAtValuationDate(ctx, leg.sellCurrency, reporting, collateral);
@@ -63,8 +87,13 @@ function forwardLeg(
   };
   const pv = cfBuy.presentValue * fxBuy + cfSell.presentValue * fxSell;
   const spot = getFxSpot(ctx, leg.buyCurrency, leg.sellCurrency);
-  const fair = leg.deliveryDate > val ? fxForwardRate(ctx, leg.buyCurrency, leg.sellCurrency, leg.deliveryDate, collateral) : spot;
+  // Fair rate: forward for future delivery, value-today rate for delivery on/before the valuation date.
+  const fair =
+    leg.deliveryDate > val
+      ? fxForwardRate(ctx, leg.buyCurrency, leg.sellCurrency, leg.deliveryDate, collateral)
+      : fxRateAtValuationDate(ctx, leg.buyCurrency, leg.sellCurrency, collateral);
   return {
+    warnings,
     legs: [
       { legIndex, legType: "FX Buy", currency: leg.buyCurrency, pv: cfBuy.presentValue, pvReporting: cfBuy.presentValue * fxBuy, cashflows: [cfBuy] },
       {
@@ -109,7 +138,7 @@ export function linearFxDeltaAmount(legs: LegResult[], ccyUp: string, reporting:
  */
 export function priceFxForward(ctx: MarketContext, trade: FxForward, reportingCurrency?: string): PricingResult {
   const reporting = reportingCurrency ?? trade.sellCurrency;
-  const r = forwardLeg(ctx, trade, 0, reporting, trade.collateralCurrency);
+  const r = forwardLeg(ctx, trade, 0, reporting, trade.collateralCurrency, "FX forward");
   const contractRate = trade.sellAmount / trade.buyAmount;
   const buyIsForeign = trade.buyCurrency !== reporting;
   const sellIsForeign = trade.sellCurrency !== reporting;
@@ -146,14 +175,22 @@ export function priceFxForward(ctx: MarketContext, trade: FxForward, reportingCu
     },
     /** Spot settlement date (T+2 / T+1 on the pair calendar), ISO. */
     details: { spotDate: toISO(spotDate) },
-    warnings: trade.deliveryDate <= ctx.valuationDate ? ["FX forward already delivered"] : [],
+    warnings: r.warnings,
   };
 }
 
+/**
+ * FX swap = near leg + far leg, each priced like a forward (`forwardLeg`). A
+ * near leg settling on the valuation date (value-today / O/N swap) is a
+ * value-today exchange: `nearFairForward` is the value-today rate, the
+ * off-market near amount enters the PV and a `SETTLES_TODAY:` warning is
+ * raised (R4-2); legs delivered before the valuation date are excluded with a
+ * warning. Leg warnings are passed through.
+ */
 export function priceFxSwap(ctx: MarketContext, trade: FxSwap, reportingCurrency?: string): PricingResult {
   const reporting = reportingCurrency ?? trade.nearLeg.sellCurrency;
-  const near = forwardLeg(ctx, trade.nearLeg, 0, reporting, trade.collateralCurrency);
-  const far = forwardLeg(ctx, trade.farLeg, 2, reporting, trade.collateralCurrency);
+  const near = forwardLeg(ctx, trade.nearLeg, 0, reporting, trade.collateralCurrency, "FX swap near leg");
+  const far = forwardLeg(ctx, trade.farLeg, 2, reporting, trade.collateralCurrency, "FX swap far leg");
   // Express the far leg's fair forward in the near leg's quotation (buy ccy per sell ccy).
   const farFair = trade.farLeg.buyCurrency === trade.nearLeg.buyCurrency ? far.fair : 1 / far.fair;
   return {
@@ -173,7 +210,7 @@ export function priceFxSwap(ctx: MarketContext, trade: FxSwap, reportingCurrency
       deltaAmount: linearFxDeltaAmount([...near.legs, ...far.legs], trade.nearLeg.buyCurrency, reporting),
     },
     details: { spotDate: toISO(fxSpotDate(ctx, trade.nearLeg.buyCurrency, trade.nearLeg.sellCurrency)) },
-    warnings: [],
+    warnings: [...near.warnings, ...far.warnings],
   };
 }
 

@@ -139,7 +139,7 @@ repliziert Bloomberg SWPM mit QuantLib – Vanilla-Pricing ist technisch kommodi
 1. **Moderne Web-UI mit Hotkeys für Berater.** Bloomberg bietet Tastatureffizienz, aber Terminal-Ästhetik und
    Seat-Preis; TMS und Managed Services bieten Web-Oberflächen ohne Pricing-Interaktivität.
 2. **Transparenz der Bewertung.** Kurvenaufbau (OIS-Diskontierung, Multi-Curve, SABR-Cube) und jeder Cashflow
-   nachvollziehbar – prüferfest nach IFRS 13/HGB (IDW RS HFA 35).
+   nachvollziehbar – prüferfest nach IFRS 13 (IDW RS HFA 47) bzw. HGB (§ 254 mit IDW RS HFA 35 für Bewertungseinheiten).
 3. **Preismodell.** Lücke zwischen Deriscope (9–199 USD/Monat) und Bloomberg (~2.000 USD/Monat) für Teams mit
    5–50 Derivaten.
 4. **Deutschsprachige Regulatorik-Integration.** MiFID-Geeignetheit, WpHG-Dokumentation, KIDs: nur LPA und die

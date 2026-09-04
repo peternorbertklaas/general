@@ -1,4 +1,11 @@
 # Dependabot – weekly dependency and GitHub-Actions updates, grouped to keep PR noise low.
+#
+# Toolchain updates come in two groups split by update type (N4-04): `tooling` bundles minor/patch
+# releases into one PR, `tooling-major` bundles the major releases (vitest 5, vite 8,
+# @vitejs/plugin-react 6, jsdom 30, …) into a separate weekly PR so majors are proposed instead of
+# silently filtered out. `typescript` is pinned to 5.x on purpose (typescript-eslint and the
+# `NodeNext`/`Bundler` module settings are validated against 5.x; see CONTRIBUTING.md) and therefore
+# excluded from the major group.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -8,11 +15,15 @@ updates:
       day: monday
       time: "06:00"
       timezone: Europe/Berlin
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 15
     versioning-strategy: increase
     labels: ["dependencies"]
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # TypeScript majors are adopted deliberately (typescript-eslint support, module resolution), not via Dependabot.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
     groups:
       fastify:
         patterns: ["fastify", "@fastify/*"]
@@ -36,6 +47,9 @@ updates:
             "globals",
           ]
         update-types: ["minor", "patch"]
+      tooling-major:
+        patterns: ["typescript-eslint", "eslint", "@eslint/*", "prettier", "vitest", "@vitest/*", "vite", "@vitejs/*", "tsx", "playwright", "jsdom", "globals"]
+        update-types: ["major"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

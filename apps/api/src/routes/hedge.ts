@@ -9,7 +9,18 @@ import {
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
+import { sendError } from "../lib/errors.js";
 import { arrayResponse, marketSnapshotRef, objectResponse, responses, tradeRef } from "../schemas.js";
+
+/**
+ * Valuations per trade of an effectiveness test (compute budget, N4-01): instrument and hypothetical
+ * derivative at current and designation market, prospective dollar offset (2 shocks), basis test, the
+ * regression set (standard parallel shocks, FX shocks 6 × 2, basis shocks 2 × 2 + discount 1 × 2) and
+ * the hypothetical's par / vol solve – conservatively 40, the same class as bucketed risk.
+ */
+const HEDGE_EFFECTIVENESS_WEIGHT = 40;
+/** Building the hypothetical derivative solves the par rate / fair forward: a handful of valuations. */
+const HEDGE_HYPOTHETICAL_WEIGHT = 4;
 
 const isoDate = { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" } as const;
 
@@ -100,7 +111,7 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
   app.post<{ Body: HedgeBody }>(
     "/api/hedge/effectiveness",
     {
-      config: { marketHeader: true },
+      config: { marketHeader: true, computeWeight: () => HEDGE_EFFECTIVENESS_WEIGHT },
       schema: {
         operationId: "hedgeEffectiveness",
         tags: ["pricing"],
@@ -179,7 +190,7 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
     async (req, reply) => {
       const rel = datesToSerial(req.body.relationship);
       const instrument = req.body.hedgingInstrument ? datesToSerial(req.body.hedgingInstrument) : ctx.trades.get(rel.hedgingInstrumentId)?.trade;
-      if (!instrument) return reply.status(404).send({ error: `Hedging instrument ${rel.hedgingInstrumentId} not found`, statusCode: 404, requestId: req.id });
+      if (!instrument) return sendError(reply, req, 404, "NOT_FOUND", `Hedging instrument ${rel.hedgingInstrumentId} not found`);
       const designationCtx = req.body.designationSnapshot ? deserializeMarket(req.body.designationSnapshot) : undefined;
       const report = hedgeEffectivenessReport(ctx.market.get(), rel, instrument, {
         designationCtx,
@@ -206,7 +217,7 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
   app.post<{ Body: { relationship: HedgeRelationship; hedgingInstrument?: Trade } }>(
     "/api/hedge/hypothetical",
     {
-      config: { marketHeader: true },
+      config: { marketHeader: true, computeWeight: () => HEDGE_HYPOTHETICAL_WEIGHT },
       schema: {
         operationId: "hedgeHypothetical",
         tags: ["pricing"],
@@ -228,6 +239,7 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
           },
           400,
           404,
+          413,
           422,
         ),
       },
@@ -235,7 +247,7 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
     async (req, reply) => {
       const rel = datesToSerial(req.body.relationship);
       const instrument = req.body.hedgingInstrument ? datesToSerial(req.body.hedgingInstrument) : ctx.trades.get(rel.hedgingInstrumentId)?.trade;
-      if (!instrument) return reply.status(404).send({ error: `Hedging instrument ${rel.hedgingInstrumentId} not found`, statusCode: 404, requestId: req.id });
+      if (!instrument) return sendError(reply, req, 404, "NOT_FOUND", `Hedging instrument ${rel.hedgingInstrumentId} not found`);
       return datesToIso(hypotheticalDerivative(ctx.market.get(), rel, instrument));
     },
   );

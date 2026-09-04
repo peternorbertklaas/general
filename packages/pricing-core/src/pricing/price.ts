@@ -1,7 +1,7 @@
 import { normalizeDayCount } from "../dates/daycount.js";
 import { frequencyPerYear } from "../dates/schedule.js";
 import { PricingError } from "../errors.js";
-import { type MarketContext } from "../market/market-context.js";
+import { type MarketContext, collateralCurveWarnings } from "../market/market-context.js";
 import { type FixedLeg, type FloatLeg, type FxForward, type PricingResult, type SwapLeg, type Trade } from "../instruments/types.js";
 import { priceCapFloor } from "./capfloor-pricer.js";
 import { priceFra } from "./fra-pricer.js";
@@ -63,6 +63,38 @@ function checkShift(v: unknown, what: string, out: string[]): void {
   if (!isNum(v) || v < 0) out.push(`${what} must be a non-negative finite number (got ${String(v)})`);
 }
 
+/** Optional business-day count (payment lag, fixing lag, lookback): non-negative integer when given (R3-4 / R4-3). */
+function checkBusinessDayCount(v: unknown, what: string, out: string[]): void {
+  if (v === undefined) return;
+  if (!Number.isInteger(v) || (v as number) < 0) out.push(`${what} must be a non-negative integer number of business days (got ${String(v)})`);
+}
+
+/**
+ * Optional amortisation schedule (R4-3c): every entry needs a finite serial
+ * `date` and a positive finite `notional`; dates strictly increasing.
+ */
+function checkNotionalSchedule(schedule: unknown, path: string, out: string[]): void {
+  if (schedule === undefined) return;
+  if (!Array.isArray(schedule)) {
+    out.push(`${path} must be an array of { date, notional }`);
+    return;
+  }
+  let prev: number | undefined;
+  schedule.forEach((e: unknown, i) => {
+    const entry = e as { date?: unknown; notional?: unknown } | null;
+    if (!entry || typeof entry !== "object") {
+      out.push(`${path}[${i}] must be an object { date, notional }`);
+      return;
+    }
+    if (!isNum(entry.date)) out.push(`${path}[${i}].date must be a serial date`);
+    else {
+      if (prev !== undefined && entry.date <= prev) out.push(`${path}[${i}].date must be after the previous entry (dates strictly increasing)`);
+      prev = entry.date;
+    }
+    checkPositive(entry.notional, `${path}[${i}].notional`, out);
+  });
+}
+
 function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
   if (!l || typeof l !== "object") {
     out.push(`${path}: leg missing`);
@@ -77,13 +109,14 @@ function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
   checkFrequency(l.frequency, `${path}.frequency`, out);
   checkDayCount(l.dayCount, `${path}.dayCount`, out);
   if (!isStr(l.calendar)) out.push(`${path}.calendar missing`);
-  if (l.paymentLag !== undefined && (!Number.isInteger(l.paymentLag) || l.paymentLag < 0)) {
-    out.push(`${path}.paymentLag must be a non-negative integer number of business days (got ${String(l.paymentLag)})`);
-  }
+  checkBusinessDayCount(l.paymentLag, `${path}.paymentLag`, out);
+  checkNotionalSchedule(l.notionalSchedule, `${path}.notionalSchedule`, out);
   if (l.type === "Fixed" && !isNum((l as FixedLeg).rate)) out.push(`${path}.rate (fixed rate) missing or not a finite number`);
   if (l.type === "Float") {
     const fl = l as FloatLeg;
     if (!isStr(fl.index)) out.push(`${path}.index (floating index) missing`);
+    checkBusinessDayCount(fl.fixingLag, `${path}.fixingLag`, out);
+    checkBusinessDayCount(fl.lookbackDays, `${path}.lookbackDays`, out);
     if (fl.capRate !== undefined && !isNum(fl.capRate)) out.push(`${path}.capRate must be a finite number`);
     if (fl.floorRate !== undefined && !isNum(fl.floorRate)) out.push(`${path}.floorRate must be a finite number`);
     if (isNum(fl.capRate) && isNum(fl.floorRate) && fl.capRate < fl.floorRate) {
@@ -107,7 +140,10 @@ function checkFxLeg(l: Omit<FxForward, "type" | "id"> | undefined, path: string,
  * Structural validation of a trade (required fields, finite numbers, date
  * order, R3-4: positive notionals, non-negative payment lags, valid frequency
  * and day-count strings, positive vol overrides, strike order of collars and
- * embedded caps/floors, exactly one fixed leg under a swaption). Returns a
+ * embedded caps/floors, exactly one fixed leg under a swaption; R4-3: swaption
+ * expiry ≤ swap start and < swap end, non-negative barrier rebate, positive
+ * strictly dated `notionalSchedule` entries, non-negative integer
+ * `fixingLag` / `lookbackDays`). Returns a
  * list of problems (empty = valid); `priceTrade` throws a
  * `PricingError("INVALID_TRADE")` with this list instead of producing a null
  * or NaN PV.
@@ -148,6 +184,7 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
           out.push(`${path}: collar floorStrike (${trade.floorStrike}) must not exceed the cap strike (${trade.strike})`);
         }
       }
+      checkNotionalSchedule(trade.notionalSchedule, `${path}.notionalSchedule`, out);
       checkVolOverride(trade.volOverride, `${path}.volOverride`, out);
       checkShift(trade.shift, `${path}.shift`, out);
       break;
@@ -162,6 +199,19 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
         const fixed = legs.filter((l) => l?.type === "Fixed").length;
         if (fixed !== 1) out.push(`${path}.underlying must have exactly one Fixed leg (found ${fixed})`);
         if (!legs.some((l) => l?.type === "Float")) out.push(`${path}.underlying must have a Float leg`);
+        // R4-3a: the option must expire before (or when) the underlying swap starts – and before it ends.
+        if (isNum(trade.expiryDate)) {
+          const starts = legs.map((l) => l?.effectiveDate).filter(isNum);
+          const ends = legs.map((l) => l?.terminationDate).filter(isNum);
+          const firstStart = starts.length ? Math.min(...starts) : undefined;
+          const lastEnd = ends.length ? Math.max(...ends) : undefined;
+          if (firstStart !== undefined && trade.expiryDate > firstStart) {
+            out.push(`${path}.expiryDate must not be after the underlying swap's effectiveDate (expiry ${trade.expiryDate} > start ${firstStart})`);
+          }
+          if (lastEnd !== undefined && trade.expiryDate >= lastEnd) {
+            out.push(`${path}.expiryDate must be before the underlying swap's terminationDate (expiry ${trade.expiryDate} ≥ end ${lastEnd})`);
+          }
+        }
       }
       checkVolOverride(trade.volOverride, `${path}.volOverride`, out);
       checkShift(trade.shift, `${path}.shift`, out);
@@ -181,6 +231,10 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
       if (!isNum(trade.expiryDate) || !isNum(trade.deliveryDate)) out.push(`${path}: expiryDate / deliveryDate must be serial dates`);
       else if (trade.deliveryDate < trade.expiryDate) out.push(`${path}: deliveryDate must not be before expiryDate`);
       if (trade.barrier && (!isNum(trade.barrier.level) || trade.barrier.level <= 0)) out.push(`${path}.barrier.level must be a positive finite number`);
+      // R4-3b: a negative rebate would give a bought option a negative value.
+      if (trade.barrier?.rebate !== undefined && (!isNum(trade.barrier.rebate) || trade.barrier.rebate < 0)) {
+        out.push(`${path}.barrier.rebate must be a non-negative finite number (got ${String(trade.barrier.rebate)})`);
+      }
       checkVolOverride(trade.volOverride, `${path}.volOverride`, out);
       break;
     default:
@@ -253,7 +307,10 @@ export function priceTrade(ctx: MarketContext, trade: Trade, reportingCurrency?:
       },
     );
   }
-  return { ...res, timingMs: performance.now() - t0 };
+  // Markt R4-1: a CSA without a collateral-specific discount curve is discounted on the standard curve – say so.
+  const csaWarnings = collateralCurveWarnings(ctx, tradeCurrencies(trade), trade.collateralCurrency);
+  const warnings = csaWarnings.length ? Array.from(new Set([...res.warnings, ...csaWarnings])) : res.warnings;
+  return { ...res, warnings, timingMs: performance.now() - t0 };
 }
 
 export function pricePortfolio(ctx: MarketContext, trades: Trade[], reportingCurrency: string) {

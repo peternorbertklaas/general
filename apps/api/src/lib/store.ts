@@ -92,6 +92,8 @@ export class MarketStore implements MarketRepository {
     this.ctx = {
       ...fresh,
       fixings: prev.fixings ?? fresh.fixings,
+      // FX fixings of past MtM-reset dates are history, not sample-market data – they survive a valuation-date change.
+      ...(prev.fxFixings ? { fxFixings: prev.fxFixings } : {}),
       credit: prev.credit ?? fresh.credit,
       ...(prev.fxSpotDates ? { fxSpotDates: prev.fxSpotDates } : {}),
       ...(prev.missingFixingPolicy ? { missingFixingPolicy: prev.missingFixingPolicy } : {}),

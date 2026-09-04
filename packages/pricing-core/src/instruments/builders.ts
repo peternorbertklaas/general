@@ -559,15 +559,54 @@ export function makeCrossCurrencySwap(p: CrossCurrencySwapParams): CrossCurrency
 }
 
 /**
- * Default index of an FRA from its period length: an IBOR index of the
- * currency whose tenor equals the period ("3x6" → 3M → EURIBOR-3M, "6x12" →
- * EURIBOR-6M); falls back to the currency's standard floating index when no
- * index with that tenor is registered.
+ * Indices whose projection curves the sample market (and every market built
+ * from `SAMPLE_QUOTES`) provides – the default `availableIndices` of
+ * `fraIndexForPeriod`. EURIBOR-1M / -12M are registered indices without a
+ * sample curve (Markt R4-6), so they are not in this list.
  */
-export function fraIndexForPeriod(currency: string, months: number): string {
+export const DEFAULT_AVAILABLE_INDICES: readonly string[] = ["EURIBOR-3M", "EURIBOR-6M", "ESTR", "SOFR", "SONIA", "SARON", "TONA"];
+
+/** Months of an IBOR tenor string ("3M" → 3, "12M" → 12); undefined for non-monthly tenors. */
+function tenorMonths(tenor: string): number | undefined {
+  const m = /^(\d+)M$/i.exec(tenor);
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * Default index of an FRA from its period length (Markt R3-2 / R4-6): the
+ * IBOR index of the currency whose tenor equals the period ("3x6" → EURIBOR-3M,
+ * "6x12" → EURIBOR-6M) **provided its curve exists**. `availableIndices`
+ * (default `DEFAULT_AVAILABLE_INDICES`, the sample-market curves; API/UI pass
+ * the indices of the loaded market, e.g. `Object.keys` of the context's curve
+ * indices) restricts the choice to indices with a projection curve. Without an
+ * exact match the nearest available IBOR tenor of the currency is used –
+ * shorter periods round to the next available tenor (1x2 → EURIBOR-3M), longer
+ * periods to the longest available (12x24 → EURIBOR-6M); currencies without an
+ * available IBOR index (USD, GBP, CHF, JPY) fall back to their RFR. The result
+ * always has a curve in the given market – an FRA is never built on an index
+ * that cannot be priced.
+ */
+export function fraIndexForPeriod(currency: string, months: number, availableIndices: readonly string[] = DEFAULT_AVAILABLE_INDICES): string {
   const ccy = currency.toUpperCase();
-  const match = Object.values(RATE_INDICES).find((i) => i.currency === ccy && i.type === "IBOR" && i.tenor.toUpperCase() === `${months}M`);
-  return match?.name ?? getSwapConventions(ccy).floatIndex;
+  const avail = new Set(availableIndices.map((n) => n.toUpperCase()));
+  const candidates = Object.values(RATE_INDICES).filter(
+    (i) => i.currency === ccy && i.type === "IBOR" && avail.has(i.name.toUpperCase()) && tenorMonths(i.tenor) !== undefined,
+  );
+  const exact = candidates.find((i) => tenorMonths(i.tenor) === months);
+  if (exact) return exact.name;
+  if (candidates.length) {
+    // Nearest available tenor; ties (e.g. 4–5M between 3M and 6M) go to the longer tenor, the market's standard FRA index.
+    const sorted = [...candidates].sort((a, b) => tenorMonths(a.tenor)! - tenorMonths(b.tenor)!);
+    let best = sorted[0]!;
+    for (const c of sorted) {
+      const dc = Math.abs(tenorMonths(c.tenor)! - months);
+      const db = Math.abs(tenorMonths(best.tenor)! - months);
+      if (dc <= db) best = c;
+    }
+    return best.name;
+  }
+  const conv = getSwapConventions(ccy);
+  return avail.has(conv.floatIndex.toUpperCase()) ? conv.floatIndex : conv.oisIndex;
 }
 
 /**

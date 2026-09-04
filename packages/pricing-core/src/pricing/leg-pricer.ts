@@ -459,8 +459,12 @@ export function legAccrued(ctx: MarketContext, leg: SwapLeg, legResult: LegResul
   return legSign(leg) * cf.notional * cf.rate * tauAccr;
 }
 
-export function scheduleDates(leg: SwapLeg): SerialDate[] {
-  const s = buildSchedule({
+/**
+ * Coupon periods of a leg with all of its conventions (business-day rule,
+ * stub, EOM, roll, payment lag) – the same schedule `priceLeg` prices.
+ */
+export function legPeriods(leg: SwapLeg): SchedulePeriod[] {
+  return buildSchedule({
     effectiveDate: leg.effectiveDate,
     terminationDate: leg.terminationDate,
     frequency: leg.frequency,
@@ -469,6 +473,20 @@ export function scheduleDates(leg: SwapLeg): SerialDate[] {
     stub: leg.stub ?? "ShortFront",
     endOfMonth: leg.endOfMonth ?? false,
     roll: leg.roll,
-  });
-  return s.periods.map((p) => p.paymentDate);
+    paymentLag: leg.paymentLag ?? 0,
+  }).periods;
+}
+
+/** Adjusted accrual end dates of a leg (payment lag ignored – kept for backward compatibility). */
+export function scheduleDates(leg: SwapLeg): SerialDate[] {
+  return buildSchedule({
+    effectiveDate: leg.effectiveDate,
+    terminationDate: leg.terminationDate,
+    frequency: leg.frequency,
+    calendar: leg.calendar,
+    businessDayConvention: leg.businessDayConvention ?? "ModifiedFollowing",
+    stub: leg.stub ?? "ShortFront",
+    endOfMonth: leg.endOfMonth ?? false,
+    roll: leg.roll,
+  }).periods.map((p) => p.paymentDate);
 }

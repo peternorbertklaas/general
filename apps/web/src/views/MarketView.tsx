@@ -3,6 +3,7 @@ import { useShallow } from "zustand/react/shallow";
 import {
   type CapletVolSurface,
   type Fixing,
+  type FxFixing,
   type FxVolSurface,
   type MarketSnapshotJson,
   type SwaptionVolSurface,
@@ -240,7 +241,14 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
         </span>
       </h3>
       <div className="table-scroll" style={{ maxHeight: 320 }}>
-        <table className="grid-table compact">
+        {/* Fixed layout: every strike column gets the same width and the input is bound to its cell (R4-01). */}
+        <table className="grid-table compact vol-grid" data-testid="caplet-vol-table" style={{ minWidth: 70 + surface.strikes.length * 62 }}>
+          <colgroup>
+            <col style={{ width: 70 }} />
+            {surface.strikes.map((k) => (
+              <col key={k} />
+            ))}
+          </colgroup>
           <thead>
             <tr>
               <th>Expiry</th>
@@ -259,19 +267,18 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
                   const cellEdited = sample ? sample.vols[i]?.[j] !== v : true;
                   return (
                     <td key={j} className={`num vol-cell ${cellEdited ? "edited" : ""}`}>
-                      <span style={{ display: "inline-block", width: 62 }}>
-                        <NumInput
-                          inline
-                          value={v}
-                          scale={1e4}
-                          step={1}
-                          digits={0}
-                          min={0.0001}
-                          ariaLabel={`Caplet-Vol ${expiryLabel(e)} Strike ${fmtNum(surface.strikes[j]! * 100, 2)} %`}
-                          testId={i === 0 && j === 0 ? "caplet-vol-cell" : undefined}
-                          onChange={(x) => setCell(i, j, x)}
-                        />
-                      </span>
+                      <NumInput
+                        inline
+                        width="100%"
+                        value={v}
+                        scale={1e4}
+                        step={1}
+                        digits={0}
+                        min={0.0001}
+                        ariaLabel={`Caplet-Vol ${expiryLabel(e)} Strike ${fmtNum(surface.strikes[j]! * 100, 2)} %`}
+                        testId={i === 0 && j === 0 ? "caplet-vol-cell" : undefined}
+                        onChange={(x) => setCell(i, j, x)}
+                      />
                     </td>
                   );
                 })}
@@ -285,6 +292,162 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
 }
 
 const FIXING_INDICES = ["EURIBOR-1M", "EURIBOR-3M", "EURIBOR-6M", "EURIBOR-12M", "ESTR", "SOFR", "SONIA", "SARON", "TONA"];
+
+const pairLabel = (p: string) => (/^[A-Z]{6}$/.test(p) ? `${p.slice(0, 3)}/${p.slice(3)}` : p);
+
+/**
+ * Editable table of historical FX fixings (pair, date, rate) for the notional
+ * resets of mark-to-market cross-currency swaps (core R4-1). The list is part of
+ * the market: persisted, exported/imported with the snapshot, undoable and
+ * counted as "Markt modifiziert".
+ */
+function FxFixingsEditor() {
+  const m = useStore((s) => s.baseMarket);
+  const fxFixings = useStore((s) => s.fxFixings);
+  const act = useStore.getState;
+  const pairs = [...new Set([...Object.keys(m.fxSpots), ...fxFixings.map((f) => f.pair)])];
+  const firstPair = pairs[0] ?? "EURUSD";
+  const [pairSel, setPairSel] = useState(firstPair);
+  const addPair = pairs.includes(pairSel) ? pairSel : firstPair;
+  const apply = (next: FxFixing[], label: string) => {
+    if (!act().setFxFixings(next, label)) act().showToast("FX-Fixing nicht übernommen (Bewertung fehlgeschlagen)");
+  };
+  const setRow = (i: number, patch: Partial<FxFixing>) => {
+    const f = { ...fxFixings[i]!, ...patch };
+    apply(
+      fxFixings.map((x, j) => (j === i ? f : x)),
+      `FX-Fixing ${pairLabel(f.pair)} ${fmtDate(f.date)} = ${fmtNum(f.rate, 4)}`,
+    );
+  };
+  const remove = (i: number) => {
+    const f = fxFixings[i]!;
+    apply(
+      fxFixings.filter((_, j) => j !== i),
+      `FX-Fixing ${pairLabel(f.pair)} ${fmtDate(f.date)} entfernt`,
+    );
+  };
+  const add = (f: FxFixing, label: string) => apply([...fxFixings, f], label);
+  /** Today's fixing of the selected pair from the market spot. */
+  const addTodayFromSpot = () => {
+    const spot = m.fxSpots[addPair];
+    const inverse = m.fxSpots[`${addPair.slice(3)}${addPair.slice(0, 3)}`];
+    const rate = spot ?? (inverse ? 1 / inverse : undefined);
+    if (rate === undefined) {
+      act().showToast(`Kein Spot für ${pairLabel(addPair)} im Markt`);
+      return;
+    }
+    if (fxFixings.some((f) => f.pair === addPair && f.date === m.valuationDate)) {
+      act().showToast(`FX-Fixing ${pairLabel(addPair)} ${fmtDate(m.valuationDate)} ist bereits hinterlegt`);
+      return;
+    }
+    add(
+      { pair: addPair, date: m.valuationDate, rate: Math.round(rate * 1e6) / 1e6 },
+      `FX-Fixing ${pairLabel(addPair)} ${fmtDate(m.valuationDate)} = ${fmtNum(rate, 4)} (Spot)`,
+    );
+  };
+  return (
+    <div className="card" data-testid="fx-fixings-editor">
+      <h3>
+        FX-Fixings (MtM-Reset, editierbar)
+        <span className="right row wrap" style={{ gap: 6 }}>
+          <select
+            className="inline"
+            value={addPair}
+            aria-label="Währungspaar für neues FX-Fixing"
+            data-testid="fx-fixing-pair"
+            onChange={(e) => setPairSel(e.target.value)}
+          >
+            {pairs.map((p) => (
+              <option key={p} value={p}>
+                {pairLabel(p)}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn ghost"
+            onClick={addTodayFromSpot}
+            data-testid="fx-fixing-add-spot"
+            title="Fixing des gewählten Paars am Bewertungstag aus dem Markt-Spot anlegen"
+          >
+            + heute aus Spot
+          </button>
+          <button
+            className="btn"
+            data-testid="fx-fixing-add"
+            onClick={() =>
+              add(
+                { pair: addPair, date: m.valuationDate, rate: m.fxSpots[addPair] ?? 1 },
+                `FX-Fixing ${pairLabel(addPair)} ${fmtDate(m.valuationDate)} hinzugefügt`,
+              )
+            }
+          >
+            + Zeile
+          </button>
+        </span>
+      </h3>
+      {fxFixings.length === 0 ? (
+        <div className="muted small">
+          Keine historischen FX-Fixings hinterlegt – vergangene MtM-Reset-Termine eines Cross-Currency-Swaps werden mit dem heutigen Kurs genähert (Hinweis
+          „FX-Fixing fehlt“ im Pricing).
+        </div>
+      ) : (
+        <div className="table-scroll" style={{ maxHeight: 260 }}>
+          <table className="grid-table" data-testid="fx-fixings-table">
+            <thead>
+              <tr>
+                <th>Paar</th>
+                <th>Datum</th>
+                <th className="num">Kurs</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {fxFixings.map((f, i) => (
+                <tr key={i} style={{ cursor: "default" }}>
+                  <td>
+                    <select className="inline" value={f.pair} aria-label={`Paar FX-Fixing ${i + 1}`} onChange={(e) => setRow(i, { pair: e.target.value })}>
+                      {[...new Set([...pairs, f.pair])].map((p) => (
+                        <option key={p} value={p}>
+                          {pairLabel(p)}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
+                    <DateInput inline value={f.date} ariaLabel={`Datum FX-Fixing ${i + 1}`} onChange={(v) => setRow(i, { date: v })} />
+                  </td>
+                  <td className="num">
+                    <span style={{ display: "inline-block", width: 110 }}>
+                      <NumInput
+                        inline
+                        value={f.rate}
+                        step={0.0005}
+                        digits={4}
+                        min={0.000001}
+                        ariaLabel={`Kurs FX-Fixing ${i + 1}`}
+                        testId={i === 0 ? "fx-fixing-rate" : undefined}
+                        onChange={(v) => setRow(i, { rate: v })}
+                      />
+                    </span>
+                  </td>
+                  <td className="num">
+                    <button className="btn ghost danger" title="FX-Fixing entfernen" aria-label={`FX-Fixing ${i + 1} entfernen`} onClick={() => remove(i)}>
+                      ✕
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div className="muted xs" style={{ marginTop: 6 }}>
+        Kurs als Preis der Basiswährung ({pairLabel(addPair)} = 1 {addPair.slice(0, 3)} in {addPair.slice(3)}); die Gegenquotierung wird automatisch bedient.
+        Teil des Snapshots (Export/Import), rückgängig mit <kbd>Ctrl</kbd>+<kbd>Z</kbd>.
+      </div>
+    </div>
+  );
+}
 
 /**
  * Credit card: CDS par-spread term structure per counterparty → piecewise
@@ -651,6 +814,7 @@ export function MarketView() {
       interpolation: st.interpolation,
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
+      fxFixings: st.fxFixings,
     })),
   );
   const act = useStore.getState;
@@ -699,7 +863,8 @@ export function MarketView() {
               </span>
             )}
             <br />
-            Kurven: {Object.keys(m.curves).length} · Fixings: {m.fixings?.length ?? 0}
+            Kurven: {Object.keys(m.curves).length} · Fixings: {m.fixings?.length ?? 0} · FX-Fixings: {m.fxFixings?.length ?? 0} · Vol-Flächen:{" "}
+            {Object.keys(m.swaptionVols ?? {}).length + Object.keys(m.capletVols ?? {}).length + Object.keys(m.fxVols ?? {}).length}
             {Object.keys(s.interpolation).length > 0 && ` · Interpolations-Overrides: ${Object.keys(s.interpolation).join(", ")}`}
           </div>
           <div className="row wrap" style={{ marginTop: 10 }}>
@@ -747,6 +912,7 @@ export function MarketView() {
                   for (const id of Object.keys(act().interpolation)) act().setInterpolation(id, undefined);
                   for (const id of Object.keys(act().turnOfYear)) act().setTurnOfYear(id, undefined);
                   act().resetVolSurfaces();
+                  if (act().fxFixings.length) act().setFxFixings([], "FX-Fixings zurückgesetzt");
                 }}
                 data-testid="market-reset"
               >
@@ -761,7 +927,7 @@ export function MarketView() {
         <div className="card">
           <h3>FX-Spots (editierbar)</h3>
           <div className="table-scroll">
-            <table className="grid-table">
+            <table className="grid-table" aria-label="FX-Spots">
               <tbody>
                 {Object.entries(m.fxSpots).map(([pair, v]) => {
                   const orig = (Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? v) as number;
@@ -791,7 +957,10 @@ export function MarketView() {
         <CreditCard />
       </div>
 
-      <FixingsEditor />
+      <div className="grid cols-2">
+        <FixingsEditor />
+        <FxFixingsEditor />
+      </div>
 
       {swpt && swptId && (
         <>

@@ -31,6 +31,40 @@ const CORE_MESSAGES: Rule[] = [
     to: (m) => `${m[1]}-Modell: verschobener Forward/Strike nicht positiv${m[2]} – innerer Wert ohne Zeitwert`,
   },
   { re: /^FRA already settled$/, to: () => "FRA bereits abgerechnet" },
+  // Core R4-1: historical FX fixing for an MtM reset missing
+  {
+    re: /^MISSING_FX_FIXING: Missing FX fixing for ([A-Z]{6}) on (\d{4}-\d{2}-\d{2}); MtM reset of leg (\d+) valued with today's rate as proxy.*$/,
+    to: (m) =>
+      `FX-Fixing ${pairDe(m[1]!)} vom ${isoToDe(m[2]!)} fehlt – MtM-Reset von Leg ${Number(m[3]) + 1} mit dem heutigen Kurs genähert (FX-Fixings im Markt hinterlegen)`,
+  },
+  {
+    re: /^MISSING_FX_FIXING: Missing FX fixing for ([A-Z]{6}) on (\d{4}-\d{2}-\d{2}); (.+)$/,
+    to: (m) => `FX-Fixing ${pairDe(m[1]!)} vom ${isoToDe(m[2]!)} fehlt – ${m[3]}`,
+  },
+  { re: /^MISSING_FX_FIXING: (.+)$/, to: (m) => `FX-Fixing fehlt (${m[1]})` },
+  // Core R4-2: FX leg delivering on the valuation date (value-today exchange)
+  {
+    re: /^SETTLES_TODAY: (.+?) settles on the valuation date (\d{4}-\d{2}-\d{2}) – valued as a value-today exchange at the today rate \(not discounted\)$/,
+    to: (m) =>
+      `${legLabelDe(m[1]!)} wird am Bewertungstag (${isoToDe(m[2]!)}) geliefert – als Value-Today-Geschäft zum Heute-Kurs bewertet (nicht diskontiert)`,
+  },
+  { re: /^SETTLES_TODAY: (.+)$/, to: (m) => `Lieferung am Bewertungstag – Value-Today-Geschäft zum Heute-Kurs (${m[1]})` },
+  {
+    re: /^(.+?) already delivered \((\d{4}-\d{2}-\d{2})\) – excluded from the PV$/,
+    to: (m) => `${legLabelDe(m[1]!)} bereits geliefert (${isoToDe(m[2]!)}) – nicht im Barwert enthalten`,
+  },
+  // Markt R4-1: CSA without a collateral curve for one of the currencies
+  {
+    re: /^COLLATERAL_CURVE_MISSING: no ([A-Z]{3}) discount curve for collateral in ([A-Z]{3}) \(collateralDiscountCurveId "([^"]+)"\); (?:discounted on (\S+)|no discount curve) – cross-currency basis not priced$/,
+    to: (m) =>
+      `Keine ${m[1]}-Diskontkurve für Besicherung in ${m[2]} (Collateral-Kurve „${m[3]}“ fehlt) – ${m[4] ? `Diskontierung auf ${m[4]}` : "keine Diskontkurve"}, Cross-Currency-Basis nicht gepreist`,
+  },
+  { re: /^COLLATERAL_CURVE_MISSING: (.+)$/, to: (m) => `Collateral-Kurve fehlt – Diskontierung auf der eigenen OIS-Kurve (${m[1]})` },
+  // Validator messages of the core ("Invalid trade X: trade.legs[0]: terminationDate must be after effectiveDate; …", R4-05)
+  {
+    re: /^Invalid trade (\S+): (.+)$/,
+    to: (m) => `Trade ${m[1]!.replace(/:$/, "")}: ${translateTradeIssues(m[2]!)}`,
+  },
   // Vol quotation conversion (core R3-1): "VOL_TYPE_CONVERTED: caplet surface X quotes normal vols but model Black was requested – vols converted to lognormal …"
   {
     re: /^VOL_TYPE_CONVERTED: (\w+) surface (\S+) quotes (normal|lognormal(?:, shift [\d.]+%)?) vols but model (\w+) was requested – vols converted to (normal|lognormal(?:, shift [\d.]+%)?) .*$/,
@@ -94,6 +128,11 @@ const CORE_MESSAGES: Rule[] = [
   { re: /^Swaption expired – intrinsic value shown$/, to: () => "Swaption verfallen – innerer Wert ausgewiesen" },
   { re: /^XVA not implemented for (\w+).*$/, to: (m) => `XVA für ${TRADE_TYPE_DE[m[1]!] ?? m[1]} nicht verfügbar (v1: Zinsswaps und FX-Forwards)` },
   { re: /^terminationDate must be after effectiveDate$/, to: () => "Enddatum muss nach dem Startdatum liegen" },
+  { re: /^effectiveDate must be before terminationDate$/, to: () => "Startdatum muss vor dem Enddatum liegen" },
+  { re: /^notional must be positive$/, to: () => "Nominal muss positiv sein" },
+  { re: /^must be positive$/, to: () => "muss positiv sein" },
+  { re: /^must be a finite number$/, to: () => "muss eine endliche Zahl sein" },
+  { re: /^expiryDate must be on or before deliveryDate$/, to: () => "Verfall muss vor oder am Lieferdatum liegen" },
   { re: /^Schedule with stub=None does not divide evenly.*$/, to: () => "Laufzeit ist ohne Stub nicht durch die Frequenz teilbar" },
   { re: /^Curve not found in market context: (.+)$/, to: (m) => `Kurve ${m[1]} nicht im Markt-Snapshot` },
   { re: /^No discount curve configured for (\w+)$/, to: (m) => `Keine Diskontkurve für ${m[1]} konfiguriert` },
@@ -199,6 +238,43 @@ function isoToDe(iso: string): string {
   return `${d}.${m}.${y}`;
 }
 
+/** Leg labels of the FX pricer ("FX forward", "near leg", "far leg") → German. */
+function legLabelDe(label: string): string {
+  const l = label.trim();
+  if (/^near leg$/i.test(l)) return "Near-Leg";
+  if (/^far leg$/i.test(l)) return "Far-Leg";
+  if (/^fx forward$/i.test(l)) return "FX-Forward";
+  return l.replace(/^leg (\d+)$/i, "Leg $1");
+}
+
+/**
+ * Semicolon-separated validator issues of the core ("trade.legs[0]: terminationDate
+ * must be after effectiveDate; trade.notional: must be positive") → "Leg 1: Enddatum …".
+ */
+export function translateTradeIssues(issues: string): string {
+  return issues
+    .split(/;\s*/)
+    .filter(Boolean)
+    .map((part) => {
+      const m = /^(?:trade\.)?(?:legs\[(\d+)\](?:\.(\w+))?|(\w+)):\s*(.+)$/.exec(part.trim());
+      if (!m) return translateCoreMessage(part.trim());
+      const msg = translateCoreMessage(m[4]!);
+      if (m[1] !== undefined) return `Leg ${Number(m[1]) + 1}: ${msg}`;
+      return `${FIELD_DE[m[3]!] ?? m[3]}: ${msg}`;
+    })
+    .join("; ");
+}
+const FIELD_DE: Record<string, string> = {
+  notional: "Nominal",
+  strike: "Strike",
+  expiryDate: "Verfall",
+  deliveryDate: "Lieferdatum",
+  effectiveDate: "Startdatum",
+  terminationDate: "Enddatum",
+  rate: "Satz",
+  pair: "Währungspaar",
+};
+
 /** "normal" / "lognormal" / "lognormal, shift 3.00%" → German quotation label. */
 function quotationDe(q: string): string {
   if (q.startsWith("normal")) return "Normal";
@@ -239,6 +315,11 @@ export const PRICING_ERROR_CODES_DE: Record<string, string> = {
   INVALID_TIMESTAMP: "Ungültiger Zeitstempel",
   HAZARD_FLOORED: "Hazard-Rate auf 0 begrenzt",
   VOL_TYPE_CONVERTED: "Volatilitätsquotierung umgerechnet",
+  // core round 4: parseISO / parseTenor throw typed errors
+  INVALID_DATE: "Ungültiges Datum",
+  INVALID_TENOR: "Ungültiger Tenor",
+  MISSING_FX_FIXING: "FX-Fixing fehlt",
+  COLLATERAL_CURVE_MISSING: "Collateral-Kurve fehlt",
 };
 
 /**
@@ -290,6 +371,11 @@ export function legTypeLabel(legType: string | undefined | null): string {
   if (!legType) return "";
   const known = LEG_TYPE_DE[legType];
   if (known) return known;
+  // "Float EURIBOR-6M" / "Float USD-SOFR" / "Fixed 3.10%" – leg badges of the cashflow table (R4-10)
+  const fl = /^Float\s+(\S+)$/i.exec(legType);
+  if (fl) return `Variabel ${fl[1]}`;
+  const fx = /^Fixed\s+(.+)$/i.exec(legType);
+  if (fx) return `Fest ${fx[1]!.replace(/(\d)\.(\d+)%/, "$1,$2 %")}`;
   const opt = /^(Vanilla|Digital|Barrier|Knock-?in|Knock-?out)?\s*(Put|Call)\s+([A-Z]{6})$/i.exec(legType);
   if (opt) {
     const style = (opt[1] ?? "").toLowerCase();

@@ -16,7 +16,7 @@ import { Term } from "../components/InfoTip.js";
 import { AnalyticsTable } from "../components/Inspector.js";
 import { NumInput } from "../components/NumInput.js";
 import { TradeEditor } from "../components/TradeEditor.js";
-import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
+import { useTableNav } from "../hooks/useTableNav.js";
 import { useRisk } from "../hooks/useRisk.js";
 import { keysText, HOTKEYS } from "../hotkeys/keymap.js";
 import { fmtDate, fmtMoney, fmtMs, fmtNum, fmtPct, signClass } from "../lib/format.js";
@@ -437,13 +437,13 @@ export function PricingWorkspace() {
                           <th className="num">kumuliert</th>
                         </tr>
                       </thead>
-                      <tbody onKeyDown={krNav.onKeyDown}>
+                      <tbody onKeyDown={krNav.onKeyDown} onFocus={krNav.onFocus}>
                         {(() => {
                           let cum = 0;
-                          return bucket.buckets.map((b) => {
+                          return bucket.buckets.map((b, bi) => {
                             cum += b.delta;
                             return (
-                              <tr key={b.label} {...navRowProps()} style={{ cursor: "default" }}>
+                              <tr key={b.label} {...krNav.rowProps(bi, bucket.buckets.length)} style={{ cursor: "default" }}>
                                 <td className="mono">{b.label}</td>
                                 <td className="mono muted">{fmtDate(parseISO(b.date))}</td>
                                 <td className={`num ${signClass(b.delta)}`}>{fmtMoney(b.delta)}</td>
@@ -591,7 +591,7 @@ export function PricingWorkspace() {
             Cashflows{" "}
             <span className="right muted xs">
               {res.legs.reduce((x, l) => x + l.cashflows.length, 0)} Zahlungen · <kbd>Ctrl</kbd>+<kbd>E</kbd> CSV · <kbd>↑</kbd>/<kbd>↓</kbd> Zeile ·{" "}
-              <kbd>y</kbd> kopieren
+              <kbd>y</kbd> <kbd>y</kbd> kopieren
             </span>
           </h3>
           <div className="table-scroll" style={{ maxHeight: 360 }}>
@@ -612,10 +612,17 @@ export function PricingWorkspace() {
                   <th>Art</th>
                 </tr>
               </thead>
-              <tbody onKeyDown={cfNav.onKeyDown}>
-                {res.legs.flatMap((leg) =>
+              <tbody onKeyDown={cfNav.onKeyDown} onFocus={cfNav.onFocus}>
+                {res.legs.flatMap((leg, li) =>
                   leg.cashflows.map((cf, i) => (
-                    <tr key={`${leg.legIndex}-${i}`} {...navRowProps()} style={{ cursor: "default" }}>
+                    <tr
+                      key={`${leg.legIndex}-${i}`}
+                      {...cfNav.rowProps(
+                        res.legs.slice(0, li).reduce((x, l) => x + l.cashflows.length, 0) + i,
+                        res.legs.reduce((x, l) => x + l.cashflows.length, 0),
+                      )}
+                      style={{ cursor: "default" }}
+                    >
                       <td>
                         <span className="badge">{legTypeLabel(leg.legType)}</span>
                       </td>

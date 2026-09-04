@@ -31,10 +31,16 @@ const TABLE_KEYS: [string, string][] = [
   ["Zeile auf/ab", "↑ / ↓"],
   ["Erste / letzte Zeile", "Home / End"],
   ["Seite", "PgUp / PgDn"],
-  ["Zeile als Text kopieren", "y"],
+  ["Zeile als Text kopieren", "y y"],
+  ["Tabelle verlassen (ein Tabstopp je Tabelle)", "Tab"],
   ["Trade öffnen (nur Blotter)", "↵"],
   ["Kontextmenü (Blotter)", "Rechtsklick"],
   ["Heatmap-Zelle wählen", "← / → / ↑ / ↓"],
+];
+const MARKET_KEYS: [string, string][] = [
+  ["Vol-Zelle bearbeiten (Swaption-Cube, FX-Smile, Caplet)", "Tab / Klick · ↑ / ↓ · ↵"],
+  ["Vol-Änderung rückgängig", "Ctrl+Z"],
+  ["Fläche auf Sample zurücksetzen", "Zurücksetzen"],
 ];
 const NUM_KEYS: [string, string][] = [
   ["Schritt ±", "↑ / ↓"],
@@ -90,6 +96,13 @@ export function HotkeyOverlay() {
           {plain(NUM_KEYS)}
           <h3 className="group-title">Datumsfelder</h3>
           {plain(DATE_KEYS)}
+          <h3 className="group-title">Markt · Vol-Flächen</h3>
+          {plain(MARKET_KEYS)}
+          <p className="muted xs" style={{ margin: "6px 0 0" }}>
+            Schnelleingabe: <code className="mono">swpt usd 1y5y payer 3.5% 10m</code> (Währung mit Vol-Cube),{" "}
+            <code className="mono">ccs eurusd 5y fixed 3% 10m</code> (Fest gegen Variabel), Daten als <code className="mono">15.03.2027</code> oder{" "}
+            <code className="mono">2027-03-15</code>.
+          </p>
         </div>
       </div>
     </Modal>

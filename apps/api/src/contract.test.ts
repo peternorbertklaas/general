@@ -267,7 +267,9 @@ describe("N-08 OpenAPI contract", () => {
           codes.some((c) => c.startsWith("2")),
           `${method.toUpperCase()} ${path} has no 2xx response`,
         ).toBe(true);
-        expect(codes, `${method.toUpperCase()} ${path} has no 429`).toContain("429");
+        // Health probes are exempt from the rate limit (N4-02) and therefore document no 429.
+        if (path.startsWith("/api/health")) expect(codes, `${path} must not document a 429`).not.toContain("429");
+        else expect(codes, `${method.toUpperCase()} ${path} has no 429`).toContain("429");
         if (method === "post" || method === "put") expect(codes, `${method.toUpperCase()} ${path} has no 400`).toContain("400");
       }
     }
@@ -283,6 +285,7 @@ describe("N-08 OpenAPI contract", () => {
         "createTradeFromTemplate",
         "deleteTrade",
         "emirValuations",
+        "emirValuationsPost",
         "getAudit",
         "getCurve",
         "getHealth",
@@ -569,16 +572,17 @@ describe("R-03 core surface round 3", () => {
     const r = await app2.inject({ method: "GET", url: `/api/emir/valuations?transactionPrice=${priceMap}` });
     expect(r.statusCode).toBe(200);
     const recs = r.json() as Record<string, unknown>[];
+    // ITS (EU) 2022/1860 value formats (N4-08): cleared Y/N, clearing obligation TRUE/FLSE/UKWN.
     expect(recs.find((x) => x.tradeId === "CLR-1")).toMatchObject({
-      cleared: "TRUE",
-      clearingObligation: "Y",
+      cleared: "Y",
+      clearingObligation: "TRUE",
       clearingMember: "Eurex Clearing AG",
       uti: "UTIABC123",
       valuationMethod: "MTMA",
     });
-    // Without an explicit clearing obligation the field is N/A – never derived from `cleared` (N3-09).
+    // Without an explicit clearing obligation the field is UKWN – never derived from `cleared` (N3-09).
     const other = recs.find((x) => x.tradeId === "IRS-0002")!;
-    expect(other).toMatchObject({ cleared: "FALSE", clearingObligation: "N/A", valuationMethod: "MTMO" });
+    expect(other).toMatchObject({ cleared: "N", clearingObligation: "UKWN", valuationMethod: "MTMO" });
     expect(other.clearingMember).toBeUndefined();
     const ts = await app2.inject({ method: "GET", url: "/api/emir/valuations?asOf=2026-09-03T17:00:00Z&timestamp=2026-09-03T18:30:00Z" });
     expect((ts.json() as { valuationTimestamp: string }[]).every((x) => x.valuationTimestamp === "2026-09-03T18:30:00Z")).toBe(true);
@@ -1249,11 +1253,22 @@ describe("R-05 core surface round 5 (error codes, vol conversion, hazard floor, 
       "SNAPSHOT_MALFORMED",
       "SNAPSHOT_INVALID",
       "PERIOD_BUDGET_EXCEEDED",
+      "STORE_BUDGET_EXCEEDED",
       "PRECONDITION_FAILED",
       "PRECONDITION_REQUIRED",
+      "NOT_FOUND",
+      "CONFLICT",
+      "ID_MISMATCH",
+      "INVALID_QUERY_MAP",
+      "INVALID_REQUEST",
+      "RATE_LIMITED",
+      "INTERNAL_ERROR",
     ]) {
       expect(API_ERROR_CODES.api).toContain(c);
     }
+    for (const c of ["INVALID_DATE", "INVALID_TENOR"]) expect(API_ERROR_CODES.core).toContain(c);
+    // N4-05: the catalogue lists INTERNAL_ERROR (batch results / 500) in `examples`, not only in the prose.
+    expect(code.examples).toContain("INTERNAL_ERROR");
   });
 
   it("snapshot id: GET /api/market/snapshot ETag = X-Market-Snapshot-Id = report.audit.snapshotId, on the full market scope (a fixing changes it)", async () => {

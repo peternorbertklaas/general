@@ -1,9 +1,19 @@
 import { type FastifyInstance } from "fastify";
-import { type CrossCurrencySwapParams, type Trade, makeCrossCurrencySwap, makeFra, parseISO, priceTrade } from "@deriva/pricing-core";
+import {
+  type CrossCurrencySwapParams,
+  type MarketContext,
+  type Trade,
+  RATE_INDICES,
+  fraIndexForPeriod,
+  makeCrossCurrencySwap,
+  makeFra,
+  parseISO,
+  priceTrade,
+} from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { CSV_TRADE_TYPES, type CsvImportResult, type CsvTradeType, csvTemplatesMarkdown, csvToTrades } from "../lib/csv-import.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
-import { describeError } from "../lib/errors.js";
+import { describeError, sendError } from "../lib/errors.js";
 import { assertTradeWithinLimits } from "../lib/limits.js";
 import { arrayResponse, errorRef, fromTemplateBodySchema, pricingResultSchema, responses, storedTradeSchema, tradeId, tradeRef } from "../schemas.js";
 
@@ -35,20 +45,33 @@ type TemplateBody = { price?: boolean; reportingCurrency?: string } & (
 );
 
 const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;
+const FRA_PERIOD_RE = /^(\d{1,3})x(\d{1,3})$/i;
 /** Builders accept a tenor ("5Y", "3x6") or an explicit date for the same parameter. */
 const dateOrTenor = (s: string): string | number => (ISO_RE.test(s) ? parseISO(s) : s);
 
-function buildFromTemplate(body: TemplateBody, marketValuationDate: number): Trade {
+/** Indices whose projection curve is loaded in the market (the builder's default list only knows the sample market). */
+function availableIndices(m: MarketContext): string[] {
+  return Object.values(RATE_INDICES)
+    .filter((ix) => m.curves[ix.curveId] !== undefined)
+    .map((ix) => ix.name);
+}
+
+function buildFromTemplate(body: TemplateBody, m: MarketContext): Trade {
   if (body.template === "CrossCurrencySwap") {
     const { effectiveDate, tenor, ...rest } = body.params;
     return makeCrossCurrencySwap({ ...rest, effectiveDate: parseISO(effectiveDate), tenor: dateOrTenor(tenor) });
   }
   const { start, end, valuationDate, ...rest } = body.params;
+  // Period form "AxB" without an explicit index: pick the tenor index that has a curve in *this* market (Markt R4-6),
+  // e.g. "1x2" → EURIBOR-3M when no 1M curve is loaded; an explicit `index` always wins.
+  const period = typeof start === "string" ? FRA_PERIOD_RE.exec(start) : null;
+  const index = rest.index ?? (period ? fraIndexForPeriod(rest.currency, Number(period[2]) - Number(period[1]), availableIndices(m)) : undefined);
   return makeFra({
     ...rest,
+    ...(index ? { index } : {}),
     start: dateOrTenor(start),
     ...(end ? { end: parseISO(end) } : {}),
-    valuationDate: valuationDate ? parseISO(valuationDate) : marketValuationDate,
+    valuationDate: valuationDate ? parseISO(valuationDate) : m.valuationDate,
   });
 }
 
@@ -85,16 +108,23 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
   app.get<{ Querystring: { price?: string; reportingCurrency?: string } }>(
     "/api/trades",
     {
-      config: { marketHeader: true },
+      // `?price=1` prices the whole store: the request budget applies to it (N4-01).
+      config: { marketHeader: true, storeFallback: (req) => Boolean((req.query as { price?: string }).price) },
       schema: {
         operationId: "listTrades",
         tags: ["trades"],
-        summary: "Alle Trades (optional mit Bewertung: ?price=1)",
+        summary: "Alle Trades (optional mit Bewertung: ?price=1 – bewertet den gesamten Store, Rechenbudget gilt)",
         querystring: {
           type: "object",
-          properties: { price: { type: "string", description: "Any value → include probe valuation" }, reportingCurrency: currencyQuery },
+          properties: {
+            price: {
+              type: "string",
+              description: "Any value → include probe valuation of every stored trade (413 `PERIOD_BUDGET_EXCEEDED` when the store exceeds the request budget)",
+            },
+            reportingCurrency: currencyQuery,
+          },
         },
-        response: responses({ 200: { type: "array", items: storedTradeSchema } }, 400),
+        response: responses({ 200: { type: "array", items: storedTradeSchema } }, 400, 413),
       },
     },
     async (req) => {
@@ -131,7 +161,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
     },
     async (req, reply) => {
       const t = ctx.trades.get(req.params.id);
-      if (!t) return reply.status(404).send({ error: "Trade not found", statusCode: 404, requestId: req.id });
+      if (!t) return sendError(reply, req, 404, "NOT_FOUND", "Trade not found");
       reply.header("etag", t.etag);
       if (etagMatches(req.headers["if-none-match"], t.etag)) return reply.status(304).send();
       return datesToIso(t);
@@ -141,11 +171,11 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
   app.post<{ Body: Trade; Querystring: { upsert?: string; reportingCurrency?: string } }>(
     "/api/trades",
     {
-      config: { marketHeader: true },
+      config: { marketHeader: true, storeWrite: true },
       schema: {
         operationId: "createTrade",
         tags: ["trades"],
-        summary: "Trade anlegen (201). Existiert die ID → 409, außer ?upsert=1",
+        summary: "Trade anlegen (201). Existiert die ID → 409, außer ?upsert=1; Store-Budget (413 STORE_BUDGET_EXCEEDED)",
         body: tradeRef,
         querystring: {
           type: "object",
@@ -168,9 +198,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       // Probe valuation in the requested reporting currency (throws → 422 via error handler).
       priceTrade(ctx.market.get(), trade, req.query.reportingCurrency ?? "EUR");
       const exists = ctx.trades.get(trade.id);
-      if (exists && !req.query.upsert) {
-        return reply.status(409).send({ error: `Trade ${trade.id} already exists (use PUT or ?upsert=1)`, statusCode: 409, requestId: req.id });
-      }
+      if (exists && !req.query.upsert) return sendError(reply, req, 409, "CONFLICT", `Trade ${trade.id} already exists (use PUT or ?upsert=1)`);
       const stored = ctx.trades.upsert(trade);
       ctx.audit.append({
         actor: "api",
@@ -187,7 +215,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
   app.put<{ Params: { id: string }; Body: Trade; Headers: { "if-match"?: string }; Querystring: { reportingCurrency?: string } }>(
     "/api/trades/:id",
     {
-      config: { marketHeader: true },
+      config: { marketHeader: true, storeWrite: true },
       schema: {
         operationId: "updateTrade",
         tags: ["trades"],
@@ -201,10 +229,10 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
     },
     async (req, reply) => {
       if (req.body.id !== req.params.id) {
-        return reply.status(400).send({ error: `Body id "${req.body.id}" does not match path id "${req.params.id}"`, statusCode: 400, requestId: req.id });
+        return sendError(reply, req, 400, "ID_MISMATCH", `Body id "${req.body.id}" does not match path id "${req.params.id}"`);
       }
       const current = ctx.trades.get(req.params.id);
-      if (!current) return reply.status(404).send({ error: "Trade not found", statusCode: 404, requestId: req.id });
+      if (!current) return sendError(reply, req, 404, "NOT_FOUND", "Trade not found");
       const failed = precondition(ctx, req.headers["if-match"], current.etag, req.id);
       if (failed) return reply.status(failed.status).send(failed.body);
       const trade = datesToSerial(req.body);
@@ -234,7 +262,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
   }>(
     "/api/trades/import",
     {
-      config: { marketHeader: true },
+      config: { marketHeader: true, storeWrite: true },
       schema: {
         operationId: "importTrades",
         tags: ["trades"],
@@ -242,7 +270,8 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
           "Batch-Import als JSON-Array oder CSV (`content-type: text/csv` + `?type=`). Jeder Trade wird validiert und probeweise bewertet; Ergebnis je Trade/Zeile",
         description:
           "JSON: `{ trades: Trade[], mode? }` – a schema violation anywhere in the array fails the whole request (400). " +
-          "CSV (`content-type: text/csv`): one column template per `?type=`; rows are mapped through the core builders (market-standard conventions), a row that cannot be mapped is reported as `rejected` with its `row` number, a header lacking a required column is a 400. `?mode=` selects create (default) or upsert. Compute bounds apply per trade and per request (400 `TOO_MANY_PERIODS`, 413 `PERIOD_BUDGET_EXCEEDED`).\n\n" +
+          "CSV (`content-type: text/csv`, declared as a second request-body media type): one column template per `?type=`; rows are mapped through the core builders (market-standard conventions), a row that cannot be mapped is reported as `rejected` with its `row` number, a header lacking a required column is a 400. `?mode=` selects create (default) or upsert. " +
+          "Compute bounds apply per trade, per request and to the store (400 `TOO_MANY_PERIODS`, 413 `PERIOD_BUDGET_EXCEEDED`, 413 `STORE_BUDGET_EXCEEDED` when the book would exceed `MAX_STORE_PERIODS` estimated coupon periods – every row counts, existing ids are netted).\n\n" +
           csvTemplatesMarkdown(),
         body: {
           type: "object",
@@ -281,15 +310,14 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       // CSV → `{ trades, mode }` before schema validation, so the JSON schema, the compute bounds and the handler apply unchanged.
       preValidation: async (req, reply) => {
         if (!isCsv(req)) return;
-        if (typeof req.body !== "string") return reply.status(400).send({ error: "CSV body must be text", statusCode: 400, requestId: req.id });
+        if (typeof req.body !== "string") return sendError(reply, req, 400, "CSV_INVALID", "CSV body must be text");
         const type = req.query.type;
-        if (!type)
-          return reply.status(400).send({ error: "CSV import needs ?type=<TradeType> to select the column template", statusCode: 400, requestId: req.id });
+        if (!type) return sendError(reply, req, 400, "CSV_INVALID", "CSV import needs ?type=<TradeType> to select the column template");
         let parsed: CsvImportResult;
         try {
           parsed = csvToTrades(req.body, type, ctx.market.get().valuationDate);
         } catch (e) {
-          return reply.status(400).send({ error: (e as Error).message, statusCode: 400, code: "CSV_INVALID", requestId: req.id });
+          return sendError(reply, req, 400, "CSV_INVALID", (e as Error).message);
         }
         req.csvImport = { rows: parsed.rows, rejected: parsed.rejected };
         if (parsed.trades.length === 0) {
@@ -364,7 +392,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
     },
     async (req) => {
       const m = ctx.market.get();
-      const trade = buildFromTemplate(req.body, m.valuationDate);
+      const trade = buildFromTemplate(req.body, m);
       // The body carries builder parameters, not a trade – bound the built trade before pricing it.
       assertTradeWithinLimits(trade, ctx.limits);
       const pricing = req.body.price ? priceTrade(m, trade, req.body.reportingCurrency ?? "EUR") : undefined;
@@ -386,7 +414,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
     },
     async (req, reply) => {
       const current = ctx.trades.get(req.params.id);
-      if (!current) return reply.status(404).send({ error: "Trade not found", statusCode: 404, requestId: req.id });
+      if (!current) return sendError(reply, req, 404, "NOT_FOUND", "Trade not found");
       const failed = precondition(ctx, req.headers["if-match"], current.etag, req.id);
       if (failed) return reply.status(failed.status).send(failed.body);
       ctx.trades.delete(req.params.id);

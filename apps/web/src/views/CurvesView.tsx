@@ -18,7 +18,7 @@ import {
 import { DateInput } from "../components/DateInput.js";
 import { EChart, cssVar } from "../components/EChart.js";
 import { NumInput } from "../components/NumInput.js";
-import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
+import { useTableNav } from "../hooks/useTableNav.js";
 import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { INTERPOLATION_DE, translatePricingError } from "../lib/i18n.js";
 import { marketModified, useStore } from "../state/store.js";
@@ -156,6 +156,7 @@ export function CurvesView() {
       interpolation: st.interpolation,
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
+      fxFixings: st.fxFixings,
       baseMarket: st.baseMarket,
       valuationDate: st.valuationDate,
     })),
@@ -178,9 +179,12 @@ export function CurvesView() {
       ? toyDraft
       : { curveId: set.curveId, date: storedToy?.date ?? nextYearEnd(s.valuationDate), bp: storedToy?.bp ?? 0 };
   const toyDirty = storedToy ? storedToy.date !== toy.date || storedToy.bp !== toy.bp : toy.bp !== 0;
-  /** A jump on or before the valuation date cannot be applied – shown as validation, never stored silently (R3-F2). */
-  const toyPast = toy.bp !== 0 && toy.date <= s.valuationDate;
-  const storedToyInactive = !!storedToy && storedToy.date <= s.valuationDate;
+  /**
+   * A *changed* draft on or before the valuation date cannot be applied – shown as validation, never stored silently (R3-F2).
+   * A stored jump the valuation date has overtaken is not an input error: it shows the "inaktiv" badge instead (R4-09).
+   */
+  const toyPast = toyDirty && toy.bp !== 0 && toy.date <= s.valuationDate;
+  const storedToyInactive = !toyDirty && !!storedToy && storedToy.bp !== 0 && storedToy.date <= s.valuationDate;
   const inactiveToys = Object.values(s.turnOfYear).filter((t) => t.date <= s.valuationDate).length;
   const pillarNav = useTableNav({ onCopied: () => useStore.getState().showToast("Pillar kopiert") });
 
@@ -357,7 +361,9 @@ export function CurvesView() {
           style={{ gap: 6 }}
           title="Turn-of-Year: Sprung des Instantan-Forwards über den Jahreswechsel (Fenster ab Datum, 1 Tag) in bp – Pillars werden neu gelöst"
         >
-          <span className="muted small">Turn-of-Year</span>
+          <span className="muted small toy-label" style={{ whiteSpace: "nowrap" }}>
+            Turn-of-Year
+          </span>
           <DateInput
             inline
             value={toy.date}
@@ -397,15 +403,23 @@ export function CurvesView() {
               Turn-of-Year muss nach dem Bewertungstag ({fmtDate(s.valuationDate)}) liegen
             </span>
           )}
-          {!toyPast && storedToyInactive && (
-            <span className="badge warn" data-testid="toy-inactive" title="Der gespeicherte Sprung liegt vor dem Bewertungstag und wirkt nicht auf die Kurve">
+          {storedToyInactive && (
+            <span
+              className="badge warn"
+              data-testid="toy-inactive"
+              title={`Der gespeicherte Sprung (${fmtDate(storedToy!.date)}) liegt am oder vor dem Bewertungstag ${fmtDate(s.valuationDate)} und wirkt nicht auf die Kurve – Datum ändern oder mit ✕ entfernen`}
+            >
               inaktiv (vor dem Bewertungstag)
             </span>
           )}
         </label>
         <div className="grow" />
         {modified && (
-          <span className="chip warn" title="Quotes, Spots, Interpolation oder Turn-of-Year weichen vom Sample-Markt ab" data-testid="market-modified-chip">
+          <span
+            className="chip warn"
+            title="Quotes, Spots, Interpolation, Turn-of-Year, Vol-Flächen oder FX-Fixings weichen vom Sample-Markt ab"
+            data-testid="market-modified-chip"
+          >
             <span className="dot" /> Markt modifiziert{overrideCount > 0 ? ` · ${overrideCount} Interpolation` : ""}
             {Object.keys(s.turnOfYear).length > 0
               ? ` · ${Object.keys(s.turnOfYear).length} Turn-of-Year${inactiveToys > 0 ? ` (${inactiveToys} inaktiv)` : ""}`
@@ -426,6 +440,7 @@ export function CurvesView() {
             for (const id of Object.keys(st.interpolation)) st.setInterpolation(id, undefined);
             for (const id of Object.keys(st.turnOfYear)) st.setTurnOfYear(id, undefined);
             st.resetVolSurfaces();
+            if (st.fxFixings.length) st.setFxFixings([], "FX-Fixings zurückgesetzt");
             setToyDraft(null);
           }}
           disabled={!modified}
@@ -565,7 +580,7 @@ export function CurvesView() {
         <h3>
           Pillars {set.curveId}{" "}
           <span className="right muted xs">
-            <kbd>↑</kbd>/<kbd>↓</kbd> Zeile · <kbd>y</kbd> kopieren
+            <kbd>↑</kbd>/<kbd>↓</kbd> Zeile · <kbd>y</kbd> <kbd>y</kbd> kopieren
           </span>
         </h3>
         <div className="table-scroll" style={{ maxHeight: 260 }}>
@@ -579,9 +594,9 @@ export function CurvesView() {
                 <th className="num">Fwd 6M ab Pillar</th>
               </tr>
             </thead>
-            <tbody onKeyDown={pillarNav.onKeyDown}>
-              {curve?.zeroRates().map((n) => (
-                <tr key={n.date} {...navRowProps()} style={{ cursor: "default" }}>
+            <tbody onKeyDown={pillarNav.onKeyDown} onFocus={pillarNav.onFocus}>
+              {curve?.zeroRates().map((n, ni, all) => (
+                <tr key={n.date} {...pillarNav.rowProps(ni, all.length)} style={{ cursor: "default" }}>
                   <td className="mono">{fmtDate(n.date)}</td>
                   <td className="num">{fmtNum(n.time, 3)}</td>
                   <td className="num">{fmtPct(n.zero, 4)}</td>

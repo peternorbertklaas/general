@@ -520,13 +520,13 @@ describe("N3-03 / N3-08 / N3-09 – snapshot time validation, framework citation
     expect(line).not.toMatch(/AT 4\.3\.[x4]/);
     expect(rep.methodology.join("\n")).not.toMatch(/HFA 35(?! \(Hedge)/);
   });
-  it("clearingObligation is an explicit trade flag, never derived from cleared; N/A when unknown", () => {
+  it("clearingObligation is an explicit trade flag, never derived from cleared; UKWN when unknown (ITS formats, N4-08)", () => {
     const priced = priceTrade(ctx, swap, "EUR");
-    expect(emirValuationRecord(ctx, { ...swap, cleared: true }, priced).clearingObligation).toBe("N/A");
-    expect(emirValuationRecord(ctx, { ...swap, cleared: true, clearingObligation: false }, priced).clearingObligation).toBe("N");
-    expect(emirValuationRecord(ctx, { ...swap, cleared: false, clearingObligation: true }, priced).clearingObligation).toBe("Y");
-    expect(emirValuationRecord(ctx, swap, priced, { clearingObligation: true }).clearingObligation).toBe("Y");
-    expect(emirValuationRecord(ctx, { ...swap, clearingObligation: false }, priced, { clearingObligation: true }).clearingObligation).toBe("N");
+    expect(emirValuationRecord(ctx, { ...swap, cleared: true }, priced).clearingObligation).toBe("UKWN");
+    expect(emirValuationRecord(ctx, { ...swap, cleared: true, clearingObligation: false }, priced).clearingObligation).toBe("FLSE");
+    expect(emirValuationRecord(ctx, { ...swap, cleared: false, clearingObligation: true }, priced).clearingObligation).toBe("TRUE");
+    expect(emirValuationRecord(ctx, swap, priced, { clearingObligation: true }).clearingObligation).toBe("TRUE");
+    expect(emirValuationRecord(ctx, { ...swap, clearingObligation: false }, priced, { clearingObligation: true }).clearingObligation).toBe("FLSE");
     expect(validateTrade({ ...swap, clearingObligation: true })).toEqual([]);
   });
 });
@@ -566,7 +566,8 @@ describe("Markt R3-1 / R3-2 / R3-3 – CCS CSA default, FRA index from the perio
     expect(f36.index).toBe("EURIBOR-3M");
     expect(makeFra({ currency: "EUR", notional: 1e7, payReceive: "Pay", start: "6x12", rate: 0.02, valuationDate: VAL }).index).toBe("EURIBOR-6M");
     expect(makeFra({ currency: "EUR", notional: 1e7, payReceive: "Pay", start: "3x9", rate: 0.02, valuationDate: VAL }).index).toBe("EURIBOR-6M");
-    expect(makeFra({ currency: "EUR", notional: 1e7, payReceive: "Pay", start: "1x2", rate: 0.02, valuationDate: VAL }).index).toBe("EURIBOR-1M");
+    // Markt R4-6: no EURIBOR-1M curve in the (sample) market → nearest available tenor
+    expect(makeFra({ currency: "EUR", notional: 1e7, payReceive: "Pay", start: "1x2", rate: 0.02, valuationDate: VAL }).index).toBe("EURIBOR-3M");
     expect(makeFra({ currency: "EUR", notional: 1e7, payReceive: "Pay", start: "1x4", rate: 0.02, valuationDate: VAL, index: "EURIBOR-6M" }).index).toBe(
       "EURIBOR-6M",
     );

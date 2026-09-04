@@ -7,7 +7,7 @@ import { Term } from "../components/InfoTip.js";
 import { Modal } from "../components/Modal.js";
 import { menuKeyNav, usePopover } from "../components/Popover.js";
 import { useMediaQuery } from "../hooks/useMediaQuery.js";
-import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
+import { useTableNav } from "../hooks/useTableNav.js";
 import { keysOf } from "../hotkeys/keymap.js";
 import {
   BLOTTER_COLUMNS,
@@ -32,6 +32,7 @@ import {
   csvTemplateText,
   downloadText,
   tradesFromCsv,
+  jsonImportError,
   tradesFromJson,
   tradesToJson,
 } from "../lib/portfolio-io.js";
@@ -485,7 +486,7 @@ export function Blotter() {
     try {
       stageImport(tradesFromJson(await file.text()), "JSON");
     } catch (e) {
-      act().showToast(`Import fehlgeschlagen: ${translatePricingError(e)}`);
+      act().showToast(`Import fehlgeschlagen: ${jsonImportError(e)}`, { ms: 7000 });
     }
   };
   /** CSV: every rejected row is listed in a dialog (R3-F7); valid rows are imported after the user continues. */
@@ -572,11 +573,12 @@ export function Blotter() {
     const b = tradeTypeBadge(r.t.type);
     const inCompare = s.compareIds.includes(r.t.id);
     const selected = r.t.id === s.selectedId;
+    const hasSelection = orderedRows.some((x) => x.t.id === s.selectedId);
     return (
       <tr
         key={r.t.id}
         className={selected ? "selected" : ""}
-        {...navRowProps(selected, { trade: true })}
+        {...nav.rowProps(orderedRows.indexOf(r), orderedRows.length, { selected, trade: true, active: hasSelection ? selected : undefined })}
         aria-current={selected ? "true" : undefined}
         data-id={r.t.id}
         onClick={() => act().select(r.t.id)}
@@ -973,7 +975,7 @@ export function Blotter() {
         </h3>
         <div className="muted xs hint-row">
           <kbd>j</kbd>/<kbd>k</kbd> navigieren · <kbd>↵</kbd>/Doppelklick öffnen · <kbd>Space</kbd> vergleichen · <kbd>d</kbd> duplizieren · <kbd>⇧D</kbd>{" "}
-          löschen · Rechtsklick für Menü · <kbd>y</kbd> Zeile kopieren
+          löschen · Rechtsklick für Menü · <kbd>y</kbd> <kbd>y</kbd> Zeile kopieren
         </div>
         <div className="table-scroll">
           <table className="grid-table blotter" ref={tableRef} role="grid" aria-label="Blotter" aria-rowcount={orderedRows.length}>
@@ -1000,7 +1002,7 @@ export function Blotter() {
                 })}
               </tr>
             </thead>
-            <tbody onKeyDown={nav.onKeyDown}>
+            <tbody onKeyDown={nav.onKeyDown} onFocus={nav.onFocus}>
               {orderedRows.length === 0 && (
                 <tr className="empty-row">
                   <td colSpan={visibleColCount} className="empty">

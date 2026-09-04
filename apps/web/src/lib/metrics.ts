@@ -233,9 +233,15 @@ export function detailRows(details: Record<string, string | undefined> | undefin
   return out;
 }
 
-/** Label of a bucketed risk key such as "EUR:1Y" or "EURUSD" → "EUR 1Y". */
+/** Vega / delta bucket kinds of the core ("swaption:EUR", "caplet:EUR-EURIBOR-6M", "fx:EURUSD") → German nouns (R4-10). */
+const BUCKET_KIND_DE: Record<string, string> = { swaption: "Swaption", caplet: "Caplet", fx: "FX", cap: "Cap", floor: "Floor" };
+
+/** Label of a bucketed risk key such as "EUR:1Y", "swaption:EUR" or "EURUSD" → "EUR 1Y", "Swaption EUR". */
 export function bucketLabel(key: string): string {
-  return key.replace(/:/g, " ");
+  return key
+    .split(":")
+    .map((part, i) => (i === 0 && BUCKET_KIND_DE[part.toLowerCase()] ? BUCKET_KIND_DE[part.toLowerCase()]! : part))
+    .join(" ");
 }
 
 /** Definitions shown as tooltips on KPI labels (Ⓘ). */

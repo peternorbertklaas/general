@@ -194,7 +194,7 @@ export function ReportView() {
           Bewertungstag {fmtDate(s.valuationDate)} · erstellt {new Date(report.generatedAt).toLocaleString("de-DE")} · Snapshot {report.audit.snapshotId} (
           {report.market.label}) · Hash {report.audit.reportHash.slice(0, 16)} · {report.audit.engineVersion} · Perspektive{" "}
           {tr(PERSPECTIVE_DE, inputs.perspective)}
-          {report.whatIf && ` · WHAT-IF ${report.whatIf.label} – NICHT PRÜFUNGSFÄHIG`}
+          {report.whatIf && ` · WHAT-IF ${whatIfLabel(s.whatIf)} – NICHT PRÜFUNGSFÄHIG`}
         </div>
       </div>
       <div className="card">
@@ -270,8 +270,8 @@ export function ReportView() {
         </h3>
         <div className="muted small" data-testid="report-header">
           {trade.name} · Nominal {fmtMoney(n.amount, n.currency)} · Bewertungstag {fmtDate(s.valuationDate)} · Reporting {report.reportingCurrency} · Snapshot{" "}
-          {report.market.label}
-          {report.whatIf && ` · What-if ${report.whatIf.label}`} · erstellt {new Date(report.generatedAt).toLocaleString("de-DE")}
+          {/* The market label of the core already carries the what-if suffix – no second "What-if" segment (R4-07). */}
+          {report.market.label} · erstellt {new Date(report.generatedAt).toLocaleString("de-DE")}
           {detailRows(report.pricing.details).map((d) => ` · ${d.label} ${d.v}`)}
         </div>
         <div className="muted xs mono audit" style={{ marginTop: 6 }} data-testid="audit-hashes">
@@ -418,7 +418,7 @@ export function ReportView() {
             )}
           </div>
           {ct && (
-            <table className="grid-table" style={{ marginTop: 10 }} data-testid="cost-table">
+            <table className="grid-table" style={{ marginTop: 10 }} data-testid="cost-table" aria-label="Kostentransparenz">
               <tbody>
                 <tr>
                   <td className="muted">Fair Value (bilateral, Sicht {tr(PERSPECTIVE_DE, ct.perspective)})</td>
@@ -494,7 +494,7 @@ export function ReportView() {
       <div className="grid cols-2">
         <div className="card">
           <h3>Sensitivitäten</h3>
-          <table className="grid-table">
+          <table className="grid-table" aria-label="Sensitivitäten">
             <tbody>
               <tr>
                 <td className="muted">

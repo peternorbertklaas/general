@@ -24,6 +24,7 @@ import { hedgeDocMarkdown } from "../lib/hedge-doc.js";
 import { TRADE_TYPE_DE, germanizeText, translatePricingError } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
 import { isOption, tradeMaturity, tradeNotional, tradeTypeBadge } from "../lib/trade-ops.js";
+import { hasErrors, validateTrade } from "../lib/validate-trade.js";
 import { buildMarket, selectedTrade, useStore } from "../state/store.js";
 
 const KINDS: { v: HedgedItemKind; l: string }[] = [
@@ -234,7 +235,7 @@ function DollarOffsetCard({ title, r, ccy }: { title: string; r: DollarOffsetRes
       </div>
       <BandBar r={r} />
       <div className="table-scroll">
-        <table className="grid-table compact" style={{ marginTop: 6 }}>
+        <table className="grid-table compact" style={{ marginTop: 6 }} aria-label={`Dollar-Offset ${title}`}>
           <tbody>
             <tr style={{ cursor: "default" }}>
               <td className="muted">ΔPV Sicherungsinstrument</td>
@@ -339,7 +340,23 @@ export function HedgeView() {
     act().showToast(`Tilgungsplan übernommen (${instrSchedule.length} Perioden)`);
   };
 
+  /**
+   * An instrument with validation errors is never sent to the core (R4-05): the German
+   * validator messages are shown instead of the core's English "Invalid trade …" text.
+   */
+  const tradeIssues = validateTrade(trade);
+  const tradeInvalid = hasErrors(tradeIssues);
+  const invalidMessage = tradeInvalid
+    ? `Sicherungsinstrument nicht bewertbar – ${tradeIssues
+        .filter((i) => i.level === "error")
+        .map((i) => i.msg)
+        .join("; ")}. Bitte den Trade im Pricing korrigieren.`
+    : null;
   const buildHypo = () => {
+    if (invalidMessage) {
+      setError(invalidMessage);
+      return;
+    }
     try {
       const h = hypotheticalDerivative(s.market, rel, trade);
       setHypo({ tradeId: trade.id, trade: h });
@@ -349,6 +366,10 @@ export function HedgeView() {
     }
   };
   const runTest = () => {
+    if (invalidMessage) {
+      setError(invalidMessage);
+      return;
+    }
     try {
       const designationCtx = simulateDesignation ? buildMarket(rel.designationDate, s.quotes, s.interpolation, s.turnOfYear) : undefined;
       const r = hedgeEffectivenessReport(s.market, rel, trade, {
@@ -440,10 +461,10 @@ export function HedgeView() {
             <button className="btn ghost" onClick={printDoc} title="Sicherungsdokumentation drucken (A4)" data-testid="hedge-print">
               ⎙ Drucken
             </button>
-            <button className="btn" onClick={buildHypo} data-testid="hedge-hypo">
+            <button className="btn" onClick={buildHypo} data-testid="hedge-hypo" disabled={tradeInvalid} title={invalidMessage ?? undefined}>
               Hypothetisches Derivat erzeugen
             </button>
-            <button className="btn primary" onClick={runTest} data-testid="hedge-test">
+            <button className="btn primary" onClick={runTest} data-testid="hedge-test" disabled={tradeInvalid} title={invalidMessage ?? undefined}>
               {stale ? "Erneut testen" : "Effektivität testen"}
             </button>
           </span>
@@ -704,9 +725,14 @@ export function HedgeView() {
           Sicherungsinstrument: {trade.name ?? trade.id} · Nominal {fmtMoney(tradeNotional(trade).amount, tradeNotional(trade).currency)} · bis{" "}
           {fmtDate(tradeMaturity(trade))}. Die Dokumentation wird je Trade lokal gespeichert.
         </div>
+        {invalidMessage && !error && (
+          <div className="warning error" style={{ marginTop: 8 }} role="alert" data-testid="hedge-invalid-trade">
+            {invalidMessage}
+          </div>
+        )}
         {error && (
-          <div className="warning error" style={{ marginTop: 8 }} role="alert">
-            {error}
+          <div className="warning error" style={{ marginTop: 8 }} role="alert" data-testid="hedge-error">
+            {germanizeText(error)}
           </div>
         )}
       </div>
@@ -872,7 +898,7 @@ export function HedgeView() {
                   <span className="right muted xs">IFRS 9 6.5.15 · Zeitwert der Option</span>
                 </h3>
                 <div className="table-scroll">
-                  <table className="grid-table compact">
+                  <table className="grid-table compact" aria-label="Cost of Hedging">
                     <tbody>
                       <tr style={{ cursor: "default" }}>
                         <td className="muted">Zeitwert am Bewertungstag</td>
@@ -984,7 +1010,7 @@ export function HedgeView() {
                 </span>
               </h3>
               <div className="table-scroll">
-                <table className="grid-table compact">
+                <table className="grid-table compact" aria-label={rep.accountingFramework === "IFRS9" ? "IFRS 9 – Buchung" : "HGB § 254 – Bewertungseinheit"}>
                   <tbody>
                     <tr style={{ cursor: "default" }}>
                       <td className="muted">Δ Sicherungsinstrument (kumuliert)</td>

@@ -82,6 +82,7 @@ export function App() {
       interpolation: st.interpolation,
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
+      fxFixings: st.fxFixings,
       valuationDate: st.valuationDate,
       reportingCurrency: st.reportingCurrency,
       tradesCount: st.trades.length,
@@ -93,7 +94,20 @@ export function App() {
   );
   const act = useStore.getState;
   const [inputMode, setInputMode] = useState(false);
+  const [online, setOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine !== false));
   const restoredShown = useRef(false);
+
+  // Offline indicator (R4-F3): the valuation core runs in the browser, the app shell is served by the service worker.
+  useEffect(() => {
+    const up = () => setOnline(true);
+    const down = () => setOnline(false);
+    window.addEventListener("online", up);
+    window.addEventListener("offline", down);
+    return () => {
+      window.removeEventListener("online", up);
+      window.removeEventListener("offline", down);
+    };
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = s.theme;
@@ -379,6 +393,52 @@ export function App() {
       <a className="skip" href="#main">
         Zum Inhalt
       </a>
+      {/* Toast stack right after the skip link: its action buttons ("Rückgängig") are the first tab stops after "Zum Inhalt" (R4-F2);
+          the live region is mounted from the start so screen readers announce the very first toast (R3-08). It sits outside the
+          `inert` app shell and is positioned fixed, so the DOM position does not change the layout. */}
+      <div
+        className="toast-stack"
+        role="status"
+        aria-live="polite"
+        onMouseEnter={() => setToastHover(true)}
+        onMouseLeave={() => setToastHover(false)}
+        data-testid="toast-stack"
+      >
+        {s.toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.action ? "with-action" : ""}`}>
+            <span className="msg" onClick={() => act().dismissToast(t.id)}>
+              {t.msg}
+              {t.count > 1 && (
+                <span className="badge count" aria-label={`${t.count}-mal`}>
+                  ×{t.count}
+                </span>
+              )}
+            </span>
+            {t.action && (
+              <button
+                className="btn xs"
+                title={t.action.label === "Rückgängig" ? `Rückgängig (${keysText(hk("undo"))})` : t.action.label}
+                onClick={() => {
+                  t.action!.run();
+                  act().dismissToast(t.id);
+                }}
+              >
+                {t.action.label}
+                {/* visible shortcut hint; the accessible name stays "Rückgängig" (the title carries the keys) */}
+                {t.action.label === "Rückgängig" && (
+                  <span className="muted xs" aria-hidden="true">
+                    {" "}
+                    ({keysText(hk("undo"))})
+                  </span>
+                )}
+              </button>
+            )}
+            <button className="close" onClick={() => act().dismissToast(t.id)} aria-label="Meldung schließen">
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
       <div
         className={`app ${s.inspectorOpen && s.view !== "pricing" ? "with-inspector" : ""} ${s.customerMode ? "customer-mode" : ""}`}
         inert={dialogOpen || undefined}
@@ -415,7 +475,17 @@ export function App() {
 
         <header className="topbar">
           <h1 className="title">DERIVA</h1>
-          <span className="crumb">/ {view.label}</span>
+          {/* The view title is the h2 of the page (h1 DERIVA → h2 view → h3 cards, R4-10); styled like the former crumb. */}
+          <h2 className="crumb">/ {view.label}</h2>
+          {!online && (
+            <span
+              className="chip warn"
+              data-testid="offline-chip"
+              title="Keine Netzwerkverbindung – Bewertung läuft lokal im Browser, der Bestand ist lokal gespeichert"
+            >
+              ⚠ offline – lokaler Bestand
+            </span>
+          )}
           {s.customerMode && (
             <button
               className="chip customer"
@@ -492,8 +562,13 @@ export function App() {
             Bewertungstag {fmtDate(s.valuationDate)}
           </button>
           {modified && (
-            <span className="warn-text" title="Marktquotes oder Interpolation wurden geändert">
+            <span className="warn-text" title="Marktquotes, Interpolation, Turn-of-Year, Vol-Flächen oder FX-Fixings wurden geändert">
               ● Markt modifiziert
+            </span>
+          )}
+          {!online && (
+            <span className="warn-text" data-testid="offline-status">
+              offline
             </span>
           )}
           {s.compareCount > 0 && (
@@ -539,42 +614,6 @@ export function App() {
 
       {s.paletteOpen && <CommandPalette onHotkey={onHotkey} />}
       {s.helpOpen && <HotkeyOverlay />}
-      {/* The live region is mounted from the start so screen readers announce the very first toast (R3-08). */}
-      <div
-        className="toast-stack"
-        role="status"
-        aria-live="polite"
-        onMouseEnter={() => setToastHover(true)}
-        onMouseLeave={() => setToastHover(false)}
-        data-testid="toast-stack"
-      >
-        {s.toasts.map((t) => (
-          <div key={t.id} className={`toast ${t.action ? "with-action" : ""}`}>
-            <span className="msg" onClick={() => act().dismissToast(t.id)}>
-              {t.msg}
-              {t.count > 1 && (
-                <span className="badge count" aria-label={`${t.count}-mal`}>
-                  ×{t.count}
-                </span>
-              )}
-            </span>
-            {t.action && (
-              <button
-                className="btn xs"
-                onClick={() => {
-                  t.action!.run();
-                  act().dismissToast(t.id);
-                }}
-              >
-                {t.action.label}
-              </button>
-            )}
-            <button className="close" onClick={() => act().dismissToast(t.id)} aria-label="Meldung schließen">
-              ✕
-            </button>
-          </div>
-        ))}
-      </div>
     </>
   );
 }

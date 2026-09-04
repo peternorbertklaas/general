@@ -3,7 +3,7 @@ import { type SerialDate, parseISO, toISO } from "../dates/date.js";
 import { type DayCountConvention } from "../dates/daycount.js";
 import { PricingError } from "../errors.js";
 import { type InterpolationMethod } from "../math/interpolation.js";
-import { type MarketContext } from "./market-context.js";
+import { type FxFixing, type MarketContext, normalizeFxPair } from "./market-context.js";
 
 /** ISO-8601 date-time with mandatory time part and zone designator (`2026-09-03T16:30:00Z`, `…+02:00`, optional fraction). */
 const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
@@ -42,6 +42,8 @@ export interface MarketSnapshotJson {
   }[];
   fxSpots: Record<string, number>;
   fixings: { index: string; date: string; value: number }[];
+  /** Historical FX fixings for MtM-reset notionals (R4-1); optional, `deriva.market/1` compatible. */
+  fxFixings?: { pair: string; date: string; rate: number }[];
   swaptionVols?: MarketContext["swaptionVols"];
   capletVols?: MarketContext["capletVols"];
   fxVols?: MarketContext["fxVols"];
@@ -58,6 +60,7 @@ export function serializeMarket(ctx: MarketContext): MarketSnapshotJson {
     curves: Object.values(ctx.curves).map((c) => serializeCurve(c)),
     fxSpots: ctx.fxSpots,
     fixings: (ctx.fixings ?? []).map((f) => ({ index: f.index, date: toISO(f.date), value: f.value })),
+    ...(ctx.fxFixings?.length ? { fxFixings: ctx.fxFixings.map((f) => ({ pair: normalizeFxPair(f.pair), date: toISO(f.date), rate: f.rate })) } : {}),
     swaptionVols: ctx.swaptionVols,
     capletVols: ctx.capletVols,
     fxVols: ctx.fxVols,
@@ -118,11 +121,31 @@ export function deserializeMarket(json: MarketSnapshotJson): MarketContext {
     curves,
     fxSpots: json.fxSpots,
     fixings: json.fixings.map((f) => ({ index: f.index, date: parseISO(f.date), value: f.value })),
+    ...(json.fxFixings !== undefined ? { fxFixings: deserializeFxFixings(json.fxFixings) } : {}),
     swaptionVols: json.swaptionVols,
     capletVols: json.capletVols,
     fxVols: json.fxVols,
     credit: json.credit,
   };
+}
+
+/**
+ * FX fixings of a snapshot (R4-1): every entry needs a 6-letter pair, an ISO
+ * date and a positive finite rate – anything else raises
+ * `PricingError("INVALID_TRADE")`-style structural errors as a plain `Error`
+ * with the offending index, like a malformed curve node would.
+ */
+function deserializeFxFixings(raw: NonNullable<MarketSnapshotJson["fxFixings"]>): FxFixing[] {
+  if (!Array.isArray(raw)) throw new Error("Market snapshot: fxFixings must be an array of { pair, date, rate }");
+  return raw.map((f, i) => {
+    const pair = typeof f?.pair === "string" ? normalizeFxPair(f.pair) : "";
+    if (!/^[A-Z]{6}$/.test(pair)) throw new Error(`Market snapshot: fxFixings[${i}].pair must be a 6-letter currency pair (got ${JSON.stringify(f?.pair)})`);
+    if (typeof f.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(f.date))
+      throw new Error(`Market snapshot: fxFixings[${i}].date must be an ISO date (got ${JSON.stringify(f.date)})`);
+    if (typeof f.rate !== "number" || !Number.isFinite(f.rate) || f.rate <= 0)
+      throw new Error(`Market snapshot: fxFixings[${i}].rate must be a positive finite number (got ${String(f.rate)})`);
+    return { pair, date: parseISO(f.date), rate: f.rate };
+  });
 }
 
 /** Validate a snapshot for internal consistency; returns a list of problems (empty = OK). */
@@ -144,6 +167,17 @@ export function validateMarket(ctx: MarketContext): string[] {
     if (!/^[A-Z]{6}$/.test(pair)) problems.push(`FX pair ${pair} malformed`);
     if (!(rate > 0)) problems.push(`FX spot ${pair} must be positive`);
   }
+  const seenFxFixings = new Set<string>();
+  (ctx.fxFixings ?? []).forEach((f, i) => {
+    const pair = typeof f.pair === "string" ? normalizeFxPair(f.pair) : "";
+    if (!/^[A-Z]{6}$/.test(pair)) problems.push(`FX fixing [${i}]: pair ${String(f.pair)} malformed`);
+    if (!Number.isFinite(f.date)) problems.push(`FX fixing [${i}] (${pair}): date must be a serial date`);
+    if (!(typeof f.rate === "number" && Number.isFinite(f.rate) && f.rate > 0))
+      problems.push(`FX fixing ${pair} on ${Number.isFinite(f.date) ? toISO(f.date) : "?"} must be positive`);
+    const key = `${pair}|${f.date}`;
+    if (seenFxFixings.has(key)) problems.push(`FX fixing ${pair} on ${toISO(f.date)} given twice`);
+    seenFxFixings.add(key);
+  });
   if (ctx.meta?.snapshotTime !== undefined && !isIsoDateTime(ctx.meta.snapshotTime)) {
     problems.push(`meta.snapshotTime ${JSON.stringify(ctx.meta.snapshotTime)} is not an ISO-8601 date-time`);
   }

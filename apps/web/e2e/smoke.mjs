@@ -59,7 +59,11 @@ try {
   await wait(2500);
   const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined;
   browser = await chromium.launch(executablePath ? { executablePath } : {});
-  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, locale: "de-DE" });
+  const context = await browser.newContext({
+    viewport: { width: 1600, height: 1000 },
+    locale: "de-DE",
+    permissions: ["clipboard-read", "clipboard-write"],
+  });
   const page = await context.newPage();
   const errors = [];
   const consoleErrors = [];
@@ -82,6 +86,36 @@ try {
   check((await page.locator('a.skip[href="#main"]').count()) === 1, "skip link present (N-13)");
   check((await page.locator('table.blotter[role="grid"] tr[data-nav="trade"]').count()) >= 10, "blotter rows marked data-nav=trade in a grid (N-02/N-13)");
   await page.screenshot({ path: join(outDir, "01-blotter.png") });
+  // Heading hierarchy: one h1, the view title is the h2 (R4-10)
+  check((await page.locator("h1").count()) === 1, "exactly one h1 (R4-10)");
+  check((await page.locator("h2.crumb").innerText()).includes("Blotter"), "view title is an h2 (R4-10)");
+  // Roving tabindex: one tab stop per table, Tab leaves the table (R4-03)
+  const blotterStops = await page.evaluate(() => ({
+    zero: document.querySelectorAll('table.blotter tbody tr[tabindex="0"]').length,
+    minus: document.querySelectorAll('table.blotter tbody tr[tabindex="-1"]').length,
+  }));
+  check(
+    blotterStops.zero === 1 && blotterStops.minus >= 9,
+    `blotter has exactly one row tab stop (${blotterStops.zero} / ${blotterStops.minus} rows at -1) (R4-03)`,
+  );
+  await page.locator("table.blotter tbody tr.selected").focus();
+  await page.keyboard.press("Tab");
+  check((await page.evaluate(() => document.activeElement?.tagName)) !== "TR", "Tab leaves the blotter after one stop (R4-03)");
+  // Chords take precedence on a focused row (R4-02): y i copies the indication, i does not toggle the inspector, y y copies the row
+  await page.locator("table.blotter tbody tr.selected").focus();
+  const inspBefore = await page.locator(".inspector").count();
+  await page.keyboard.press("y");
+  await page.keyboard.press("i");
+  await wait(400);
+  const clipInd = await page.evaluate(() => navigator.clipboard.readText());
+  check(clipInd.includes("PV") && !clipInd.includes("\t"), `y i on a blotter row copies the indication (${clipInd.slice(0, 40)}…) (R4-02)`);
+  check((await page.locator(".inspector").count()) === inspBefore, "i after y does not toggle the inspector (R4-02)");
+  await page.keyboard.press("y");
+  await page.keyboard.press("y");
+  await wait(400);
+  const clipRow = await page.evaluate(() => navigator.clipboard.readText());
+  check(clipRow.includes("IRS-0001") && clipRow.includes("\t"), "y y copies the focused row as tab-separated text (R4-02)");
+  check((await page.locator(".toast", { hasText: "Zeile kopiert" }).count()) === 1, "row copy toast");
 
   // Grouping with subtotals (Markt N19)
   await page.locator('[data-testid="group-select"]').selectOption("cpty");
@@ -411,6 +445,7 @@ try {
   await page.keyboard.press("Enter");
   await wait(600);
   check((await page.locator('[data-testid="vega-dimension"]').count()) === 1, "swaption offers the vega dimension toggle");
+  check((await page.locator('select[aria-label="Währung"] option').count()) >= 3, "swaption editor offers a currency select fed by the vol cubes (Markt R4-2)");
   await page.locator('[data-testid="vega-dimension"] button', { hasText: "Tenor" }).click();
   await wait(800);
   check((await page.locator('[data-testid="vega-heatmap"]').count()) === 1, "expiry × tenor vega heatmap renders");
@@ -426,6 +461,20 @@ try {
   check((await page.locator('[data-testid="vega-smile-table"]').count()) === 1, "smile toggle adds the RR/BF bucket table");
   await page.locator('[data-testid="vega-smile"]').uncheck();
 
+  // Quick entry accepts German dates (R4-06) and a swaption currency (Markt R4-2) – preview only
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("fxf eurusd -2m 1.1725 15.03.2027");
+  await wait(200);
+  check((await page.locator(".palette .item").first().innerText()).includes("15.03.2027"), "quick entry accepts German dates (R4-06)");
+  await page.keyboard.press("Control+a");
+  await page.keyboard.type("swpt usd 1y5y payer 3.5% 10m");
+  await wait(200);
+  check(
+    (await page.locator(".palette .item").first().innerText()).includes("Payer-Swaption USD"),
+    "quick entry swaption takes the currency token (Markt R4-2)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
   // CCS via palette quick entry: fair basis spread as key metric, interim exchange and MtM reset in the editor
   await page.keyboard.press("Control+k");
   await page.keyboard.type("ccs eurusd 5y -20bp 10m mtm");
@@ -515,6 +564,12 @@ try {
   await page.keyboard.press("]");
   await wait(400);
   check((await page.locator('[data-testid="report-whatif-badge"]').count()) === 1, "what-if badge on report");
+  const whatIfHeader = await page.locator('[data-testid="report-header"]').innerText();
+  check((whatIfHeader.match(/What-if/g) ?? []).length <= 1 && !/What-if What-if/.test(whatIfHeader), "report header names the what-if at most once (R4-07)");
+  check(
+    /WHAT-IF Zinsen \+10 bp – NICHT PRÜFUNGSFÄHIG/.test(await page.locator(".report-print-header").innerText()),
+    "print header carries the German what-if label (R4-07)",
+  );
   // documents under what-if carry the stress banner (R3-F1) and ask before print/download
   await page.locator('[data-testid="open-termsheet"]').click();
   await wait(500);
@@ -559,7 +614,7 @@ try {
   await page.emulateMedia({ media: "print" });
   await wait(300);
   const printDoc = await page.evaluate(() => {
-    const h1 = document.querySelector(".doc-head h1");
+    const h1 = document.querySelector(".doc-head h2");
     const cs = h1 ? getComputedStyle(h1) : null;
     const rect = h1?.getBoundingClientRect();
     const bg = document.querySelector(".modal") ? getComputedStyle(document.querySelector(".modal")).backgroundColor : "";
@@ -691,6 +746,34 @@ try {
   check(hedgePrint.ratioVisible && hedgePrint.ratio === "50", `hedge print shows the hedge ratio (${hedgePrint.ratio}) (R3-04)`);
   check(hedgePrint.notionalVisible && /\d/.test(hedgePrint.notional ?? ""), `hedge print shows the hedged-item notional (${hedgePrint.notional}) (R3-04)`);
   check(hedgePrint.header.includes("ERGEBNIS VERALTET"), "hedge print header carries the stale marker");
+  // Selects print their full option text and the unit sits next to the value (R4-08)
+  const hedgePrintFit = await page.evaluate(() => {
+    const measure = (el, text) => {
+      const s = document.createElement("span");
+      s.style.font = getComputedStyle(el).font;
+      s.style.position = "absolute";
+      s.style.visibility = "hidden";
+      s.style.whiteSpace = "nowrap";
+      s.textContent = text;
+      document.body.appendChild(s);
+      const w = s.getBoundingClientRect().width;
+      s.remove();
+      return w;
+    };
+    const sels = ['select[aria-label="Art des Grundgeschäfts"]', 'select[aria-label="Tilgungsplan Grundgeschäft"]']
+      .map((q) => document.querySelector(q))
+      .filter(Boolean);
+    const clipped = sels.filter((sel) => sel.clientWidth + 2 < measure(sel, sel.selectedOptions[0]?.textContent ?? "")).length;
+    const ratio = document.querySelector('input[aria-label="Hedge Ratio"]');
+    const unit = ratio?.parentElement?.querySelector(".unit");
+    const gap = ratio && unit ? unit.getBoundingClientRect().left - ratio.getBoundingClientRect().right : 999;
+    return { sels: sels.length, clipped, gap };
+  });
+  check(
+    hedgePrintFit.sels >= 2 && hedgePrintFit.clipped === 0,
+    `hedge print: selects are not clipped (${hedgePrintFit.clipped} of ${hedgePrintFit.sels}) (R4-08)`,
+  );
+  check(hedgePrintFit.gap >= -1 && hedgePrintFit.gap < 30, `hedge print: unit sits next to the value (gap ${Math.round(hedgePrintFit.gap)} px) (R4-08)`);
   await page.screenshot({ path: join(outDir, "08-hedge-print.png"), fullPage: true });
   await page.emulateMedia({ media: "screen" });
   // "Zurücksetzen" asks first (R3-F4)
@@ -804,6 +887,25 @@ try {
   await wait(800);
   check((await page.locator('[data-testid="toy-badge"]').count()) === 1, "turn-of-year badge after applying the jump");
   check((await page.locator('[data-testid="market-modified-chip"]').innerText()).includes("Turn-of-Year"), "turn-of-year counts as modified market");
+  // A valuation date past the stored jump shows the "inaktiv" badge instead of a validation error (R4-09)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("stichtag 15.01.2027");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(900);
+  check(
+    (await page.locator('[data-testid="toy-inactive"]').count()) === 1,
+    "stored turn-of-year overtaken by the valuation date shows the inaktiv badge (R4-09)",
+  );
+  check((await page.locator('[data-testid="toy-past"]').count()) === 0, "no validation error for the unchanged stored jump (R4-09)");
+  check((await page.locator(".toast", { hasText: "inaktiv" }).count()) >= 1, "toast announces the inactive turn-of-year (R4-09)");
+  const toyLabelH = await page.evaluate(() => document.querySelector(".toy-label")?.getBoundingClientRect().height ?? 999);
+  check(toyLabelH < 30, `Turn-of-Year label stays on one line (${Math.round(toyLabelH)} px) (R4-09)`);
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("stichtag 30.09.2026");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(900);
   await page.locator("button.btn", { hasText: "Zurücksetzen" }).click();
   await wait(500);
   check((await page.locator('[data-testid="toy-badge"]').count()) === 0, "reset removes the turn-of-year jump");
@@ -856,6 +958,50 @@ try {
   check((await volCell.inputValue()) === volBefore, `vol cell restored after undo (${volBefore})`);
   check((await page.locator('[data-testid="fx-vol-cell"]').count()) === 1, "FX smile rows are editable");
   check((await page.locator('[data-testid="caplet-vol-cell"]').count()) === 1, "caplet surface cells are editable");
+  // Caplet inputs are bound to their cells: readable values, click hits the right cell (R4-01 / Markt R4-3)
+  const capletFit = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('[data-testid="caplet-vol-table"] tbody tr:first-child td.vol-cell input')).map((i) => {
+      const td = i.closest("td");
+      const ir = i.getBoundingClientRect();
+      const tr = td.getBoundingClientRect();
+      return {
+        w: Math.round(ir.width),
+        tdw: Math.round(tr.width),
+        fits: ir.right <= tr.right + 0.5 && ir.left >= tr.left - 0.5,
+        overflow: i.scrollWidth > i.clientWidth + 1,
+      };
+    }),
+  );
+  check(
+    capletFit.length >= 3 && capletFit.every((c) => c.fits),
+    `caplet vol inputs stay inside their cells (${capletFit[0]?.w} ≤ ${capletFit[0]?.tdw} px) (R4-01)`,
+  );
+  check(
+    capletFit.every((c) => !c.overflow),
+    "caplet vol values are fully visible (R4-01)",
+  );
+  const secondCell = page.locator('[data-testid="caplet-vol-table"] tbody tr:first-child td.vol-cell').nth(1);
+  await secondCell.click();
+  await wait(100);
+  const capletActive = await page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? "");
+  const secondLabel = await secondCell.locator("input").getAttribute("aria-label");
+  check(capletActive === secondLabel, `clicking a caplet cell focuses its own input (${capletActive}) (R4-01)`);
+  await page.keyboard.press("Escape");
+  await wait(100);
+  check(
+    (await page.locator('[aria-label="Swaption-Cube Währung"] button', { hasText: "CHF" }).count()) === 1 &&
+      (await page.locator('[aria-label="Swaption-Cube Währung"] button', { hasText: "JPY" }).count()) === 1,
+    "swaption cube segment lists CHF and JPY (Markt R4-4)",
+  );
+  check((await page.locator('[aria-label="Caplet-Fläche"] button', { hasText: "CHF-SARON" }).count()) === 1, "caplet segment lists CHF-SARON (Markt R4-4)");
+  // FX fixings editor: add from spot, market modified, undo (core R4-1)
+  await page.locator('[data-testid="fx-fixing-add-spot"]').click();
+  await wait(500);
+  check((await page.locator('[data-testid="fx-fixings-table"] tbody tr').count()) === 1, "FX fixing added from the spot");
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"), "FX fixing marks the market as modified");
+  await page.keyboard.press("Control+z");
+  await wait(500);
+  check((await page.locator('[data-testid="fx-fixings-table"]').count()) === 0, "Ctrl+Z removes the FX fixing again");
 
   // Toast stack is capped at four (N-09)
   await chord(page, "b");
@@ -965,6 +1111,19 @@ try {
   check(afterReload === beforeReload, `trades persisted across reload (${beforeReload} → ${afterReload})`);
   check((await page.locator(".toast", { hasText: "lokalem Speicher" }).count()) === 1, "restore toast");
   check((await page.locator(".toast button", { hasText: "Zurücksetzen" }).count()) === 1, "restore toast offers reset");
+  // Toast actions are the first tab stops after the skip link (R4-F2)
+  await page.locator("a.skip").focus();
+  await page.keyboard.press("Tab");
+  check(
+    (await page.evaluate(() => document.activeElement?.closest(".toast-stack") !== null)) === true,
+    "first Tab after the skip link lands on the toast action (R4-F2)",
+  );
+  check(
+    (await page.evaluate(
+      () => !!(document.querySelector(".toast-stack").compareDocumentPosition(document.querySelector(".app")) & Node.DOCUMENT_POSITION_FOLLOWING),
+    )) === true,
+    "toast stack precedes the app shell in the DOM (R4-F2)",
+  );
 
   // 1280 px layout: no horizontal overflow with the inspector open
   await page.setViewportSize({ width: 1280, height: 800 });
@@ -991,6 +1150,31 @@ try {
   await chord(page, "r");
   const reportFit = await noOverflow(page);
   check(reportFit.main, "1280px report market table does not overflow (R3-09)");
+
+  // Offline reload via the app-shell service worker (US-8.13 / R4-F3)
+  const swReady = await page.evaluate(() =>
+    "serviceWorker" in navigator ? Promise.race([navigator.serviceWorker.ready.then(() => true), new Promise((r) => setTimeout(() => r(false), 8000))]) : false,
+  );
+  check(swReady === true, "service worker registered and active (R4-F3)");
+  await page.reload({ waitUntil: "networkidle" }); // controlled by the worker from now on → assets enter the cache
+  await wait(800);
+  check((await page.evaluate(() => !!navigator.serviceWorker.controller)) === true, "page is controlled by the service worker after a reload (R4-F3)");
+  await context.setOffline(true);
+  let offlineOk = false;
+  try {
+    await page.reload({ waitUntil: "load" });
+    await wait(800);
+    offlineOk = (await page.locator("h1").count()) === 1 && (await page.locator("h1").innerText()) === "DERIVA";
+  } catch {
+    offlineOk = false;
+  }
+  check(offlineOk, "offline reload renders the app from the service-worker cache (R4-F3)");
+  if (offlineOk) {
+    check((await page.locator('[data-testid="offline-chip"]').count()) === 1, "offline chip shown while offline (R4-F3)");
+    check(Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]) === Number(afterReload), "portfolio available offline");
+  }
+  await context.setOffline(false);
+  await wait(300);
 
   check(errors.length === 0, `page errors: ${errors.join(" | ")}`);
   const relevantConsole = consoleErrors.filter((m) => !/favicon|ResizeObserver loop/.test(m));

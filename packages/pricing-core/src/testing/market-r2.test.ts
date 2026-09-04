@@ -470,8 +470,9 @@ describe("N5 – EMIR valuation record: UTI, delta, timestamp, clearing", () => 
     expect(rec.uti).toBe(swap.uti);
     expect(rec.delta).toBe(1); // pay fixed = long rates
     expect(rec.valuationTimestamp).toBe("2026-09-03T16:30:00Z");
-    expect(rec.cleared).toBe("TRUE");
-    expect(rec.clearingObligation).toBe("Y");
+    // N4-08: ITS 2022/1860 value formats – field 31 Y/N/I, field 30 TRUE/FLSE/UKWN
+    expect(rec.cleared).toBe("Y");
+    expect(rec.clearingObligation).toBe("TRUE");
     expect(rec.clearingMember).toBe("LCH-MEMBER-1");
     expect(rec.valuationMethod).toBe("MTMO");
     const rec2 = emirValuationRecord(
@@ -486,14 +487,14 @@ describe("N5 – EMIR valuation record: UTI, delta, timestamp, clearing", () => 
       { transactionPrice: 25_000, asOf: "2026-09-03T18:00:00Z", uti: "OVERRIDE" },
     );
     expect(rec2.delta).toBe(-1);
-    expect(rec2.cleared).toBe("FALSE");
-    // N3-09: the clearing obligation is never derived from `cleared` – unknown → "N/A"
-    expect(rec2.clearingObligation).toBe("N/A");
-    expect(emirValuationRecord(ctx, { ...swap, cleared: true, clearingObligation: undefined }, priceTrade(ctx, swap, "EUR")).clearingObligation).toBe("N/A");
-    expect(emirValuationRecord(ctx, { ...swap, cleared: false, clearingObligation: true }, priceTrade(ctx, swap, "EUR")).clearingObligation).toBe("Y");
+    expect(rec2.cleared).toBe("N");
+    // N3-09: the clearing obligation is never derived from `cleared` – unknown → "UKWN"
+    expect(rec2.clearingObligation).toBe("UKWN");
+    expect(emirValuationRecord(ctx, { ...swap, cleared: true, clearingObligation: undefined }, priceTrade(ctx, swap, "EUR")).clearingObligation).toBe("UKWN");
+    expect(emirValuationRecord(ctx, { ...swap, cleared: false, clearingObligation: true }, priceTrade(ctx, swap, "EUR")).clearingObligation).toBe("TRUE");
     expect(
       emirValuationRecord(ctx, { ...swap, clearingObligation: undefined }, priceTrade(ctx, swap, "EUR"), { clearingObligation: false }).clearingObligation,
-    ).toBe("N");
+    ).toBe("FLSE");
     expect(rec2.valuationMethod).toBe("MTMA");
     expect(rec2.valuationTimestamp).toBe("2026-09-03T18:00:00Z");
     expect(rec2.uti).toBe("OVERRIDE");
@@ -502,7 +503,7 @@ describe("N5 – EMIR valuation record: UTI, delta, timestamp, clearing", () => 
     const lines = csv.split("\n");
     expect(lines[0]!.split(";")).toEqual([...EMIR_CSV_HEADER]);
     expect(lines[1]!).toContain(swap.uti);
-    expect(lines[1]!).toContain(";TRUE;Y;LCH-MEMBER-1");
+    expect(lines[1]!).toContain(";FLSE;Y;TRUE;LCH-MEMBER-1"); // field 26 FLSE (no CSA), 31 Y, 30 TRUE (N4-08 formats)
     expect(lines[2]!).toContain(";-1.000000;");
   });
 

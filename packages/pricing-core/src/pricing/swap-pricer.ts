@@ -1,6 +1,7 @@
 import { type SerialDate, toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
-import { type MarketContext, getDiscountCurve } from "../market/market-context.js";
+import { PricingError } from "../errors.js";
+import { type MarketContext, getDiscountCurve, getFxFixing } from "../market/market-context.js";
 import {
   type CrossCurrencySwap,
   type FixedLeg,
@@ -11,7 +12,7 @@ import {
   type SwapLeg,
 } from "../instruments/types.js";
 import { fxForwardRate } from "./fx-pricer.js";
-import { fixedRateAt, floatSpreadAt, fxToReporting, legAccrued, priceLeg, scheduleDates } from "./leg-pricer.js";
+import { fixedRateAt, floatSpreadAt, fxToReporting, legAccrued, legPeriods, priceLeg } from "./leg-pricer.js";
 
 /**
  * Swap analytics. Par solver with coupon schedules (step-up swaps):
@@ -146,10 +147,60 @@ export function priceInterestRateSwap(ctx: MarketContext, trade: InterestRateSwa
   };
 }
 
+/** Structured warning for a required but unavailable FX reset fixing (prefix `MISSING_FX_FIXING:`, R4-1). */
+export function missingFxFixingMessage(pair: string, resetDate: SerialDate, detail: string): string {
+  return `MISSING_FX_FIXING: Missing FX fixing for ${pair} on ${toISO(resetDate)}; ${detail}`;
+}
+
+/**
+ * Notional schedule of the resetting leg of a mark-to-market cross-currency
+ * swap (R4-1). Per coupon period the notional is the other leg's notional
+ * converted at the FX rate *fixed* for that period:
+ * - reset date (adjusted accrual start) after the valuation date → the
+ *   spot-date-anchored forward FX rate for that date;
+ * - reset date on/before the valuation date → the historical fixing from
+ *   `ctx.fxFixings` (either quotation of the pair);
+ * - first period without a fixing → the contractual notional of the leg (it
+ *   was fixed at inception);
+ * - later past reset without a fixing → today's rate (forward to the
+ *   valuation date) as a proxy with a `MISSING_FX_FIXING:` warning, or a
+ *   `PricingError("MISSING_FIXING")` under `missingFixingPolicy: "throw"`.
+ * Periods whose cashflows have all been paid never trigger a warning.
+ */
+export function mtmResetNotionalSchedule(
+  ctx: MarketContext,
+  trade: CrossCurrencySwap,
+  resettingLegIndex: number,
+  warnings: string[],
+): { date: SerialDate; notional: number }[] {
+  const reset = trade.legs[resettingLegIndex]!;
+  const other = trade.legs.find((_, i) => i !== resettingLegIndex)!;
+  const periods = legPeriods(reset);
+  const val = ctx.valuationDate;
+  const pair = `${other.currency}${reset.currency}`;
+  const policy = ctx.missingFixingPolicy ?? "curve";
+  const forwardAt = (d: SerialDate) => other.notional * fxForwardRate(ctx, other.currency, reset.currency, d, trade.collateralCurrency);
+  return periods.map((p, i) => {
+    const d = p.accrualStart;
+    if (d > val) return { date: d, notional: forwardAt(d) };
+    const fixing = getFxFixing(ctx, pair, d);
+    if (fixing !== undefined) return { date: d, notional: other.notional * fixing };
+    if (i === 0) return { date: d, notional: reset.notional };
+    // The notional of period i pays coupon i and the exchanges at the end of periods i−1 and i.
+    const stillRelevant = p.paymentDate > val || periods[i - 1]!.paymentDate > val;
+    if (!stillRelevant) return { date: d, notional: reset.notional };
+    const message = missingFxFixingMessage(pair, d, `MtM reset of leg ${resettingLegIndex} valued with today's rate as proxy (load ctx.fxFixings)`);
+    if (policy === "throw") throw new PricingError("MISSING_FIXING", message, { pair, fixingDate: d, legIndex: resettingLegIndex, tradeId: trade.id });
+    warnings.push(message);
+    return { date: d, notional: forwardAt(val) };
+  });
+}
+
 /**
  * Cross-currency swap. Constant-notional CCS is priced leg-by-leg with
  * notional exchanges; MtM-resetting CCS recomputes the resetting leg's
- * notional at each period start from spot-date-anchored forward FX rates.
+ * notional per period – forward FX for future resets, the historical FX
+ * fixing for past resets (see `mtmResetNotionalSchedule`).
  */
 export function priceCrossCurrencySwap(ctx: MarketContext, trade: CrossCurrencySwap, reportingCurrency?: string): PricingResult {
   const reporting = reportingCurrency ?? trade.legs[0]!.currency;
@@ -157,20 +208,18 @@ export function priceCrossCurrencySwap(ctx: MarketContext, trade: CrossCurrencyS
     ...l,
     notionalExchange: l.notionalExchange ?? { initial: true, final: true },
   }));
+  const warnings: string[] = [];
   if (trade.mtmReset) {
     const ri = trade.mtmReset.resettingLegIndex;
-    const reset = legs[ri]!;
-    const other = legs.find((_, i) => i !== ri)!;
-    const dates = scheduleDates(reset);
-    // Notional at each accrual start = other notional × forward FX(start) (1 other = x reset)
-    const starts = [reset.effectiveDate, ...dates.slice(0, -1)];
-    const schedule = starts.map((d) => ({
-      date: d,
-      notional: other.notional * fxForwardRate(ctx, other.currency, reset.currency, Math.max(d, ctx.valuationDate), trade.collateralCurrency),
-    }));
+    const schedule = mtmResetNotionalSchedule(ctx, trade, ri, warnings);
     legs = legs.map((l, i) => (i === ri ? { ...l, notionalSchedule: schedule, notionalExchange: { initial: true, final: true, interim: true } } : l));
   }
   const irs: InterestRateSwap = { ...trade, type: "InterestRateSwap", legs };
   const res = priceInterestRateSwap(ctx, irs, reporting);
-  return { ...res, tradeType: "CrossCurrencySwap", analytics: { ...res.analytics, mtmReset: trade.mtmReset ? "yes" : "no" } };
+  return {
+    ...res,
+    tradeType: "CrossCurrencySwap",
+    analytics: { ...res.analytics, mtmReset: trade.mtmReset ? "yes" : "no" },
+    warnings: Array.from(new Set([...res.warnings, ...warnings])),
+  };
 }

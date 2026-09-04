@@ -57,6 +57,7 @@ export function CommandPalette({ onHotkey }: Props) {
       trades: st.trades,
       results: st.results,
       fxSpots: st.market.fxSpots,
+      swaptionVols: st.market.swaptionVols,
     })),
   );
   const act = useStore.getState;
@@ -75,7 +76,10 @@ export function CommandPalette({ onHotkey }: Props) {
     return () => restoreFocus(prevFocus.current);
   }, []);
 
-  const parsed = useMemo(() => parseQuickEntry(q, s.valuationDate, { fxSpots: s.fxSpots }), [q, s.valuationDate, s.fxSpots]);
+  const parsed = useMemo(
+    () => parseQuickEntry(q, s.valuationDate, { fxSpots: s.fxSpots, swaptionVolCurrencies: Object.keys(s.swaptionVols ?? {}) }),
+    [q, s.valuationDate, s.fxSpots, s.swaptionVols],
+  );
   const valDateCmd = useMemo(() => parseValuationDateCommand(q), [q]);
 
   const items = useMemo<Item[]>(() => {

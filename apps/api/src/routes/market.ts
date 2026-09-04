@@ -1,7 +1,18 @@
 import { type FastifyInstance } from "fastify";
-import { type BootstrapSpec, type Curve, type Fixing, type InterpolatedCurve, type MarketContext, bootstrapCurve, parseISO, toISO } from "@deriva/pricing-core";
+import {
+  type BootstrapSpec,
+  type Curve,
+  type Fixing,
+  type FxFixing,
+  type InterpolatedCurve,
+  type MarketContext,
+  bootstrapCurve,
+  parseISO,
+  toISO,
+} from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
+import { sendError } from "../lib/errors.js";
 import { arrayResponse, bootstrapBodySchema, marketPutSchema, objectResponse, responses } from "../schemas.js";
 
 function curveSummary(c: Curve, valuationDate: number) {
@@ -144,7 +155,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
     async (req, reply) => {
       const m = ctx.market.get();
       const c = m.curves[req.params.id];
-      if (!c) return reply.status(404).send({ error: `Curve ${req.params.id} not found`, statusCode: 404, requestId: req.id });
+      if (!c) return sendError(reply, req, 404, "NOT_FOUND", `Curve ${req.params.id} not found`);
       return curveSummary(c, m.valuationDate);
     },
   );
@@ -271,9 +282,13 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
     Body: {
       fxSpots?: Record<string, number>;
       fixings?: { index: string; date: string; value: number }[];
+      fxFixings?: { pair: string; date: string; rate: number }[];
       valuationDate?: string;
       fxSpotDates?: Record<string, string>;
       missingFixingPolicy?: "curve" | "throw";
+      swaptionVols?: MarketContext["swaptionVols"];
+      capletVols?: MarketContext["capletVols"];
+      fxVols?: MarketContext["fxVols"];
     };
   }>(
     "/api/market",
@@ -282,7 +297,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       schema: {
         operationId: "updateMarket",
         tags: ["market"],
-        summary: "Spots/Fixings/Spot-Daten/Fixing-Policy setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut)",
+        summary:
+          "Spots/Fixings/FX-Fixings/Spot-Daten/Fixing-Policy/Vol-Flächen setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut; Vol-Flächen je Key ersetzt, ohne kompletten Snapshot)",
         body: marketPutSchema,
         response: responses(
           {
@@ -293,8 +309,12 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
                 snapshotId: { type: "string" },
                 fxSpots: objectResponse("Spot per pair"),
                 fixings: arrayResponse("{ index, date, value }[]"),
+                fxFixings: arrayResponse("{ pair, date, rate }[] – FX fixings for MtM-reset notionals"),
                 fxSpotDates: objectResponse("ISO spot date per pair"),
                 missingFixingPolicy: { type: "string", enum: ["curve", "throw"] },
+                swaptionVols: { type: "array", items: { type: "string" }, description: "Keys of the swaption vol cubes now in the market" },
+                capletVols: { type: "array", items: { type: "string" }, description: "Keys of the caplet vol surfaces now in the market" },
+                fxVols: { type: "array", items: { type: "string" }, description: "Keys of the FX vol surfaces now in the market" },
               },
               additionalProperties: true,
             },
@@ -317,21 +337,50 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         const fixings = datesToSerial(req.body.fixings) as unknown as Fixing[];
         m = { ...m, fixings: [...(m.fixings ?? []), ...fixings] };
       }
+      if (req.body.fxFixings) {
+        // Append; a fixing for the same pair and date replaces the stored one (the snapshot validation rejects duplicates).
+        const incoming = datesToSerial(req.body.fxFixings) as unknown as FxFixing[];
+        const key = (f: FxFixing) => `${f.pair.toUpperCase()}@${f.date}`;
+        const replaced = new Set(incoming.map(key));
+        m = { ...m, fxFixings: [...(m.fxFixings ?? []).filter((f) => !replaced.has(key(f))), ...incoming] };
+      }
+      // Vol surfaces are plain data in the snapshot format – replace per key (R4-5: IPV pushes one broker surface, not the whole snapshot).
+      const vols = {
+        swaption: Object.keys(req.body.swaptionVols ?? {}),
+        caplet: Object.keys(req.body.capletVols ?? {}),
+        fx: Object.keys(req.body.fxVols ?? {}),
+      };
+      if (req.body.swaptionVols) m = { ...m, swaptionVols: { ...(m.swaptionVols ?? {}), ...req.body.swaptionVols } };
+      if (req.body.capletVols) m = { ...m, capletVols: { ...(m.capletVols ?? {}), ...req.body.capletVols } };
+      if (req.body.fxVols) m = { ...m, fxVols: { ...(m.fxVols ?? {}), ...req.body.fxVols } };
       ctx.market.set(m);
       const snapshotId = ctx.market.snapshotId();
       ctx.audit.append({
         actor: "api",
         action: "market.update",
         subject: "market",
-        details: { valuationDate: toISO(m.valuationDate), spots: Object.keys(req.body.fxSpots ?? {}), fixings: req.body.fixings?.length ?? 0, snapshotId },
+        details: {
+          valuationDate: toISO(m.valuationDate),
+          spots: Object.keys(req.body.fxSpots ?? {}),
+          fixings: req.body.fixings?.length ?? 0,
+          fxFixings: req.body.fxFixings?.length ?? 0,
+          snapshotId,
+        },
       });
+      if (vols.swaption.length + vols.caplet.length + vols.fx.length > 0) {
+        ctx.audit.append({ actor: "api", action: "market.vols", subject: "market", details: { ...vols, snapshotId } });
+      }
       return {
         valuationDate: toISO(m.valuationDate),
         snapshotId,
         fxSpots: m.fxSpots,
         fixings: datesToIso(m.fixings),
+        fxFixings: datesToIso(m.fxFixings ?? []),
         fxSpotDates: Object.fromEntries(Object.entries(m.fxSpotDates ?? {}).map(([k, v]) => [k, toISO(v)])),
         missingFixingPolicy: m.missingFixingPolicy ?? "curve",
+        swaptionVols: Object.keys(m.swaptionVols ?? {}),
+        capletVols: Object.keys(m.capletVols ?? {}),
+        fxVols: Object.keys(m.fxVols ?? {}),
       };
     },
   );

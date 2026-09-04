@@ -292,7 +292,87 @@
     "closedFormPillars": ["1W", "1M", "3M", "6M", "9M", "1Y"]
   },
   "quantlib": {
-    "status": "pending",
-    "note": "QuantLib not installed when the file was generated; run tools/quantlib-golden.py with the QuantLib Python bindings to fill in the cross-check."
+    "status": "done",
+    "version": "1.43",
+    "engine": "PiecewiseLogLinearDiscount / OISRateHelper (paymentLag 1, Annual, ModifiedFollowing, TARGET)",
+    "stubConvention": "no spot node; DF(spot) log-linear between t=0 and the 1W pillar",
+    "pillars": [
+      {
+        "date": "2026-09-03",
+        "df": 1.0
+      },
+      {
+        "date": "2026-09-15",
+        "df": 0.9993303552072814
+      },
+      {
+        "date": "2026-10-08",
+        "df": 0.9980405626315382
+      },
+      {
+        "date": "2026-12-08",
+        "df": 0.9946166479358471
+      },
+      {
+        "date": "2027-03-09",
+        "df": 0.9894649784188417
+      },
+      {
+        "date": "2027-06-08",
+        "df": 0.9842683315671906
+      },
+      {
+        "date": "2027-09-08",
+        "df": 0.9788751447306233
+      },
+      {
+        "date": "2028-03-08",
+        "df": 0.9678616588630661
+      },
+      {
+        "date": "2028-09-08",
+        "df": 0.9562916293510064
+      },
+      {
+        "date": "2029-09-10",
+        "df": 0.932354756598967
+      },
+      {
+        "date": "2030-09-10",
+        "df": 0.9080285653377851
+      },
+      {
+        "date": "2031-09-09",
+        "df": 0.8833683525719044
+      },
+      {
+        "date": "2033-09-08",
+        "df": 0.8334436549113438
+      },
+      {
+        "date": "2036-09-09",
+        "df": 0.7594678298906773
+      },
+      {
+        "date": "2038-09-08",
+        "df": 0.7123811984013181
+      },
+      {
+        "date": "2041-09-10",
+        "df": 0.646881215702217
+      },
+      {
+        "date": "2046-09-10",
+        "df": 0.5592815685901404
+      },
+      {
+        "date": "2051-09-08",
+        "df": 0.49449577462342564
+      },
+      {
+        "date": "2056-09-08",
+        "df": 0.4445802486595664
+      }
+    ]
   }
 }

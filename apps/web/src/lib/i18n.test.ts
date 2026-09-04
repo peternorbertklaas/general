@@ -72,6 +72,12 @@ describe("i18n core message mapping (F-25)", () => {
     expect(translatePricingError(new PricingError("NON_FINITE_PV", "PV not finite"))).toBe("Barwert nicht berechenbar");
     expect(translatePricingError(new Error("FRA already settled"))).toBe("FRA bereits abgerechnet");
     expect(translatePricingError("plain")).toBe("plain");
+    // core round 4: typed date / tenor parse errors
+    expect(translatePricingError(new PricingError("INVALID_DATE", "Invalid ISO date: 2026-13-45"))).toBe("Ungültiges Datum: Ungültiges Datum: 2026-13-45");
+    expect(translatePricingError(new PricingError("INVALID_DATE", "Invalid date: foo"))).toBe("Ungültiges Datum: Ungültiges Datum: foo");
+    expect(translatePricingError(new PricingError("INVALID_TENOR", "Invalid tenor: 7X"))).toBe("Ungültiger Tenor: Ungültiger Tenor: 7X");
+    expect(PRICING_ERROR_CODES_DE.INVALID_DATE).toBe("Ungültiges Datum");
+    expect(PRICING_ERROR_CODES_DE.INVALID_TENOR).toBe("Ungültiger Tenor");
   });
   it("maps badges and select options", () => {
     expect(t(LEG_TYPE_DE, "Fixed")).toBe("Fest");
