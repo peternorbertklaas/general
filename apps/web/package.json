@@ -1,6 +1,6 @@
 {
   "name": "@deriva/web",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "DERIVA Web-Frontend – keyboard-first Bewertungs-Workstation für Zins- und Währungsderivate",
   "type": "module",

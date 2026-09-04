@@ -269,10 +269,10 @@ describe("N5-03 strong ETags, RFC 9110 comparison", () => {
     expect(String(put.headers.etag)).toMatch(/^"2-[0-9a-f]{16}"$/);
     expect(put.headers.etag).not.toBe(etag);
     expect((await app2.inject({ method: "DELETE", url: "/api/trades/IRS-0001", headers: { "if-match": "*" } })).statusCode).toBe(204);
-    // Snapshot: strong ETag = snapshot id, weak comparison on If-None-Match.
+    // Snapshot: strong ETag = snapshot id (+ envelope hash since the export carries `quotes`, R9-1/R10-1), weak comparison on If-None-Match.
     const snap = await app2.inject({ method: "GET", url: "/api/market/snapshot" });
     const snapEtag = String(snap.headers.etag);
-    expect(snapEtag).toMatch(/^"[0-9a-f]{16}"$/);
+    expect(snapEtag).toMatch(/^"[0-9a-f]{16}(-[0-9a-f]{16})?"$/);
     expect((await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": `W/${snapEtag}` } })).statusCode).toBe(304);
     expect((await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": '"nope"' } })).statusCode).toBe(200);
     // Contract: the header descriptions name the comparison.

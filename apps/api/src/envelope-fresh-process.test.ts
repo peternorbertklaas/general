@@ -141,7 +141,7 @@ describe("N9-01 envelope with composite calendar ids imports into a fresh proces
     expect(snapshot.calendars.map((c) => c.id)).toEqual([CAL]);
     expect(snapshot.indices.map((ix) => ix.fixingCalendar)).toEqual([JOINT, JOINT]);
     expect(snapshot.conventions.map((c) => c.calendar)).toEqual([JOINT]);
-    expect(snapshot.quotes.map((q) => q.curveId)).toEqual(["CZK-CZEONIA-X9"]);
+    expect(snapshot.quotes.map((q) => q.curveId)).toContain("CZK-CZEONIA-X9"); // plus the sample specs since R10-1
     await app.close();
 
     // Importer: a brand-new node process (tsx loader) that has never seen CZ-X9.
@@ -166,7 +166,8 @@ describe("N9-01 envelope with composite calendar ids imports into a fresh proces
     expect(result.fresh).toEqual({ calendarKnown: false, builtIn: false, czk: false, indices: [] });
     // The import succeeded although CZ-X9 was only pending in the same envelope and referenced as `CZ-X9+TARGET`.
     expect(result.imported.status, JSON.stringify(result.imported.body)).toBe(200);
-    expect(result.imported.body).toMatchObject({ calendars: [CAL], indices: ["CZEONIA-X9", "PRIBOR-6M-X9"], conventions: ["CZK"], quotes: ["CZK-CZEONIA-X9"] });
+    expect(result.imported.body).toMatchObject({ calendars: [CAL], indices: ["CZEONIA-X9", "PRIBOR-6M-X9"], conventions: ["CZK"] });
+    expect(result.imported.body.quotes).toContain("CZK-CZEONIA-X9"); // plus the sample specs (R10-1)
     expect(result.market.source).toBe("import");
     expect(result.market.snapshotId).toBe(exporterId);
     expect(result.market.currencies).toContain("CZK");

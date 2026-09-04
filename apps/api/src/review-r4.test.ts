@@ -528,6 +528,9 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "validateSwapConventions",
     "rollMarket",
     "tradeCurveIds",
+    // R10: spec ↔ curve consistency of the par-risk specs (Markt R10-1; ADR-024 R10)
+    "checkParRiskSpecs",
+    "ParRiskSpecCheck",
     // Builders
     "makeVanillaSwap",
     "makeCapFloor",

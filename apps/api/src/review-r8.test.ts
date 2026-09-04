@@ -276,7 +276,8 @@ describe("N8-03 the snapshot export ETag covers the register envelope", () => {
     const before = await app2.inject({ method: "GET", url: "/api/market/snapshot" });
     const etag = String(before.headers.etag);
     const marketId = String(before.headers["x-market-snapshot-id"]);
-    expect(etag).toBe(`"${marketId}"`);
+    // Since R10-1 the sample export carries the sample specs as `quotes`, so the envelope hash is present from the start.
+    expect(etag).toMatch(new RegExp(`^"${marketId}-[0-9a-f]{16}"$`));
     expect((await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": etag } })).statusCode).toBe(304);
     expect((await app2.inject({ method: "POST", url: "/api/market/indices", payload: czeonia("CZEONIA-N803") })).statusCode).toBe(201);
     const after = await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": etag } });
@@ -461,7 +462,8 @@ describe("Markt R8-3 par risk for every curve with known quotes", () => {
     // Imported into a fresh instance without the `quotes` envelope (round-8 format – since R9-1 the export carries the
     // quotes and the import keeps par risk complete, see review-r9.test.ts) the curve has no quotes: reported, not zeroed silently.
     const snap = (await app2.inject({ method: "GET", url: "/api/market/snapshot" })).json() as Json;
-    expect((snap.quotes as unknown[]).map((q) => (q as { curveId: string }).curveId)).toEqual(["NOK-NOWA"]);
+    // Since R10-1 the block carries the sample specs as well; the runtime curve is in it.
+    expect((snap.quotes as unknown[]).map((q) => (q as { curveId: string }).curveId)).toContain("NOK-NOWA");
     delete snap.quotes;
     const app3 = await buildApp({ logger: false, seedPortfolio: false });
     expect((await app3.inject({ method: "PUT", url: "/api/market/snapshot", payload: snap })).statusCode).toBe(200);
@@ -669,8 +671,8 @@ describe("Markt R8-4 the workstation's CSV templates import through the API", ()
 });
 
 describe("Catalogue and toolchain (N6-03a / N4-03 rest, prefix lists)", () => {
-  it("WARNING_PREFIXES has twelve entries, all described in the contract and listed in README and Architektur", () => {
-    expect(WARNING_PREFIXES).toHaveLength(12);
+  it("WARNING_PREFIXES has thirteen entries (PAR_RISK_INCONSISTENT since R10), all described in the contract and listed in README and Architektur", () => {
+    expect(WARNING_PREFIXES).toHaveLength(13);
     const doc = app.swagger() as unknown as Doc;
     const description = (doc.components.schemas.ErrorResponse as { properties: { code: { description: string } } }).properties.code.description;
     for (const w of WARNING_PREFIXES) expect(description, w).toContain(`\`${w}:\``);

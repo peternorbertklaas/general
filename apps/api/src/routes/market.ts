@@ -75,6 +75,11 @@ const curveSummarySchema = {
     referenceDate: { type: "string" },
     nodes: arrayResponse("{ date, years, zero, df }[]"),
     forwards: arrayResponse("{ date, years, forward6M }[]"),
+    quotes: {
+      type: "boolean",
+      description:
+        "`GET /api/market/curves/:id` and `POST /api/market/curves`: `true` when the store knows the curve's bootstrap spec (par risk bumps it, the snapshot export carries it in `quotes[]`; R10-1)",
+    },
   },
   additionalProperties: true,
 } as const;
@@ -134,7 +139,9 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
               },
               meta: objectResponse("Snapshot metadata"),
               discountCurveId: objectResponse("Discount curve id per currency"),
-              curves: arrayResponse("{ id, currency, nodes }[]"),
+              curves: arrayResponse(
+                "{ id, currency, nodes, quotes }[] – `quotes: true` when the store knows the curve's bootstrap spec (par risk bumps it, the snapshot export carries it in `quotes[]`; R10-1): sample curves and curves loaded through `POST /api/market/curves` in sample mode, in import mode only the curves whose snapshot carried a `quotes` entry or that were loaded since",
+              ),
               fxSpots: objectResponse("Spot per pair"),
               swaptionVols: { type: "array", items: { type: "string" } },
               capletVols: { type: "array", items: { type: "string" } },
@@ -170,7 +177,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         source: ctx.market.source(),
         meta: m.meta,
         discountCurveId: m.discountCurveId,
-        curves: Object.values(m.curves).map((c) => ({ id: c.id, currency: c.currency, nodes: c.nodeDates.length })),
+        curves: Object.values(m.curves).map((c) => ({ id: c.id, currency: c.currency, nodes: c.nodeDates.length, quotes: ctx.market.hasQuotes(c.id) })),
         fxSpots: m.fxSpots,
         swaptionVols: Object.keys(m.swaptionVols ?? {}),
         capletVols: Object.keys(m.capletVols ?? {}),
@@ -200,7 +207,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       schema: {
         operationId: "getCurve",
         tags: ["market"],
-        summary: "Kurve mit Pillars, Zero-Rates und Forwards",
+        summary: "Kurve mit Pillars, Zero-Rates und Forwards (`quotes`: Bootstrap-Spec im Store bekannt)",
         params: curveIdParams,
         response: responsesWithoutBody({ 200: curveSummarySchema }, 400, 404),
       },
@@ -209,7 +216,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       const m = ctx.market.get();
       const c = m.curves[req.params.id];
       if (!c) return sendError(reply, req, 404, "NOT_FOUND", `Curve ${req.params.id} not found`);
-      return curveSummary(c, m.valuationDate);
+      return { ...curveSummary(c, m.valuationDate), quotes: ctx.market.hasQuotes(c.id) };
     },
   );
 
@@ -306,7 +313,8 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         summary: "Kurve bootstrappen und im Snapshot ersetzen (erste Kurve einer Währung wird deren Diskontkurve, `isDiscountCurve` steuert es explizit)",
         description:
           "Bootstraps the curve (`spec` = component `CurveBuildSpec`, as for `POST /api/market/bootstrap`; `spec.index` must be registered – `GET /api/market` lists `indices`, `POST /api/market/indices` registers more – else 422 `UNKNOWN_INDEX`) and stores it under `spec.id`. Discount-curve mapping (Markt R7-3, same rule as the workstation's \"+ Kurve\"): when the curve's currency has no `discountCurveId` yet – a newly registered currency such as NOK or CZK – the new curve becomes its discount curve, so swaps in that currency price without `NO_DISCOUNT_CURVE`; `isDiscountCurve: true` forces the mapping (also over an existing one), `false` suppresses it. The response reports `discountCurveSet`; `PUT /api/market { discountCurveId }` changes the mapping later. " +
-          "The store remembers the spec with its quotes (`parRiskTracked: true`): `POST /api/risk/par` bumps the curve's quotes (Markt R8-3), a valuation-date change (`PUT /api/market { valuationDate }`) re-bootstraps the curve for the new date instead of dropping it (N8-01, with the discount-curve rule above re-applied – N9-03) and `GET /api/market/snapshot` exports the spec in the envelope's `quotes` so a re-import keeps par risk complete (R9-1); a sample curve id replaces that curve's quote set.",
+          "The store remembers the spec with its quotes (`parRiskTracked: true`): `POST /api/risk/par` bumps the curve's quotes (Markt R8-3), a valuation-date change (`PUT /api/market { valuationDate }`) re-bootstraps the curve for the new date instead of dropping it (N8-01, with the discount-curve rule above re-applied – N9-03) and `GET /api/market/snapshot` exports the spec in the envelope's `quotes` so a re-import keeps par risk complete (R9-1); a sample curve id replaces that curve's quote set and the body becomes the curve's spec (exported like any other, R10-1). " +
+          "Dependent curves (R10-1 (d)): every curve whose spec the store knows and that is built on the replaced curve – dual-curve projection curves (`discountCurveId`), basis / CSA curves referencing it in their quotes – is re-bootstrapped on the new curve in dependency order and named in `rebuilt[]` (`POST /curves EUR-ESTR` rebuilds `EUR-EURIBOR-6M`, `EUR-EURIBOR-3M`, `EUR-ESTR-USDCSA`), so spec and curve stay consistent and par risk ≈ zero DV01; a dependant that no longer bootstraps answers 422 with the core's code and leaves the market unchanged. In import mode only curves with a `quotes` entry (or loaded since the import) are known dependants.",
         body: bootstrapBodySchema,
         response: responses(
           {
@@ -315,6 +323,12 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
               properties: {
                 ...curveSummarySchema.properties,
                 mergedQuotes: arrayResponse("Quotes dropped by pillarMergeToleranceDays"),
+                rebuilt: {
+                  type: "array",
+                  items: { type: "string" },
+                  description:
+                    "Ids of the curves re-bootstrapped on the new curve because their spec depends on it (dependency order; empty when nothing depends on it), R10-1",
+                },
                 discountCurveSet: { type: "boolean", description: "`true` when this call set `discountCurveId[currency]` to the new curve" },
                 discountCurveId: {
                   type: "string",
@@ -340,9 +354,12 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
       const ccy = res.curve.currency;
       const setDiscount = req.body.isDiscountCurve ?? m.discountCurveId[ccy] === undefined;
       const discountCurveId = setDiscount ? { ...m.discountCurveId, [ccy]: res.curve.id } : m.discountCurveId;
-      ctx.market.set({ ...m, curves: { ...m.curves, [res.curve.id]: res.curve }, discountCurveId });
-      // Sample curve: quote set replaced; any other id: runtime curve remembered for rebuilds and par risk (R8-3 / N8-01).
-      ctx.market.rememberCurve({ spec: req.body.spec, ...(req.body.isDiscountCurve !== undefined ? { isDiscountCurve: req.body.isDiscountCurve } : {}) });
+      const body: BootstrapBody = { spec: req.body.spec, ...(req.body.isDiscountCurve !== undefined ? { isDiscountCurve: req.body.isDiscountCurve } : {}) };
+      // R10-1 (d): curves built on the replaced one are re-bootstrapped before anything is stored (a failure leaves the market unchanged).
+      const { market, rebuilt } = ctx.market.withDependentsRebuilt({ ...m, curves: { ...m.curves, [res.curve.id]: res.curve }, discountCurveId }, body);
+      ctx.market.set(market);
+      // The body is the curve's spec from now on – sample or runtime id – for rebuilds, par risk and the export (R8-3 / N8-01 / R10-1).
+      ctx.market.rememberCurve(body);
       ctx.audit.append({
         actor: "api",
         action: "curve.replace",
@@ -352,15 +369,18 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
           merged: res.mergedQuotes?.length ?? 0,
           parRiskTracked: true,
           discountCurveSet: setDiscount,
+          rebuilt,
           snapshotId: ctx.market.snapshotId(),
         },
       });
       return {
         ...curveSummary(res.curve, valuationDate),
         mergedQuotes: datesToIso(res.mergedQuotes ?? []),
+        rebuilt,
         discountCurveSet: setDiscount,
         ...(discountCurveId[ccy] ? { discountCurveId: discountCurveId[ccy] } : {}),
         parRiskTracked: true,
+        quotes: true,
       };
     },
   );
@@ -543,7 +563,7 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
           "Vol surfaces are validated structurally before the market is touched (Markt R5-1): grid rows = expiries, row length = tenors / strikes, FX vectors = expiries, axes strictly increasing, finite non-negative quotes, key = `currency` / `currency-index` / `pair`. A malformed surface answers 400 `VOL_SURFACE_INVALID` with `problems[]` and leaves the market unchanged – it can no longer be stored and fail every later swaption valuation. " +
           "Structurally sound but implausible surfaces (numbers that do not fit the declared `volType` – a Lognormal cube of normal-sized numbers, a Normal surface of lognormal-sized ones – or degenerate all-zero / constant grids, Markt R6-4) are stored and answered 200 with `warnings[]` (`VOL_IMPLAUSIBLE:` per surface); every valuation reading such a surface repeats the warning. " +
           "`discountCurveId` / `collateralDiscountCurveId` (Markt R7-3) merge into the snapshot's mappings after the curves are checked: a curve id that is not in the market answers 422 `CURVE_NOT_FOUND`, a curve in another currency than its key – the currency for `discountCurveId`, the first currency of `ccy|csa` for `collateralDiscountCurveId` (N8-02) – 400 `INVALID_REQUEST`; nothing is applied on a failed check. " +
-          '`valuationDate` (N8-01): in sample mode the sample market is rebuilt for the new date and the user state carried over – curves loaded through `POST /api/market/curves` are re-bootstrapped from their remembered quotes (in load order, so dependent curves find their references), `discountCurveId` / `collateralDiscountCurveId` mappings and vol surfaces set through this route are re-applied, FX fixings, spots, spot dates, credit data and the fixing policy survive, the sample fixings follow the date (`sampleFixings(valuationDate)` up to the day before, as in the workstation – Markt R7-4) while loaded fixings are kept and win per index and date. Runtime curves re-bootstrapped by the rebuild get the discount-curve rule of `POST /api/market/curves` again (N9-03): their remembered `isDiscountCurve`, or – unset – "first curve of a currency without a discount curve", so a book whose imported discount curve is discarded keeps a discount curve when a runtime curve of that currency exists (the `MARKET_STATE_DROPPED:` entry of the lost mapping names the replacement). In import mode (`GET /api/market` `source: "import"`) the imported market is rolled to the new date (`rollMarket`: constant zero curves; spots, fixings, FX fixings, vol surfaces, discount / collateral mappings, credit and the remembered `quotes` stay as imported) unless `discardImport: true` asks for the sample market; the roll drops `meta.snapshotTime` – it timestamped the imported state and would have dated EMIR field 23 before the new valuation date – and marks `meta.label` `(rolled to <date>)` (N9-02), so `GET /api/emir/valuations` reports 17:00 UTC of the new date unless `timestamp`/`asOf` say otherwise. Whatever a rebuild cannot carry over – a runtime curve that no longer bootstraps, a mapping whose curve is gone, a discarded import – is named in `warnings[]` with the prefix `MARKET_STATE_DROPPED:`; a plain date change of a sample market with runtime curves and mappings answers `warnings: []`.',
+          '`valuationDate` (N8-01): in sample mode the sample market is rebuilt for the new date and the user state carried over – curves loaded through `POST /api/market/curves` are re-bootstrapped from their remembered quotes (in load order, so dependent curves find their references), `discountCurveId` / `collateralDiscountCurveId` mappings and vol surfaces set through this route are re-applied, FX fixings, spots, spot dates, credit data and the fixing policy survive, the sample fixings follow the date (`sampleFixings(valuationDate)` up to the day before, as in the workstation – Markt R7-4) while loaded fixings are kept and win per index and date. Runtime curves re-bootstrapped by the rebuild get the discount-curve rule of `POST /api/market/curves` again (N9-03): their remembered `isDiscountCurve`, or – unset – "first curve of a currency without a discount curve", so a book whose imported discount curve is discarded keeps a discount curve when a runtime curve of that currency exists (the `MARKET_STATE_DROPPED:` entry of the lost mapping names the replacement). In import mode (`GET /api/market` `source: "import"`) the imported market is rolled to the new date (`rollMarket`: constant zero curves; spots, fixings, FX fixings, vol surfaces, discount / collateral mappings and credit stay as imported) – except that every curve with a remembered spec (the snapshot\'s `quotes`, `POST /api/market/curves` since the import) is re-bootstrapped from its quotes at the new date, in dependency order, so spec and curve stay consistent for par risk (R10-1; a spec that no longer bootstraps is dropped with `MARKET_STATE_DROPPED:` and its curve stays rolled) – unless `discardImport: true` asks for the sample market, which is rebuilt from the store\'s own sample quotes: `quotes` entries of the import for sample curve ids are dropped (`MARKET_STATE_DROPPED:` when they differ from the sample spec, silently when identical – N10-02), curves loaded through `POST /api/market/curves` are re-bootstrapped together with every sample curve built on them; the roll drops `meta.snapshotTime` – it timestamped the imported state and would have dated EMIR field 23 before the new valuation date – and marks `meta.label` `(rolled to <date>)` (N9-02), so `GET /api/emir/valuations` reports 17:00 UTC of the new date unless `timestamp`/`asOf` say otherwise. Whatever a rebuild cannot carry over – a runtime curve that no longer bootstraps, a mapping whose curve is gone, a discarded import – is named in `warnings[]` with the prefix `MARKET_STATE_DROPPED:`; a plain date change of a sample market with runtime curves and mappings answers `warnings: []`.',
         body: marketPutSchema,
         response: responses(
           {

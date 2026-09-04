@@ -131,8 +131,9 @@ describe("N-04 market snapshot schema and ETag", () => {
     const get = await app.inject({ method: "GET", url: "/api/market/snapshot" });
     expect(get.statusCode).toBe(200);
     const etag = String(get.headers.etag);
-    expect(etag).toMatch(/^"[0-9a-f]{16}"$/);
-    expect(get.headers["x-market-snapshot-id"]).toBe(etag.slice(1, -1));
+    // Since R10-1 the sample export always carries the `quotes` envelope (sample specs), so the ETag is `"<snapshotId>-<hash>"`.
+    expect(etag).toMatch(/^"[0-9a-f]{16}-[0-9a-f]{16}"$/);
+    expect(get.headers["x-market-snapshot-id"]).toBe(etag.slice(1, 17));
     const notModified = await app.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": etag } });
     expect(notModified.statusCode).toBe(304);
     const snap = get.json();
@@ -151,7 +152,7 @@ describe("N-04 market snapshot schema and ETag", () => {
     const app2 = await buildApp({ logger: false, seedPortfolio: false });
     const ok = await app2.inject({ method: "PUT", url: "/api/market/snapshot", payload: snap });
     expect(ok.statusCode).toBe(200);
-    expect(ok.json().snapshotId).toBe(etag.slice(1, -1));
+    expect(ok.json().snapshotId).toBe(etag.slice(1, 17));
     await app2.close();
   });
 });
@@ -1285,19 +1286,20 @@ describe("R-05 core surface round 5 (error codes, vol conversion, hazard floor, 
     expect(rep.statusCode).toBe(200);
     const id = rep.json().audit.snapshotId as string;
     expect(id).toMatch(/^[0-9a-f]{16}$/);
-    expect(etag).toBe(`"${id}"`);
+    // The ETag starts with the market id and adds the envelope hash (the sample specs are exported as `quotes` since R10-1).
+    expect(etag).toMatch(new RegExp(`^"${id}-[0-9a-f]{16}"$`));
     expect(rep.headers["x-market-snapshot-id"]).toBe(id);
     const portfolio = await app2.inject({ method: "POST", url: "/api/report/portfolio", payload: { trades: [t] } });
     expect(portfolio.json().audit.snapshotId).toBe(id);
     expect(portfolio.headers["x-market-snapshot-id"]).toBe(id);
-    expect((await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": `"${id}"` } })).statusCode).toBe(304);
+    expect((await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": etag } })).statusCode).toBe(304);
     // Full scope: an added fixing (not a curve node or spot) changes the id everywhere consistently.
     const put = await app2.inject({ method: "PUT", url: "/api/market", payload: { fixings: [{ index: "EURIBOR-6M", date: "2026-09-01", value: 0.0205 }] } });
     expect(put.statusCode, put.body).toBe(200);
     const id2 = String(put.headers["x-market-snapshot-id"]);
     expect(id2).not.toBe(id);
     expect(put.json().snapshotId).toBe(id2);
-    expect(await snapshotEtag()).toBe(`"${id2}"`);
+    expect(await snapshotEtag()).toMatch(new RegExp(`^"${id2}-[0-9a-f]{16}"$`));
     const rep2 = await report();
     expect(rep2.json().audit.snapshotId).toBe(id2);
     expect(rep2.headers["x-market-snapshot-id"]).toBe(id2);

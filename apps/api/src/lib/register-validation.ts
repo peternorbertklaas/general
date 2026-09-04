@@ -116,12 +116,18 @@ export function envelopeProblems(env: EnvelopeInput): EnvelopeProblem[] {
 /**
  * `problems[]` of the snapshot envelope's `quotes` (Markt R9-1): every entry must name a curve of the snapshot,
  * `spec.id`/`spec.currency` must agree with it, `spec.index` must be a registered index or one of the envelope's
- * `indices`, and no curve may carry two specs. The quotes themselves are taken as given – a spec that does not
- * bootstrap surfaces at `POST /api/risk/par` (422) or as `MARKET_STATE_DROPPED:` on the next sample rebuild.
+ * `indices` and – R10-1 (5) – denominated in the curve's currency, and no curve may carry two specs. The quotes
+ * themselves are taken as given – a spec that does not bootstrap or does not reproduce the curve surfaces at
+ * `POST /api/risk/par` (`PAR_RISK_INCONSISTENT:`) or as `MARKET_STATE_DROPPED:` on the next rebuild.
  */
-export function quotesProblems(m: Pick<MarketContext, "curves">, quotes: RuntimeCurveQuotes[], pendingIndices: Pick<RateIndex, "name">[] = []): string[] {
+export function quotesProblems(
+  m: Pick<MarketContext, "curves">,
+  quotes: RuntimeCurveQuotes[],
+  pendingIndices: (Pick<RateIndex, "name"> & Partial<Pick<RateIndex, "currency">>)[] = [],
+): string[] {
   const problems: string[] = [];
-  const known = new Set([...knownIndices().map((ix) => ix.name), ...pendingIndices.map((ix) => ix.name.toUpperCase())]);
+  const known = new Map<string, string | undefined>(knownIndices().map((ix) => [ix.name, ix.currency]));
+  for (const ix of pendingIndices) known.set(ix.name.toUpperCase(), ix.currency?.toUpperCase());
   const seen = new Set<string>();
   for (const { curveId, spec } of quotes) {
     const curve = m.curves[curveId];
@@ -129,8 +135,14 @@ export function quotesProblems(m: Pick<MarketContext, "curves">, quotes: Runtime
     else if (spec.currency.toUpperCase() !== curve.currency)
       problems.push(`quotes: curve ${curveId} is denominated in ${curve.currency}, its spec in ${spec.currency}`);
     if (spec.id !== curveId) problems.push(`quotes: curve ${curveId}: spec.id ${spec.id} does not match curveId`);
-    if (!known.has(spec.index.toUpperCase())) {
+    const index = spec.index.toUpperCase();
+    if (!known.has(index)) {
       problems.push(`quotes: curve ${curveId}: index ${spec.index} is not registered (add it to the envelope's indices or POST /api/market/indices first)`);
+    } else {
+      const indexCurrency = known.get(index);
+      if (curve && indexCurrency !== undefined && indexCurrency !== curve.currency) {
+        problems.push(`quotes: curve ${curveId}: index ${index} is denominated in ${indexCurrency}, the curve in ${curve.currency}`);
+      }
     }
     if (seen.has(curveId)) problems.push(`quotes: curve ${curveId} has more than one spec`);
     seen.add(curveId);

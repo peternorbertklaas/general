@@ -4,20 +4,24 @@ import {
   type CustomCalendarJson,
   type Fixing,
   type MarketContext,
+  type ParRiskSpecCheck,
   type ParRiskSpecs,
   type RateIndex,
   type SampleMarketQuotes,
   type SwapConventions,
   type Trade,
+  PricingError,
   SAMPLE_CURVE_IDS,
   SAMPLE_QUOTES,
   advance,
   bootstrapCurve,
   buildSampleMarket,
+  checkParRiskSpecs,
   customCalendarFromJson,
   getCalendar,
   hashString,
   isBuiltInCalendar,
+  isPricingError,
   knownCurrencies,
   knownIndices,
   makeCapFloor,
@@ -38,7 +42,18 @@ import {
 } from "@deriva/pricing-core";
 
 export type { CustomCalendarJson };
-import { type BootstrapBody, type RuntimeCurveQuotes, resolveBootstrap, toCurveBuildSpec } from "./curve-specs.js";
+import {
+  type BootstrapBody,
+  type RuntimeCurveQuotes,
+  affectedBodies,
+  fromCurveBuildSpec,
+  orderBodies,
+  resolveBootstrap,
+  toCurveBuildSpec,
+} from "./curve-specs.js";
+
+/** Tolerance of the spec ↔ curve check (R10-1 (c)): |Δdf| at the pillars; a re-bootstrap of the same quotes is exact to ≈ 1e-15. */
+export const PAR_RISK_DF_TOLERANCE = 1e-8;
 
 /** Vol surfaces set through `PUT /api/market` (per key) – re-applied after a sample-market rebuild (N8-01). */
 export type VolOverrides = Pick<MarketContext, "swaptionVols" | "capletVols" | "fxVols">;
@@ -59,6 +74,25 @@ export interface RebuildResult {
 
 /** Prefix of the `warnings[]` entries naming state a valuation-date change had to drop (Architektur N8-01). */
 export const MARKET_STATE_DROPPED_PREFIX = "MARKET_STATE_DROPPED";
+
+/** Where a remembered spec came from: `POST /api/market/curves` or the `quotes` envelope of an imported snapshot. */
+export type RuntimeCurveOrigin = "curves" | "import";
+
+/** Result of `withDependentsRebuilt`: the market with every dependant re-bootstrapped and their ids (dependency order). */
+export interface DependentsRebuild {
+  market: MarketContext;
+  rebuilt: string[];
+}
+
+/** The store's par-risk specs after the consistency check (`parRiskCheck`). */
+export interface ParRiskSpecsChecked {
+  /** Specs that reproduce their curve – the only ones `parRisk` may bump. */
+  specs: ParRiskSpecs;
+  /** Every spec the store knows (for `curvesWithoutQuotes`: a curve without any spec). */
+  all: ParRiskSpecs;
+  /** Specs excluded because they do not reproduce the market's curve (`PAR_RISK_INCONSISTENT:`). */
+  inconsistent: ParRiskSpecCheck["inconsistent"];
+}
 
 /**
  * In-memory repositories behind small interfaces. The API is stateless by
@@ -82,24 +116,44 @@ export interface MarketRepository {
    * carried over is named in `warnings` (`MARKET_STATE_DROPPED:`).
    */
   rebuild(valuationDate: number, opts?: RebuildOptions): RebuildResult;
-  /** Current market quotes per sample curve (basis for par-risk re-bootstrapping and rebuilds). */
+  /** Current market quotes per sample curve (basis of the sample-market rebuild). */
   getQuotes(): SampleMarketQuotes;
   /**
-   * Remember the bootstrap body of a curve stored via `POST /api/market/curves`: a sample curve id updates its quote
-   * set, any other id is kept as a runtime curve (re-bootstrapped on rebuild, bumped by par risk). Always tracked.
+   * Remember the bootstrap body of a curve stored via `POST /api/market/curves` (always tracked): the body is kept as
+   * the curve's spec – for a sample curve id it overrides the sample spec (and updates the sample quote set), any
+   * other id becomes a runtime curve. Re-bootstrapped on rebuild, bumped by par risk, exported in `quotes`.
    */
   rememberCurve(body: BootstrapBody): void;
   /**
    * Remember the bootstrap spec of a curve the imported snapshot carries in its `quotes` envelope (Markt R9-1): the
-   * curve stays the snapshot's, the spec serves par risk (`parRiskSpecs`) and a later sample rebuild.
+   * curve stays the snapshot's, the spec serves par risk (`parRiskSpecs`) and a later rebuild. An entry for a sample
+   * curve id is kept for the import mode only – `discardImport` drops it (N10-02).
    */
   rememberQuotes(entry: RuntimeCurveQuotes): void;
-  /** Runtime curves with remembered quotes in load order – the snapshot envelope's `quotes` (R9-1). */
+  /**
+   * Every curve with a known spec – the snapshot envelope's `quotes` (R9-1, since R10-1 including the sample curves):
+   * sample mode → the sample specs at the store's current quotes (a `POST /api/market/curves` body of the same id
+   * overrides its sample spec) followed by the runtime curves in load order; import mode → the imported snapshot's
+   * `quotes` plus curves loaded since, in load order. Never the default sample specs for an imported market.
+   */
   listQuotes(): RuntimeCurveQuotes[];
+  /** `true` when the store knows a bootstrap spec for the curve (`GET /api/market` `curves[].quotes`, R10). */
+  hasQuotes(curveId: string): boolean;
   /** Remember vol surfaces set per key through `PUT /api/market` so a sample-market rebuild re-applies them. */
   rememberVols(vols: VolOverrides): void;
-  /** Bootstrap specs of every curve with known quotes (sample curves + runtime curves) for `parRisk`. */
+  /** Bootstrap specs of every curve with known quotes (same set as `listQuotes`) in the core's `ParRiskSpecs` shape. */
   parRiskSpecs(): ParRiskSpecs;
+  /**
+   * `parRiskSpecs()` after the consistency check (R10-1 (c), `checkParRiskSpecs`): only specs whose re-bootstrap
+   * reproduces the market's curve may be bumped; the others are reported. Cached per market state.
+   */
+  parRiskCheck(): ParRiskSpecsChecked;
+  /**
+   * `m` with every known curve built on `body.spec.id` re-bootstrapped on the new curve, in dependency order (R10-1
+   * (d): `POST /api/market/curves EUR-ESTR` rebuilds EUR-EURIBOR-6M/-3M and the CSA curve). Throws `PricingError`
+   * when a dependant no longer bootstraps – the caller leaves the market unchanged.
+   */
+  withDependentsRebuilt(m: MarketContext, body: BootstrapBody): DependentsRebuild;
   /** Deterministic id of the active market (same hash as `ValuationReport.audit.snapshotId`). */
   snapshotId(): string;
 }
@@ -128,14 +182,18 @@ export class MarketStore implements MarketRepository {
   private quotes: SampleMarketQuotes;
   private origin: MarketSource = "sample";
   /**
-   * Curves stored via `POST /api/market/curves` that are not sample curves, in insertion order (a later curve may
-   * reference an earlier one). The body – not the curve – is remembered: a rebuild re-bootstraps from the quotes.
+   * Specs remembered next to the market's curves, in insertion order (a later curve may reference an earlier one):
+   * bodies of `POST /api/market/curves` (origin `curves`, sample curve ids included since R10-1 – the body overrides
+   * the sample spec) and the `quotes` entries of an imported snapshot (origin `import`). The body – not the curve –
+   * is remembered: a rebuild re-bootstraps from the quotes.
    */
-  private runtimeCurves = new Map<string, BootstrapBody>();
+  private runtimeCurves = new Map<string, BootstrapBody & { origin: RuntimeCurveOrigin }>();
   /** Vol surfaces set per key through `PUT /api/market` (sample mode: re-applied after a rebuild). */
   private volOverrides: VolOverrides = {};
   /** Snapshot ids per (immutable) market context object. */
   private ids = new WeakMap<MarketContext, string>();
+  /** `parRiskCheck()` of the current market (invalidated by a new market object or a remembered spec). */
+  private checked?: { ctx: MarketContext; result: ParRiskSpecsChecked };
   constructor(valuationDate = parseISO("2026-09-03"), quotes: SampleMarketQuotes = SAMPLE_QUOTES) {
     this.quotes = quotes;
     this.ctx = buildSampleMarket(valuationDate, quotes);
@@ -152,6 +210,7 @@ export class MarketStore implements MarketRepository {
     this.origin = "import";
     this.runtimeCurves.clear();
     this.volOverrides = {};
+    this.checked = undefined;
   }
   source(): MarketSource {
     return this.origin;
@@ -168,22 +227,77 @@ export class MarketStore implements MarketRepository {
     return this.quotes;
   }
   rememberCurve(body: BootstrapBody): void {
+    // A sample curve id also updates the sample quote set (the sample rebuild starts from it); the body itself is the
+    // curve's spec from now on – interpolation, day count or turn-of-year of the request must not get lost (R10-1).
     const key = QUOTE_KEY_BY_CURVE[body.spec.id];
-    if (key) {
-      this.quotes = { ...this.quotes, [key]: body.spec.quotes };
-      return;
-    }
+    if (key) this.quotes = { ...this.quotes, [key]: body.spec.quotes };
     // Re-insert so the order stays "latest definition last" (dependencies were stored before their dependants).
     this.runtimeCurves.delete(body.spec.id);
-    this.runtimeCurves.set(body.spec.id, { spec: body.spec, ...(body.isDiscountCurve !== undefined ? { isDiscountCurve: body.isDiscountCurve } : {}) });
+    this.runtimeCurves.set(body.spec.id, {
+      spec: body.spec,
+      ...(body.isDiscountCurve !== undefined ? { isDiscountCurve: body.isDiscountCurve } : {}),
+      origin: "curves",
+    });
+    this.checked = undefined;
   }
   rememberQuotes(entry: RuntimeCurveQuotes): void {
     // Same slot as a curve loaded through `POST /api/market/curves`; the id is the curve's (validated by `quotesProblems`).
     this.runtimeCurves.delete(entry.curveId);
-    this.runtimeCurves.set(entry.curveId, { spec: { ...entry.spec, id: entry.curveId } });
+    this.runtimeCurves.set(entry.curveId, { spec: { ...entry.spec, id: entry.curveId }, origin: "import" });
+    this.checked = undefined;
+  }
+  /**
+   * Every spec the store knows, keyed by curve id: in sample mode the sample specs of the curves in the market (at the
+   * store's quotes; a remembered body of the same id replaces the sample spec in place), then the runtime curves in
+   * load order; in import mode the remembered specs only (R10-1 (b)).
+   */
+  private specBodies(): Map<string, BootstrapBody> {
+    const out = new Map<string, BootstrapBody>();
+    if (this.origin === "sample") {
+      for (const [id, spec] of Object.entries(sampleBootstrapSpecs(this.ctx.valuationDate, this.quotes))) {
+        if (this.ctx.curves[id]) out.set(id, { spec: fromCurveBuildSpec(spec) });
+      }
+    }
+    for (const [id, { origin: _origin, ...body }] of this.runtimeCurves) out.set(id, body);
+    return out;
   }
   listQuotes(): RuntimeCurveQuotes[] {
-    return [...this.runtimeCurves].map(([curveId, body]) => ({ curveId, spec: body.spec }));
+    return [...this.specBodies()].map(([curveId, body]) => ({ curveId, spec: { ...body.spec, id: curveId } }));
+  }
+  hasQuotes(curveId: string): boolean {
+    return this.specBodies().has(curveId);
+  }
+  parRiskCheck(): ParRiskSpecsChecked {
+    if (this.checked?.ctx !== this.ctx) {
+      const all = this.parRiskSpecs();
+      // Core `checkParRiskSpecs` (R10): every spec re-bootstrapped against the market's own curves and compared at the pillars.
+      const check = checkParRiskSpecs(this.ctx, all, { tolerance: PAR_RISK_DF_TOLERANCE });
+      const specs: ParRiskSpecs = {};
+      for (const id of check.consistent) specs[id] = all[id]!;
+      this.checked = { ctx: this.ctx, result: { specs, all, inconsistent: check.inconsistent } };
+    }
+    return this.checked.result;
+  }
+  withDependentsRebuilt(m: MarketContext, body: BootstrapBody): DependentsRebuild {
+    const bodies = this.specBodies();
+    bodies.set(body.spec.id, body);
+    let market = m;
+    const rebuilt: string[] = [];
+    for (const dep of affectedBodies([body.spec.id], bodies)) {
+      try {
+        const { spec } = resolveBootstrap(market, dep);
+        const curve: Curve = bootstrapCurve(market.valuationDate, spec).curve;
+        market = { ...market, curves: { ...market.curves, [curve.id]: curve } };
+        rebuilt.push(curve.id);
+      } catch (e) {
+        throw new PricingError(
+          isPricingError(e) ? e.code : "INVALID_CURVE_SPEC",
+          `curve ${dep.spec.id} is built on ${body.spec.id} and could not be re-bootstrapped on the new curve: ${(e as Error).message} – market unchanged`,
+          { curveId: dep.spec.id, dependsOn: body.spec.id, rebuilt },
+        );
+      }
+    }
+    return { market, rebuilt };
   }
   rememberVols(vols: VolOverrides): void {
     this.volOverrides = {
@@ -195,8 +309,8 @@ export class MarketStore implements MarketRepository {
     };
   }
   parRiskSpecs(): ParRiskSpecs {
-    const specs: ParRiskSpecs = { ...sampleBootstrapSpecs(this.ctx.valuationDate, this.quotes) };
-    for (const [id, body] of this.runtimeCurves) specs[id] = toCurveBuildSpec(body.spec);
+    const specs: ParRiskSpecs = {};
+    for (const [id, body] of this.specBodies()) specs[id] = toCurveBuildSpec({ ...body.spec, id });
     return specs;
   }
   rebuild(valuationDate: number, opts: RebuildOptions = {}): RebuildResult {
@@ -206,10 +320,28 @@ export class MarketStore implements MarketRepository {
       // Import mode: the snapshot is the market – roll its curves to the new date (constant zero curves, the core's
       // theta roll); spots, fixings, vols, mappings and credit stay as imported. Nothing is dropped – except the
       // snapshot's own timestamp (N9-02): `meta.snapshotTime` described the imported state, not the rolled one, and
-      // would put EMIR field 23 months before the valuation date; the label says what happened.
+      // would put EMIR field 23 months before the valuation date; the label says what happened. Curves with known
+      // quotes (the snapshot's `quotes`, `POST /api/market/curves` since the import) are re-bootstrapped from them at
+      // the new date instead – a spec must reproduce its curve for par risk (R10-1 (c)); a spec that no longer
+      // bootstraps is dropped and the curve stays rolled.
       const rolled = rollMarket(prev, valuationDate - prev.valuationDate);
-      this.ctx = { ...rolled, meta: rolledMeta(rolled.meta, valuationDate) };
-      return { market: this.ctx, warnings };
+      let m: MarketContext = { ...rolled, meta: rolledMeta(rolled.meta, valuationDate) };
+      for (const body of orderBodies([...this.runtimeCurves.values()])) {
+        try {
+          const { spec } = resolveBootstrap(m, body);
+          const curve: Curve = bootstrapCurve(valuationDate, spec).curve;
+          m = { ...m, curves: { ...m.curves, [curve.id]: curve } };
+        } catch (e) {
+          this.runtimeCurves.delete(body.spec.id);
+          warnings.push(
+            dropped(
+              `quotes of curve ${body.spec.id} could not be re-bootstrapped for ${toISO(valuationDate)} (${(e as Error).message}) – the curve was rolled instead and par risk reports it without quotes`,
+            ),
+          );
+        }
+      }
+      this.ctx = m;
+      return { market: m, warnings };
     }
     if (this.origin === "import") {
       warnings.push(
@@ -229,17 +361,47 @@ export class MarketStore implements MarketRepository {
       ...(prev.fxSpotDates ? { fxSpotDates: prev.fxSpotDates } : {}),
       ...(prev.missingFixingPolicy ? { missingFixingPolicy: prev.missingFixingPolicy } : {}),
     };
-    // Runtime curves (`POST /api/market/curves` or the `quotes` envelope, N8-01): re-bootstrap from the remembered quotes, in insertion order.
+    // N10-02: a `quotes` entry of the discarded import for a sample curve id described the imported curve – the sample
+    // market has its own quotes, so the entry is dropped (silently when it equals the sample spec, else named) instead
+    // of re-bootstrapping the imported curve over the sample curve. Bodies of `POST /api/market/curves` stay.
+    const sample = sampleBootstrapSpecs(valuationDate, this.quotes);
+    for (const [id, entry] of [...this.runtimeCurves]) {
+      if (entry.origin !== "import" || !sample[id]) continue;
+      this.runtimeCurves.delete(id);
+      if (stableStringify(toCurveBuildSpec(entry.spec)) !== stableStringify(sample[id])) {
+        warnings.push(
+          dropped(
+            `quotes of sample curve ${id} from the imported snapshot (the sample market rebuilt ${id} from its own quotes; load them with POST /api/market/curves to keep them)`,
+          ),
+        );
+      }
+    }
+    // Remembered specs (`POST /api/market/curves` bodies, `quotes` of runtime curves, N8-01): re-bootstrap from the
+    // remembered quotes in dependency order – together with every sample curve built on a replaced sample curve
+    // (EUR-EURIBOR-6M on a re-loaded EUR-ESTR, R10-1 (d)), so spec and curve agree after the rebuild.
+    const bodies = new Map<string, BootstrapBody>();
+    for (const [id, spec] of Object.entries(sample)) if (m.curves[id]) bodies.set(id, { spec: fromCurveBuildSpec(spec) });
+    for (const [id, { origin: _origin, ...body }] of this.runtimeCurves) bodies.set(id, body);
     const rebuilt: { curve: Curve; body: BootstrapBody }[] = [];
-    for (const [id, body] of [...this.runtimeCurves]) {
+    for (const body of affectedBodies(this.runtimeCurves.keys(), bodies, true)) {
+      const id = body.spec.id;
       try {
         const { spec } = resolveBootstrap(m, body);
         const curve: Curve = bootstrapCurve(valuationDate, spec).curve;
         m = { ...m, curves: { ...m.curves, [curve.id]: curve } };
-        rebuilt.push({ curve, body });
+        if (this.runtimeCurves.has(id)) rebuilt.push({ curve, body });
       } catch (e) {
-        this.runtimeCurves.delete(id);
-        warnings.push(dropped(`curve ${id} could not be re-bootstrapped for ${toISO(valuationDate)} (${(e as Error).message})`));
+        if (this.runtimeCurves.has(id)) {
+          this.runtimeCurves.delete(id);
+          warnings.push(dropped(`curve ${id} could not be re-bootstrapped for ${toISO(valuationDate)} (${(e as Error).message})`));
+        } else {
+          // A sample curve whose replaced input no longer supports it – kept as built from the sample quotes and named.
+          warnings.push(
+            dropped(
+              `sample curve ${id} could not be re-bootstrapped on its replaced input(s) (${(e as Error).message}) – kept as built from the sample quotes`,
+            ),
+          );
+        }
       }
     }
     // Discount / collateral mappings of the previous market survive where their curve still exists.
@@ -405,7 +567,10 @@ export class RegisterStore {
     const conventions = this.listConventions();
     const calendars = this.listCalendars();
     if (!indices.length && !conventions.length && !calendars.length && !quotes.length) return "";
-    return hashString(stableStringify({ indices, conventions, calendars, quotes })).slice(0, 16);
+    // Order-independent (Markt R10, "ohne Abzug"): the register lists are sorted already; the quotes are sorted by curve
+    // id here so that re-loading an identical spec (which moves the entry to the end of the load order) keeps the ETag.
+    const sorted = [...quotes].sort((a, b) => a.curveId.localeCompare(b.curveId));
+    return hashString(stableStringify({ indices, conventions, calendars, quotes: sorted })).slice(0, 16);
   }
 }
 

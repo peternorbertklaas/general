@@ -290,8 +290,11 @@ describe("Markt R9-1 snapshot envelope `quotes`", () => {
     const app2 = await buildApp({ logger: false, seedPortfolio: false });
     const plain = await snapshot(app2);
     const idBefore = String(plain.headers["x-market-snapshot-id"]);
-    expect(plain.headers.etag).toBe(`"${idBefore}"`);
-    expect(plain.json().quotes).toBeUndefined();
+    // Since R10-1 the sample specs are exported as `quotes` too, so the plain export already carries the envelope hash.
+    expect(plain.headers.etag).toMatch(new RegExp(`^"${idBefore}-[0-9a-f]{16}"$`));
+    const plainIds = (plain.json().quotes as RuntimeCurveQuotes[]).map((q) => q.curveId);
+    expect(plainIds).toContain("EUR-ESTR");
+    expect(plainIds).not.toContain("NOK-NOWA");
     const spec = oisSpec("NOK", "NOWA", 0.045);
     expect((await app2.inject({ method: "POST", url: "/api/market/curves", payload: { spec } })).statusCode).toBe(200);
     const exported = await snapshot(app2);
@@ -300,7 +303,8 @@ describe("Markt R9-1 snapshot envelope `quotes`", () => {
     // The curve changed the market id; the quotes block is API metadata and hashed into the ETag only.
     expect(exported.headers.etag).toMatch(new RegExp(`^"${exporterId}-[0-9a-f]{16}"$`));
     const snap = exported.json() as Json & { quotes: RuntimeCurveQuotes[]; curves: { id: string }[] };
-    expect(snap.quotes).toEqual([{ curveId: "NOK-NOWA", spec }]);
+    expect(snap.quotes).toContainEqual({ curveId: "NOK-NOWA", spec });
+    expect(snap.quotes.map((q) => q.curveId)).toEqual([...plainIds, "NOK-NOWA"]);
     expect(snap.curves.map((c) => c.id)).toContain("NOK-NOWA");
     expect(snap.indices).toBeUndefined();
     // A revalidation with the ETag → 304; the register hash alone (as if no quotes were known) → 200.
@@ -314,7 +318,7 @@ describe("Markt R9-1 snapshot envelope `quotes`", () => {
     const app3 = await buildApp({ logger: false, seedPortfolio: false });
     const imported = await app3.inject({ method: "PUT", url: "/api/market/snapshot", payload: snap });
     expect(imported.statusCode, imported.body).toBe(200);
-    expect(imported.json()).toMatchObject({ quotes: ["NOK-NOWA"], snapshotId: exporterId });
+    expect(imported.json()).toMatchObject({ quotes: [...plainIds, "NOK-NOWA"], snapshotId: exporterId });
     expect((await market(app3)).snapshotId).toBe(exporterId);
     const trade = oisSwap("IRS-NOK-R91", "NOK", "NOWA");
     const par = await app3.inject({ method: "POST", url: "/api/risk/par", payload: { trade, reportingCurrency: "NOK" } });
@@ -486,14 +490,18 @@ describe("N9-04 / round-9 documentation and contract texts", () => {
     const changelog = read("CHANGELOG.md");
     expect(changelog).toContain(pending);
     expect(changelog).not.toContain("die Tags werden am Ende dieser Qualitätsrunde gesetzt");
+    // N10-04: no "will be set" / "follows" sentence about a tag that is already set – in the CHANGELOG or the compliance mapping.
+    const stale = /(wird|werden) am Ende dieser Qualitätsrunde[^.\n]*gesetzt|folgt am Ende dieser Qualitätsrunde/;
+    expect(changelog).not.toMatch(stale);
+    expect(read("docs", "compliance", "01-regulatorik-mapping.md")).not.toMatch(stale);
     // Quant reviewer: the smile bound is 50 absolute vol points, not 50 % of the ATM.
     expect(changelog).not.toContain("|RR|/|BF| > 50 % des ATM");
     expect(changelog).toContain("50 Vol-Punkte");
-    // Round 9 release section with its compare link; version files agree.
+    // Round 9 release section with its compare link; version files agree with the newest CHANGELOG section (0.3.1 since R10).
     expect(changelog).toContain("## [0.3.0] – 2026-09-04");
     expect(changelog).toContain("[0.3.0]: https://github.com/peternorbertklaas/general/compare/v0.2.0...v0.3.0");
     const version = (JSON.parse(read("package.json")) as { version: string }).version;
-    expect(version).toBe("0.3.0");
+    expect(version).toBe(/^## \[(\d+\.\d+\.\d+)\]/m.exec(changelog)![1]);
     for (const file of [join("apps", "api", "package.json"), join("apps", "web", "package.json"), join("packages", "pricing-core", "package.json")]) {
       expect((JSON.parse(read(file)) as { version: string }).version, file).toBe(version);
     }
