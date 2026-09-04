@@ -29,8 +29,15 @@ export interface TradeBase {
   quoteValidUntil?: SerialDate;
   /** Unique Transaction Identifier (EMIR Refit / UTI, ISO 23897) – reported in the EMIR valuation export. */
   uti?: string;
-  /** Centrally cleared (EMIR Art. 4 / 4a clearing obligation). Undefined = bilateral / unknown. */
+  /** Centrally cleared (ITS 2022/1860 Table 2 field 31). Undefined = bilateral / unknown. */
   cleared?: boolean;
+  /**
+   * Subject to the EMIR Art. 4 clearing obligation (ITS 2022/1860 Table 2
+   * field 30). Independent of `cleared`: a voluntarily cleared trade may be
+   * "N", a mandatory trade that is not (yet) cleared "Y". Undefined = not
+   * determined → reported as "N/A" (N3-09).
+   */
+  clearingObligation?: boolean;
   /** Clearing member (when `cleared`), informational. */
   clearingMember?: string;
 }

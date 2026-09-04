@@ -2,7 +2,17 @@ import { describe, expect, it } from "vitest";
 import { type Trade, parseISO, toISO } from "@deriva/pricing-core";
 import { newTradeTemplate } from "./templates.js";
 import { samplePortfolio } from "../state/sample-portfolio.js";
-import { CSV_IMPORT_TEMPLATES, csvTemplateText, datesToIso, portfolioCsv, splitCsvLine, tradesFromCsv, tradesFromJson, tradesToJson } from "./portfolio-io.js";
+import {
+  CSV_IMPORT_TEMPLATES,
+  csvErrorsText,
+  csvTemplateText,
+  datesToIso,
+  portfolioCsv,
+  splitCsvLine,
+  tradesFromCsv,
+  tradesFromJson,
+  tradesToJson,
+} from "./portfolio-io.js";
 
 const VAL = parseISO("2026-09-03");
 
@@ -79,6 +89,44 @@ describe("CSV trade import with column mapping (Markt N16)", () => {
     }
     const cap = tradesFromCsv(csvTemplateText("CAP"), { valuationDate: VAL }).trades[0]!;
     if (cap.type === "CapFloor") expect(cap.strike).toBeCloseTo(0.03, 10);
+    // round-3 templates: Swaption, FX-Option, CCS, FRA (Markt N16)
+    const swpt = tradesFromCsv(csvTemplateText("SWPT"), { valuationDate: VAL }).trades[0]!;
+    expect(swpt.type).toBe("Swaption");
+    if (swpt.type === "Swaption") {
+      expect(swpt.payerReceiver).toBe("Payer");
+      expect(swpt.underlying.legs[0]!.notional).toBe(10_000_000);
+    }
+    const fxo = tradesFromCsv(csvTemplateText("FXO"), { valuationDate: VAL }).trades[0]!;
+    expect(fxo.type).toBe("FxOption");
+    if (fxo.type === "FxOption") {
+      expect(fxo.optionType).toBe("Put");
+      expect(fxo.strike).toBeCloseTo(1.15, 10);
+      expect(fxo.expiryDate).toBe(parseISO("2027-06-15"));
+    }
+    const ccs = tradesFromCsv(csvTemplateText("CCS"), { valuationDate: VAL }).trades[0]!;
+    expect(ccs.type).toBe("CrossCurrencySwap");
+    if (ccs.type === "CrossCurrencySwap") {
+      expect(ccs.legs[0]!.notional).toBe(10_000_000);
+      expect((ccs.legs[0] as { spread: number }).spread).toBeCloseTo(-0.002, 10);
+      expect(ccs.legs[1]!.notional).toBeCloseTo(11_700_000, 3);
+      expect(ccs.collateralCurrency).toBe("USD");
+    }
+    const fra = tradesFromCsv(csvTemplateText("FRA"), { valuationDate: VAL }).trades[0]!;
+    expect(fra.type).toBe("FRA");
+    if (fra.type === "FRA") {
+      expect(fra.index).toBe("EURIBOR-3M");
+      expect(fra.fixedRate).toBeCloseTo(0.022, 10);
+      expect(fra.payReceive).toBe("Pay");
+    }
+    // the market spot fills a missing fxSpot column for CCS rows
+    const noSpot = tradesFromCsv("type;pair;notional;spread;maturity\nCCS;EURUSD;5000000;-15;3Y\n", { valuationDate: VAL, fxSpots: { EURUSD: 1.2 } });
+    expect(noSpot.errors).toEqual([]);
+    expect(noSpot.trades[0]?.type === "CrossCurrencySwap" && noSpot.trades[0].legs[1]!.notional).toBeCloseTo(6_000_000, 3);
+    expect(tradesFromCsv("type;pair;notional;spread;maturity\nCCS;EURUSD;5000000;-15;3Y\n", { valuationDate: VAL }).errors[0]?.msg).toMatch(/FX-Spot fehlt/);
+    // error list export
+    const errCsv = csvErrorsText([{ row: 3, msg: "Nominal fehlt; oder ≤ 0" }]);
+    expect(errCsv.startsWith("\uFEFFZeile;Meldung")).toBe(true);
+    expect(errCsv).toContain('4;"Nominal fehlt; oder ≤ 0"');
   });
   it("accepts German headers, comma separator, German numbers / dates and an explicit mapping", () => {
     const text = [
@@ -114,7 +162,7 @@ describe("CSV trade import with column mapping (Markt N16)", () => {
     expect(res.trades.map((t) => t.id)).toEqual(["C"]);
     expect(res.errors).toEqual([
       { row: 1, msg: "Nominal fehlt oder ≤ 0" },
-      { row: 2, msg: "Unbekannter Typ „XYZ“ (erlaubt: IRS, FXF, CAP)" },
+      { row: 2, msg: "Unbekannter Typ „XYZ“ (erlaubt: IRS, FXF, CAP, SWPT, FXO, CCS, FRA)" },
     ]);
     expect(() => tradesFromCsv("id;notional\nA;1", { valuationDate: VAL })).toThrow(/Typ/);
     expect(splitCsvLine('a;"b;c";"d""e"', ";")).toEqual(["a", "b;c", 'd"e']);

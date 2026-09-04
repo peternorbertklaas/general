@@ -20,10 +20,68 @@ import { EChart, cssVar } from "../components/EChart.js";
 import { NumInput } from "../components/NumInput.js";
 import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
 import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
-import { translatePricingError } from "../lib/i18n.js";
+import { INTERPOLATION_DE, translatePricingError } from "../lib/i18n.js";
 import { marketModified, useStore } from "../state/store.js";
 
 export { bumpQuote };
+
+/** Months of a tenor token ("3M" → 3, "18M" → 18, "2Y" → 24, "1W" → 0.25) – for sorting quotes by pillar. */
+export function tenorMonths(tenor: string): number {
+  const m = /^(\d+)([DWMY])$/i.exec(tenor.trim());
+  if (!m) return Number.POSITIVE_INFINITY;
+  const n = Number(m[1]);
+  switch (m[2]!.toUpperCase()) {
+    case "D":
+      return n / 30;
+    case "W":
+      return n / 4;
+    case "M":
+      return n;
+    default:
+      return n * 12;
+  }
+}
+
+/** Pillar tenor of a quote ("5Y"); FRA quotes are keyed by their end tenor. */
+export function quoteTenor(q: CurveQuote): string {
+  if ("tenor" in q) return q.tenor;
+  return "end" in q ? q.end : "";
+}
+
+/** Identity of a quote inside a quote set (type + tenor + pair) – used to find the shipped original of an edited row. */
+export function quoteKey(q: CurveQuote): string {
+  const pair = "pair" in q ? q.pair : "";
+  return `${q.type}|${quoteTenor(q)}|${pair}`;
+}
+
+/**
+ * New FX-swap-points quote for a curve (R3-6): the first tenor of 1M/3M/6M/9M
+ * not yet used, the first market pair that contains the curve currency whose
+ * other currency has a discount curve, points 0 (= forward at spot).
+ */
+export function newFxPointsQuote(
+  currency: string,
+  existing: CurveQuote[],
+  fxSpots: Record<string, number>,
+  discountCurveId: Record<string, string>,
+): Extract<CurveQuote, { type: "FxSwapPoints" }> | undefined {
+  const pairs = Object.keys(fxSpots).filter((p) => p.slice(0, 3) === currency || p.slice(3) === currency);
+  const pair = pairs.find((p) => discountCurveId[p.slice(0, 3) === currency ? p.slice(3) : p.slice(0, 3)] !== undefined);
+  if (!pair) return undefined;
+  const other = pair.slice(0, 3) === currency ? pair.slice(3) : pair.slice(0, 3);
+  const used = new Set(existing.filter((q) => q.type === "FxSwapPoints").map((q) => q.tenor));
+  const tenor = ["1M", "3M", "6M", "9M", "2W", "1W"].find((t) => !used.has(t));
+  if (!tenor) return undefined;
+  return {
+    type: "FxSwapPoints",
+    tenor,
+    points: 0,
+    pair,
+    fxSpot: fxSpots[pair]!,
+    otherDiscountCurveId: discountCurveId[other]!,
+    ...(other === "JPY" || currency === "JPY" ? { pipFactor: 100 } : {}),
+  };
+}
 
 const QUOTE_SETS: { key: keyof Omit<SampleMarketQuotes, "fxSpots">; curveId: string; label: string; title: string }[] = [
   { key: "eurOis", curveId: "EUR-ESTR", label: "€STR", title: "EUR €STR OIS" },
@@ -36,13 +94,11 @@ const QUOTE_SETS: { key: keyof Omit<SampleMarketQuotes, "fxSpots">; curveId: str
   { key: "eurUsdXccy", curveId: "EUR-ESTR-USDCSA", label: "EUR/USD CSA", title: "EUR Diskont unter USD-CSA (Xccy-Basis)" },
 ];
 
-const INTERPOLATIONS: { v: InterpolationMethod; l: string }[] = [
-  { v: "logLinear", l: "log-linear (DF)" },
-  { v: "linearZero", l: "linear (Zero)" },
-  { v: "cubicSplineZero", l: "kubischer Spline (Zero)" },
-  { v: "flatForward", l: "flat forward" },
-  { v: "monotoneConvex", l: "monoton-konvex (Hagan–West)" },
-];
+/** Interpolation options – labels from the single German map in `lib/i18n.ts` (R3-06). */
+const INTERPOLATIONS: { v: InterpolationMethod; l: string }[] = (Object.keys(INTERPOLATION_DE) as InterpolationMethod[]).map((v) => ({
+  v,
+  l: INTERPOLATION_DE[v]!,
+}));
 
 /** Next 31 December after the valuation date (default turn-of-year window start). */
 export function nextYearEnd(valuationDate: number): number {
@@ -99,6 +155,7 @@ export function CurvesView() {
       quotes: st.quotes,
       interpolation: st.interpolation,
       turnOfYear: st.turnOfYear,
+      volSurfaces: st.volSurfaces,
       baseMarket: st.baseMarket,
       valuationDate: st.valuationDate,
     })),
@@ -121,6 +178,10 @@ export function CurvesView() {
       ? toyDraft
       : { curveId: set.curveId, date: storedToy?.date ?? nextYearEnd(s.valuationDate), bp: storedToy?.bp ?? 0 };
   const toyDirty = storedToy ? storedToy.date !== toy.date || storedToy.bp !== toy.bp : toy.bp !== 0;
+  /** A jump on or before the valuation date cannot be applied – shown as validation, never stored silently (R3-F2). */
+  const toyPast = toy.bp !== 0 && toy.date <= s.valuationDate;
+  const storedToyInactive = !!storedToy && storedToy.date <= s.valuationDate;
+  const inactiveToys = Object.values(s.turnOfYear).filter((t) => t.date <= s.valuationDate).length;
   const pillarNav = useTableNav({ onCopied: () => useStore.getState().showToast("Pillar kopiert") });
 
   const series = useMemo(() => {
@@ -178,6 +239,26 @@ export function CurvesView() {
     const qv = quoteValue(before);
     applyQuotes(next, `Quote ${quoteLabel(before)} ${fmtNum(qv.value, qv.digits)} → ${fmtNum(v, qv.digits)} ${qv.unit}`);
   };
+  /** "+ FX-Punkte": add an FX-swap-points quote (short end from FX forwards, R3-6), inserted in pillar order. */
+  const fxPointsCandidate = curve ? newFxPointsQuote(curve.currency, quotes[set.key] ?? [], quotes.fxSpots, s.baseMarket.discountCurveId) : undefined;
+  const addFxPoints = () => {
+    if (!fxPointsCandidate) return;
+    const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
+    const list = [...(next[set.key] ?? [])];
+    const months = tenorMonths(fxPointsCandidate.tenor);
+    let at = list.findIndex((q) => tenorMonths(quoteTenor(q)) > months);
+    if (at < 0) at = list.length;
+    list.splice(at, 0, fxPointsCandidate);
+    next[set.key] = list;
+    applyQuotes(next, `FX-Punkte ${fxPointsCandidate.pair} ${fxPointsCandidate.tenor} hinzugefügt`);
+  };
+  const removeQuote = (i: number) => {
+    const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
+    const list = [...(next[set.key] ?? [])];
+    const [removed] = list.splice(i, 1);
+    next[set.key] = list;
+    applyQuotes(next, `Quote ${removed ? quoteLabel(removed) : ""} entfernt`);
+  };
   const bumpAll = (bp: number) => {
     const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
     next[set.key] = (next[set.key] ?? []).map((q) => bumpQuote(q, bp));
@@ -195,8 +276,12 @@ export function CurvesView() {
   };
   const applyToy = () => {
     const st = useStore.getState();
+    if (toyPast) {
+      st.showToast("Turn-of-Year muss nach dem Bewertungstag liegen");
+      return;
+    }
     const ok = st.setTurnOfYear(set.curveId, toy.bp === 0 ? undefined : { date: toy.date, bp: toy.bp });
-    if (!ok) st.showToast("Bootstrap mit Turn-of-Year fehlgeschlagen");
+    if (!ok) st.showToast(toy.date <= s.valuationDate ? "Turn-of-Year muss nach dem Bewertungstag liegen" : "Bootstrap mit Turn-of-Year fehlgeschlagen");
     else
       st.showToast(
         toy.bp === 0
@@ -209,8 +294,9 @@ export function CurvesView() {
     useStore.getState().setTurnOfYear(set.curveId, undefined);
     setToyDraft(null);
   };
-  const original = (i: number): CurveQuote | undefined => SAMPLE_QUOTES[set.key]?.[i];
-  const isEdited = (i: number, q: CurveQuote) => JSON.stringify(original(i)) !== JSON.stringify(q);
+  /** Shipped original of a quote (matched by type/tenor/pair, so added rows never shift the mapping). */
+  const original = (q: CurveQuote): CurveQuote | undefined => SAMPLE_QUOTES[set.key]?.find((x) => quoteKey(x) === quoteKey(q));
+  const isEdited = (q: CurveQuote) => JSON.stringify(original(q)) !== JSON.stringify(q);
   const interpValue = override ?? curve?.interpolation ?? "logLinear";
   const interpOptions = INTERP_ALLOWED.has(interpValue) ? INTERPOLATIONS : [...INTERPOLATIONS, { v: interpValue as InterpolationMethod, l: interpValue }];
   const overrideCount = Object.keys(s.interpolation).length;
@@ -272,7 +358,13 @@ export function CurvesView() {
           title="Turn-of-Year: Sprung des Instantan-Forwards über den Jahreswechsel (Fenster ab Datum, 1 Tag) in bp – Pillars werden neu gelöst"
         >
           <span className="muted small">Turn-of-Year</span>
-          <DateInput inline value={toy.date} ariaLabel="Turn-of-Year Datum" onChange={(v) => setToyDraft({ curveId: set.curveId, date: v, bp: toy.bp })} />
+          <DateInput
+            inline
+            value={toy.date}
+            ariaLabel="Turn-of-Year Datum"
+            invalid={toyPast}
+            onChange={(v) => setToyDraft({ curveId: set.curveId, date: v, bp: toy.bp })}
+          />
           <span style={{ display: "inline-block", width: 96 }}>
             <NumInput
               inline
@@ -286,7 +378,13 @@ export function CurvesView() {
               onCommit={() => undefined}
             />
           </span>
-          <button className="btn xs" onClick={applyToy} disabled={!toyDirty} data-testid="toy-apply" title="Turn-of-Year auf die Kurve anwenden (Bootstrap)">
+          <button
+            className="btn xs"
+            onClick={applyToy}
+            disabled={!toyDirty || toyPast}
+            data-testid="toy-apply"
+            title={toyPast ? "Datum muss nach dem Bewertungstag liegen" : "Turn-of-Year auf die Kurve anwenden (Bootstrap)"}
+          >
             Anwenden
           </button>
           {storedToy && (
@@ -294,12 +392,24 @@ export function CurvesView() {
               ✕
             </button>
           )}
+          {toyPast && (
+            <span className="field-msg error" role="alert" data-testid="toy-past">
+              Turn-of-Year muss nach dem Bewertungstag ({fmtDate(s.valuationDate)}) liegen
+            </span>
+          )}
+          {!toyPast && storedToyInactive && (
+            <span className="badge warn" data-testid="toy-inactive" title="Der gespeicherte Sprung liegt vor dem Bewertungstag und wirkt nicht auf die Kurve">
+              inaktiv (vor dem Bewertungstag)
+            </span>
+          )}
         </label>
         <div className="grow" />
         {modified && (
           <span className="chip warn" title="Quotes, Spots, Interpolation oder Turn-of-Year weichen vom Sample-Markt ab" data-testid="market-modified-chip">
             <span className="dot" /> Markt modifiziert{overrideCount > 0 ? ` · ${overrideCount} Interpolation` : ""}
-            {Object.keys(s.turnOfYear).length > 0 ? ` · ${Object.keys(s.turnOfYear).length} Turn-of-Year` : ""}
+            {Object.keys(s.turnOfYear).length > 0
+              ? ` · ${Object.keys(s.turnOfYear).length} Turn-of-Year${inactiveToys > 0 ? ` (${inactiveToys} inaktiv)` : ""}`
+              : ""}
           </span>
         )}
         <button className="btn" onClick={() => bumpAll(10)}>
@@ -315,6 +425,7 @@ export function CurvesView() {
             st.resetQuotes();
             for (const id of Object.keys(st.interpolation)) st.setInterpolation(id, undefined);
             for (const id of Object.keys(st.turnOfYear)) st.setTurnOfYear(id, undefined);
+            st.resetVolSurfaces();
             setToyDraft(null);
           }}
           disabled={!modified}
@@ -364,12 +475,24 @@ export function CurvesView() {
         <div className="card">
           <h3>
             Marktquotes (editierbar){" "}
-            <span className="right muted xs">
-              geänderte Zellen orange · Original im Tooltip · <kbd>Ctrl</kbd>+<kbd>Z</kbd> macht Quote-Änderungen rückgängig
+            <span className="right row wrap" style={{ gap: 8 }}>
+              <span className="muted xs">
+                geänderte Zellen orange · Original im Tooltip · <kbd>Ctrl</kbd>+<kbd>Z</kbd> rückgängig
+              </span>
+              {fxPointsCandidate && (
+                <button
+                  className="btn ghost xs"
+                  onClick={addFxPoints}
+                  data-testid="add-fx-points"
+                  title={`FX-Swap-Punkte ${fxPointsCandidate.pair.slice(0, 3)}/${fxPointsCandidate.pair.slice(3)} ${fxPointsCandidate.tenor} als Quote anlegen (kurzes Ende aus Devisentermingeschäften, Diskontkurve ${fxPointsCandidate.otherDiscountCurveId})`}
+                >
+                  + FX-Punkte {fxPointsCandidate.pair.slice(0, 3)}/{fxPointsCandidate.pair.slice(3)}
+                </button>
+              )}
             </span>
           </h3>
           <div className="table-scroll" style={{ maxHeight: 420 }}>
-            <table className="grid-table quotes">
+            <table className="grid-table quotes compact" data-testid="quotes-table">
               <thead>
                 <tr>
                   <th>Instrument</th>
@@ -378,7 +501,7 @@ export function CurvesView() {
                   <th className="num">Zero</th>
                   <th className="num">DF</th>
                   <th className="num" title="Bootstrap-Residuum: Satzdifferenz (bp) bzw. NPV je Nominaleinheit (×10⁻⁶)">
-                    Residuum
+                    Resid.
                   </th>
                 </tr>
               </thead>
@@ -386,15 +509,33 @@ export function CurvesView() {
                 {(quotes[set.key] ?? []).map((q, i) => {
                   const node = curve?.zeroRates()[i];
                   const qv = quoteValue(q);
-                  const edited = isEdited(i, q);
-                  const orig = original(i);
-                  const origText = orig ? `Original ${fmtNum(quoteValue(orig).value, qv.digits)} ${qv.unit}` : "";
+                  const edited = isEdited(q);
+                  const orig = original(q);
+                  const origText = orig ? `Original ${fmtNum(quoteValue(orig).value, qv.digits)} ${qv.unit}` : "Hinzugefügte Quote (nicht im Sample-Markt)";
                   return (
-                    <tr key={i} style={{ cursor: "default" }} className={edited ? "edited" : ""}>
-                      <td>{quoteLabel(q)}</td>
+                    <tr
+                      key={`${quoteKey(q)}-${i}`}
+                      style={{ cursor: "default" }}
+                      className={edited ? "edited" : ""}
+                      data-testid={orig ? undefined : "added-quote"}
+                    >
+                      <td>
+                        {quoteLabel(q)}
+                        {!orig && (
+                          <button
+                            className="btn ghost danger xs"
+                            style={{ marginLeft: 4 }}
+                            aria-label={`Quote ${quoteLabel(q)} entfernen`}
+                            title="Hinzugefügte Quote entfernen"
+                            onClick={() => removeQuote(i)}
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </td>
                       <td className="mono muted xs">{boot?.dates[i] ? fmtDate(boot.dates[i]!.end) : ""}</td>
                       <td className={`num quote-cell ${edited ? "edited" : ""}`} title={edited ? origText : undefined}>
-                        <span style={{ display: "inline-block", width: 112 }}>
+                        <span style={{ display: "inline-block", width: 104 }}>
                           <NumInput
                             inline
                             value={qv.value}

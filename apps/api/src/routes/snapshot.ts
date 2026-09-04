@@ -6,6 +6,7 @@ import {
   deserializeMarket,
   emirCsv,
   emirValuationRecord,
+  isPricingError,
   priceTrade,
   serializeMarket,
   validateMarket,
@@ -26,6 +27,8 @@ type EmirQuery = {
   uti?: string;
   /** JSON object mapping trade id → observable transaction price; such trades report MTMA unless `method` is given. */
   transactionPrice?: string;
+  /** Reporter default for field 30 (clearing obligation) when a trade does not carry `clearingObligation`; omitted → N/A. */
+  clearingObligation?: boolean;
 };
 
 /** Parse a `{ "<tradeId>": value }` query parameter; `null` when it is not an object or a value fails `isValid`. */
@@ -103,7 +106,9 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
       try {
         m = deserializeMarket(req.body);
       } catch (e) {
-        return reply.status(400).send({ error: (e as Error).message, statusCode: 400, requestId: req.id });
+        // Structural problems the schema cannot express (e.g. an unparsable timestamp) – a client error with the core's code when it has one.
+        const code = isPricingError(e) ? e.code : "SNAPSHOT_MALFORMED";
+        return reply.status(400).send({ error: (e as Error).message, statusCode: 400, code, requestId: req.id });
       }
       const problems = validateMarket(m);
       if (problems.length)
@@ -127,9 +132,10 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
       schema: {
         operationId: "emirValuations",
         tags: ["pricing"],
-        summary: "EMIR-Refit-Bewertungsfelder (Tabelle 2, Felder 21–26 Bewertung, 31–33 Clearing) für alle Trades (JSON oder ?format=csv)",
+        summary:
+          "EMIR-Refit-Bewertungsfelder (ITS 2022/1860 Tabelle 2: 21–24 Bewertung, 25 Delta, 26 Collateral-Indikator, 30 Clearingpflicht, 31 Cleared) für alle Trades (JSON oder ?format=csv)",
         description:
-          "Clearing fields come from the trade (`cleared`, `clearingMember`; `clearingObligation` derived). Valuation timestamp (field 23): `timestamp` → snapshot `meta.snapshotTime` → `asOf` → 17:00 UTC of the valuation date. Method (field 24): `method` → MTMA for trades with a `transactionPrice` → MTMO.",
+          "Clearing fields come from the trade: `cleared` (field 31), `clearingObligation` (field 30 – explicit flag or the `?clearingObligation=` reporter default, N/A when neither is set; never derived from `cleared`), `clearingMember` (Table 1). Valuation timestamp (field 23, ISO-8601 date-time): `timestamp` → snapshot `meta.snapshotTime` → `asOf` → 17:00 UTC of the valuation date. Method (field 24): `method` → MTMA for trades with a `transactionPrice` → MTMO.",
         querystring: {
           type: "object",
           properties: {
@@ -147,6 +153,10 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
               type: "string",
               maxLength: 20000,
               description: 'JSON object { "<tradeId>": <price> } – observable transaction prices; those trades report MTMA unless `method` is given',
+            },
+            clearingObligation: {
+              type: "boolean",
+              description: "Reporter default for field 30 (Art. 4 EMIR) applied to trades without their own `clearingObligation`; omitted → N/A",
             },
           },
           additionalProperties: false,
@@ -178,6 +188,7 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
         if (req.query.method) opts.method = req.query.method;
         if (req.query.asOf) opts.asOf = req.query.asOf;
         if (req.query.timestamp) opts.timestamp = req.query.timestamp;
+        if (req.query.clearingObligation !== undefined) opts.clearingObligation = req.query.clearingObligation;
         const uti = utiMap[s.trade.id];
         if (uti) opts.uti = uti;
         const transactionPrice = priceMap[s.trade.id];

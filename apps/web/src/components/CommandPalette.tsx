@@ -19,18 +19,22 @@ interface Item {
   run: (e?: { shiftKey?: boolean }) => void;
 }
 
-function score(query: string, text: string): number {
+/** Trade-id-like query ("FRA-0002", "irs-1"): only exact / prefix / substring hits count – no fuzzy jump to another trade (R3-F5). */
+export const ID_LIKE = /^[a-z]{2,6}-\d+[a-z0-9-]*$/i;
+
+export function score(query: string, text: string, idLike = false): number {
   const q = query.toLowerCase();
   const t = text.toLowerCase();
   if (!q) return 1;
   if (t.includes(q)) return 100 - t.indexOf(q);
+  if (idLike) return 0;
   // subsequence
   let qi = 0;
   for (let i = 0; i < t.length && qi < q.length; i++) if (t[i] === q[qi]) qi++;
   return qi === q.length ? 10 : 0;
 }
 
-const ICONS: Record<string, string> = { Navigation: "→", Aktionen: "⚡", Bewertung: "ƒ", Ansicht: "◐", Blotter: "▤" };
+const ICONS: Record<string, string> = { Navigation: "→", Aktionen: "⚡", "Dokumente & Export": "▣", Bewertung: "ƒ", Ansicht: "◐", Blotter: "▤" };
 
 /** Items excluded from the palette: it is open already / pure key aliases. */
 const EXCLUDED = new Set(["palette", "palette2", "escape", "open", "down", "up"]);
@@ -151,7 +155,15 @@ export function CommandPalette({ onHotkey }: Props) {
       };
     });
     const all = [...hot, ...extra, ...trades];
-    const scored = all.map((it) => ({ it, sc: score(q, `${it.label} ${it.desc ?? ""} ${it.search ?? ""} ${it.id}`) })).filter((x) => x.sc > 0);
+    const qq = q.trim();
+    const idLike = ID_LIKE.test(qq);
+    const scored = all
+      .map((it) => ({
+        it,
+        // an exact trade-id match always ranks first (R3-F5)
+        sc: it.id === `trade.${qq.toUpperCase()}` ? 1000 : score(qq, `${it.label} ${it.desc ?? ""} ${it.search ?? ""} ${it.id}`, idLike),
+      }))
+      .filter((x) => x.sc > 0);
     scored.sort((a, b) => b.sc - a.sc);
     return scored.map((x) => x.it);
   }, [q, s, onHotkey, act]);
@@ -261,7 +273,13 @@ export function CommandPalette({ onHotkey }: Props) {
           </div>
         )}
         <div className="results" id="palette-results" role="listbox" ref={listRef} aria-label="Treffer">
-          {list.length === 0 && (
+          {list.length === 0 && ID_LIKE.test(q.trim()) && (
+            <div className="empty" data-testid="palette-no-trade">
+              Kein Trade <code className="mono">{q.trim().toUpperCase()}</code> im Bestand – Trade anlegen mit <kbd>n</kbd> <kbd>s</kbd> … oder per
+              Schnelleingabe (<code className="mono">fra 3x6 pay 2.2% 10m</code>)
+            </div>
+          )}
+          {list.length === 0 && !ID_LIKE.test(q.trim()) && (
             <div className="empty">
               Keine Treffer für „{q}“ – versuchen Sie eine Schnelleingabe wie <code className="mono">irs 10y pay 3.1% 10m</code>
             </div>

@@ -5,11 +5,74 @@ import { yearFraction } from "../dates/daycount.js";
 import { buildSchedule } from "../dates/schedule.js";
 import { type CapFloor, type Cashflow, type PricingResult } from "../instruments/types.js";
 import { type MarketContext, getCurve, getDiscountCurve, getFixing } from "../market/market-context.js";
-import { bachelierGreeks, black76Greeks, type OptionType } from "../models/black.js";
-import { capletVol } from "../models/vol-surfaces.js";
+import { type IrVolQuotation, bachelierGreeks, black76Greeks, convertIrVol, type OptionType } from "../models/black.js";
+import { type VolType, capletVol } from "../models/vol-surfaces.js";
 import { estimateMissingIborRate, fxToReporting, missingFixingMessage } from "./leg-pricer.js";
 
 export type CapFloorModel = "Bachelier" | "Black" | "ShiftedBlack";
+
+/** Model implied by a surface's vol type (Normal → Bachelier, Lognormal → Black, ShiftedLognormal → ShiftedBlack). */
+export function modelForVolType(volType: VolType | undefined): CapFloorModel {
+  return volType === "Lognormal" ? "Black" : volType === "ShiftedLognormal" ? "ShiftedBlack" : "Bachelier";
+}
+
+/** Vol quotation a model expects (`shift` only matters for ShiftedBlack). */
+export function modelQuotation(model: CapFloorModel, shift: number): IrVolQuotation {
+  return model === "Bachelier" ? { kind: "normal" } : { kind: "lognormal", shift: model === "ShiftedBlack" ? shift : 0 };
+}
+
+/** Vol quotation of a surface (a missing surface's fallback vol is quoted as a normal vol). */
+export function surfaceQuotation(s: { volType: VolType; shift?: number } | undefined): IrVolQuotation {
+  return !s || s.volType === "Normal" ? { kind: "normal" } : { kind: "lognormal", shift: s.shift ?? 0 };
+}
+
+export function sameQuotation(a: IrVolQuotation, b: IrVolQuotation): boolean {
+  return a.kind === b.kind && (a.kind === "normal" || (b.kind === "lognormal" && a.shift === b.shift));
+}
+
+/** Human-readable quotation label for warnings / methodology. */
+export function quotationLabel(q: IrVolQuotation): string {
+  return q.kind === "normal" ? "normal" : q.shift ? `lognormal, shift ${(q.shift * 100).toFixed(2)}%` : "lognormal";
+}
+
+/**
+ * Warning text emitted when a surface vol is converted into the model's
+ * quotation (R3-1). Prefix `VOL_TYPE_CONVERTED:` is stable for consumers.
+ */
+export function volTypeConvertedWarning(
+  kind: "caplet" | "swaption",
+  surfaceId: string,
+  from: IrVolQuotation,
+  model: CapFloorModel,
+  to: IrVolQuotation,
+): string {
+  return `VOL_TYPE_CONVERTED: ${kind} surface ${surfaceId} quotes ${quotationLabel(from)} vols but model ${model} was requested – vols converted to ${quotationLabel(to)} by price equivalence at each forward/strike/expiry`;
+}
+
+/**
+ * Convert a surface vol into the model's quotation; throws
+ * `PricingError("VOL_MODEL_INCOMPATIBLE")` when the requested lognormal model
+ * cannot be fed (non-positive shifted forward or strike).
+ */
+export function convertSurfaceVol(
+  vol: number,
+  from: IrVolQuotation,
+  to: IrVolQuotation,
+  forward: number,
+  strike: number,
+  tExp: number,
+  context: Record<string, unknown>,
+): number {
+  if (sameQuotation(from, to)) return vol;
+  if (to.kind === "lognormal" && (!(forward + to.shift > 0) || !(strike + to.shift > 0))) {
+    throw new PricingError(
+      "VOL_MODEL_INCOMPATIBLE",
+      `A ${to.shift ? "shifted " : ""}lognormal model cannot be fed from the ${quotationLabel(from)} surface: shifted forward ${((forward + to.shift) * 100).toFixed(3)}% / strike ${((strike + to.shift) * 100).toFixed(3)}% is not positive – use Bachelier or a larger shift`,
+      { ...context, forward, strike, shift: to.shift },
+    );
+  }
+  return convertIrVol(vol, from, to, forward, strike, tExp);
+}
 
 function optionValue(model: CapFloorModel, type: OptionType, fwd: number, strike: number, vol: number, t: number, shift: number) {
   if (model === "Bachelier") return bachelierGreeks(type, fwd, strike, vol, t);
@@ -32,6 +95,14 @@ function capNotionalAt(trade: CapFloor, accrualStart: number): number {
  * surface's vol type (Normal → Bachelier, Lognormal → Black,
  * ShiftedLognormal → ShiftedBlack), default Bachelier.
  *
+ * Model / surface mismatch (R3-1): when the requested model's vol quotation
+ * differs from the surface's (e.g. `model: "Black"` on a normal surface) every
+ * caplet vol is converted by price equivalence at its forward/strike/expiry
+ * (`convertIrVol`) and a `VOL_TYPE_CONVERTED` warning is emitted; a
+ * lognormal model on a non-positive shifted forward/strike raises
+ * `PricingError("VOL_MODEL_INCOMPATIBLE")`. A `volOverride` is always read in
+ * the model's own quotation and never converted.
+ *
  * Conventions: caplet expiry = fixing date, payment in arrears at the period
  * end; the first caplet of a spot-starting cap is included (its fixing is
  * usually known – load it as a fixing to value it intrinsically). For RFR
@@ -47,11 +118,14 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
   const disc = getDiscountCurve(ctx, trade.currency, trade.collateralCurrency);
   const fx = fxToReporting(ctx, trade.currency, reporting, trade.collateralCurrency);
   const surface = ctx.capletVols?.[`${trade.currency}-${idx.name}`] ?? ctx.capletVols?.[trade.currency];
-  const model: CapFloorModel =
-    trade.model ?? (surface?.volType === "Lognormal" ? "Black" : surface?.volType === "ShiftedLognormal" ? "ShiftedBlack" : "Bachelier");
+  const model: CapFloorModel = trade.model ?? modelForVolType(surface?.volType);
   const shift = trade.shift ?? surface?.shift ?? 0;
   const warnings: string[] = [];
   if (!surface && trade.volOverride === undefined) warnings.push("No caplet vol surface – using 60bp normal vol");
+  const from = surfaceQuotation(surface);
+  const to = modelQuotation(model, shift);
+  const convert = trade.volOverride === undefined && !sameQuotation(from, to);
+  if (convert) warnings.push(volTypeConvertedWarning("caplet", surface?.id ?? "(fallback 60bp normal)", from, model, to));
   const schedule = buildSchedule({
     effectiveDate: trade.effectiveDate,
     terminationDate: trade.terminationDate,
@@ -98,7 +172,10 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
     const notional = capNotionalAt(trade, p.accrualStart);
     let amount = 0;
     for (const c of components) {
-      const vol = trade.volOverride ?? (surface ? capletVol(surface, tExp, c.strike) : 0.006);
+      let vol = trade.volOverride ?? (surface ? capletVol(surface, tExp, c.strike) : 0.006);
+      if (convert && !isFixed && tExp > 0) {
+        vol = convertSurfaceVol(vol, from, to, fwd, c.strike, tExp, { tradeId: trade.id, model, surfaceId: surface?.id, fixingDate: toISO(p.fixingDate) });
+      }
       if (!isFixed && model !== "Bachelier" && (fwd + shift <= 0 || c.strike + shift <= 0)) {
         warnings.push(
           `NEGATIVE_RATE_LOGNORMAL: ${model} model with non-positive shifted forward/strike (${(fwd * 100).toFixed(3)}% / ${(c.strike * 100).toFixed(3)}%, shift ${(shift * 100).toFixed(2)}%) – intrinsic value used, no time value`,
@@ -160,6 +237,8 @@ export function priceCapFloor(ctx: MarketContext, trade: CapFloor, reportingCurr
       gammaPerBp2: gamma * fx * 1e-8,
       /** Vega per 1bp normal vol (Bachelier) or 1 vol point (Black / ShiftedBlack). */
       vega: vega * fx * (model === "Bachelier" ? 1e-4 : 0.01),
+      /** "yes" when surface vols were converted into the model's quotation (R3-1). */
+      volConverted: convert ? "yes" : "no",
     },
     warnings: Array.from(new Set(warnings)),
   };

@@ -38,10 +38,14 @@ export interface MarketRepository {
 }
 
 /**
- * The snapshot id is the core's `marketSnapshotId` (FNV-1a over valuation
- * date, curve pillars and FX spots) – the same function that writes
- * `audit.snapshotId` into valuation reports, so the `X-Market-Snapshot-Id`
- * header can be matched to a report without a replicated hash here.
+ * The snapshot id is the core's `marketSnapshotId` in its default `full`
+ * scope (FNV-1a over the canonical JSON of every market input: valuation
+ * date, curves with nodes and conventions, discount / CSA mappings, FX spots
+ * and spot dates, fixings, vol surfaces, credit data, label) – the same call
+ * that writes `audit.snapshotId` into valuation and portfolio reports, so the
+ * `X-Market-Snapshot-Id` header and the snapshot `ETag` can be matched to a
+ * report without a replicated hash here. A vol bump or an added fixing
+ * therefore changes the id (the legacy `curves` scope would not).
  */
 export { marketSnapshotId };
 

@@ -1,0 +1,298 @@
+{
+  "case": "sample-market-bootstrap",
+  "description": "Sample-market €STR OIS discount curve (EUR-ESTR) bootstrapped independently: TARGET calendar, spot T+2, ModifiedFollowing, €STR payment lag 1 business day, log-linear discount factors in ACT/365F time; 18 OIS quotes 1W … 30Y, valuation 2026-09-03.",
+  "derivation": "Re-derive the sample €STR OIS discount curve independently of the engine.\n\n    Conventions (curves/bootstrap.ts, index-definitions.ts): spot = valuation + 2 TARGET business days;\n    accrual end = spot + tenor, ModifiedFollowing on TARGET; pillar = last payment date = accrual end + 1 TARGET\n    business day (€STR payment lag 1); quotes ≤ 1Y are single-period (zero-coupon) OIS, longer quotes pay annually\n    (fixed ACT/360 vs €STR compounded in arrears, short front stub, both legs on the same schedule); the first\n    node is the spot date with DF = 1/(1 + r_1W·τ_spot); discount factors are interpolated log-linearly in ACT/365F\n    time. Daily compounding telescopes to DF ratios, so the par conditions are algebraic in the pillar DFs:\n\n      ≤ 1Y:  DF(accEnd) = DF(spot) / (1 + r·τ)  (closed form; the pillar DF follows from the log-linear segment\n             between the previous node and the pillar, as the accrual end lies inside that segment),\n      > 1Y:  Σ_i DF(pay_i)·[DF(acc_{i−1})/DF(acc_i) − 1 − r·τ_i] = 0 solved by bisection in the pillar DF\n             (earlier DFs interpolated from the already solved nodes).",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "curveId": "EUR-ESTR",
+    "index": "ESTR",
+    "calendar": "TARGET",
+    "spotLag": 2,
+    "paymentLag": 1,
+    "interpolation": "logLinear",
+    "dayCount": "ACT/365F",
+    "quotes": [
+      {
+        "type": "OIS",
+        "tenor": "1W",
+        "rate": 0.0201
+      },
+      {
+        "type": "OIS",
+        "tenor": "1M",
+        "rate": 0.0202
+      },
+      {
+        "type": "OIS",
+        "tenor": "3M",
+        "rate": 0.0203
+      },
+      {
+        "type": "OIS",
+        "tenor": "6M",
+        "rate": 0.0205
+      },
+      {
+        "type": "OIS",
+        "tenor": "9M",
+        "rate": 0.0207
+      },
+      {
+        "type": "OIS",
+        "tenor": "1Y",
+        "rate": 0.021
+      },
+      {
+        "type": "OIS",
+        "tenor": "18M",
+        "rate": 0.0215
+      },
+      {
+        "type": "OIS",
+        "tenor": "2Y",
+        "rate": 0.0221
+      },
+      {
+        "type": "OIS",
+        "tenor": "3Y",
+        "rate": 0.0231
+      },
+      {
+        "type": "OIS",
+        "tenor": "4Y",
+        "rate": 0.0239
+      },
+      {
+        "type": "OIS",
+        "tenor": "5Y",
+        "rate": 0.0246
+      },
+      {
+        "type": "OIS",
+        "tenor": "7Y",
+        "rate": 0.0258
+      },
+      {
+        "type": "OIS",
+        "tenor": "10Y",
+        "rate": 0.0272
+      },
+      {
+        "type": "OIS",
+        "tenor": "12Y",
+        "rate": 0.0279
+      },
+      {
+        "type": "OIS",
+        "tenor": "15Y",
+        "rate": 0.0286
+      },
+      {
+        "type": "OIS",
+        "tenor": "20Y",
+        "rate": 0.0287
+      },
+      {
+        "type": "OIS",
+        "tenor": "25Y",
+        "rate": 0.0281
+      },
+      {
+        "type": "OIS",
+        "tenor": "30Y",
+        "rate": 0.0273
+      }
+    ]
+  },
+  "expected": {
+    "spotDate": "2026-09-07",
+    "spotDf": 0.9997767165333077,
+    "pillars": [
+      {
+        "tenor": "1W",
+        "rate": 0.0201,
+        "accrualEnd": "2026-09-14",
+        "date": "2026-09-15",
+        "time": 0.03287671232876712,
+        "df": 0.9993303365232911,
+        "zero": 0.020375753960728358,
+        "method": "closed-form"
+      },
+      {
+        "tenor": "1M",
+        "rate": 0.0202,
+        "accrualEnd": "2026-10-07",
+        "date": "2026-10-08",
+        "time": 0.0958904109589041,
+        "df": 0.998040543971853,
+        "zero": 0.020454373424241792,
+        "method": "closed-form"
+      },
+      {
+        "tenor": "3M",
+        "rate": 0.0203,
+        "accrualEnd": "2026-12-07",
+        "date": "2026-12-08",
+        "time": 0.26301369863013696,
+        "df": 0.9946166293399832,
+        "zero": 0.020523315870698056,
+        "method": "closed-form"
+      },
+      {
+        "tenor": "6M",
+        "rate": 0.0205,
+        "accrualEnd": "2027-03-08",
+        "date": "2027-03-09",
+        "time": 0.5123287671232877,
+        "df": 0.989464959919295,
+        "zero": 0.020672129210537595,
+        "method": "closed-form"
+      },
+      {
+        "tenor": "9M",
+        "rate": 0.0207,
+        "accrualEnd": "2027-06-07",
+        "date": "2027-06-08",
+        "time": 0.7616438356164383,
+        "df": 0.9842683131647938,
+        "zero": 0.020819105173886118,
+        "method": "closed-form"
+      },
+      {
+        "tenor": "1Y",
+        "rate": 0.021,
+        "accrualEnd": "2027-09-07",
+        "date": "2027-09-08",
+        "time": 1.0136986301369864,
+        "df": 0.9788751264289243,
+        "zero": 0.02106266706780945,
+        "method": "closed-form"
+      },
+      {
+        "tenor": "18M",
+        "rate": 0.0215,
+        "accrualEnd": "2028-03-07",
+        "date": "2028-03-08",
+        "time": 1.5123287671232877,
+        "df": 0.9678616407674312,
+        "zero": 0.021599889999514586,
+        "method": "bisection"
+      },
+      {
+        "tenor": "2Y",
+        "rate": 0.0221,
+        "accrualEnd": "2028-09-07",
+        "date": "2028-09-08",
+        "time": 2.0164383561643837,
+        "df": 0.9562916114716928,
+        "zero": 0.022164019736586642,
+        "method": "bisection"
+      },
+      {
+        "tenor": "3Y",
+        "rate": 0.0231,
+        "accrualEnd": "2029-09-07",
+        "date": "2029-09-10",
+        "time": 3.021917808219178,
+        "df": 0.9323547391671898,
+        "zero": 0.02317796834181841,
+        "method": "bisection"
+      },
+      {
+        "tenor": "4Y",
+        "rate": 0.0239,
+        "accrualEnd": "2030-09-09",
+        "date": "2030-09-10",
+        "time": 4.021917808219178,
+        "df": 0.9080285483608224,
+        "zero": 0.023988421581345693,
+        "method": "bisection"
+      },
+      {
+        "tenor": "5Y",
+        "rate": 0.0246,
+        "accrualEnd": "2031-09-08",
+        "date": "2031-09-09",
+        "time": 5.019178082191781,
+        "df": 0.8833683360560016,
+        "zero": 0.02470783496829575,
+        "method": "bisection"
+      },
+      {
+        "tenor": "7Y",
+        "rate": 0.0258,
+        "accrualEnd": "2033-09-07",
+        "date": "2033-09-08",
+        "time": 7.019178082191781,
+        "df": 0.8334436393288589,
+        "zero": 0.025955916237731125,
+        "method": "bisection"
+      },
+      {
+        "tenor": "10Y",
+        "rate": 0.0272,
+        "accrualEnd": "2036-09-08",
+        "date": "2036-09-09",
+        "time": 10.024657534246575,
+        "df": 0.7594678156913426,
+        "zero": 0.02744605813789826,
+        "method": "bisection"
+      },
+      {
+        "tenor": "12Y",
+        "rate": 0.0279,
+        "accrualEnd": "2038-09-07",
+        "date": "2038-09-08",
+        "time": 12.021917808219179,
+        "df": 0.712381185082154,
+        "zero": 0.02821031917990017,
+        "method": "bisection"
+      },
+      {
+        "tenor": "15Y",
+        "rate": 0.0286,
+        "accrualEnd": "2041-09-09",
+        "date": "2041-09-10",
+        "time": 15.03013698630137,
+        "df": 0.6468812036078027,
+        "zero": 0.028981280267308916,
+        "method": "bisection"
+      },
+      {
+        "tenor": "20Y",
+        "rate": 0.0287,
+        "accrualEnd": "2046-09-07",
+        "date": "2046-09-10",
+        "time": 20.03287671232877,
+        "df": 0.5592815581335282,
+        "zero": 0.02900742909586266,
+        "method": "bisection"
+      },
+      {
+        "tenor": "25Y",
+        "rate": 0.0281,
+        "accrualEnd": "2051-09-07",
+        "date": "2051-09-08",
+        "time": 25.03013698630137,
+        "df": 0.4944957653780683,
+        "zero": 0.02813475179073797,
+        "method": "bisection"
+      },
+      {
+        "tenor": "30Y",
+        "rate": 0.0273,
+        "accrualEnd": "2056-09-07",
+        "date": "2056-09-08",
+        "time": 30.035616438356165,
+        "df": 0.4445802403473884,
+        "zero": 0.026988782593041688,
+        "method": "bisection"
+      }
+    ],
+    "closedFormPillars": ["1W", "1M", "3M", "6M", "9M", "1Y"]
+  },
+  "quantlib": {
+    "status": "pending",
+    "note": "QuantLib not installed when the file was generated; run tools/quantlib-golden.py with the QuantLib Python bindings to fill in the cross-check."
+  }
+}

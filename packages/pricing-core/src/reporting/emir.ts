@@ -1,22 +1,31 @@
 import { toISO } from "../dates/date.js";
+import { PricingError } from "../errors.js";
 import { type PricingResult, type Trade } from "../instruments/types.js";
 import { type MarketContext } from "../market/market-context.js";
+import { isIsoDateTime } from "../market/snapshot.js";
 import { csvCell } from "./valuation-report.js";
 
 /**
- * EMIR Refit valuation fields (Table 2, fields 21–26 of the ITS on reporting):
- * valuation amount, valuation currency, valuation timestamp, valuation method
- * and – for collateralised trades – the delta of the position (field 26), plus
- * the clearing fields (Table 2 fields 31–33: cleared, clearing obligation,
- * clearing member). DERIVA marks everything to model (MTMO) unless the caller
- * provides an observable market price (`opts.transactionPrice` → MTMA) or a
- * CCP valuation (CCPV).
+ * EMIR Refit valuation fields (ITS (EU) 2022/1860, Table 2 – transaction data):
+ * field 21 valuation amount, 22 valuation currency, 23 valuation timestamp,
+ * 24 valuation method, 25 delta, 26 collateral portfolio indicator; clearing
+ * data: field 30 clearing obligation, 31 cleared, 32 clearing timestamp (not
+ * produced here), 33 central counterparty. The clearing member is a Table 1
+ * (counterparty data) field and is carried for convenience. DERIVA marks
+ * everything to model (MTMO) unless the caller provides an observable market
+ * price (`opts.transactionPrice` → MTMA) or a CCP valuation (CCPV).
  *
- * Delta (field 26): for options the option delta ratio ∂V/∂underlying per unit
+ * Delta (field 25): for options the option delta ratio ∂V/∂underlying per unit
  * of notional (FX option: signed spot delta; swaption / cap: annuity-weighted
  * ∂PV/∂F divided by the annuity, i.e. the Bachelier/Black delta) taken from
  * the pricing analytics; for linear instruments ±1 by direction (pay fixed /
  * long the underlying rate or bought currency → +1, receive fixed → −1).
+ *
+ * Clearing obligation (field 30, N3-09): taken from the trade's explicit
+ * `clearingObligation` flag (or `opts.clearingObligation`); it is **not**
+ * derived from `cleared` – the Art. 4 obligation depends on counterparty
+ * classification, product class and thresholds, not on whether the trade was
+ * (voluntarily) cleared. Unknown → "N/A".
  */
 export interface EmirValuationRecord {
   uti?: string;
@@ -25,16 +34,23 @@ export interface EmirValuationRecord {
   productClassification: string;
   notional: number;
   notionalCurrency: string;
+  /** Field 21. */
   valuationAmount: number;
+  /** Field 22. */
   valuationCurrency: string;
+  /** Field 23, ISO-8601 UTC (`YYYY-MM-DDThh:mm:ssZ`). */
   valuationTimestamp: string;
+  /** Field 24. */
   valuationMethod: "MTMA" | "MTMO" | "CCPV";
+  /** Field 25. */
   delta?: number;
+  /** Field 26. */
   collateralPortfolioIndicator: "TRUE" | "FALSE";
-  /** Centrally cleared (field 31); "FALSE" when the trade does not say otherwise. */
+  /** Field 31 – centrally cleared; "FALSE" when the trade does not say otherwise. */
   cleared: "TRUE" | "FALSE";
-  /** Clearing obligation (field 32), derived: cleared → "Y", else "N". */
-  clearingObligation: "Y" | "N";
+  /** Field 30 – clearing obligation from the trade / options; "N/A" when not determined (never derived from `cleared`). */
+  clearingObligation: "Y" | "N" | "N/A";
+  /** Table 1 field – clearing member, informational. */
   clearingMember?: string;
 }
 
@@ -53,19 +69,42 @@ export interface EmirRecordOptions {
   asOf?: string;
   /** Observable transaction price → valuation method MTMA (mark-to-market) when no explicit `method` is given. */
   transactionPrice?: number;
+  /** Clearing obligation (field 30) when the trade does not carry `clearingObligation`. */
+  clearingObligation?: boolean;
 }
 
-/** Valuation timestamp: explicit → snapshot time → reporter's asOf → EoD 17:00 UTC of the valuation date. */
+/** Normalise an ISO-8601 date-time to `YYYY-MM-DDThh:mm:ssZ` (UTC); a bare date is completed to the EoD convention. */
+function normaliseTimestamp(raw: string, source: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return `${raw}T17:00:00Z`;
+  if (!isIsoDateTime(raw)) {
+    throw new PricingError("INVALID_TIMESTAMP", `${source} ${JSON.stringify(raw)} is not an ISO-8601 date-time – EMIR field 23 needs YYYY-MM-DDThh:mm:ssZ`, {
+      source,
+      value: raw,
+    });
+  }
+  return new Date(raw).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/**
+ * Valuation timestamp (field 23): explicit → snapshot time → reporter's asOf
+ * → EoD 17:00 UTC of the valuation date. Every candidate must be ISO-8601
+ * (N3-03): an unparsable explicit `timestamp` / `asOf` raises
+ * `PricingError("INVALID_TIMESTAMP")`; an unparsable `meta.snapshotTime` is
+ * ignored (the snapshot validator flags it) and the next candidate is used.
+ */
 export function emirValuationTimestamp(ctx: MarketContext, opts: Pick<EmirRecordOptions, "timestamp" | "asOf"> = {}): string {
   const eod = `${toISO(ctx.valuationDate)}T17:00:00Z`;
-  const raw = opts.timestamp ?? ctx.meta?.snapshotTime ?? opts.asOf ?? eod;
-  // A bare date is completed to the EoD convention.
-  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T17:00:00Z` : raw;
+  if (opts.timestamp !== undefined) return normaliseTimestamp(opts.timestamp, "timestamp");
+  const snap = ctx.meta?.snapshotTime;
+  if (snap !== undefined && (isIsoDateTime(snap) || /^\d{4}-\d{2}-\d{2}$/.test(snap))) return normaliseTimestamp(snap, "meta.snapshotTime");
+  if (opts.asOf !== undefined) return normaliseTimestamp(opts.asOf, "asOf");
+  return eod;
 }
 
 export function emirValuationRecord(ctx: MarketContext, trade: Trade, pricing: PricingResult, opts: EmirRecordOptions = {}): EmirValuationRecord {
   const { notional, currency } = notionalOf(trade);
   const cleared = trade.cleared === true;
+  const obligation = trade.clearingObligation ?? opts.clearingObligation;
   return {
     uti: opts.uti ?? trade.uti,
     tradeId: trade.id,
@@ -80,7 +119,7 @@ export function emirValuationRecord(ctx: MarketContext, trade: Trade, pricing: P
     delta: opts.delta ?? emirDelta(trade, pricing),
     collateralPortfolioIndicator: trade.collateralCurrency ? "TRUE" : "FALSE",
     cleared: cleared ? "TRUE" : "FALSE",
-    clearingObligation: cleared ? "Y" : "N",
+    clearingObligation: obligation === undefined ? "N/A" : obligation ? "Y" : "N",
     clearingMember: trade.clearingMember,
   };
 }
@@ -94,7 +133,7 @@ function legFx(pricing: PricingResult): number {
 }
 
 /**
- * Delta of the position (EMIR field 26) as a ratio, see module doc. Returns
+ * Delta of the position (EMIR field 25) as a ratio, see module doc. Returns
  * undefined when the analytics needed for an option are missing.
  */
 export function emirDelta(trade: Trade, pricing: PricingResult): number | undefined {
@@ -205,7 +244,7 @@ export function emirCsv(records: EmirValuationRecord[], sep = ";", opts: { decim
     r.delta !== undefined ? r.delta.toFixed(6) : "",
     r.collateralPortfolioIndicator,
     r.cleared ?? "FALSE",
-    r.clearingObligation ?? "N",
+    r.clearingObligation ?? "N/A",
     r.clearingMember ?? "",
   ]);
   return (opts.bom ? "﻿" : "") + [[...EMIR_CSV_HEADER], ...rows].map((r) => r.map((c) => csvCell(c, sep, opts.decimalComma ?? false)).join(sep)).join("\n");

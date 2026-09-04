@@ -1,9 +1,12 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import {
+  type CapletVolSurface,
+  type FxVolSurface,
   type HedgeRelationship,
   type InterpolationMethod,
   type MarketContext,
+  type SwaptionVolSurface,
   type PricingResult,
   type ReportPerspective,
   type RiskReport,
@@ -21,9 +24,10 @@ import {
   shiftCurvesParallel,
   shiftFxSpots,
   stableStringify,
+  toISO,
 } from "@deriva/pricing-core";
 import { type ViewId } from "../hotkeys/keymap.js";
-import { germanTradeName, translatePricingError } from "../lib/i18n.js";
+import { INTERPOLATION_DE, germanTradeName, translatePricingError } from "../lib/i18n.js";
 import { copyName, idPrefix, nextId } from "../lib/ids.js";
 import { hasErrors, validateTrade } from "../lib/validate-trade.js";
 import { samplePortfolio } from "./sample-portfolio.js";
@@ -92,9 +96,25 @@ export interface ImportSummary {
   replaced: number;
 }
 
-/** Undo entries are typed: trade snapshots and quote snapshots (N-14). */
+/** Edited volatility surfaces (only the overridden ones, keyed like the market context). */
+export interface VolSurfaces {
+  swaptionVols?: Record<string, SwaptionVolSurface>;
+  capletVols?: Record<string, CapletVolSurface>;
+  fxVols?: Record<string, FxVolSurface>;
+}
+export type VolKind = keyof VolSurfaces;
+
+/**
+ * Undo entries are typed: trade snapshots, quote snapshots (N-14), market
+ * parameters (interpolation / turn-of-year, R3-F3), vol surfaces (R3-4) and
+ * hedge documentations (R3-F4).
+ */
 export type UndoEntry =
-  { kind: "trades"; trades: Trade[]; label: string; at: number; tradeId?: string } | { kind: "quotes"; quotes: SampleMarketQuotes; label: string; at: number };
+  | { kind: "trades"; trades: Trade[]; label: string; at: number; tradeId?: string }
+  | { kind: "quotes"; quotes: SampleMarketQuotes; label: string; at: number }
+  | { kind: "market"; interpolation: Record<string, InterpolationMethod>; turnOfYear: Record<string, TurnOfYear>; label: string; at: number }
+  | { kind: "vols"; volSurfaces: VolSurfaces; label: string; at: number }
+  | { kind: "hedge"; tradeId: string; relationship: HedgeRelationship | undefined; label: string; at: number };
 
 export interface RestoreInfo {
   trades: number;
@@ -135,6 +155,8 @@ interface AppState {
   turnOfYear: Record<string, TurnOfYear>;
   /** CDS term structures per counterparty (persisted) – bootstrapped to hazard curves for the XVA panel. */
   cdsCurves: Record<string, CdsQuote[]>;
+  /** Edited vol surfaces (swaption cubes, caplet surfaces, FX smiles) overriding the sample market (persisted, R3-4). */
+  volSurfaces: VolSurfaces;
   baseMarket: MarketContext;
   market: MarketContext;
   whatIf: WhatIf;
@@ -179,10 +201,14 @@ interface AppState {
   restored: RestoreInfo | null;
   /** Number of open modal dialogs (documents, context menus …) – background hotkeys are suspended while > 0. */
   modalDepth: number;
+  /** Number of open popovers (Export ▾, Spalten, Datums-Vorlagen) – hotkeys are suspended, the shell stays interactive (R3-02). */
+  popoverDepth: number;
 
   // actions
   openModal(): void;
   closeModal(): void;
+  openPopover(): void;
+  closePopover(): void;
   setView(v: ViewId): void;
   select(id: string | null): void;
   setVisibleIds(ids: string[]): void;
@@ -215,8 +241,12 @@ interface AppState {
   setQuotes(q: SampleMarketQuotes, label?: string): boolean;
   resetQuotes(): void;
   setInterpolation(curveId: string, method: InterpolationMethod | undefined): boolean;
+  /** Set / remove a turn-of-year jump; refuses dates on or before the valuation date (R3-F2). */
   setTurnOfYear(curveId: string, toy: TurnOfYear | undefined): boolean;
   setCdsCurve(counterparty: string, quotes: CdsQuote[] | undefined): void;
+  /** Override one vol surface (undoable, marks the market as modified); `undefined` restores the sample surface. */
+  setVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface | undefined, label: string): boolean;
+  resetVolSurfaces(): void;
   repriceAll(): void;
   /**
    * Risk report from the cache, computed on demand *without* writing to the
@@ -228,6 +258,7 @@ interface AppState {
   ensureRisk(id: string): RiskReport | undefined;
   setValuationDate(iso: string): boolean;
   setHedgeRelationship(rel: HedgeRelationship): void;
+  /** Discard the stored hedge documentation of a trade – undoable (R3-F4). */
   removeHedgeRelationship(tradeId: string): void;
   setReportInputs(tradeId: string, patch: Partial<ReportInputs>): void;
   resetReportInputs(tradeId: string): void;
@@ -286,6 +317,16 @@ export function priceAll(market: MarketContext, trades: Trade[], ccy: string): {
   return { results, ms: performance.now() - t0 };
 }
 
+/** German label of an interpolation method for undo entries ("log-linear (DF)"). */
+function interpolationLabel(m: string | undefined): string {
+  return m ? (INTERPOLATION_DE[m] ?? m) : "log-linear (DF)";
+}
+/** Serial date → TT.MM.JJJJ (undo labels). */
+function isoDe(d: number): string {
+  const [y, m, day] = toISO(d).split("-");
+  return `${day}.${m}.${y}`;
+}
+
 export const INITIAL_DATE_ISO = "2026-09-03";
 const initialDate = parseISO(INITIAL_DATE_ISO);
 const cloneQuotes = (q: SampleMarketQuotes): SampleMarketQuotes => JSON.parse(JSON.stringify(q)) as SampleMarketQuotes;
@@ -299,9 +340,30 @@ export function quotesModified(q: SampleMarketQuotes): boolean {
   return JSON.stringify(q) !== JSON.stringify(SAMPLE_QUOTES);
 }
 
-/** Quotes, spots, interpolation overrides or turn-of-year jumps differ from the sample market (N-23). */
-export function marketModified(s: Pick<AppState, "quotes" | "interpolation"> & { turnOfYear?: Record<string, TurnOfYear> }): boolean {
-  return quotesModified(s.quotes) || Object.keys(s.interpolation).length > 0 || Object.keys(s.turnOfYear ?? {}).length > 0;
+/** Number of overridden vol surfaces. */
+export function volSurfaceCount(v: VolSurfaces | undefined): number {
+  if (!v) return 0;
+  return Object.keys(v.swaptionVols ?? {}).length + Object.keys(v.capletVols ?? {}).length + Object.keys(v.fxVols ?? {}).length;
+}
+
+/** Quotes, spots, interpolation overrides, turn-of-year jumps or vol surfaces differ from the sample market (N-23, R3-4). */
+export function marketModified(
+  s: Pick<AppState, "quotes" | "interpolation"> & { turnOfYear?: Record<string, TurnOfYear>; volSurfaces?: VolSurfaces },
+): boolean {
+  return (
+    quotesModified(s.quotes) || Object.keys(s.interpolation).length > 0 || Object.keys(s.turnOfYear ?? {}).length > 0 || volSurfaceCount(s.volSurfaces) > 0
+  );
+}
+
+/** Apply edited vol surfaces on top of a built market. */
+export function withVolSurfaces(m: MarketContext, v: VolSurfaces | undefined): MarketContext {
+  if (!v || volSurfaceCount(v) === 0) return m;
+  return {
+    ...m,
+    swaptionVols: v.swaptionVols ? { ...m.swaptionVols, ...v.swaptionVols } : m.swaptionVols,
+    capletVols: v.capletVols ? { ...m.capletVols, ...v.capletVols } : m.capletVols,
+    fxVols: v.fxVols ? { ...m.fxVols, ...v.fxVols } : m.fxVols,
+  };
 }
 
 /** Stable short hash of the quote set (report staleness key, N-18). */
@@ -319,8 +381,9 @@ export function buildMarket(
   quotes: SampleMarketQuotes,
   interpolation: Record<string, InterpolationMethod>,
   turnOfYear: Record<string, TurnOfYear> = {},
+  volSurfaces: VolSurfaces = {},
 ): MarketContext {
-  const built = buildSampleMarket(date, quotes);
+  const built = withVolSurfaces(buildSampleMarket(date, quotes), volSurfaces);
   const overrides = Object.keys(interpolation).filter((id) => id in built.curves);
   // A turn-of-year jump only makes sense while the date lies ahead of the valuation date.
   const toys = Object.entries(turnOfYear).filter(([id, t]) => id in built.curves && t.date > date && t.bp !== 0);
@@ -437,6 +500,26 @@ function isPlausibleCdsCurve(v: unknown): v is CdsQuote[] {
   return Array.isArray(v) && v.every((q) => q && typeof q === "object" && typeof (q as CdsQuote).tenor === "string" && Number.isFinite((q as CdsQuote).spread));
 }
 
+/** Persisted vol overrides: every surface must be an object with an `id` and an `expiries` array. */
+function plausibleVolSurfaces(v: unknown): VolSurfaces {
+  const out: VolSurfaces = {};
+  if (!v || typeof v !== "object") return out;
+  for (const kind of ["swaptionVols", "capletVols", "fxVols"] as VolKind[]) {
+    const group = (v as Record<string, unknown>)[kind];
+    if (!group || typeof group !== "object") continue;
+    const ok: Record<string, unknown> = {};
+    for (const [id, s] of Object.entries(group as Record<string, unknown>))
+      if (s && typeof s === "object" && typeof (s as { id?: unknown }).id === "string" && Array.isArray((s as { expiries?: unknown }).expiries)) ok[id] = s;
+    if (Object.keys(ok).length) (out as Record<string, unknown>)[kind] = ok;
+  }
+  return out;
+}
+
+/** The shipped sample vol surfaces (reference for "edited" markers and resets). */
+export function sampleVolSurfaces(): Required<VolSurfaces> {
+  return { swaptionVols: initialMarket.swaptionVols ?? {}, capletVols: initialMarket.capletVols ?? {}, fxVols: initialMarket.fxVols ?? {} };
+}
+
 /** Slice of the state written to localStorage. */
 export interface PersistedSlice {
   trades: Trade[];
@@ -444,6 +527,7 @@ export interface PersistedSlice {
   interpolation: Record<string, InterpolationMethod>;
   turnOfYear?: Record<string, TurnOfYear>;
   cdsCurves?: Record<string, CdsQuote[]>;
+  volSurfaces?: VolSurfaces;
   valuationDate: number;
   reportingCurrency: string;
   view: ViewId;
@@ -481,13 +565,32 @@ export const useStore = create<AppState>()(
         const entry: UndoEntry = { kind: "quotes", quotes: cloneQuotes(quotes), label, at: now };
         set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
       };
+      /** Push a snapshot of the market parameters (interpolation, turn-of-year) for undo (R3-F3). */
+      const pushMarketUndo = (label: string) => {
+        const { undoStack, interpolation, turnOfYear } = get();
+        const entry: UndoEntry = { kind: "market", interpolation: { ...interpolation }, turnOfYear: { ...turnOfYear }, label, at: Date.now() };
+        set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
+      };
+      /** Push a vol-surface snapshot for undo (R3-4); consecutive edits within 1 s are coalesced. */
+      const pushVolUndo = (label: string) => {
+        const { undoStack, volSurfaces } = get();
+        const last = undoStack[undoStack.length - 1];
+        const now = Date.now();
+        if (last && last.kind === "vols" && now - last.at < 1000) {
+          set({ undoStack: [...undoStack.slice(0, -1), { ...last, label, at: now }] });
+          return;
+        }
+        const entry: UndoEntry = { kind: "vols", volSurfaces: JSON.parse(JSON.stringify(volSurfaces)) as VolSurfaces, label, at: now };
+        set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
+      };
       const rebuildMarket = (
         date: number,
         quotes: SampleMarketQuotes,
         interpolation = get().interpolation,
         turnOfYear: Record<string, TurnOfYear> = get().turnOfYear,
+        volSurfaces: VolSurfaces = get().volSurfaces,
       ): MarketContext => {
-        const built = buildMarket(date, quotes, interpolation, turnOfYear);
+        const built = buildMarket(date, quotes, interpolation, turnOfYear, volSurfaces);
         const fixings = get().baseMarket.fixings;
         return fixings && fixings.length > 0 ? { ...built, fixings } : built;
       };
@@ -497,6 +600,7 @@ export const useStore = create<AppState>()(
         interpolation: {},
         turnOfYear: {},
         cdsCurves: {},
+        volSurfaces: {},
         baseMarket: initialMarket,
         market: initialMarket,
         whatIf: { ratesBp: 0, fxPct: 0, volBp: 0 },
@@ -527,9 +631,12 @@ export const useStore = create<AppState>()(
         docKind: null,
         restored: null,
         modalDepth: 0,
+        popoverDepth: 0,
 
         openModal: () => set({ modalDepth: get().modalDepth + 1 }),
         closeModal: () => set({ modalDepth: Math.max(0, get().modalDepth - 1) }),
+        openPopover: () => set({ popoverDepth: get().popoverDepth + 1 }),
+        closePopover: () => set({ popoverDepth: Math.max(0, get().popoverDepth - 1) }),
         setView: (view) => set({ view }),
         select: (selectedId) => set({ selectedId }),
         setVisibleIds: (ids) => {
@@ -669,6 +776,35 @@ export const useStore = create<AppState>()(
             }
             return entry.label;
           }
+          if (entry.kind === "market") {
+            set({ undoStack: undoStack.slice(0, -1) });
+            try {
+              const base = rebuildMarket(get().valuationDate, get().quotes, entry.interpolation, entry.turnOfYear);
+              set({ interpolation: entry.interpolation, turnOfYear: entry.turnOfYear });
+              get().setMarket(base);
+            } catch {
+              return null;
+            }
+            return entry.label;
+          }
+          if (entry.kind === "vols") {
+            set({ undoStack: undoStack.slice(0, -1) });
+            try {
+              const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, entry.volSurfaces);
+              set({ volSurfaces: entry.volSurfaces });
+              get().setMarket(base);
+            } catch {
+              return null;
+            }
+            return entry.label;
+          }
+          if (entry.kind === "hedge") {
+            const next = { ...get().hedgeRelationships };
+            if (entry.relationship) next[entry.tradeId] = entry.relationship;
+            else delete next[entry.tradeId];
+            set({ undoStack: undoStack.slice(0, -1), hedgeRelationships: next });
+            return entry.label;
+          }
           const { results, ms } = priceAll(market, entry.trades, reportingCurrency);
           const selectedId = entry.trades.some((t) => t.id === get().selectedId) ? get().selectedId : (entry.trades[0]?.id ?? null);
           set({
@@ -778,11 +914,15 @@ export const useStore = create<AppState>()(
           get().setQuotes(cloneQuotes(SAMPLE_QUOTES), "Quotes zurückgesetzt");
         },
         setInterpolation: (curveId, method) => {
+          const prev = get().interpolation[curveId];
+          if (prev === method) return true;
           const interpolation = { ...get().interpolation };
           if (method === undefined) delete interpolation[curveId];
           else interpolation[curveId] = method;
           try {
             const base = rebuildMarket(get().valuationDate, get().quotes, interpolation);
+            const curveDefault = (get().baseMarket.curves[curveId] as { interpolation?: string } | undefined)?.interpolation;
+            pushMarketUndo(`Interpolation ${curveId} ${interpolationLabel(prev ?? curveDefault)} → ${interpolationLabel(method ?? curveDefault)}`);
             set({ interpolation });
             get().setMarket(base);
             return true;
@@ -791,17 +931,48 @@ export const useStore = create<AppState>()(
           }
         },
         setTurnOfYear: (curveId, toy) => {
+          // A jump on or before the valuation date can never be applied – refuse instead of storing it silently (R3-F2).
+          if (toy && toy.date <= get().valuationDate) return false;
           const turnOfYear = { ...get().turnOfYear };
           if (toy === undefined) delete turnOfYear[curveId];
           else turnOfYear[curveId] = toy;
           try {
             const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, turnOfYear);
+            pushMarketUndo(
+              toy
+                ? `Turn-of-Year ${curveId} ${isoDe(toy.date)} ${toy.bp > 0 ? "+" : ""}${String(toy.bp).replace(".", ",")} bp`
+                : `Turn-of-Year ${curveId} entfernt`,
+            );
             set({ turnOfYear });
             get().setMarket(base);
             return true;
           } catch {
             return false;
           }
+        },
+        setVolSurface: (kind, id, surface, label) => {
+          const cur = get().volSurfaces;
+          const group: Record<string, unknown> = { ...(cur[kind] ?? {}) };
+          if (surface === undefined) delete group[id];
+          else group[id] = surface;
+          const volSurfaces: VolSurfaces = { ...cur, [kind]: Object.keys(group).length ? group : undefined };
+          if (!volSurfaces[kind]) delete volSurfaces[kind];
+          try {
+            const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, volSurfaces);
+            pushVolUndo(label);
+            set({ volSurfaces });
+            get().setMarket(base);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        resetVolSurfaces: () => {
+          if (volSurfaceCount(get().volSurfaces) === 0) return;
+          const base = rebuildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, {});
+          pushVolUndo("Vol-Flächen zurückgesetzt");
+          set({ volSurfaces: {} });
+          get().setMarket(base);
         },
         setCdsCurve: (counterparty, quotes) => {
           const cdsCurves = { ...get().cdsCurves };
@@ -845,9 +1016,12 @@ export const useStore = create<AppState>()(
         },
         setHedgeRelationship: (rel) => set({ hedgeRelationships: { ...get().hedgeRelationships, [rel.hedgingInstrumentId]: rel } }),
         removeHedgeRelationship: (tradeId) => {
+          const prev = get().hedgeRelationships[tradeId];
+          if (!prev) return;
           const next = { ...get().hedgeRelationships };
           delete next[tradeId];
-          set({ hedgeRelationships: next });
+          const entry: UndoEntry = { kind: "hedge", tradeId, relationship: prev, label: `Sicherungsdokumentation ${tradeId} verworfen`, at: Date.now() };
+          set({ hedgeRelationships: next, undoStack: [...get().undoStack, entry].slice(-UNDO_DEPTH) });
         },
         setReportInputs: (tradeId, patch) => {
           const cur = get().reportInputs[tradeId] ?? DEFAULT_REPORT_INPUTS;
@@ -877,6 +1051,7 @@ export const useStore = create<AppState>()(
             interpolation: {},
             turnOfYear: {},
             cdsCurves: {},
+            volSurfaces: {},
             trades,
             baseMarket,
             market,
@@ -906,6 +1081,7 @@ export const useStore = create<AppState>()(
         interpolation: s.interpolation,
         turnOfYear: s.turnOfYear,
         cdsCurves: s.cdsCurves,
+        volSurfaces: s.volSurfaces,
         valuationDate: s.valuationDate,
         reportingCurrency: s.reportingCurrency,
         view: s.view,
@@ -934,9 +1110,10 @@ export const useStore = create<AppState>()(
           if (p.cdsCurves && typeof p.cdsCurves === "object") {
             for (const [k, v] of Object.entries(p.cdsCurves)) if (isPlausibleCdsCurve(v) && v.length > 0) cdsCurves[k] = v;
           }
+          const volSurfaces = plausibleVolSurfaces(p.volSurfaces);
           const valuationDate = typeof p.valuationDate === "number" && Number.isFinite(p.valuationDate) ? p.valuationDate : current.valuationDate;
           const view = VIEW_IDS.includes(p.view as ViewId) ? (p.view as ViewId) : current.view;
-          const baseMarket = buildMarket(valuationDate, quotes, interpolation, turnOfYear);
+          const baseMarket = buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces);
           const reportingCurrency =
             typeof p.reportingCurrency === "string" && reportingCurrencies(baseMarket).includes(p.reportingCurrency)
               ? p.reportingCurrency
@@ -954,6 +1131,7 @@ export const useStore = create<AppState>()(
             interpolation,
             turnOfYear,
             cdsCurves,
+            volSurfaces,
             valuationDate,
             reportingCurrency,
             view,
@@ -966,7 +1144,7 @@ export const useStore = create<AppState>()(
             results,
             lastPricingMs: ms,
             selectedId,
-            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear }) },
+            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear, volSurfaces }) },
           };
         } catch {
           return current;

@@ -18,7 +18,8 @@ import { NumInput } from "../components/NumInput.js";
 import { keysText, HOTKEYS } from "../hotkeys/keymap.js";
 import { hazardCurveFor } from "../lib/credit.js";
 import { fmtBp, fmtDate, fmtMoney, fmtNum, fmtPct, signClass } from "../lib/format.js";
-import { PERSPECTIVE_DE, SNAPSHOT_STATUS_DE, t as tr, translateCoreMessage } from "../lib/i18n.js";
+import { INTERPOLATION_DE, PERSPECTIVE_DE, SNAPSHOT_STATUS_DE, germanizeParagraph, t as tr, translateCoreMessage } from "../lib/i18n.js";
+import { whatIfExportQuestion } from "../lib/portfolio-export.js";
 import { bucketLabel, detailRows } from "../lib/metrics.js";
 import { downloadText } from "../lib/portfolio-io.js";
 import { tradeNotional, tradeTypeBadge } from "../lib/trade-ops.js";
@@ -178,7 +179,7 @@ export function ReportView() {
   const ct = report.costTransparency;
   const gov = report.governance;
   const reportJson = () => {
-    if (wiActive && !window.confirm(`Der Report enthält What-if-Zahlen (${whatIfLabel(s.whatIf)}) und ist nicht prüfungsfähig. Trotzdem exportieren?`)) return;
+    if (wiActive && !window.confirm(whatIfExportQuestion(whatIfLabel(s.whatIf)))) return;
     downloadText(`${trade.id}-report-${report.valuationDate}${wiActive ? "-whatif" : ""}.json`, JSON.stringify(report, null, 2), "application/json");
     act().showToast("Report als JSON exportiert");
   };
@@ -284,7 +285,9 @@ export function ReportView() {
           <span className="muted">Quellen: {gov.inputSources.join(", ") || "–"}</span>
           <span className="muted">Modell {gov.modelVersion}</span>
           {gov.validatedBy && <span className="muted">validiert von {gov.validatedBy}</span>}
-          {gov.snapshotStatus !== "approved" && <span className="muted">· ohne unabhängige Validierung (MaRisk BTO 2.2.1) nur indikativ</span>}
+          {gov.snapshotStatus !== "approved" && (
+            <span className="muted">· ohne unabhängige Validierung (MaRisk AT 4.3.5, IFRS 13 / IDW RS HFA 47) nur indikativ</span>
+          )}
         </div>
       </div>
 
@@ -374,7 +377,6 @@ export function ReportView() {
                 onChange={(v) => setInputs({ offerPv: v })}
                 testId="offer-pv"
               />
-              <span className="print-only">{fmtMoney(inputs.offerPv, s.reportingCurrency)}</span>
             </div>
             {!customer && (
               <>
@@ -389,7 +391,6 @@ export function ReportView() {
                     disabled={!!cptyHazardCurve}
                     onChange={(v) => setInputs({ cptySpreadBp: v })}
                   />
-                  <span className="print-only">{fmtNum(inputs.cptySpreadBp, 0)} bp</span>
                   {cptyHazardCurve && (
                     <span className="field-msg muted">
                       CDS-Termstruktur aus der Marktansicht ({cptyHazardCurve.times.length} Pillars) ersetzt den flachen Spread.
@@ -399,7 +400,6 @@ export function ReportView() {
                 <div className="field">
                   <label>Eigener Spread</label>
                   <NumInput value={inputs.ownSpreadBp} step={5} min={0} unit="bp" ariaLabel="Eigener Spread" onChange={(v) => setInputs({ ownSpreadBp: v })} />
-                  <span className="print-only">{fmtNum(inputs.ownSpreadBp, 0)} bp</span>
                 </div>
                 <div className="field">
                   <label>Recovery</label>
@@ -413,7 +413,6 @@ export function ReportView() {
                     ariaLabel="Recovery"
                     onChange={(v) => setInputs({ recovery: v })}
                   />
-                  <span className="print-only">{fmtNum(inputs.recovery, 0)} %</span>
                 </div>
               </>
             )}
@@ -454,7 +453,7 @@ export function ReportView() {
           )}
           {ct && (
             <div className="muted xs" style={{ marginTop: 8 }} data-testid="sign-rule">
-              {ct.signRule}
+              {germanizeParagraph(ct.signRule)}
             </div>
           )}
           <div className="muted xs" style={{ marginTop: 8 }}>
@@ -538,51 +537,53 @@ export function ReportView() {
         </div>
         <div className="card">
           <h3>Methodik & Marktdaten</h3>
-          <ul className="small" style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
+          <ul className="small" style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }} data-testid="methodology">
             {report.methodology.map((m) => (
-              <li key={m}>{translateCoreMessage(m)}</li>
+              <li key={m}>{germanizeParagraph(translateCoreMessage(m))}</li>
             ))}
           </ul>
           <div className="muted xs" style={{ marginTop: 10 }}>
-            {report.fairValue.rationale}
+            {germanizeParagraph(report.fairValue.rationale)}
           </div>
-          <table className="grid-table" style={{ marginTop: 10 }}>
-            <thead>
-              <tr>
-                <th>Kurve</th>
-                <th className="num">Pillars</th>
-                <th>Interpolation</th>
-                <th className="num">Zero 2Y</th>
-                <th className="num">Zero 10Y</th>
-              </tr>
-            </thead>
-            <tbody>
-              {report.market.curves.map((c) => {
-                const z = (yrs: number) => {
-                  const target = new Date(report.valuationDate).getTime() + yrs * 365.25 * 86400000;
-                  let best = c.nodes[0]!;
-                  for (const nd of c.nodes) if (Math.abs(new Date(nd.date).getTime() - target) < Math.abs(new Date(best.date).getTime() - target)) best = nd;
-                  return best.zero;
-                };
-                return (
-                  <tr key={c.id} style={{ cursor: "default" }}>
-                    <td className="mono">{c.id}</td>
-                    <td className="num">{c.nodes.length}</td>
-                    <td className="muted xs">
-                      {c.interpolation ?? "–"}
-                      {s.interpolation[c.id] && (
-                        <span className="badge warn" style={{ marginLeft: 4 }}>
-                          Override
-                        </span>
-                      )}
-                    </td>
-                    <td className="num">{fmtPct(z(2), 3)}</td>
-                    <td className="num">{fmtPct(z(10), 3)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <div className="table-scroll" style={{ marginTop: 10 }}>
+            <table className="grid-table" data-testid="market-table">
+              <thead>
+                <tr>
+                  <th>Kurve</th>
+                  <th className="num">Pillars</th>
+                  <th>Interpolation</th>
+                  <th className="num">Zero 2Y</th>
+                  <th className="num">Zero 10Y</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.market.curves.map((c) => {
+                  const z = (yrs: number) => {
+                    const target = new Date(report.valuationDate).getTime() + yrs * 365.25 * 86400000;
+                    let best = c.nodes[0]!;
+                    for (const nd of c.nodes) if (Math.abs(new Date(nd.date).getTime() - target) < Math.abs(new Date(best.date).getTime() - target)) best = nd;
+                    return best.zero;
+                  };
+                  return (
+                    <tr key={c.id} style={{ cursor: "default" }}>
+                      <td className="mono">{c.id}</td>
+                      <td className="num">{c.nodes.length}</td>
+                      <td className="muted xs">
+                        {c.interpolation ? tr(INTERPOLATION_DE, c.interpolation) : "–"}
+                        {s.interpolation[c.id] && (
+                          <span className="badge warn" style={{ marginLeft: 4 }}>
+                            Override
+                          </span>
+                        )}
+                      </td>
+                      <td className="num">{fmtPct(z(2), 3)}</td>
+                      <td className="num">{fmtPct(z(10), 3)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
           <div className="muted xs" style={{ marginTop: 6 }}>
             FX-Spots:{" "}
             {Object.entries(report.market.fxSpots)

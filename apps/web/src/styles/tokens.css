@@ -43,8 +43,11 @@
   --btn-primary-fg: #0b0f17;
   /* KUNDENANSICHT chip text on --warn */
   --chip-customer-fg: #1a1200;
-  /* active segment-button text on accent-soft over bg-0 / bg-1 */
+  /* active segment-button text on accent-soft over bg-0 / bg-1 (also active filter chips) */
   --seg-active-fg: #7fb0ff;
+  /* signed numbers inside a selected (accent-tinted) row – ≥ 4.5:1 on the tint (R3-07) */
+  --pos-strong: #4ade80;
+  --neg-strong: #ff8a8a;
 
   --backdrop: rgba(0, 0, 0, 0.5);
   --radius-s: 4px;
@@ -95,6 +98,8 @@
   --btn-primary-fg: #ffffff;
   --chip-customer-fg: #ffffff;
   --seg-active-fg: #1d4ed8;
+  --pos-strong: #0f6b34;
+  --neg-strong: #9f1c1c;
   --backdrop: rgba(15, 23, 42, 0.32);
   --shadow-1: 0 1px 2px rgba(15, 23, 42, 0.08), 0 0 0 1px rgba(15, 23, 42, 0.04);
   --shadow-2: 0 12px 40px rgba(15, 23, 42, 0.18);

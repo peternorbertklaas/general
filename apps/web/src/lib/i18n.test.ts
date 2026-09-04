@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { PricingError } from "@deriva/pricing-core";
 import {
   CASHFLOW_KIND_DE,
+  INTERPOLATION_DE,
   LEG_TYPE_DE,
+  PRICING_ERROR_CODES_DE,
   germanTradeName,
   germanizeDocValue,
   germanizeParagraph,
@@ -103,5 +105,93 @@ describe("i18n core message mapping (F-25)", () => {
     expect(germanizeParagraph("Kontrahentenrisiko: Swaption-replication (Sorensen–Bollier), smile vol at strike, flat hazard; Pillar 2056-09-08")).toBe(
       "Kontrahentenrisiko: Swaption-Replikation (Sorensen–Bollier), Smile-Vol am Strike, konstante Hazard-Rate; Pillar 08.09.2056",
     );
+  });
+  it("methodology prose: code identifiers, conventions and interpolation ids become German labels (R3-06)", () => {
+    expect(germanizeParagraph("Perspektive Kunde: Barwert (fairValue) und Transaktionspreis; marginBp/marginPct beziehen die Marge auf das Nominal.")).toBe(
+      "Perspektive Kunde: Barwert (Fair Value) und Transaktionspreis; Marge in bp / % des Nominals beziehen die Marge auf das Nominal.",
+    );
+    expect(germanizeParagraph("Geldbetrag wie analytics.deltaAmount, nicht die Delta-Quote deltaPct")).toBe(
+      "Geldbetrag wie Delta-Betrag (Analytics), nicht die Delta-Quote Delta-Quote",
+    );
+    expect(germanizeParagraph("Leg 2 (Empfang, Float EURIBOR-6M): 6M, ACT/360, ModifiedFollowing, Kalender TARGET, Stub ShortFront")).toBe(
+      "Leg 2 (Empfang, variabel EURIBOR-6M): 6M, ACT/360, Modified Following, Kalender TARGET, Stub: kurzer Stub vorne",
+    );
+    expect(germanizeParagraph("als MISSING_FIXING gemeldet (Policy „curve“)")).toBe("als „Fixing fehlt“ gemeldet (Regel „curve“)");
+    expect(germanizeParagraph("Interpolation logLinear, Kurve monotoneConvex")).toBe("Interpolation log-linear (DF), Kurve monoton-konvex (Hagan–West)");
+    // defensive fallback: unknown camelCase identifiers never survive raw
+    expect(germanizeParagraph("siehe spotDate und greeksMethod")).toBe("siehe Spot Date und Greeks Method");
+    expect(germanizeParagraph("siehe Spot Date")).not.toMatch(/\b[a-z]+[A-Z]\w+\b/);
+    expect(INTERPOLATION_DE.logLinear).toBe("log-linear (DF)");
+    expect(INTERPOLATION_DE.linearZero).toBe("linear (Zero)");
+    expect(INTERPOLATION_DE.cubicSplineZero).toBe("kubischer Spline (Zero)");
+    expect(INTERPOLATION_DE.flatForward).toBe("flat forward");
+    expect(INTERPOLATION_DE.monotoneConvex).toMatch(/^monoton-konvex/);
+  });
+  it("translates the round-3 core codes (vol conversion, frequency, day count, periods, credit curve, timestamp, hazard floor)", () => {
+    expect(
+      translateCoreMessage(
+        "VOL_TYPE_CONVERTED: caplet surface EUR-EURIBOR-6M quotes normal vols but model Black was requested – vols converted to lognormal by price equivalence at each forward/strike/expiry",
+      ),
+    ).toBe(
+      "Volatilität der Caplet-Fläche EUR-EURIBOR-6M von Normal- in Lognormal-Quotierung umgerechnet (Modell Black, preisäquivalent je Forward/Strike/Verfall)",
+    );
+    expect(
+      translateCoreMessage(
+        "VOL_TYPE_CONVERTED: swaption surface EUR quotes lognormal, shift 3.00% vols but model Bachelier was requested – vols converted to normal by price equivalence at each forward/strike/expiry",
+      ),
+    ).toMatch(/Swaption-Fläche EUR von Lognormal \(Shift 3,00%\)- in Normal-Quotierung umgerechnet/);
+    expect(
+      translatePricingError(
+        new PricingError(
+          "VOL_MODEL_INCOMPATIBLE",
+          "A lognormal model cannot be fed from the normal surface: shifted forward -0.250% / strike 1.000% is not positive – use Bachelier or a larger shift",
+        ),
+      ),
+    ).toBe(
+      "Volatilitätsquotierung mit dem Modell unvereinbar: Lognormal-Modell nicht mit der Normal-Fläche vereinbar: verschobener Forward -0,250% / Strike 1,000% nicht positiv – Bachelier oder größeren Shift verwenden",
+    );
+    expect(translatePricingError(new PricingError("INVALID_FREQUENCY", 'Invalid frequency: 7X (expected a tenor like "3M", "6M", "1Y" or "ZC")'))).toBe(
+      "Ungültige Kuponfrequenz: Ungültige Frequenz: 7X (erwartet ein Tenor wie 3M, 6M, 1Y oder ZC)",
+    );
+    expect(translatePricingError(new PricingError("UNKNOWN_DAYCOUNT", "Unknown day count convention: ACT/999"))).toBe(
+      "Unbekannte Tageszählung: Unbekannte Tageszählung: ACT/999",
+    );
+    expect(
+      translatePricingError(
+        new PricingError(
+          "TOO_MANY_PERIODS",
+          "Schedule with frequency 1M would have 1200 periods (limit 1000) – shorten the leg or use a longer coupon frequency",
+        ),
+      ),
+    ).toBe("Zu viele Zahlungsperioden: Zahlungsplan mit Frequenz 1M hätte 1200 Perioden (Grenze 1000) – Laufzeit verkürzen oder längere Kuponfrequenz wählen");
+    expect(
+      translatePricingError(new PricingError("INVALID_CREDIT_CURVE", "bootstrapHazardCurve: CDS spread of 5Y must be a finite, non-negative number")),
+    ).toBe("Ungültige CDS-Termstruktur: CDS-Termstruktur: Spread 5Y muss eine endliche, nicht negative Zahl sein");
+    expect(
+      translatePricingError(
+        new PricingError(
+          "INVALID_CREDIT_CURVE",
+          "bootstrapHazardCurve: pillar 2Y (t = 2.014y) implies a hazard rate of -12.3bp: the survival probability would increase over the interval (inverted CDS quotes)",
+        ),
+      ),
+    ).toMatch(/Pillar 2Y \(t = 2,014 J\) impliziert eine Hazard-Rate von -12,3 bp/);
+    expect(
+      translateCoreMessage(
+        "HAZARD_FLOORED: pillar 2Y (t = 2.014y) implies a hazard rate of -12.3bp: the survival probability would increase over the interval (inverted CDS quotes) – floored at 0, the 2Y quote does not reprice",
+      ),
+    ).toBe("Hazard-Rate am Pillar 2Y (t = 2,014 J) wäre -12,3 bp (inverse CDS-Quotes) – auf 0 begrenzt, die 2Y-Quote wird nicht exakt reproduziert");
+    expect(
+      translatePricingError(new PricingError("INVALID_TIMESTAMP", 'asOf "gestern" is not an ISO-8601 date-time – EMIR field 23 needs YYYY-MM-DDThh:mm:ssZ')),
+    ).toBe('Ungültiger Zeitstempel: asOf "gestern" ist kein ISO-8601-Zeitstempel – EMIR-Feld 23 erwartet JJJJ-MM-TTThh:mm:ssZ');
+    for (const code of [
+      "VOL_MODEL_INCOMPATIBLE",
+      "INVALID_FREQUENCY",
+      "UNKNOWN_DAYCOUNT",
+      "TOO_MANY_PERIODS",
+      "INVALID_CREDIT_CURVE",
+      "INVALID_TIMESTAMP",
+      "HAZARD_FLOORED",
+    ])
+      expect(PRICING_ERROR_CODES_DE[code], code).toBeTruthy();
   });
 });

@@ -1,3 +1,4 @@
+import { PricingError } from "../errors.js";
 import { type SerialDate, addMonths, fromYMD, isEndOfMonth, isLeapYear, toYMD, daysInMonth } from "./date.js";
 
 export type DayCountConvention =
@@ -26,7 +27,9 @@ export interface YearFractionContext {
   businessDays?: (from: SerialDate, to: SerialDate) => number;
 }
 
+/** Canonical day-count convention for a market string; unknown conventions raise `PricingError("UNKNOWN_DAYCOUNT")`. */
 export function normalizeDayCount(dc: string): DayCountConvention {
+  if (typeof dc !== "string") throw new PricingError("UNKNOWN_DAYCOUNT", `Unknown day count convention: ${String(dc)}`, { dayCount: dc });
   const u = dc.trim().toUpperCase().replace(/\s+/g, " ");
   switch (u) {
     case "ACT/360":
@@ -62,7 +65,7 @@ export function normalizeDayCount(dc: string): DayCountConvention {
     case "BUS/252":
       return "BUS/252";
     default:
-      throw new Error(`Unknown day count convention: ${dc}`);
+      throw new PricingError("UNKNOWN_DAYCOUNT", `Unknown day count convention: ${dc}`, { dayCount: dc });
   }
 }
 

@@ -26,6 +26,16 @@ export function isTemplateId(x: string): x is TemplateId {
   return (TEMPLATE_IDS as string[]).includes(x);
 }
 
+/**
+ * Default CSA currency of a cross-currency swap: the foreign (USD) leg's
+ * currency – the sample market carries the collateral curve "EUR|USD" →
+ * EUR-ESTR-USDCSA, so the Xccy basis is priced (Markt R3-1).
+ */
+export const CCS_CSA_CURRENCY = "USD";
+export function ccsCollateralCurrency(pair: string): string {
+  return pair.slice(0, 3).toUpperCase() === "EUR" ? pair.slice(3, 6).toUpperCase() : CCS_CSA_CURRENCY;
+}
+
 /** New trade from a template. Ids are assigned by the store (`autoId`); the counterparty stays open. */
 export function newTradeTemplate(kind: TemplateId, valuationDate: number): Trade {
   const cal = getCalendar("TARGET");
@@ -106,6 +116,7 @@ export function newTradeTemplate(kind: TemplateId, valuationDate: number): Trade
         name: "FX-Swap EUR/USD 1Y",
       };
     case "ccs":
+      // USD CSA: the EUR leg is discounted on EUR-ESTR-USDCSA (Xccy basis) – without it the fair basis spread is ≈ 0 (Markt R3-1).
       return makeCrossCurrencySwap({
         name: "CCS EUR/USD 5Y €STR −20 bp vs SOFR",
         pair: "EURUSD",
@@ -114,6 +125,7 @@ export function newTradeTemplate(kind: TemplateId, valuationDate: number): Trade
         spread: -0.002,
         effectiveDate: spot,
         tenor: "5Y",
+        collateralCurrency: CCS_CSA_CURRENCY,
       });
     case "fra":
       return makeFra({

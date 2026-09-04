@@ -1,13 +1,31 @@
 import { type FastifyInstance } from "fastify";
 import { type CrossCurrencySwapParams, type Trade, makeCrossCurrencySwap, makeFra, parseISO, priceTrade } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
+import { CSV_TRADE_TYPES, type CsvImportResult, type CsvTradeType, csvTemplatesMarkdown, csvToTrades } from "../lib/csv-import.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import { describeError } from "../lib/errors.js";
+import { assertTradeWithinLimits } from "../lib/limits.js";
 import { arrayResponse, errorRef, fromTemplateBodySchema, pricingResultSchema, responses, storedTradeSchema, tradeId, tradeRef } from "../schemas.js";
 
 const currencyQuery = { type: "string", pattern: "^[A-Z]{3}$", description: "Reporting currency for the probe valuation (default EUR)" } as const;
 const idParams = { type: "object", required: ["id"], properties: { id: tradeId } } as const;
-const ifMatchHeaders = { type: "object", properties: { "if-match": { type: "string", description: 'ETag of the version being modified, or "*"' } } } as const;
+const ifMatchHeaders = {
+  type: "object",
+  properties: {
+    "if-match": {
+      type: "string",
+      description:
+        'ETag of the version being modified, or "*". Optional unless the server runs with REQUIRE_IF_MATCH=1 (then 428 without it); a mismatch is always 412.',
+    },
+  },
+} as const;
+
+declare module "fastify" {
+  interface FastifyRequest {
+    /** Set by the CSV `preValidation` of `POST /api/trades/import`: row numbers of the built trades and the rejected rows. */
+    csvImport?: Pick<CsvImportResult, "rows" | "rejected">;
+  }
+}
 
 type FraParams = Parameters<typeof makeFra>[0];
 /** `POST /api/trades/from-template` body: builder parameters with ISO dates (validated by `fromTemplateBodySchema`). */
@@ -41,6 +59,26 @@ function etagMatches(header: string | undefined, etag: string): boolean {
     const t = v.trim();
     return t === "*" || t === etag;
   });
+}
+
+/** 412 on an `If-Match` that does not match; 428 when the header is missing and the server requires it; `null` = proceed. */
+function precondition(ctx: AppContext, ifMatch: string | undefined, currentEtag: string, requestId: string) {
+  if (ifMatch && !etagMatches(ifMatch, currentEtag)) {
+    return { status: 412, body: { error: "ETag mismatch – trade was modified", statusCode: 412, code: "PRECONDITION_FAILED", currentEtag, requestId } };
+  }
+  if (!ifMatch && ctx.requireIfMatch) {
+    return {
+      status: 428,
+      body: {
+        error: "If-Match header required (send the ETag of the version you read, or `*`)",
+        statusCode: 428,
+        code: "PRECONDITION_REQUIRED",
+        currentEtag,
+        requestId,
+      },
+    };
+  }
+  return null;
 }
 
 export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext) {
@@ -153,12 +191,12 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       schema: {
         operationId: "updateTrade",
         tags: ["trades"],
-        summary: "Trade aktualisieren (optimistic locking über If-Match)",
+        summary: "Trade aktualisieren (optimistic locking über If-Match: Abweichung → 412; ohne Header → 428 bei REQUIRE_IF_MATCH=1)",
         params: idParams,
         headers: ifMatchHeaders,
         querystring: { type: "object", properties: { reportingCurrency: currencyQuery } },
         body: tradeRef,
-        response: responses({ 200: storedTradeSchema }, 400, 404, 412, 413, 422),
+        response: responses({ 200: storedTradeSchema }, 400, 404, 412, 413, 422, 428),
       },
     },
     async (req, reply) => {
@@ -167,10 +205,8 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       }
       const current = ctx.trades.get(req.params.id);
       if (!current) return reply.status(404).send({ error: "Trade not found", statusCode: 404, requestId: req.id });
-      const ifMatch = req.headers["if-match"];
-      if (ifMatch && !etagMatches(ifMatch, current.etag)) {
-        return reply.status(412).send({ error: "ETag mismatch – trade was modified", statusCode: 412, currentEtag: current.etag, requestId: req.id });
-      }
+      const failed = precondition(ctx, req.headers["if-match"], current.etag, req.id);
+      if (failed) return reply.status(failed.status).send(failed.body);
       const trade = datesToSerial(req.body);
       priceTrade(ctx.market.get(), trade, req.query.reportingCurrency ?? "EUR");
       const stored = ctx.trades.update(trade);
@@ -180,21 +216,48 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
     },
   );
 
-  app.post<{ Body: { trades: Trade[]; mode?: "create" | "upsert" }; Querystring: { reportingCurrency?: string } }>(
+  type ImportResult = {
+    id?: string;
+    row?: number;
+    status: "imported" | "skipped" | "rejected";
+    version?: number;
+    pv?: number;
+    warnings?: string[];
+    reason?: string;
+    code?: string;
+  };
+  const isCsv = (req: { headers: { "content-type"?: string } }) => (req.headers["content-type"] ?? "").toLowerCase().startsWith("text/csv");
+
+  app.post<{
+    Body: { trades: Trade[]; mode?: "create" | "upsert" };
+    Querystring: { reportingCurrency?: string; type?: CsvTradeType; mode?: "create" | "upsert" };
+  }>(
     "/api/trades/import",
     {
       config: { marketHeader: true },
       schema: {
         operationId: "importTrades",
         tags: ["trades"],
-        summary: "Batch-Import (JSON-Array). Jeder Trade wird validiert und probeweise bewertet; Ergebnis je Trade",
+        summary:
+          "Batch-Import als JSON-Array oder CSV (`content-type: text/csv` + `?type=`). Jeder Trade wird validiert und probeweise bewertet; Ergebnis je Trade/Zeile",
+        description:
+          "JSON: `{ trades: Trade[], mode? }` – a schema violation anywhere in the array fails the whole request (400). " +
+          "CSV (`content-type: text/csv`): one column template per `?type=`; rows are mapped through the core builders (market-standard conventions), a row that cannot be mapped is reported as `rejected` with its `row` number, a header lacking a required column is a 400. `?mode=` selects create (default) or upsert. Compute bounds apply per trade and per request (400 `TOO_MANY_PERIODS`, 413 `PERIOD_BUDGET_EXCEEDED`).\n\n" +
+          csvTemplatesMarkdown(),
         body: {
           type: "object",
           required: ["trades"],
           properties: { trades: { type: "array", items: tradeRef, minItems: 1, maxItems: 5000 }, mode: { type: "string", enum: ["create", "upsert"] } },
           additionalProperties: false,
         },
-        querystring: { type: "object", properties: { reportingCurrency: currencyQuery } },
+        querystring: {
+          type: "object",
+          properties: {
+            reportingCurrency: currencyQuery,
+            type: { type: "string", enum: [...CSV_TRADE_TYPES], description: "CSV only: column template / trade type of every row" },
+            mode: { type: "string", enum: ["create", "upsert"], description: "CSV only (JSON bodies carry `mode` in the body): default create" },
+          },
+        },
         response: responses(
           {
             200: {
@@ -205,7 +268,9 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
                 imported: { type: "integer" },
                 skipped: { type: "integer" },
                 rejected: { type: "integer" },
-                results: arrayResponse("Per trade: { id, status: imported|skipped|rejected, version?, pv?, warnings?, reason?, code? }"),
+                results: arrayResponse(
+                  "Per trade / CSV row: { id?, row? (CSV, 1-based data row), status: imported|skipped|rejected, version?, pv?, warnings?, reason?, code? }",
+                ),
               },
             },
           },
@@ -213,24 +278,54 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
           413,
         ),
       },
+      // CSV → `{ trades, mode }` before schema validation, so the JSON schema, the compute bounds and the handler apply unchanged.
+      preValidation: async (req, reply) => {
+        if (!isCsv(req)) return;
+        if (typeof req.body !== "string") return reply.status(400).send({ error: "CSV body must be text", statusCode: 400, requestId: req.id });
+        const type = req.query.type;
+        if (!type)
+          return reply.status(400).send({ error: "CSV import needs ?type=<TradeType> to select the column template", statusCode: 400, requestId: req.id });
+        let parsed: CsvImportResult;
+        try {
+          parsed = csvToTrades(req.body, type, ctx.market.get().valuationDate);
+        } catch (e) {
+          return reply.status(400).send({ error: (e as Error).message, statusCode: 400, code: "CSV_INVALID", requestId: req.id });
+        }
+        req.csvImport = { rows: parsed.rows, rejected: parsed.rejected };
+        if (parsed.trades.length === 0) {
+          // Every row failed to map: report them (200 with all rows rejected) instead of tripping `minItems: 1`.
+          const results: ImportResult[] = parsed.rejected.map((r) => ({ row: r.row, status: "rejected", reason: r.reason, code: "CSV_ROW_INVALID" }));
+          return reply.send({ total: results.length, imported: 0, skipped: 0, rejected: results.length, results });
+        }
+        req.body = { trades: datesToIso(parsed.trades), mode: req.query.mode };
+      },
     },
     async (req) => {
       const m = ctx.market.get();
       const mode = req.body.mode ?? "create";
       const reporting = req.query.reportingCurrency ?? "EUR";
-      const results = datesToSerial(req.body.trades).map((t) => {
+      const rows = req.csvImport?.rows;
+      const results: ImportResult[] = datesToSerial(req.body.trades).map((t, i) => {
+        const row = rows ? { row: rows[i] } : {};
         try {
-          if (mode === "create" && ctx.trades.get(t.id)) return { id: t.id, status: "skipped" as const, reason: "exists" };
+          if (mode === "create" && ctx.trades.get(t.id)) return { id: t.id, ...row, status: "skipped", reason: "exists" };
           const p = priceTrade(m, t, reporting);
           const stored = ctx.trades.upsert(t);
-          return { id: t.id, status: "imported" as const, version: stored.version, pv: p.pv, warnings: p.warnings };
+          return { id: t.id, ...row, status: "imported", version: stored.version, pv: p.pv, warnings: p.warnings };
         } catch (e) {
           const d = describeError(e);
-          return { id: t.id, status: "rejected" as const, reason: d.message, code: d.code };
+          return { id: t.id, ...row, status: "rejected", reason: d.message, code: d.code };
         }
       });
+      for (const r of req.csvImport?.rejected ?? []) results.push({ row: r.row, status: "rejected", reason: r.reason, code: "CSV_ROW_INVALID" });
+      if (rows) results.sort((a, b) => (a.row ?? 0) - (b.row ?? 0));
       const imported = results.filter((r) => r.status === "imported").length;
-      ctx.audit.append({ actor: "api", action: "trade.import", subject: "batch", details: { total: results.length, imported } });
+      ctx.audit.append({
+        actor: "api",
+        action: "trade.import",
+        subject: "batch",
+        details: { total: results.length, imported, ...(rows ? { format: "csv", type: req.query.type } : {}) },
+      });
       return {
         total: results.length,
         imported,
@@ -270,6 +365,8 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
     async (req) => {
       const m = ctx.market.get();
       const trade = buildFromTemplate(req.body, m.valuationDate);
+      // The body carries builder parameters, not a trade – bound the built trade before pricing it.
+      assertTradeWithinLimits(trade, ctx.limits);
       const pricing = req.body.price ? priceTrade(m, trade, req.body.reportingCurrency ?? "EUR") : undefined;
       return datesToIso({ trade, ...(pricing ? { pricing } : {}) });
     },
@@ -281,19 +378,17 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       schema: {
         operationId: "deleteTrade",
         tags: ["trades"],
-        summary: "Trade löschen (If-Match optional; Abweichung → 412)",
+        summary: "Trade löschen (If-Match: Abweichung → 412; ohne Header → 428 bei REQUIRE_IF_MATCH=1)",
         params: idParams,
         headers: ifMatchHeaders,
-        response: { 204: { type: "null", description: "Deleted" }, 400: errorRef, ...responses({}, 404, 412) },
+        response: { 204: { type: "null", description: "Deleted" }, 400: errorRef, ...responses({}, 404, 412, 428) },
       },
     },
     async (req, reply) => {
       const current = ctx.trades.get(req.params.id);
       if (!current) return reply.status(404).send({ error: "Trade not found", statusCode: 404, requestId: req.id });
-      const ifMatch = req.headers["if-match"];
-      if (ifMatch && !etagMatches(ifMatch, current.etag)) {
-        return reply.status(412).send({ error: "ETag mismatch – trade was modified", statusCode: 412, currentEtag: current.etag, requestId: req.id });
-      }
+      const failed = precondition(ctx, req.headers["if-match"], current.etag, req.id);
+      if (failed) return reply.status(failed.status).send(failed.body);
       ctx.trades.delete(req.params.id);
       ctx.audit.append({ actor: "api", action: "trade.delete", subject: req.params.id, details: { version: current.version } });
       return reply.status(204).send();

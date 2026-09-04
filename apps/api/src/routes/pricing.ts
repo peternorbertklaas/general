@@ -74,7 +74,7 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
   app.post<{ Body: { trades?: Trade[]; reportingCurrency: string; useStore?: boolean } }>(
     "/api/price/portfolio",
     {
-      config: { marketHeader: true },
+      config: { marketHeader: true, storeFallback: true },
       schema: {
         operationId: "pricePortfolio",
         tags: ["pricing"],
@@ -108,7 +108,8 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
   app.post<{ Body: PriceBody & { bucketed?: boolean; vega?: boolean; theta?: boolean } }>(
     "/api/risk",
     {
-      config: { marketHeader: true },
+      // Bucketed risk reprices the trade per curve pillar (≈ 2 × pillars valuations); the weight keeps it within the request budget.
+      config: { marketHeader: true, computeWeight: (b) => ((b as { bucketed?: boolean }).bucketed ? 40 : 4) },
       schema: {
         operationId: "computeRisk",
         tags: ["pricing"],
@@ -128,10 +129,19 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
     },
   );
 
-  app.post<{ Body: { trades?: Trade[]; scenarios?: ScenarioDefinition[]; includeHistorical?: boolean; reportingCurrency?: string } }>(
+  type ScenariosBody = { trades?: Trade[]; scenarios?: ScenarioDefinition[]; includeHistorical?: boolean; reportingCurrency?: string };
+  app.post<{ Body: ScenariosBody }>(
     "/api/scenarios",
     {
-      config: { marketHeader: true },
+      config: {
+        marketHeader: true,
+        storeFallback: true,
+        // Base valuation + one per scenario.
+        computeWeight: (b) => {
+          const body = b as ScenariosBody;
+          return 1 + (body.scenarios?.length ?? STANDARD_SCENARIOS.length) + (body.includeHistorical ? HISTORICAL_SCENARIOS.length : 0);
+        },
+      },
       schema: {
         operationId: "runScenarios",
         tags: ["pricing"],
@@ -191,10 +201,19 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
     async () => datesToIso(HISTORICAL_SCENARIOS),
   );
 
-  app.post<{ Body: { trades?: Trade[]; reportingCurrency?: string; ratesBp?: number[]; fxPct?: number[]; fxCurrency?: string } }>(
+  type GridBody = { trades?: Trade[]; reportingCurrency?: string; ratesBp?: number[]; fxPct?: number[]; fxCurrency?: string };
+  app.post<{ Body: GridBody }>(
     "/api/scenarios/grid",
     {
-      config: { marketHeader: true },
+      config: {
+        marketHeader: true,
+        storeFallback: true,
+        // One valuation per grid cell.
+        computeWeight: (b) => {
+          const body = b as GridBody;
+          return (body.ratesBp?.length ?? 7) * (body.fxPct?.length ?? 5);
+        },
+      },
       schema: {
         operationId: "scenarioGrid",
         tags: ["pricing"],
@@ -270,7 +289,14 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
     },
   );
 
-  app.post<{ Body: { quotes: { tenor: string; spread: number }[]; recovery: number; valuationDate?: string; discountCurveId?: string } }>(
+  type HazardCurveBody = {
+    quotes: { tenor: string; spread: number }[];
+    recovery: number;
+    valuationDate?: string;
+    discountCurveId?: string;
+    floorHazard?: boolean;
+  };
+  app.post<{ Body: HazardCurveBody }>(
     "/api/xva/hazard-curve",
     {
       config: { marketHeader: true },
@@ -278,12 +304,15 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
         operationId: "bootstrapHazardCurve",
         tags: ["pricing"],
         summary: "Hazard-Kurve aus Par-CDS-Spreads bootstrappen (stückweise konstant) – als `credit.cptyHazardCurve` / `ownHazardCurve` in /api/xva verwendbar",
+        description:
+          "Sequential bootstrap with quarterly premium dates. Inverted quotes (spread × maturity decreasing) imply a negative hazard on that pillar: 422 `INVALID_CREDIT_CURVE` with `details.pillar`, or – with `floorHazard: true` – a hazard of 0 on that interval and a `HAZARD_FLOORED: …` entry in `warnings` (200).",
         body: hazardCurveBodySchema,
         response: responses(
           {
             200: {
               type: "object",
-              description: "HazardCurve (times in years ACT/365F, hazard per interval, recovery) plus survival probabilities at the pillars.",
+              description:
+                "HazardCurve (times in years ACT/365F, hazard per interval, recovery, `warnings` when a pillar was floored) plus survival probabilities at the pillars.",
               required: ["times", "hazards", "recovery", "pillars"],
               properties: {
                 ...hazardCurveSchema.properties,
@@ -306,7 +335,7 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
       if (req.body.discountCurveId && !discount) {
         return reply.status(404).send({ error: `Curve ${req.body.discountCurveId} not found`, statusCode: 404, requestId: req.id });
       }
-      const curve = bootstrapHazardCurve(req.body.quotes, req.body.recovery, valuationDate, discount);
+      const curve = bootstrapHazardCurve(req.body.quotes, req.body.recovery, valuationDate, discount, { floorHazard: req.body.floorHazard });
       // Label each pillar with the quote whose maturity (same ACT/365F time as the core) produced it.
       const quoteTimes = req.body.quotes.map((q) => ({ tenor: q.tenor, t: yearFraction(valuationDate, addTenor(valuationDate, q.tenor), "ACT/365F") }));
       return {
@@ -334,7 +363,8 @@ export async function registerPricingRoutes(app: FastifyInstance, ctx: AppContex
   }>(
     "/api/report",
     {
-      config: { marketHeader: true },
+      // Pricing + bucketed risk (unless includeRisk=false) + XVA.
+      config: { marketHeader: true, computeWeight: (b) => ((b as { includeRisk?: boolean }).includeRisk === false ? 2 : 40) },
       schema: {
         operationId: "valuationReport",
         tags: ["pricing"],

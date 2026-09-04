@@ -1,8 +1,21 @@
 import { type CurveExtrapolation, InterpolatedCurve, type Curve } from "../curves/curve.js";
 import { type SerialDate, parseISO, toISO } from "../dates/date.js";
 import { type DayCountConvention } from "../dates/daycount.js";
+import { PricingError } from "../errors.js";
 import { type InterpolationMethod } from "../math/interpolation.js";
 import { type MarketContext } from "./market-context.js";
+
+/** ISO-8601 date-time with mandatory time part and zone designator (`2026-09-03T16:30:00Z`, `…+02:00`, optional fraction). */
+const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * True when `s` is an ISO-8601 date-time that JavaScript parses to a valid
+ * instant (N3-03: `meta.snapshotTime` feeds the EMIR valuation timestamp and
+ * must never be free text).
+ */
+export function isIsoDateTime(s: unknown): s is string {
+  return typeof s === "string" && ISO_DATETIME.test(s) && Number.isFinite(Date.parse(s));
+}
 
 /**
  * Portable, versioned JSON representation of a market snapshot. Dates are ISO
@@ -69,8 +82,19 @@ export function serializeCurve(c: Curve): MarketSnapshotJson["curves"][number] {
   };
 }
 
+/**
+ * Rebuild a market context from its JSON form. Curves without a `meta.source`
+ * are tagged `"import"` (pillars taken from the snapshot, R3-7); a
+ * `meta.snapshotTime` that is not an ISO-8601 date-time raises
+ * `PricingError("INVALID_TIMESTAMP")` (N3-03).
+ */
 export function deserializeMarket(json: MarketSnapshotJson): MarketContext {
   if (json.schema !== "deriva.market/1") throw new Error(`Unsupported market snapshot schema: ${String(json.schema)}`);
+  if (json.meta?.snapshotTime !== undefined && !isIsoDateTime(json.meta.snapshotTime)) {
+    throw new PricingError("INVALID_TIMESTAMP", `meta.snapshotTime must be an ISO-8601 date-time (got ${JSON.stringify(json.meta.snapshotTime)})`, {
+      snapshotTime: json.meta.snapshotTime,
+    });
+  }
   const valuationDate: SerialDate = parseISO(json.valuationDate);
   const curves: Record<string, Curve> = {};
   for (const c of json.curves) {
@@ -81,7 +105,7 @@ export function deserializeMarket(json: MarketSnapshotJson): MarketContext {
       dayCount: c.dayCount,
       interpolation: c.interpolation,
       extrapolation: c.extrapolation,
-      meta: c.meta,
+      meta: { ...c.meta, source: c.meta?.source ?? "import" },
       nodes: c.nodes.map((n) => ({ date: parseISO(n.date), df: n.df })),
       forwardJumps: c.forwardJumps?.map((j) => ({ date: parseISO(j.date), bp: j.bp, days: j.days })),
     });
@@ -119,6 +143,9 @@ export function validateMarket(ctx: MarketContext): string[] {
   for (const [pair, rate] of Object.entries(ctx.fxSpots)) {
     if (!/^[A-Z]{6}$/.test(pair)) problems.push(`FX pair ${pair} malformed`);
     if (!(rate > 0)) problems.push(`FX spot ${pair} must be positive`);
+  }
+  if (ctx.meta?.snapshotTime !== undefined && !isIsoDateTime(ctx.meta.snapshotTime)) {
+    problems.push(`meta.snapshotTime ${JSON.stringify(ctx.meta.snapshotTime)} is not an ISO-8601 date-time`);
   }
   return problems;
 }

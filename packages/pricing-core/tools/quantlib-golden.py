@@ -410,6 +410,236 @@ def golden_cap() -> None:
     write("cap-flat-curve.json", payload)
 
 
+# --------------------------------------------------------------------------
+# H. Sample-market €STR OIS bootstrap (TARGET calendar, ModifiedFollowing,
+#    payment lag 1, log-linear discount factors) – independent re-derivation
+# --------------------------------------------------------------------------
+def easter_sunday(year: int) -> dt.date:
+    """Anonymous Gregorian algorithm (Meeus/Jones/Butcher), as in dates/calendar.ts."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d_ = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d_ - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l_ = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l_) // 451
+    month = (h + l_ - 7 * m + 114) // 31
+    day = ((h + l_ - 7 * m + 114) % 31) + 1
+    return dt.date(year, month, day)
+
+
+def target_holidays(year: int) -> set:
+    e = easter_sunday(year)
+    return {dt.date(year, 1, 1), e - dt.timedelta(days=2), e + dt.timedelta(days=1), dt.date(year, 5, 1), dt.date(year, 12, 25), dt.date(year, 12, 26)}
+
+
+def is_target_bd(x: dt.date) -> bool:
+    return x.weekday() < 5 and x not in target_holidays(x.year)
+
+
+def add_bd(x: dt.date, n: int) -> dt.date:
+    step = 1 if n >= 0 else -1
+    remaining = abs(n)
+    while remaining > 0:
+        x += dt.timedelta(days=step)
+        if is_target_bd(x):
+            remaining -= 1
+    return x
+
+
+def adjust_mf(x: dt.date) -> dt.date:
+    """ModifiedFollowing on TARGET."""
+    y = x
+    while not is_target_bd(y):
+        y += dt.timedelta(days=1)
+    if y.month != x.month:
+        y = x
+        while not is_target_bd(y):
+            y -= dt.timedelta(days=1)
+    return y
+
+
+def days_in_month(y: int, m: int) -> int:
+    return [31, 29 if (y % 4 == 0 and y % 100 != 0) or y % 400 == 0 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+
+
+def add_months(x: dt.date, n: int) -> dt.date:
+    total = x.year * 12 + (x.month - 1) + n
+    y, m = divmod(total, 12)
+    return dt.date(y, m + 1, min(x.day, days_in_month(y, m + 1)))
+
+
+def add_tenor(x: dt.date, tenor: str) -> dt.date:
+    n, unit = int(tenor[:-1]), tenor[-1].upper()
+    if unit == "D":
+        return x + dt.timedelta(days=n)
+    if unit == "W":
+        return x + dt.timedelta(days=7 * n)
+    if unit == "M":
+        return add_months(x, n)
+    return add_months(x, 12 * n)
+
+
+# The sample €STR OIS quotes (market/sample-market.ts SAMPLE_QUOTES.eurOis); the TypeScript test asserts equality.
+SAMPLE_EUR_OIS = [
+    ("1W", 0.0201), ("1M", 0.0202), ("3M", 0.0203), ("6M", 0.0205), ("9M", 0.0207), ("1Y", 0.021), ("18M", 0.0215), ("2Y", 0.0221), ("3Y", 0.0231),
+    ("4Y", 0.0239), ("5Y", 0.0246), ("7Y", 0.0258), ("10Y", 0.0272), ("12Y", 0.0279), ("15Y", 0.0286), ("20Y", 0.0287), ("25Y", 0.0281), ("30Y", 0.0273),
+]
+
+
+def golden_sample_bootstrap() -> None:
+    """
+    Re-derive the sample €STR OIS discount curve independently of the engine.
+
+    Conventions (curves/bootstrap.ts, index-definitions.ts): spot = valuation + 2 TARGET business days;
+    accrual end = spot + tenor, ModifiedFollowing on TARGET; pillar = last payment date = accrual end + 1 TARGET
+    business day (€STR payment lag 1); quotes ≤ 1Y are single-period (zero-coupon) OIS, longer quotes pay annually
+    (fixed ACT/360 vs €STR compounded in arrears, short front stub, both legs on the same schedule); the first
+    node is the spot date with DF = 1/(1 + r_1W·τ_spot); discount factors are interpolated log-linearly in ACT/365F
+    time. Daily compounding telescopes to DF ratios, so the par conditions are algebraic in the pillar DFs:
+
+      ≤ 1Y:  DF(accEnd) = DF(spot) / (1 + r·τ)  (closed form; the pillar DF follows from the log-linear segment
+             between the previous node and the pillar, as the accrual end lies inside that segment),
+      > 1Y:  Σ_i DF(pay_i)·[DF(acc_{i−1})/DF(acc_i) − 1 − r·τ_i] = 0 solved by bisection in the pillar DF
+             (earlier DFs interpolated from the already solved nodes).
+    """
+    t = lambda x: (x - VAL).days / 365.0  # noqa: E731 – curve time ACT/365F
+    spot = add_bd(VAL, 2)
+    tau_spot = (spot - VAL).days / 360.0
+    nodes = [(spot, 1.0 / (1.0 + SAMPLE_EUR_OIS[0][1] * tau_spot))]
+
+    def df_at(curve, x: dt.date) -> float:
+        tx = t(x)
+        if tx <= 0:
+            return 1.0
+        times = [0.0] + [t(d_) for d_, _ in curve]
+        logs = [0.0] + [math.log(f) for _, f in curve]
+        if tx >= times[-1]:
+            fwd = -(logs[-1] - logs[-2]) / (times[-1] - times[-2])
+            return math.exp(logs[-1] - fwd * (tx - times[-1]))
+        i = max(j for j in range(len(times) - 1) if times[j] <= tx)
+        w = (tx - times[i]) / (times[i + 1] - times[i])
+        return math.exp(logs[i] + w * (logs[i + 1] - logs[i]))
+
+    pillars = []
+    items = []
+    for tenor, rate in SAMPLE_EUR_OIS:
+        end_unadj = add_tenor(spot, tenor)
+        acc_end = adjust_mf(end_unadj)
+        pay = add_bd(acc_end, 1)
+        items.append((pay, tenor, rate, end_unadj, acc_end))
+    items.sort(key=lambda it: it[0])
+    for pay, tenor, rate, end_unadj, acc_end in items:
+        years = (end_unadj - spot).days / 365.0
+        prev_date, prev_df = nodes[-1]
+        if years <= 1.01:
+            tau = (acc_end - spot).days / 360.0
+            df_acc = nodes[0][1] / (1.0 + rate * tau)
+            # log-linear segment through (prev, df_prev) and (acc_end, df_acc) evaluated at the pillar
+            slope = (math.log(df_acc) - math.log(prev_df)) / (t(acc_end) - t(prev_date))
+            df_pay = math.exp(math.log(prev_df) + slope * (t(pay) - t(prev_date)))
+            method = "closed-form"
+        else:
+            # annual schedule rolled back from the unadjusted end (short front stub), ModifiedFollowing, pay lag 1
+            dates = [end_unadj]
+            i = 1
+            while True:
+                d_ = add_months(end_unadj, -12 * i)
+                if d_ <= spot:
+                    break
+                dates.append(d_)
+                i += 1
+            dates.append(spot)
+            dates.reverse()
+            accs = [adjust_mf(d_) for d_ in dates]
+            pays = [add_bd(a, 1) for a in accs[1:]]
+            assert pays[-1] == pay
+
+            def npv(df_pay_trial: float) -> float:
+                curve = nodes + [(pay, df_pay_trial)]
+                total = 0.0
+                for j in range(1, len(accs)):
+                    tau = (accs[j] - accs[j - 1]).days / 360.0
+                    total += df_at(curve, pays[j - 1]) * (df_at(curve, accs[j - 1]) / df_at(curve, accs[j]) - 1.0 - rate * tau)
+                return total
+
+            lo, hi = prev_df * 0.2, min(1.0, prev_df * 1.05)
+            f_lo, f_hi = npv(lo), npv(hi)
+            assert f_lo * f_hi < 0, (tenor, f_lo, f_hi)
+            for _ in range(200):
+                mid = 0.5 * (lo + hi)
+                f_mid = npv(mid)
+                if f_lo * f_mid <= 0:
+                    hi, f_hi = mid, f_mid
+                else:
+                    lo, f_lo = mid, f_mid
+                if hi - lo < 1e-16:
+                    break
+            df_pay = 0.5 * (lo + hi)
+            method = "bisection"
+        nodes.append((pay, df_pay))
+        pillars.append({
+            "tenor": tenor,
+            "rate": rate,
+            "accrualEnd": acc_end.isoformat(),
+            "date": pay.isoformat(),
+            "time": t(pay),
+            "df": df_pay,
+            "zero": -math.log(df_pay) / t(pay),
+            "method": method,
+        })
+    payload = {
+        "case": "sample-market-bootstrap",
+        "description": "Sample-market €STR OIS discount curve (EUR-ESTR) bootstrapped independently: TARGET calendar, spot T+2, ModifiedFollowing, €STR payment lag 1 business day, log-linear discount factors in ACT/365F time; 18 OIS quotes 1W … 30Y, valuation 2026-09-03.",
+        "derivation": golden_sample_bootstrap.__doc__.strip(),
+        "inputs": {
+            "valuationDate": VAL.isoformat(),
+            "curveId": "EUR-ESTR",
+            "index": "ESTR",
+            "calendar": "TARGET",
+            "spotLag": 2,
+            "paymentLag": 1,
+            "interpolation": "logLinear",
+            "dayCount": "ACT/365F",
+            "quotes": [{"type": "OIS", "tenor": tn, "rate": r} for tn, r in SAMPLE_EUR_OIS],
+        },
+        "expected": {
+            "spotDate": spot.isoformat(),
+            "spotDf": nodes[0][1],
+            "pillars": pillars,
+            "closedFormPillars": [p["tenor"] for p in pillars if p["method"] == "closed-form"],
+        },
+        "quantlib": ql_sample_bootstrap_check() if HAVE_QL else None,
+    }
+    if payload["quantlib"] is None:
+        # Not executed in this environment: see tools/README.md for the regeneration recipe.
+        payload["quantlib"] = {"status": "pending", "note": "QuantLib not installed when the file was generated; run tools/quantlib-golden.py with the QuantLib Python bindings to fill in the cross-check."}
+    write("sample-market-bootstrap.json", payload)
+
+
+def ql_sample_bootstrap_check():  # pragma: no cover
+    """QuantLib cross-check: PiecewiseLogLinearDiscount from OISRateHelpers on an €STR-like index (TARGET, pay lag 1)."""
+    ql.Settings.instance().evaluationDate = ql.Date(3, 9, 2026)
+    cal = ql.TARGET()
+    estr = ql.OvernightIndex("ESTR", 0, ql.EURCurrency(), cal, ql.Actual360())
+    helpers = []
+    for tenor, rate in SAMPLE_EUR_OIS:
+        h = ql.OISRateHelper(2, ql.Period(tenor), ql.QuoteHandle(ql.SimpleQuote(rate)), estr, ql.YieldTermStructureHandle(), False, 1, ql.ModifiedFollowing, ql.Annual)
+        helpers.append(h)
+    curve = ql.PiecewiseLogLinearDiscount(ql.Date(3, 9, 2026), helpers, ql.Actual365Fixed())
+    curve.enableExtrapolation()
+    return {
+        "status": "done",
+        "engine": "PiecewiseLogLinearDiscount / OISRateHelper (paymentLag 1, Annual, ModifiedFollowing, TARGET)",
+        "pillars": [{"date": ql.Date.to_date(d_).isoformat(), "df": curve.discount(d_)} for d_ in curve.dates()],
+    }
+
+
 if __name__ == "__main__":
     print("QuantLib available:", HAVE_QL)
     golden_swap()
@@ -419,4 +649,5 @@ if __name__ == "__main__":
     golden_fx_forward()
     golden_swaption()
     golden_cap()
+    golden_sample_bootstrap()
     sys.exit(0)

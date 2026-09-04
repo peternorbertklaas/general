@@ -1,13 +1,26 @@
-import { type InterpolatedCurve } from "../curves/curve.js";
+import { type InterpolatedCurve, curveSource } from "../curves/curve.js";
 import { getIndex } from "../curves/index-definitions.js";
 import { parseISO, toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
 import { frequencyPerYear } from "../dates/schedule.js";
 import { formatDateDe, formatDe, formatPctDe } from "../format.js";
+import {
+  barrierTypeLabelDe,
+  bdcLabelDe,
+  cashSettlementLabelDe,
+  fxAtmConventionLabelDe,
+  fxDeltaConventionLabelDe,
+  irModelLabelDe,
+  stubLabelDe,
+  volTypeLabelDe,
+  xvaMethodLabelDe,
+} from "../instruments/labels.js";
 import { embeddedOptionLegs, tradeMaturityDate } from "../instruments/trade-dates.js";
 import { type FloatLeg, type PricingResult, type SwapLeg, type Trade } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve } from "../market/market-context.js";
 import { fxSpotLag } from "../market/fx-spot.js";
+import { serializeCurve } from "../market/snapshot.js";
+import { isNonLocalInterpolation } from "../math/interpolation.js";
 import { splitPair } from "../pricing/fx-pricer.js";
 import { type RiskReport, capletSurfaceKeysFor, tradeCurveIds } from "../risk/sensitivities.js";
 import { PACKAGE_NAME, PACKAGE_VERSION } from "../version.js";
@@ -63,9 +76,10 @@ export interface ValuationReport {
   };
   methodology: string[];
   /**
-   * Valuation governance (IDW RS HFA 35 / MaRisk AT 4.3.x): status of the
-   * market snapshot, data sources and the model version used, plus the
-   * validator when the snapshot has been approved.
+   * Valuation governance (IDW RS HFA 47 for the fair-value measurement,
+   * MaRisk AT 4.3.5 for the use of models): status of the market snapshot,
+   * data sources and the model version used, plus the validator when the
+   * snapshot has been approved.
    */
   governance: ValuationGovernance;
   /** Reproducibility anchors: snapshot id (market inputs), inputs hash (trade + snapshot), report hash (content, excludes timings). */
@@ -162,9 +176,13 @@ function volSurfaceExtrapolation(ctx: MarketContext, trade: Trade, pricing: Pric
  * trade's CSA, projection curves of its indices – not every curve in the
  * market context), when an option expiry / tenor lies beyond the vol surface
  * grid, or when a required vol surface is missing (fallback vol used).
+ * Model-dependent but observable-input situations (barrier without smile
+ * correction, a surface vol converted into the requested model's quotation,
+ * R3-1) stay Level 2 and are listed as hints in the rationale.
  */
 export function ifrs13Level(ctx: MarketContext, trade: Trade, pricing: PricingResult): { level: 1 | 2 | 3; rationale: string } {
   const reasons: string[] = [];
+  const hints: string[] = [];
   const maturity = tradeMaturityDate(trade);
   for (const id of tradeCurveIds(ctx, trade)) {
     const c = ctx.curves[id]!;
@@ -175,18 +193,27 @@ export function ifrs13Level(ctx: MarketContext, trade: Trade, pricing: PricingRe
   }
   reasons.push(...volSurfaceExtrapolation(ctx, trade, pricing));
   const hasOverride = "volOverride" in trade && (trade as { volOverride?: number }).volOverride !== undefined;
-  if (hasOverride) reasons.push("manueller Volatilitäts-Override statt beobachtbarer Fläche");
-  if (pricing.warnings.some((w) => /No .*vol surface/i.test(w))) reasons.push("keine Volatilitätsfläche vorhanden, Fallback-Vol verwendet");
+  if (hasOverride) reasons.push("manuelle Volatilitätsvorgabe statt beobachtbarer Fläche");
+  if (pricing.warnings.some((w) => /No .*vol surface/i.test(w))) reasons.push("keine Volatilitätsfläche vorhanden, Rückfall-Volatilität verwendet");
   if (trade.type === "FxOption" && trade.barrier)
-    reasons.push("Barriere-Option: Modellabhängigkeit (Reiner-Rubinstein ohne Smile-Korrektur) – als Level 2 mit Hinweis eingestuft");
-  if (reasons.some((r) => !r.startsWith("Barriere"))) {
-    return { level: 3, rationale: `Wesentliche nicht beobachtbare Inputs: ${reasons.join("; ")} → Level 3.` };
+    hints.push("Barriere-Option: Modellabhängigkeit (Reiner-Rubinstein ohne Smile-Korrektur) – als Level 2 mit Hinweis eingestuft");
+  if (pricing.warnings.some((w) => w.startsWith("VOL_TYPE_CONVERTED"))) {
+    const model = irModelLabelDe(String(pricing.analytics.model ?? "Bachelier"));
+    hints.push(
+      `Volatilitätstyp der beobachtbaren Fläche weicht vom gewählten Modell ${model} ab – Volatilitäten per Preisäquivalenz je Forward/Strike/Laufzeit konvertiert (beobachtbare Inputs, Level 2 mit Hinweis)`,
+    );
+  }
+  if (reasons.length) {
+    return {
+      level: 3,
+      rationale: `Wesentliche nicht beobachtbare Inputs: ${reasons.join("; ")} → Level 3.${hints.length ? ` Hinweis: ${hints.join("; ")}.` : ""}`,
+    };
   }
   return {
     level: 2,
     rationale:
       "Bewertung mit beobachtbaren Marktdaten (OIS-/Swapkurven, Volatilitäten, FX-Spots) und marktüblichen Modellen; keine wesentlichen nicht beobachtbaren Inputs → Level 2." +
-      (reasons.length ? ` Hinweis: ${reasons.join("; ")}.` : ""),
+      (hints.length ? ` Hinweis: ${hints.join("; ")}.` : ""),
   };
 }
 
@@ -213,18 +240,65 @@ export function hashString(s: string): string {
   return h.toString(16).padStart(16, "0");
 }
 
+export interface MarketSnapshotIdOptions {
+  /**
+   * "full" (default): every market input – valuation date, curves (sorted by
+   * id; base nodes, forward jumps, interpolation, extrapolation, day count),
+   * discount / collateral curve mappings, FX spots and explicit spot dates,
+   * fixings (sorted), swaption / caplet / FX vol surfaces including their
+   * conventions, credit data and the snapshot label. "curves": the legacy
+   * curve-only hash (valuation date, curve node discount factors, FX spots)
+   * for consumers that want to label a curve set independently of vols.
+   */
+  scope?: "full" | "curves";
+}
+
 /**
- * Deterministic id of a market snapshot: FNV-1a hash over valuation date,
- * curve node discount factors (per curve id) and FX spots. Identical to
- * `report.audit.snapshotId`, so API and UI can label results without building
- * a report (`X-Market-Snapshot-Id`).
+ * Deterministic id of a market snapshot (FNV-1a over the canonical, key-sorted
+ * JSON of all market inputs, R3-2). Order-independent: the same snapshot with
+ * curves inserted in a different order, fixings in a different order or FX
+ * spots in a different key order yields the same id; a +1 bp vol bump, an
+ * added fixing, a changed hazard rate, a different CSA mapping or an explicit
+ * spot date changes it. Identical to `report.audit.snapshotId`, so API and
+ * UI can label results without building a report (`X-Market-Snapshot-Id`).
  */
-export function marketSnapshotId(ctx: MarketContext): string {
+export function marketSnapshotId(ctx: MarketContext, opts: MarketSnapshotIdOptions = {}): string {
+  if (opts.scope === "curves") {
+    return hashString(
+      stableStringify({
+        valuationDate: ctx.valuationDate,
+        curves: Object.values(ctx.curves)
+          .map((c) => ({ id: c.id, nodes: c.nodeDates.map((d) => [d, c.df(d)]) }))
+          .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+        fx: ctx.fxSpots,
+      }),
+    );
+  }
+  const curves = Object.values(ctx.curves)
+    .map((c) => {
+      // Provenance (`meta.source`, `meta.index`) is not a market input; the numbers and conventions are.
+      const { meta: _meta, ...rest } = serializeCurve(c);
+      return rest;
+    })
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const fixings = (ctx.fixings ?? [])
+    .map((f) => ({ index: f.index.toUpperCase(), date: f.date, value: f.value }))
+    .sort((a, b) => (a.index < b.index ? -1 : a.index > b.index ? 1 : a.date - b.date));
   return hashString(
     stableStringify({
+      schema: "deriva.market/1",
       valuationDate: ctx.valuationDate,
-      curves: Object.values(ctx.curves).map((c) => ({ id: c.id, nodes: c.nodeDates.map((d) => [d, c.df(d)]) })),
-      fx: ctx.fxSpots,
+      label: ctx.meta?.label,
+      discountCurveId: ctx.discountCurveId,
+      collateralDiscountCurveId: ctx.collateralDiscountCurveId,
+      curves,
+      fxSpots: ctx.fxSpots,
+      fxSpotDates: ctx.fxSpotDates,
+      fixings,
+      swaptionVols: ctx.swaptionVols,
+      capletVols: ctx.capletVols,
+      fxVols: ctx.fxVols,
+      credit: ctx.credit,
     }),
   );
 }
@@ -279,8 +353,8 @@ export function costTransparencyFor(
 function costSignRule(perspective: ReportPerspective): string {
   const who = perspective === "Bank" ? "der Bank" : "des Kunden";
   return (
-    `Perspektive ${perspective}: Barwert (fairValue) und Transaktionspreis sind aus Sicht ${who} angegeben (Transaktionspreis > 0 = ${who === "der Bank" ? "die Bank zahlt" : "der Kunde zahlt"} bei Abschluss). ` +
-    `Marge der Bank = ${perspective === "Bank" ? "fairValue − Transaktionspreis" : "Transaktionspreis − fairValue"}; anfänglicher Marktwert aus Kundensicht = −Marge der Bank (negativ, wenn der Kunde eine Marge trägt). marginBp/marginPct beziehen die Marge der Bank auf das Nominal.`
+    `Perspektive ${perspective}: Fair Value (Barwert) und Transaktionspreis sind aus Sicht ${who} angegeben (Transaktionspreis > 0 = ${who === "der Bank" ? "die Bank zahlt" : "der Kunde zahlt"} bei Abschluss). ` +
+    `Marge der Bank = ${perspective === "Bank" ? "Fair Value − Transaktionspreis" : "Transaktionspreis − Fair Value"}; anfänglicher Marktwert aus Kundensicht = −Marge der Bank (negativ, wenn der Kunde eine Marge trägt). Die Marge wird zusätzlich in Basispunkten und in Prozent des Nominals ausgewiesen.`
   );
 }
 
@@ -315,12 +389,14 @@ export function buildValuationReport(ctx: MarketContext, trade: Trade, pricing: 
   });
   const snapshotId = marketSnapshotId(ctx);
   // Inputs hash covers everything that changes the report content besides the market: the trade, the
-  // reporting currency and the cost-transparency inputs (transaction price, perspective, notional, what-if).
+  // reporting currency, the fixing policy and the cost-transparency inputs (transaction price,
+  // perspective, notional, what-if). The market itself is covered by the snapshot id (R3-2).
   const inputsHash = hashString(
     stableStringify({
       trade,
       snapshotId,
       reportingCurrency: pricing.currency,
+      missingFixingPolicy: ctx.missingFixingPolicy ?? "curve",
       transactionPrice: opts.transactionPrice,
       perspective: opts.transactionPrice !== undefined ? perspective : undefined,
       notional: opts.transactionPrice !== undefined ? notional : undefined,
@@ -447,12 +523,25 @@ function curveLines(ctx: MarketContext, trade: Trade): string[] {
       (projection.length ? `; Projektion der Forwards mit indexspezifischen Kurven – ${projection.join(", ")}.` : "."),
   );
   for (const id of tradeCurveIds(ctx, trade)) {
-    const c = ctx.curves[id]! as Partial<InterpolatedCurve>;
+    const curve = ctx.curves[id]!;
+    const c = curve as Partial<InterpolatedCurve>;
     const last = c.nodeDates?.[c.nodeDates.length - 1];
-    const interp = c.interpolation ? (INTERPOLATION_LABELS[c.interpolation] ?? c.interpolation) : "n/a";
-    const extra = c.extrapolation ? (EXTRAPOLATION_LABELS[c.extrapolation] ?? c.extrapolation) : "n/a";
+    const interp = c.interpolation ? (INTERPOLATION_LABELS[c.interpolation] ?? "n/a") : "n/a";
+    const extra = c.extrapolation ? (EXTRAPOLATION_LABELS[c.extrapolation] ?? "n/a") : "n/a";
+    // Construction text from the curve's provenance (R3-7): only bootstrapped curves were bootstrapped.
+    const source = curveSource(curve);
+    const construction =
+      source === "bootstrap"
+        ? "sequentielles Bootstrapping (Brent je Pillar) aus Marktquotes"
+        : source === "flat"
+          ? "flache Kurve (konstanter Zero-Satz, Test-/What-if-Kurve)"
+          : "importierte Kurve (Pillars aus Snapshot, kein Bootstrapping im Bewertungskern)";
+    const nonLocal = c.interpolation && isNonLocalInterpolation(c.interpolation);
     lines.push(
-      `Kurve ${id}: sequentielles Bootstrapping (Brent je Pillar), Interpolation ${interp}, Extrapolation jenseits des letzten Pillars${last !== undefined ? ` (${formatDateDe(last)})` : ""}: ${extra}; am kurzen Ende erster Forward.`,
+      `Kurve ${id}: ${construction}, Interpolation ${interp}, Extrapolation jenseits des letzten Pillars${last !== undefined ? ` (${formatDateDe(last)})` : ""}: ${extra}; am kurzen Ende erster Forward.` +
+        (nonLocal
+          ? " Hinweis: Unter nicht-lokaler Interpolation sind die Zero-Buckets je Pillar nicht exakt additiv zum parallelen DV01 (Positivitätsschranken, nicht-lokale Sensitivität); für Hedge-Zwecke das Par-Risiko je Marktquote verwenden."
+          : ""),
     );
   }
   return lines;
@@ -467,7 +556,7 @@ function conventionLines(trade: Trade): string[] {
   const parts = legs.map((l, i) => {
     const kind =
       l.type === "Fixed" ? `Fix ${pct(l.rate)}` : `Float ${l.index}${l.spread ? ` ${l.spread >= 0 ? "+" : ""}${formatDe(l.spread * 1e4, 1)} bp` : ""}`;
-    return `Leg ${i + 1} (${l.payReceive === "Receive" ? "Empfang" : "Zahlung"}, ${kind}): ${l.frequency}, ${l.dayCount}, ${l.businessDayConvention ?? "ModifiedFollowing"}, Kalender ${l.calendar}, Stub ${l.stub ?? "ShortFront"}${l.endOfMonth ? ", EOM-Roll" : ""}${l.roll === "IMM" ? ", IMM-Roll" : ""}${l.paymentLag ? `, Zahlungsverzug ${l.paymentLag} GT` : ""}`;
+    return `Leg ${i + 1} (${l.payReceive === "Receive" ? "Empfang" : "Zahlung"}, ${kind}): ${l.frequency}, ${l.dayCount}, ${bdcLabelDe(l.businessDayConvention)}, Kalender ${l.calendar}, ${stubLabelDe(l.stub)}${l.endOfMonth ? ", EOM-Roll" : ""}${l.roll === "IMM" ? ", IMM-Roll" : ""}${l.paymentLag ? `, Zahlungsverzug ${l.paymentLag} GT` : ""}`;
   });
   return [
     `Konventionen gemäß ISDA-Definitionen (regelbasierte Kalender TARGET2/US/UK/CH/JP, in Produktion durch Feiertagsfeeds überschreibbar): ${parts.join("; ")}.`,
@@ -502,7 +591,7 @@ function fixingLines(ctx: MarketContext, trade: Trade, pricing: PricingResult): 
       const key = capletSurfaceKeysFor(ctx, trade).find((k) => k.startsWith(l.currency));
       const s = key ? ctx.capletVols?.[key] : undefined;
       lines.push(
-        `Eingebettete Option auf Leg ${l.index} (${parts.join(", ")}): erwarteter Kupon E[min(max(L, Floor), Cap)] = L + Floorlet − Caplet, bewertet ${s ? `mit ${s.volType === "Normal" ? "Bachelier" : "Black-76" + (s.shift ? ` (Shift ${pct(s.shift, 2)})` : "")} auf der Caplet-Fläche ${s.id} (Vol je Expiry/Strike)` : "intrinsisch (keine Caplet-Fläche im Marktkontext)"}; fixierte Perioden intrinsisch. Vega/Vega-Buckets werden über die Caplet-Fläche ausgewiesen.`,
+        `Eingebettete Option auf Leg ${l.index} (${parts.join(", ")}): erwarteter Kupon E[min(max(L, Floor), Cap)] = L + Floorlet − Caplet, bewertet ${s ? `mit ${s.volType === "Normal" ? "Bachelier" : "Black-76" + (s.shift ? ` (Shift ${pct(s.shift, 2)})` : "")} auf der Caplet-Fläche ${s.id} (Vol je Laufzeit/Strike)` : "intrinsisch (keine Caplet-Fläche im Marktkontext)"}; fixierte Perioden intrinsisch. Vega und Vega-Buckets werden über die Caplet-Fläche ausgewiesen.`,
       );
     }
   }
@@ -528,32 +617,37 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
       const model = String(a.model ?? "Bachelier");
       const key = capletSurfaceKeysFor(ctx, trade)[0];
       const s = key ? ctx.capletVols?.[key] : undefined;
+      const converted = pricing.warnings.some((w) => w.startsWith("VOL_TYPE_CONVERTED"));
+      const volUnit = model === "Bachelier" ? "bp Normal-Vol" : "Vol-Punkt (lognormal)";
       const volSrc =
         trade.volOverride !== undefined
-          ? `flache Override-Vol ${trade.volOverride}`
+          ? `flache Volatilitätsvorgabe ${model === "Bachelier" ? `${formatDe(trade.volOverride * 1e4, 2)} bp` : pct(trade.volOverride, 2)}`
           : s
-            ? `Caplet-Fläche ${s.id} (${s.volType}, bilinear in Expiry/Strike)`
-            : "Fallback-Vol 60 bp (keine Fläche)";
+            ? `Caplet-Fläche ${s.id} (${volTypeLabelDe(s.volType)}, bilinear in Laufzeit/Strike)${converted ? `; Volatilitätstyp der Fläche ≠ Modell – Vols je Caplet per Preisäquivalenz in ${model === "Bachelier" ? "Normal-Vol" : "Lognormal-Vol"} konvertiert` : ""}`
+            : `Rückfall-Volatilität 60 bp Normal-Vol (keine Fläche)${converted ? ", per Preisäquivalenz in die Modell-Quotierung konvertiert" : ""}`;
       return [
-        `Caplets/Floorlets als Strip auf den Index-Forward, Modell ${model}${model === "ShiftedBlack" ? ` (Shift ${pct(trade.shift ?? s?.shift ?? 0, 2)})` : ""}; Volatilität: ${volSrc}; Caplet-Expiry = Fixingtermin, Zahlung nachschüssig; fixierte Caplets intrinsisch. Greeks analytisch (Delta/Gamma je bp, Vega je ${model === "Bachelier" ? "bp Normal-Vol" : "Vol-Punkt"}).`,
+        `Caplets/Floorlets als Strip auf den Index-Forward, Modell ${irModelLabelDe(model)}${model === "ShiftedBlack" ? ` (Shift ${pct(trade.shift ?? s?.shift ?? 0, 2)})` : ""}; Volatilität: ${volSrc}; Caplet-Laufzeit bis zum Fixingtermin, Zahlung nachschüssig; fixierte Caplets intrinsisch. Greeks analytisch (Delta/Gamma je bp, Vega je ${volUnit}).`,
       ];
     }
     case "Swaption": {
       const model = String(a.model ?? "Bachelier");
       const ccy = trade.underlying.legs[0]?.currency ?? "";
       const s = ctx.swaptionVols?.[ccy];
+      const converted = pricing.warnings.some((w) => w.startsWith("VOL_TYPE_CONVERTED"));
+      const fmtVol = (v: number) => (model === "Bachelier" ? `${formatDe(v * 1e4, 2)} bp` : pct(v, 2));
       const volSrc =
         trade.volOverride !== undefined
-          ? `flache Override-Vol ${trade.volOverride}`
+          ? `flache Volatilitätsvorgabe ${fmtVol(trade.volOverride)}`
           : s
-            ? `ATM-Cube ${s.id} (${s.volType}, bilinear in Expiry/Tenor)${s.sabr ? `, Smile am Strike per SABR (Hagan) mit Alpha-Rekalibrierung auf ATM, Parameter zwischen Gitterpunkten geblendet` : ", ohne Smile (ATM-Vol am Strike)"}`
-            : "Fallback-Vol 70 bp (keine Fläche)";
-      const vol =
-        typeof a.volatility === "number"
-          ? ` – verwendete Vol ${s?.volType === "Normal" || !s ? `${formatDe(a.volatility * 1e4, 2)} bp` : pct(a.volatility, 2)}`
-          : "";
+            ? `ATM-Cube ${s.id} (${volTypeLabelDe(s.volType)}, bilinear in Laufzeit/Tenor)${s.sabr ? `, Smile am Strike per SABR (Hagan) mit Alpha-Rekalibrierung auf ATM, Parameter zwischen Gitterpunkten geblendet` : ", ohne Smile (ATM-Vol am Strike)"}${converted ? `; Volatilitätstyp der Fläche ≠ Modell – Smile-Vol per Preisäquivalenz in ${model === "Bachelier" ? "Normal-Vol" : "Lognormal-Vol"} konvertiert` : ""}`
+            : `Rückfall-Volatilität 70 bp Normal-Vol (keine Fläche)${converted ? ", per Preisäquivalenz in die Modell-Quotierung konvertiert" : ""}`;
+      const vol = typeof a.volatility === "number" ? ` – verwendete Vol ${fmtVol(a.volatility)}` : "";
+      const settlement =
+        trade.settlement === "Cash"
+          ? `Cash-Settlement nach ${cashSettlementLabelDe(trade.cashSettlementConvention)} (${(trade.cashSettlementConvention ?? "CollateralisedCashPrice") === "IRR" ? "Cash-Annuität aus der Yield-Formel, auf das Settlement-Datum diskontiert" : "Diskont-Annuität"})`
+          : "physische Lieferung (Diskont-Annuität)";
       return [
-        `Europäische Swaption, Modell ${model}${model === "ShiftedBlack" ? ` (Shift ${pct(trade.shift ?? s?.shift ?? 0, 2)})` : ""} auf den Forward-Swapsatz; Settlement ${String(a.settlement ?? trade.settlement)} (${trade.settlement === "Cash" && (trade.cashSettlementConvention ?? "CollateralisedCashPrice") === "IRR" ? "IRR-Cash-Annuität, auf das Settlement-Datum diskontiert" : "Diskont-Annuität"}); Volatilität: ${volSrc}${vol}. Greeks analytisch (Annuitäts-gewichtet).`,
+        `Europäische Swaption, Modell ${irModelLabelDe(model)}${model === "ShiftedBlack" ? ` (Shift ${pct(trade.shift ?? s?.shift ?? 0, 2)})` : ""} auf den Forward-Swapsatz; ${settlement}; Volatilität: ${volSrc}${vol}. Greeks analytisch (Annuitäts-gewichtet).`,
       ];
     }
     case "FxForward":
@@ -563,28 +657,37 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
       const lag = fxSpotLag(b, q);
       return [
         `FX-Forward über Zinsparität mit Spot-Date-Anker (${b}${q}: T+${lag} auf dem Paar-Kalender${b !== "USD" && q !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${spotDateDe(pricing.details.spotDate)}` : ""}): F = S · [DF_Basis(T)/DF_Basis(t_s)] / [DF_Quote(T)/DF_Quote(t_s)]; Barwert = diskontierte Zahlungsströme beider Währungen, umgerechnet zum auf den Bewertungstag angepassten Spot S·DF_Quote(t_s)/DF_Basis(t_s).`,
-        `FX-Delta: deltaAmount = Barwertänderung in der Reporting-Währung bei +1 % Spot der Kaufwährung ${b} gegen ${q} (linear: ±Barwert des Legs in der bewegten Währung × 1 %); ein deltaPct wird für lineare FX-Geschäfte nicht ausgewiesen (Delta ±1).`,
+        `FX-Delta-Betrag: Barwertänderung in der Reporting-Währung bei +1 % Spot der Kaufwährung ${b} gegen ${q} (linear: ±Barwert des Legs in der bewegten Währung × 1 %); eine Delta-Quote wird für lineare FX-Geschäfte nicht ausgewiesen (Delta ±1).`,
       ];
     }
     case "FxOption": {
       const { base, quote } = splitPair(trade.pair);
       const s = ctx.fxVols?.[`${base}${quote}`] ?? ctx.fxVols?.[`${quote}${base}`];
       const lag = fxSpotLag(base, quote);
-      const kind = String(a.kind ?? "Vanilla");
+      const kind = trade.barrier
+        ? `Barriere-Option ${barrierTypeLabelDe(trade.barrier.type)}`
+        : trade.digital
+          ? `Digital-Option (${/asset/i.test(String(a.kind)) ? "Asset-or-Nothing, Auszahlung in der Basiswährung" : "Cash-or-Nothing"})`
+          : "Vanilla-Option";
       const greeks =
         a.greeksMethod === "finite-difference"
           ? "Greeks per zentralen finiten Differenzen der geschlossenen Formel (Spot-Schritt ≤ ½ Barrierabstand)"
           : "Greeks analytisch (Garman-Kohlhagen)";
       const smile =
         trade.volOverride !== undefined
-          ? `flache Override-Vol ${trade.volOverride}`
+          ? `flache Volatilitätsvorgabe ${pct(trade.volOverride, 2)}`
           : s
-            ? `Smile aus ATM/RR/BF-Quotes der Fläche ${s.id} (ATM ${s.atmConvention ?? "DeltaNeutral"}, Delta-Konvention ${s.deltaConvention ?? "Forward"}, Butterfly als ${(s.strangleType ?? "Smile") === "Broker" ? "Broker-Strangle (Reiswich-Wystup-Iteration)" : "Smile-Strangle"}, Interpolation ${(s.smileInterpolation ?? "linear") === "cubic" ? "monoton-kubisch" : "linear"} im Delta-Raum, flache Extrapolation jenseits der äußeren Pillars, Fixpunkt Strike↔Delta)`
-            : "Fallback-Vol 8 % (keine Fläche)";
+            ? `Smile aus ATM/RR/BF-Quotes der Fläche ${s.id} (ATM ${fxAtmConventionLabelDe(s.atmConvention)}, Delta-Konvention ${fxDeltaConventionLabelDe(s.deltaConvention)}, Butterfly als ${(s.strangleType ?? "Smile") === "Broker" ? "Broker-Strangle (Reiswich-Wystup-Iteration)" : "Smile-Strangle"}, Interpolation ${(s.smileInterpolation ?? "linear") === "cubic" ? "monoton-kubisch" : "linear"} im Delta-Raum, flache Extrapolation jenseits der äußeren Pillars, Fixpunkt Strike↔Delta)`
+            : "Rückfall-Volatilität 8 % (keine Fläche)";
       const vol = typeof a.volatility === "number" ? `, verwendete Vol ${pct(a.volatility, 3)}` : "";
+      const barrierNote = trade.barrier
+        ? ` / Reiner-Rubinstein (Single-Barrier: Auszahlung auf das Lieferdatum diskontiert und gegen den Lieferdatums-Forward gestellt, Diffusion und Barrier-Drift auf dem Horizont bis zur Ausübung${a.deliveryConvention === "non-standard" ? "; Lieferdatum weicht vom Spot-Datum der Ausübung ab – Drift und Rebate-Diskontierung aus den Kurven bis zum Standard-Lieferdatum, nur Auszahlungsdiskont und Forward auf das tatsächliche Lieferdatum" : ""})`
+        : trade.digital
+          ? " (Digital analytisch, Cash- bzw. Asset-or-Nothing)"
+          : "";
       return [
-        `${kind}: Garman-Kohlhagen${trade.barrier ? " / Reiner-Rubinstein (Single-Barrier, Diskontierung und Forward auf das Lieferdatum, Diffusion bis Expiry)" : trade.digital ? " (Digital analytisch, Cash- bzw. Asset-or-nothing)" : ""}; Forward Spot-Date-verankert (${base}${quote}: T+${lag} auf dem Paar-Kalender${base !== "USD" && quote !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Date ${spotDateDe(pricing.details.spotDate)}` : ""}), Diskontierung bis Lieferdatum ${formatDateDe(trade.deliveryDate)}, Vol-Zeit bis Expiry ${formatDateDe(trade.expiryDate)}; ${smile}${vol}; ${greeks}.`,
-        `FX-Delta: deltaAmount = Barwertänderung in der Reporting-Währung bei +1 % Spot der Basiswährung ${base} gegen ${quote} (Geldbetrag); deltaPct = vorzeichenbehaftetes Spot-Delta als Anteil des Nominals (= deltaAmount / (1 % des Nominals in Reporting-Währung), Long Call ≈ +0,5 am Geld, Long Put ≈ −0,5; für Vanillas in [−1, 1]). Vega-Buckets je Expiry-Zeile der FX-Fläche (ATM +1 Vol-Punkt, optional RR/BF als Smile-Buckets).`,
+        `${kind}: Garman-Kohlhagen${barrierNote}; Forward am Spot-Datum verankert (${base}${quote}: T+${lag} auf dem Paar-Kalender${base !== "USD" && quote !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Datum ${spotDateDe(pricing.details.spotDate)}` : ""}), Diskontierung bis Lieferdatum ${formatDateDe(trade.deliveryDate)}, Vol-Zeit bis Ausübung ${formatDateDe(trade.expiryDate)}; ${smile}${vol}; ${greeks}.`,
+        `FX-Delta-Betrag: Barwertänderung in der Reporting-Währung bei +1 % Spot der Basiswährung ${base} gegen ${quote} (Geldbetrag); Delta-Quote = vorzeichenbehaftetes Spot-Delta als Anteil des Nominals (= Delta-Betrag / (1 % des Nominals in Reporting-Währung), Long Call ≈ +0,5 am Geld, Long Put ≈ −0,5; für Vanillas in [−1, 1]). Vega-Buckets je Laufzeitzeile der FX-Fläche (ATM +1 Vol-Punkt, optional RR/BF als Smile-Buckets; Summe ≈ paralleles Vega bis auf die Varianz-Interpolation zwischen den Laufzeiten).`,
       ];
     }
   }
@@ -594,12 +697,12 @@ function riskLines(risk: RiskReport | undefined, xva: XvaResult | undefined): st
   const lines: string[] = [];
   if (risk) {
     lines.push(
-      "Sensitivitäten per Bump-and-Reprice: DV01 und Buckets als zentrale Differenz ±1 bp der Zero-Sätze (parallel bzw. je Pillar), Vega +1 bp Normal-Vol (bzw. +1 Vol-Punkt lognormal/FX), FX-Delta ±1 % Spot (Barwertänderung in Reporting-Währung je +1 % Aufwertung der Fremdwährung – Geldbetrag wie analytics.deltaAmount, nicht die Delta-Quote deltaPct); Theta = 1-Tages-Constant-Curve-Roll (Zero-Sätze je Laufzeit konstant, Vol-Flächen sticky expiry) plus in (t, t+1] gezahlte Cashflows, zerlegt in Carry (Forward-Roll) und Roll-Down.",
+      "Sensitivitäten per Bump-and-Reprice: DV01 und Zero-Buckets als zentrale Differenz ±1 bp der Zero-Sätze (parallel bzw. je Pillar; unter lokaler Interpolation summieren sich die Buckets zum DV01, unter monoton-konvexer oder Spline-Interpolation nur näherungsweise – für Hedge-Zwecke Par-Risiko je Marktquote), Vega +1 bp Normal-Vol (bzw. +1 Vol-Punkt lognormal/FX), FX-Delta ±1 % Spot (Barwertänderung in Reporting-Währung je +1 % Aufwertung der Fremdwährung – Geldbetrag, nicht die Delta-Quote); Theta = 1-Tages-Constant-Curve-Roll (Zero-Sätze je Laufzeit konstant, Turn-of-Year-Sprünge bleiben auf ihrem Kalenderdatum, Vol-Flächen mit fester Restlaufzeit) plus in (t, t+1] gezahlte Cashflows, zerlegt in Carry (Forward-Roll) und Roll-Down.",
     );
   }
   if (xva)
     lines.push(
-      `Kontrahentenrisiko: ${xva.method}; CVA = LGD · Σ EPE · ΔPD, DVA analog auf dem negativen Exposure; Fair Value = risikofreier Barwert − CVA + DVA.`,
+      `Kontrahentenrisiko: ${xvaMethodLabelDe(xva.method)}; CVA = LGD · Σ EPE · ΔPD, DVA analog auf dem negativen Exposure; Fair Value = risikofreier Barwert − CVA + DVA.`,
     );
   return lines;
 }
@@ -612,8 +715,15 @@ function riskLines(risk: RiskReport | undefined, xva: XvaResult | undefined): st
  * rule). Without `ctx`/`pricing` a static per-type description is returned
  * (backward compatible).
  */
+/**
+ * Valuation framework citation (N3-08): fair-value measurement per IFRS 13 and
+ * IDW RS HFA 47 („Einzelfragen zur Ermittlung des Fair Value nach IFRS 13“);
+ * IDW RS HFA 35 governs hedge accounting (Bewertungseinheiten, § 254 HGB) and
+ * is cited only by the hedge module. MaRisk requirements on the use of
+ * valuation models are AT 4.3.5; BTO 2.2.1 covers the independent valuation.
+ */
 const VALUATION_FRAMEWORK_LINE =
-  "Bewertungsrahmen: IFRS 13 / IDW RS HFA 35 – Bewertungstechnik „Income Approach“ (Barwertmethode: diskontierte erwartete Zahlungsströme bzw. Optionspreismodelle), Inputs der Stufe 2 der Bewertungshierarchie (beobachtbare Kurven, Volatilitäten, FX-Spots); Modellannahmen, Marktdatenquellen und Freigabestatus sind im Abschnitt „governance“ dokumentiert (Modellvalidierung/-freigabe nach MaRisk AT 4.3.x, BTO 2.2.1).";
+  "Bewertungsrahmen: IFRS 13 / IDW RS HFA 47 (Fair-Value-Ermittlung) – Bewertungstechnik „Income Approach“ (Barwertmethode: diskontierte erwartete Zahlungsströme bzw. Optionspreismodelle), Inputs der Stufe 2 der Bewertungshierarchie (beobachtbare Kurven, Volatilitäten, FX-Spots); für Bewertungseinheiten gilt § 254 HGB i. V. m. IDW RS HFA 35 (Hedge-Accounting-Modul). Modellannahmen, Marktdatenquellen und Freigabestatus sind im Abschnitt zur Bewertungs-Governance dokumentiert (Verwendung und Validierung von Bewertungsmodellen nach MaRisk AT 4.3.5, handelsunabhängige Bewertung nach BTO 2.2.1).";
 
 function governanceLine(g: ValuationGovernance): string {
   return `Bewertungs-Governance: Snapshot-Status „${g.snapshotStatus === "approved" ? "freigegeben" : "indikativ"}“${g.validatedBy ? ` (validiert durch ${g.validatedBy})` : ""}, Marktdatenquellen: ${g.inputSources.join(", ") || "n/a"}; Modellversion ${g.modelVersion}.${g.snapshotStatus === "indicative" ? " Indikative Marktdaten sind nicht unabhängig validiert – keine prüfungsfähige Bewertung." : ""}`;
@@ -636,7 +746,7 @@ export function methodologyFor(
   ];
   if (opts.governance) lines.push(governanceLine(opts.governance));
   lines.push(
-    "IFRS-13-Einstufung (Heuristik): Level 2 bei beobachtbaren Kurven/Volatilitäten; Level 3, wenn die Fälligkeit mehr als 30 Tage über den letzten Pillar einer tatsächlich genutzten Kurve (Diskontkurve unter dem CSA des Geschäfts, Projektionskurven der referenzierten Indizes) hinausgeht, eine Optionslaufzeit/ein Tenor jenseits des Gitters der genutzten Volatilitätsfläche liegt, eine Volatilitätsfläche fehlt oder ein manueller Vol-Override verwendet wird.",
+    "IFRS-13-Einstufung (Heuristik): Level 2 bei beobachtbaren Kurven/Volatilitäten; Level 3, wenn die Fälligkeit mehr als 30 Tage über den letzten Pillar einer tatsächlich genutzten Kurve (Diskontkurve unter dem CSA des Geschäfts, Projektionskurven der referenzierten Indizes) hinausgeht, eine Optionslaufzeit/ein Tenor jenseits des Gitters der genutzten Volatilitätsfläche liegt, eine Volatilitätsfläche fehlt oder eine manuelle Volatilitätsvorgabe verwendet wird. Modellabhängige Ergänzungen auf beobachtbaren Inputs (Barriere ohne Smile-Korrektur, Konvertierung des Volatilitätstyps in die Modell-Quotierung) bleiben Level 2 und werden als Hinweis ausgewiesen.",
   );
   if (opts.perspective) lines.push(`Kostentransparenz (MiFID II ex-ante, BGH XI ZR 33/10): ${costSignRule(opts.perspective)}`);
   return lines;
@@ -645,7 +755,7 @@ export function methodologyFor(
 function staticMethodology(trade: Trade): string[] {
   const common = [
     "Multi-Curve-Framework: Diskontierung mit OIS-Kurve (€STR/SOFR/SONIA/SARON), Projektion der Forwards mit indexspezifischer Kurve (EURIBOR-3M/-6M).",
-    "Kurven per sequentiellem Bootstrapping aus Depos/FRAs/Futures/Swaps bzw. OIS-Swaps; Interpolation log-linear in Diskontfaktoren, Extrapolation flat-forward.",
+    "Kurven per sequentiellem Bootstrapping aus Depos/FRAs/Futures/Swaps bzw. OIS-Swaps (importierte Kurven: Pillars aus dem Snapshot); Interpolation log-linear in Diskontfaktoren, Extrapolation mit konstantem letztem Forward.",
     "Tageszählung, Geschäftstagekonvention und Kalender gemäß ISDA-Definitionen (TARGET2, US, UK, CH, JP).",
   ];
   switch (trade.type) {

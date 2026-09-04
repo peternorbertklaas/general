@@ -98,7 +98,7 @@ describe("report hashing & IFRS 13", () => {
     };
     const rr = buildValuationReport(ctx, swpt, priceTrade(ctx, swpt, "EUR"));
     expect(rr.fairValue.ifrs13Level).toBe(3);
-    expect(rr.fairValue.rationale).toContain("Override");
+    expect(rr.fairValue.rationale).toContain("Volatilitätsvorgabe");
   });
 });
 

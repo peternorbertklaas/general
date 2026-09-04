@@ -382,12 +382,23 @@ export function HedgeView() {
   const exportDoc = () => {
     downloadText(
       `${trade.id}-hedge-dokumentation.md`,
-      hedgeDocMarkdown(rel, trade, rep, { valuationDate: s.valuationDate, ccy }),
+      hedgeDocMarkdown(rel, trade, rep, { valuationDate: s.valuationDate, ccy, stale }),
       "text/markdown;charset=utf-8",
     );
-    act().showToast("Sicherungsdokumentation als Markdown exportiert");
+    act().showToast(stale ? "Sicherungsdokumentation exportiert – mit Vermerk „Ergebnis veraltet“" : "Sicherungsdokumentation als Markdown exportiert");
   };
   const printDoc = () => window.print();
+  /** "Zurücksetzen" asks first and can be undone (R3-F4). */
+  const resetDoc = () => {
+    if (
+      !window.confirm(
+        `Gespeicherte Sicherungsdokumentation für ${trade.id} verwerfen? Hedge Ratio, Grundgeschäft und Designation gehen auf die Standardwerte zurück.`,
+      )
+    )
+      return;
+    act().removeHedgeRelationship(trade.id);
+    act().showToast(`Sicherungsdokumentation ${trade.id} verworfen`, { action: { label: "Rückgängig", run: () => act().undo() } });
+  };
 
   return (
     <div className="stack hedge" data-testid="hedge-view">
@@ -409,7 +420,12 @@ export function HedgeView() {
           </span>
           <span className="right row wrap">
             {stored && (
-              <button className="btn ghost" onClick={() => act().removeHedgeRelationship(trade.id)} title="Gespeicherte Dokumentation verwerfen">
+              <button
+                className="btn ghost"
+                onClick={resetDoc}
+                title="Gespeicherte Dokumentation verwerfen (mit Rückfrage, rückgängig über Ctrl+Z)"
+                data-testid="hedge-reset"
+              >
                 Zurücksetzen
               </button>
             )}

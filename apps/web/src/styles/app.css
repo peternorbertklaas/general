@@ -1431,13 +1431,43 @@ select.inline {
   .seg,
   .infotip,
   .hint-row,
-  .num-input,
-  .input-unit .unit,
   input[type="range"] {
     display: none !important;
   }
   .print-only {
     display: block;
+  }
+  /* Inputs print as static text: no frames, no arrows – the value stays (R3-04). */
+  .num-input,
+  .field input,
+  .field select,
+  .date-input input,
+  input.inline,
+  select.inline {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    color: #111 !important;
+    appearance: none;
+    -webkit-appearance: none;
+    font-family: var(--font-mono);
+  }
+  .input-unit .unit {
+    position: static;
+    margin-left: 4px;
+    color: #333;
+  }
+  .input-unit input {
+    padding-right: 0 !important;
+    width: auto !important;
+    flex: 0 1 auto;
+  }
+  .num-input {
+    text-align: left !important;
+  }
+  table.grid-table tbody tr:hover {
+    background: transparent !important;
   }
   .report-print-header {
     display: block;
@@ -1611,14 +1641,18 @@ select.inline {
   margin-left: 6px;
   padding: 0 5px;
 }
-/* Curves grid: quotes card keeps its columns readable with the inspector open (N-10) */
+/* Curves grid: the quotes card never falls below its table width (Instrument … Residuum), also at 1600 px with the inspector (N-10 / R3-09) */
 .curves-grid {
-  grid-template-columns: minmax(0, 1.4fr) minmax(460px, 1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(600px, 0.9fr);
 }
 @media (max-width: 1500px) {
   .curves-grid {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+table.grid-table.quotes td,
+table.grid-table.quotes th {
+  padding: 3px 6px;
 }
 select.inline.edited {
   border-color: var(--warn);
@@ -1776,6 +1810,21 @@ datalist {
   body.print-doc .doc-disclaimer {
     color: #333 !important;
   }
+  /* Long document cells wrap on A4 instead of pushing the page to several thousand pixels (R3-05) */
+  body.print-doc .doc td,
+  body.print-doc .doc th {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  body.print-doc .doc .table-scroll {
+    overflow: visible;
+  }
+  body.print-doc .doc-whatif {
+    border: 2px solid #b91c1c;
+    color: #7f1d1d !important;
+    background: #fff5f5 !important;
+    font-size: 12px;
+  }
   /* Hedge documentation print */
   .hedge .report-print-header {
     display: block;
@@ -1807,4 +1856,104 @@ datalist {
 .scenario-desc td {
   white-space: normal;
   line-height: 1.45;
+}
+
+/* ---------- Round-3 remediation (review-ui-r3) ---------- */
+/* Signed numbers inside the accent-tinted selected row use the stronger tokens (≥ 4.5:1, R3-07 / N-08) */
+table.grid-table tbody tr.selected .pos,
+table.grid-table tbody tr.selected td.num.pos {
+  color: var(--pos-strong);
+}
+table.grid-table tbody tr.selected .neg,
+table.grid-table tbody tr.selected td.num.neg {
+  color: var(--neg-strong);
+}
+table.grid-table tbody tr:hover .pos,
+table.grid-table tbody tr[data-hist] .pos {
+  color: var(--pos-strong);
+}
+table.grid-table tbody tr:hover .neg,
+table.grid-table tbody tr[data-hist] .neg {
+  color: var(--neg-strong);
+}
+/* Active filter chips share the segment-button foreground (Light 5.3:1 on the accent tint, R3-07) */
+.chip.active {
+  color: var(--seg-active-fg);
+}
+/* Documents: long text cells (KID target market, SRI derivation, exit costs) wrap instead of widening the table (R3-05) */
+.doc table.grid-table.doc-rows {
+  table-layout: fixed;
+  width: 100%;
+}
+.doc table.grid-table.doc-rows td:first-child {
+  width: 36%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.doc td.text {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+  line-height: 1.45;
+  font-family: var(--font-sans);
+}
+.doc td.num {
+  overflow-wrap: anywhere;
+}
+/* What-if (stress market) marker on generated documents (R3-F1) */
+.doc-whatif {
+  border-left: 3px solid var(--neg);
+  background: var(--neg-soft);
+  color: var(--fg-0);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: var(--fs-s);
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+/* Editable vol surfaces in the market view (R3-4) */
+.heat.editable .cell {
+  padding: 2px;
+}
+.heat .cell .num-input.inline {
+  width: 100%;
+  padding: 2px 4px;
+  text-align: right;
+}
+.heat .cell.edited .num-input,
+td.vol-cell.edited .num-input {
+  border-color: var(--warn);
+}
+/* Blotter toolbar: compact mode (icon buttons, filter popover) below 1400 px (R3-09 / N-12) */
+.popover.filters {
+  left: 0;
+  right: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 300px;
+}
+.popover.filters .row.wrap {
+  gap: 6px;
+}
+.blotter-toolbar .search.compact {
+  width: 140px;
+}
+.filter-count {
+  margin-left: 4px;
+  padding: 0 5px;
+}
+/* Import error list (R3-F7) */
+.csv-errors .table-scroll {
+  max-height: 300px;
+}
+.csv-errors td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* Popover buttons receive the roving focus */
+.popover.export-menu .item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }

@@ -1,9 +1,11 @@
 import { yearFraction } from "../dates/daycount.js";
 import { frequencyPerYear } from "../dates/schedule.js";
+import { PricingError } from "../errors.js";
 import { type FixedLeg, type PricingResult, type Swaption } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve } from "../market/market-context.js";
 import { bachelierGreeks, black76Greeks } from "../models/black.js";
 import { swaptionVol } from "../models/vol-surfaces.js";
+import { convertSurfaceVol, modelForVolType, modelQuotation, sameQuotation, surfaceQuotation, volTypeConvertedWarning } from "./capfloor-pricer.js";
 import { fxToReporting } from "./leg-pricer.js";
 import { priceInterestRateSwap } from "./swap-pricer.js";
 
@@ -13,11 +15,23 @@ import { priceInterestRateSwap } from "./swap-pricer.js";
  * "Collateralised Cash Price" convention use the discount annuity; the legacy
  * IRR cash-settlement convention uses the yield-based cash annuity discounted
  * to the settlement date (the underlying swap's start = expiry + spot lag).
+ *
+ * Model / surface mismatch (R3-1): a requested model whose vol quotation
+ * differs from the cube's (e.g. `model: "Black"` on a normal cube) converts
+ * the smile vol at (forward, strike, expiry) by price equivalence and emits a
+ * `VOL_TYPE_CONVERTED` warning; a lognormal model on a non-positive shifted
+ * forward/strike raises `PricingError("VOL_MODEL_INCOMPATIBLE")`. A
+ * `volOverride` is read in the model's own quotation.
  */
 export function priceSwaption(ctx: MarketContext, trade: Swaption, reportingCurrency?: string): PricingResult {
   const swap = trade.underlying;
-  const fixed = swap.legs.find((l): l is FixedLeg => l.type === "Fixed");
-  if (!fixed) throw new Error("Swaption underlying must have a fixed leg");
+  const fixedLegs = swap.legs.filter((l): l is FixedLeg => l.type === "Fixed");
+  const fixed = fixedLegs[0];
+  if (!fixed || fixedLegs.length !== 1) {
+    throw new PricingError("INVALID_TRADE", `Swaption ${trade.id}: underlying must have exactly one fixed leg (found ${fixedLegs.length})`, {
+      tradeId: trade.id,
+    });
+  }
   const ccy = fixed.currency;
   const reporting = reportingCurrency ?? ccy;
   const fx = fxToReporting(ctx, ccy, reporting, trade.collateralCurrency);
@@ -26,19 +40,32 @@ export function priceSwaption(ctx: MarketContext, trade: Swaption, reportingCurr
   const swapRes = priceInterestRateSwap(ctx, swap, ccy);
   const forward = swapRes.analytics.parRate as number | undefined;
   const annuityDisc = (swapRes.analytics.annuity as number | undefined) ?? 0;
-  if (forward === undefined) throw new Error("Cannot derive forward swap rate");
+  if (forward === undefined || !Number.isFinite(forward)) {
+    throw new PricingError("INVALID_TRADE", `Swaption ${trade.id}: cannot derive the forward swap rate of the underlying (no floating leg / zero annuity)`, {
+      tradeId: trade.id,
+    });
+  }
   const strike = fixed.rate;
   const tExp = Math.max(0, yearFraction(ctx.valuationDate, trade.expiryDate, "ACT/365F"));
   const tenorYears = yearFraction(fixed.effectiveDate, fixed.terminationDate, "ACT/365F");
   const surface = ctx.swaptionVols?.[ccy];
-  const model = trade.model ?? (surface?.volType === "Lognormal" ? "Black" : surface?.volType === "ShiftedLognormal" ? "ShiftedBlack" : "Bachelier");
+  const model = trade.model ?? modelForVolType(surface?.volType);
   const shift = trade.shift ?? surface?.shift ?? 0;
+  const from = surfaceQuotation(surface);
+  const to = modelQuotation(model, shift);
+  const convert = trade.volOverride === undefined && !sameQuotation(from, to);
   let vol = trade.volOverride;
+  let surfaceVol: number | undefined;
   if (vol === undefined) {
     if (surface) vol = swaptionVol(surface, tExp, tenorYears, forward, strike);
     else {
       vol = 0.007;
       warnings.push("No swaption vol surface – using 70bp normal vol");
+    }
+    if (convert && tExp > 0) {
+      surfaceVol = vol;
+      warnings.push(volTypeConvertedWarning("swaption", surface?.id ?? "(fallback 70bp normal)", from, model, to));
+      vol = convertSurfaceVol(vol, from, to, forward, strike, tExp, { tradeId: trade.id, model, surfaceId: surface?.id });
     }
   }
   // Payer swaption = call on the swap rate.
@@ -112,7 +139,11 @@ export function priceSwaption(ctx: MarketContext, trade: Swaption, reportingCurr
       settlement: trade.settlement === "Cash" ? `Cash (${convention})` : "Physical",
       forwardSwapRate: forward,
       strike,
+      /** Vol used by the model, in the model's quotation (normal for Bachelier, lognormal for Black / ShiftedBlack). */
       volatility: vol,
+      /** Surface vol before conversion (only when the model's quotation differs from the surface's, R3-1). */
+      surfaceVolatility: surfaceVol,
+      volConverted: surfaceVol !== undefined ? "yes" : "no",
       expiryYears: tExp,
       tenorYears,
       annuity: annuity * notional,

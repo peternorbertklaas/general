@@ -20,32 +20,39 @@ export interface ContextMenuState {
 /**
  * Right-click menu (role=menu) with roving focus: the active `menuitem` owns
  * the focus and the menu carries `aria-activedescendant` (N-06). ↑/↓/Home/End,
- * Enter/Space activate, Esc closes; outside click closes; focus returns to the opener.
+ * Enter/Space activate, Esc closes; outside click closes; focus returns to the
+ * opener. The opener is captured once on mount (never re-captured on re-renders)
+ * and, for rows carrying `data-id`, re-resolved by id on close so a re-rendered
+ * row still receives the focus (R3-08).
  */
 export function ContextMenu({ menu, onClose }: { menu: ContextMenuState; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
-  const opener = useRef<Element | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const [idx, setIdx] = useState(0);
   const baseId = useId();
   useModalRegistration();
   const enabled = menu.items.filter((i) => !i.disabled);
   useEffect(() => {
-    opener.current = document.activeElement;
+    const opener = document.activeElement as HTMLElement | null;
+    const openerId = opener?.closest<HTMLElement>("[data-id]")?.dataset.id;
     const el = ref.current;
-    if (!el) return;
-    // keep inside the viewport
-    const r = el.getBoundingClientRect();
-    if (r.right > window.innerWidth) el.style.left = `${Math.max(4, window.innerWidth - r.width - 4)}px`;
-    if (r.bottom > window.innerHeight) el.style.top = `${Math.max(4, window.innerHeight - r.height - 4)}px`;
+    if (el) {
+      // keep inside the viewport
+      const r = el.getBoundingClientRect();
+      if (r.right > window.innerWidth) el.style.left = `${Math.max(4, window.innerWidth - r.width - 4)}px`;
+      if (r.bottom > window.innerHeight) el.style.top = `${Math.max(4, window.innerHeight - r.height - 4)}px`;
+    }
     const onDown = (e: MouseEvent) => {
-      if (!el.contains(e.target as Node)) onClose();
+      if (ref.current && !ref.current.contains(e.target as Node)) onCloseRef.current();
     };
     document.addEventListener("mousedown", onDown);
     return () => {
       document.removeEventListener("mousedown", onDown);
-      restoreFocus(opener.current);
+      const byId = openerId ? document.querySelector<HTMLElement>(`[data-id="${openerId.replace(/"/g, '\\"')}"]`) : null;
+      restoreFocus(byId ?? opener);
     };
-  }, [onClose]);
+  }, []);
   // Roving tabindex: focus follows the active item.
   useEffect(() => {
     ref.current?.querySelector<HTMLElement>(`[id="${baseId}-${idx}"]`)?.focus();

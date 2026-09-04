@@ -115,7 +115,15 @@ export function validateTrade(t: Trade): TradeIssue[] {
       break;
   }
   if (!t.counterparty || !t.counterparty.trim()) out.push({ field: "counterparty", level: "warn", msg: "Kontrahent fehlt (offen)" });
+  if (t.uti !== undefined && !utiValid(t.uti)) out.push({ field: "uti", level: "warn", msg: UTI_MSG });
   return out;
+}
+
+/** UTI format (EMIR Refit / ISO 23897): 1–52 characters A–Z, 0–9, no separators (R3-12). */
+export const UTI_RE = /^[A-Z0-9]{1,52}$/;
+export const UTI_MSG = "UTI: 1–52 Zeichen A–Z / 0–9 ohne Leer- und Sonderzeichen (ISO 23897, i. d. R. LEI-Präfix)";
+export function utiValid(uti: string | undefined): boolean {
+  return uti === undefined || UTI_RE.test(uti.trim());
 }
 
 export function hasErrors(issues: TradeIssue[]): boolean {

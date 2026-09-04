@@ -65,7 +65,8 @@ export async function registerPortfolioReportRoutes(app: FastifyInstance, ctx: A
   app.post<{ Body: PortfolioReportBody; Querystring: { format?: string } }>(
     "/api/report/portfolio",
     {
-      config: { marketHeader: true },
+      // PV + parallel DV01 (2) + theta (2) per trade.
+      config: { marketHeader: true, storeFallback: true, computeWeight: () => 5 },
       schema: {
         operationId: "portfolioReport",
         tags: ["pricing"],

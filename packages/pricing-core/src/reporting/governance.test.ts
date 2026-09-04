@@ -191,7 +191,9 @@ describe("N-18 / N-20 – governance block and structured suitability costs", ()
       modelVersion: ENGINE_VERSION,
       validatedBy: undefined,
     });
-    expect(rep.methodology.some((m) => m.startsWith("Bewertungsrahmen: IFRS 13 / IDW RS HFA 35") && m.includes("Income Approach"))).toBe(true);
+    expect(
+      rep.methodology.some((m) => m.startsWith("Bewertungsrahmen: IFRS 13 / IDW RS HFA 47") && m.includes("Income Approach") && m.includes("AT 4.3.5")),
+    ).toBe(true);
     expect(rep.methodology.some((m) => m.startsWith("Bewertungs-Governance") && m.includes("indikativ") && m.includes("keine prüfungsfähige Bewertung"))).toBe(
       true,
     );

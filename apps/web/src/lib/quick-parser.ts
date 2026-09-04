@@ -14,8 +14,10 @@ import {
   makeSwaption,
   makeVanillaSwap,
   parseISO,
+  toISO,
 } from "@deriva/pricing-core";
-import { fmtNum } from "./format.js";
+import { fmtDate, fmtNum } from "./format.js";
+import { ccsCollateralCurrency } from "./templates.js";
 
 /**
  * Bloomberg-style quick entry, e.g.
@@ -70,10 +72,34 @@ function parseDateOrTenor(tok: string, from: number): number | undefined {
   return undefined;
 }
 
+/** Trade-name fragment of a date / tenor token: ISO dates become TT.MM.JJJJ (R3-11), tenors stay ("9M"). */
+export function dateLabel(tok: string): string {
+  return DATE.test(tok) ? fmtDate(parseISO(tok)) : tok.toUpperCase();
+}
+
+/** Plain price token (strike / forward rate): "1.15", "1,1725" or – for JPY-style pairs – "175" (R3-5b). */
+const PRICE = /^\d+(?:[.,]\d+)?$/;
+
+/** Market spot of a pair from the options, direct or via the inverse quotation. */
+function spotOf(pair: string, opts: QuickEntryOptions): number | undefined {
+  const spots = opts.fxSpots ?? {};
+  const direct = spots[pair];
+  if (direct !== undefined) return direct;
+  const inverse = spots[`${pair.slice(3)}${pair.slice(0, 3)}`];
+  return inverse ? 1 / inverse : undefined;
+}
+
+/** A price is plausible when it lies within 0.3× … 3× of the market spot (or when no spot is known). */
+function priceImplausible(price: number, pair: string, opts: QuickEntryOptions): string | undefined {
+  const spot = spotOf(pair, opts);
+  if (spot === undefined || (price >= spot * 0.3 && price <= spot * 3)) return undefined;
+  return `Kurs ${fmtNum(price, price >= 20 ? 2 : 4)} passt nicht zum Spot ${pair.slice(0, 3)}/${pair.slice(3)} ${fmtNum(spot, spot >= 20 ? 2 : 4)}`;
+}
+
 const CCYS = new Set(["eur", "usd", "gbp", "chf", "jpy"]);
 const DIRECTION = new Set(["pay", "payer", "p", "rec", "receive", "receiver", "r", "call", "put", "c"]);
-/** Modifier words of the grammar ("mtm" = MtM reset, "step" introduces the coupon list). */
-const MODIFIERS = new Set(["mtm", "step"]);
+/** Modifier words of the grammar ("mtm" = MtM reset, "step" introduces the coupon list, "fixed" the CCS fixed rate). */
+const MODIFIERS = new Set(["mtm", "step", "fixed", "fest", "fix"]);
 const COMMANDS = new Set([
   "irs",
   "swap",
@@ -231,25 +257,38 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       const farRate = rates[1] ? Number(rates[1].replace(",", ".")) : nearRate;
       const trade = {
         ...makeFxSwap({ pair, baseAmount: parseAmount(amtTok)!, nearRate, farRate, nearDate: spot, farDate: parseDateOrTenor(dateTok, spot)! }),
-        name: `FX-Swap ${pair.slice(0, 3)}/${pair.slice(3)} ${dateTok.toUpperCase()}`,
+        name: `FX-Swap ${pair.slice(0, 3)}/${pair.slice(3)} ${dateLabel(dateTok)}`,
       };
       return { ok: true, trade, description: `FX-Swap ${pair} ${amtTok} @ ${fmtNum(nearRate, 4)}/${fmtNum(farRate, 4)} · Far ${dateTok}` };
     }
     if (["ccs", "xccy"].includes(cmd)) {
-      // ccs <pair> <tenor> [spreadbp] [notional] [mtm] [fixed <rate%>]   e.g. "ccs eurusd 5y -20bp 10m mtm"
+      // ccs <pair> <tenor> [spreadbp] [notional] [mtm] [fixed <rate%>]   e.g. "ccs eurusd 5y -20bp 10m mtm", "ccs eurusd 5y fixed 3% 10m"
       let pair: string | undefined;
       let tenor: string | undefined;
       let spread = 0;
       let notional = 10_000_000;
       let mtm = false;
       let fxSpot: number | undefined;
+      let fixedRate: number | undefined;
+      let expectFixed = false;
       let pr: "Pay" | "Receive" = "Receive";
       for (const t of rest) {
         const tl = t.toLowerCase();
+        if (expectFixed) {
+          // "fixed 3%" / "fixed 3.00" → fixed-vs-float CCS (R3-5a); a missing rate falls through to the normal tokens.
+          expectFixed = false;
+          const r = /^-?\d+(?:[.,]\d+)?%?$/.test(t) ? parseRate(t.endsWith("%") ? t : `${t}%`) : undefined;
+          if (r !== undefined) {
+            fixedRate = r;
+            continue;
+          }
+        }
         if (/^[a-z]{6}$/i.test(t) && CCYS.has(tl.slice(0, 3)) && CCYS.has(tl.slice(3))) pair = t.toUpperCase();
         else if (TENOR.test(t) && !tenor) tenor = t.toUpperCase();
         else if (/bp$/i.test(t)) spread = parseRate(t) ?? 0;
         else if (tl === "mtm") mtm = true;
+        else if (tl === "fixed" || tl === "fest" || tl === "fix") expectFixed = true;
+        else if (/%$/.test(t)) fixedRate = parseRate(t);
         else if (["pay", "payer", "p"].includes(tl)) pr = "Pay";
         else if (["rec", "receive", "receiver", "r"].includes(tl)) pr = "Receive";
         else if (/^\d+[.,]\d{2,}$/.test(t)) fxSpot = Number(t.replace(",", "."));
@@ -258,7 +297,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           if (amt !== undefined) notional = amt;
         }
       }
-      if (!pair || !tenor) return { ok: false, error: "Format: ccs eurusd 5y -20bp 10m [mtm]" };
+      if (!pair || !tenor) return { ok: false, error: "Format: ccs eurusd 5y -20bp 10m [mtm] [fixed 3%]" };
       const dom = pair.slice(0, 3);
       const forCcy = pair.slice(3);
       // Foreign notional = domestic × spot: typed rate first, then the market spot (direct or inverse quotation).
@@ -268,20 +307,27 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       if (rate === undefined)
         return { ok: false, error: `FX-Spot für ${dom}/${forCcy} fehlt – Kurs angeben (z.B. ccs ${pair.toLowerCase()} 5y -20bp 10m 1.17)` };
       const trade = makeCrossCurrencySwap({
-        name: `Cross-Currency-Swap ${dom}/${forCcy} ${tenor} ${fmtNum(spread * 1e4, 1)} bp${mtm ? " MtM" : ""}`,
+        name: `Cross-Currency-Swap ${dom}/${forCcy} ${tenor} ${fixedRate !== undefined ? `fest ${fmtNum(fixedRate * 100, 2)} %` : `${fmtNum(spread * 1e4, 1)} bp`}${mtm ? " MtM" : ""}`,
         pair,
         domesticNotional: notional,
         fxSpot: rate,
         spread,
+        fixedRate,
         effectiveDate: spot,
         tenor,
         mtmReset: mtm,
         domesticPayReceive: pr,
+        // CSA in the foreign currency activates the Xccy-basis discount curve of the sample market (Markt R3-1).
+        collateralCurrency: ccsCollateralCurrency(pair),
       });
+      const legDesc =
+        fixedRate !== undefined
+          ? `Fest ${fmtNum(fixedRate * 100, 2)} % ${dom} vs ${forCcy}-RFR`
+          : `${pr === "Receive" ? "Erhalte" : "Zahle"} ${dom} ${spread >= 0 ? "+" : ""}${fmtNum(spread * 1e4, 1)} bp`;
       return {
         ok: true,
         trade,
-        description: `Cross-Currency-Swap ${dom}/${forCcy} ${tenor} · ${pr === "Receive" ? "Erhalte" : "Zahle"} ${dom} ${spread >= 0 ? "+" : ""}${fmtNum(spread * 1e4, 1)} bp · Nominal ${fmtNum(notional, 0)} ${dom} @ ${fmtNum(rate, 4)}${mtm ? " · MtM-Reset" : ""}`,
+        description: `Cross-Currency-Swap ${dom}/${forCcy} ${tenor} · ${legDesc} · Nominal ${fmtNum(notional, 0)} ${dom} @ ${fmtNum(rate, 4)}${mtm ? " · MtM-Reset" : ""}`,
       };
     }
     if (cmd === "fra") {
@@ -310,7 +356,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       const m = FRA_PERIOD.exec(period)!;
       if (Number(m[2]) <= Number(m[1])) return { ok: false, error: "FRA-Periode: Ende muss nach dem Start liegen (z.B. 3x6)" };
       if (rate === undefined) return { ok: false, error: "Festsatz fehlt (z.B. 2.2%)" };
-      if (!index && ccy === "EUR") index = `EURIBOR-${Number(m[2]) - Number(m[1])}M`;
+      // The index follows the period length inside the core builder (3x6 → EURIBOR-3M) unless typed explicitly.
       const trade = makeFra({
         name: `FRA ${ccy} ${period} ${pr === "Pay" ? "Zahler" : "Empfänger"}`,
         currency: ccy,
@@ -324,7 +370,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       return {
         ok: true,
         trade,
-        description: `FRA ${ccy} ${period} · Fest ${pr === "Pay" ? "zahlen" : "erhalten"} @ ${fmtNum(rate * 100, 3)} % · Nominal ${fmtNum(notional, 0)}${index ? ` · ${index}` : ""}`,
+        description: `FRA ${ccy} ${period} · Fest ${pr === "Pay" ? "zahlen" : "erhalten"} @ ${fmtNum(rate * 100, 3)} % · Nominal ${fmtNum(notional, 0)} · ${trade.index}`,
       };
     }
     if (["irs", "swap", "ois", "amort", "amortising"].includes(cmd)) {
@@ -362,6 +408,9 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
         }
       }
       if (!tenor) return { ok: false, error: "Laufzeit fehlt (z.B. 10Y)" };
+      // "step" without a coupon list is a typo, not a plain swap (R3-10).
+      if (expectSteps || (rest.some((t) => t.toLowerCase() === "step" || t.toLowerCase() === "staffel") && !steps))
+        return { ok: false, error: "step ohne Stufen – Format: step 2,5/3,0/3,5 (eine Stufe je Jahr)" };
       if (rate === undefined) {
         // Take last plain number as rate if no notional-unit
         rate = 0.03;
@@ -444,14 +493,18 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       const amtIdx = rest.findIndex((t) => /^-?\d+(?:[.,]\d+)?(k|m|mio)$/i.test(t));
       const amtTok = amtIdx >= 0 ? rest[amtIdx] : undefined;
       const dateTok = rest.find((t, i) => i !== amtIdx && (DATE.test(t) || TENOR.test(t)));
-      const rateTok = rest.find((t) => t !== amtTok && /^\d+[.,]\d{2,}$/.test(t));
+      const rateTok = rest.find((t) => t !== amtTok && t !== dateTok && PRICE.test(t));
       if (!pair || !amtTok || !dateTok) return { ok: false, error: "Format: fxf eurusd 2m 1.1725 2027-03-15" };
       const delivery = parseDateOrTenor(dateTok, spot)!;
       const rate = rateTok ? Number(rateTok.replace(",", ".")) : undefined;
+      if (rate !== undefined) {
+        const bad = priceImplausible(rate, pair, opts);
+        if (bad) return { ok: false, error: bad };
+      }
       const base = parseAmount(amtTok)!;
       const trade = {
         ...makeFxForward({ pair, baseAmount: base, rate: rate ?? 1, deliveryDate: delivery }),
-        name: `${base < 0 ? "Verkauf" : "Kauf"} ${pair.slice(0, 3)}/${pair.slice(3)} ${dateTok.toUpperCase()}`,
+        name: `${base < 0 ? "Verkauf" : "Kauf"} ${pair.slice(0, 3)}/${pair.slice(3)} ${dateLabel(dateTok)}`,
       };
       return { ok: true, trade, description: `FX-Forward ${pair} ${amtTok} @ ${rate === undefined ? "fair" : fmtNum(rate, 4)} · Lieferung ${dateTok}` };
     }
@@ -462,8 +515,12 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       const amtIdx = rest.findIndex((t) => /^-?\d+(?:[.,]\d+)?(k|m|mio)$/i.test(t));
       const amtTok = amtIdx >= 0 ? rest[amtIdx] : undefined;
       const dateTok = rest.find((t, i) => i !== amtIdx && (DATE.test(t) || TENOR.test(t)));
-      const strikeTok = rest.find((t) => t !== amtTok && /^\d+[.,]\d{2,}$/.test(t));
+      // Strikes may lack decimals for JPY-style pairs ("fxo eurjpy call 175 1m 6m", R3-5b); plausibility against the spot.
+      const strikeTok = rest.find((t) => t !== amtTok && t !== dateTok && t !== typeTok && PRICE.test(t));
       if (!pair || !typeTok || !strikeTok || !dateTok) return { ok: false, error: "Format: fxo eurusd put 1.15 3m 2027-06-15" };
+      const strike = Number(strikeTok.replace(",", "."));
+      const badStrike = priceImplausible(strike, pair, opts);
+      if (badStrike) return { ok: false, error: badStrike.replace(/^Kurs/, "Strike") };
       const expiry = parseDateOrTenor(dateTok, valuationDate)!;
       const isCall = /^c/i.test(typeTok);
       const trade = {
@@ -471,16 +528,16 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           pair,
           optionType: isCall ? "Call" : "Put",
           notional: amtTok ? Math.abs(parseAmount(amtTok)!) : 1_000_000,
-          strike: Number(strikeTok.replace(",", ".")),
+          strike,
           expiryDate: expiry,
           deliveryDate: addTenor(expiry, "2D"),
         }),
-        name: `${pair.slice(0, 3)}-${isCall ? "Call" : "Put"}/${pair.slice(3)}-${isCall ? "Put" : "Call"} ${dateTok.toUpperCase()}`,
+        name: `${pair.slice(0, 3)}-${isCall ? "Call" : "Put"}/${pair.slice(3)}-${isCall ? "Put" : "Call"} ${dateLabel(dateTok)}`,
       };
       return {
         ok: true,
         trade,
-        description: `FX-Option ${pair} ${isCall ? "Call" : "Put"} @ ${fmtNum(Number(strikeTok.replace(",", ".")), 4)} · ${amtTok ?? "1m"} · Verfall ${dateTok}`,
+        description: `FX-Option ${pair} ${isCall ? "Call" : "Put"} @ ${fmtNum(strike, strike >= 20 ? 2 : 4)} · ${amtTok ?? "1m"} · Verfall ${dateLabel(dateTok)}`,
       };
     }
   } catch (e) {
@@ -506,14 +563,20 @@ export const QUICK_ENTRY_EXAMPLES = [
   "irs 5y rec 2.4% 5m @Landesbank",
 ];
 
-/** Palette command "stichtag 2026-12-31" / "stichtag heute". */
+/** Palette command "stichtag 2026-12-31" / "stichtag 31.12.2026" / "stichtag heute"; impossible dates (31.02.) are not offered (R3-13). */
 export function parseValuationDateCommand(input: string): string | undefined {
   const m = /^(?:stichtag|bewertungstag|valdate)\s+(\S+)$/i.exec(input.trim());
   if (!m) return undefined;
   const tok = m[1]!.toLowerCase();
   if (tok === "heute" || tok === "today") return new Date().toISOString().slice(0, 10);
-  if (DATE.test(tok)) return tok;
+  let iso: string | undefined;
+  if (DATE.test(tok)) iso = tok;
   const de = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(tok);
-  if (de) return `${de[3]}-${de[2]!.padStart(2, "0")}-${de[1]!.padStart(2, "0")}`;
-  return undefined;
+  if (de) iso = `${de[3]}-${de[2]!.padStart(2, "0")}-${de[1]!.padStart(2, "0")}`;
+  if (!iso) return undefined;
+  try {
+    return toISO(parseISO(iso)) === iso ? iso : undefined;
+  } catch {
+    return undefined;
+  }
 }

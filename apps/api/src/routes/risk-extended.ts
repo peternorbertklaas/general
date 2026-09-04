@@ -106,7 +106,7 @@ export async function registerExtendedRiskRoutes(app: FastifyInstance, ctx: AppC
   app.post<{ Body: { trades?: Trade[]; useStore?: boolean; reportingCurrency?: string; curveIds?: string[]; bumpBp?: number } }>(
     "/api/risk/par/portfolio",
     {
-      config: { marketHeader: true },
+      config: { marketHeader: true, storeFallback: true },
       schema: {
         operationId: "parRiskPortfolio",
         tags: ["pricing"],

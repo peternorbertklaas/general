@@ -109,6 +109,24 @@ describe("WCAG contrast of design tokens (F-10, section 5)", () => {
           expect(r, `fg-0 on 50 % ${hue} = ${r.toFixed(2)}`).toBeGreaterThanOrEqual(AA);
         }
       });
+      it("signed numbers in a selected or hovered row use the strong tokens ≥ 4.5 (R3-07)", () => {
+        const selectedRow = composite(rgb(tk, "accent"), 0.16, rgb(tk, "bg-1"));
+        for (const fg of ["pos-strong", "neg-strong"] as const) {
+          const r = contrastRatio(rgb(tk, fg), selectedRow);
+          expect(r, `${fg} in selected row = ${r.toFixed(2)}`).toBeGreaterThanOrEqual(AA);
+          const h = contrastRatio(rgb(tk, fg), rgb(tk, "bg-hover"));
+          expect(h, `${fg} in hovered row = ${h.toFixed(2)}`).toBeGreaterThanOrEqual(AA);
+          // the plain tokens stay readable on the card surface
+          expect(contrastRatio(rgb(tk, fg), rgb(tk, "bg-1"))).toBeGreaterThanOrEqual(AA);
+        }
+      });
+      it("active filter chips (seg-active-fg on the accent tint over bg-1 / bg-2) ≥ 4.5 (R3-07)", () => {
+        for (const bg of ["bg-1", "bg-2"] as const) {
+          const chip = composite(rgb(tk, "accent"), 0.16, rgb(tk, bg));
+          const r = contrastRatio(rgb(tk, "seg-active-fg"), chip);
+          expect(r, `chip active over ${bg} = ${r.toFixed(2)}`).toBeGreaterThanOrEqual(AA);
+        }
+      });
       it("uses color-mix instead of hard-coded rgba for tints", () => {
         expect(tk["accent-soft"]).toMatch(/color-mix/);
         expect(tk["pos-soft"]).toMatch(/color-mix/);

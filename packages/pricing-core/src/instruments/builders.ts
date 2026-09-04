@@ -1,4 +1,4 @@
-import { getIndex, getSwapConventions } from "../curves/index-definitions.js";
+import { RATE_INDICES, getIndex, getSwapConventions } from "../curves/index-definitions.js";
 import { type CalendarId, addBusinessDays, advance, getCalendar } from "../dates/calendar.js";
 import { type SerialDate, addTenor, immDate, nextImmDate, today, toYMD } from "../dates/date.js";
 import { buildSchedule, frequencyPerYear } from "../dates/schedule.js";
@@ -447,9 +447,26 @@ export interface CrossCurrencySwapParams {
   notionalExchange?: { initial?: boolean; final?: boolean; interim?: boolean };
   /** Payment frequency of both legs (default "3M", market standard for RFR xccy swaps; IBOR legs default to their tenor). */
   frequency?: string;
-  collateralCurrency?: string;
+  /**
+   * CSA / collateral currency selecting the discount curves. Default (market
+   * practice for cross-currency swaps, Bloomberg SWPM / LSEG IPA): USD when
+   * one leg is USD, otherwise the quote (second) currency of the pair – for
+   * EURUSD this activates the USD-collateral EUR discount curve
+   * (`EUR-ESTR-USDCSA` in the sample market) so the fair basis spread reflects
+   * the quoted cross-currency basis instead of ≈ 0. Pass `null` for an
+   * explicitly uncollateralised swap (both legs on their own OIS curves).
+   */
+  collateralCurrency?: string | null;
   counterparty?: string;
   name?: string;
+}
+
+/**
+ * Default CSA currency of a cross-currency swap: USD when involved, else the
+ * quote currency of the pair (see `CrossCurrencySwapParams.collateralCurrency`).
+ */
+export function defaultCcsCollateralCurrency(domestic: string, foreign: string): string {
+  return domestic === "USD" || foreign === "USD" ? "USD" : foreign;
 }
 
 /**
@@ -457,7 +474,8 @@ export interface CrossCurrencySwapParams {
  * or fixed) vs foreign leg (float), notionals exchanged at start and maturity
  * (foreign notional = domestic × `fxSpot`), quarterly payments on the joint
  * calendar of both currencies. The leg carrying the spread is leg 0 so that
- * `analytics.fairSpread` refers to it.
+ * `analytics.fairSpread` refers to it. Collateralised by default (see
+ * `defaultCcsCollateralCurrency`) so the cross-currency basis is priced.
  */
 export function makeCrossCurrencySwap(p: CrossCurrencySwapParams): CrossCurrencySwap {
   const pair = p.pair.replace("/", "").toUpperCase();
@@ -528,22 +546,37 @@ export function makeCrossCurrencySwap(p: CrossCurrencySwapParams): CrossCurrency
   const tenorLabel = typeof p.tenor === "string" ? p.tenor : "";
   const desc =
     p.fixedRate !== undefined ? `${rateDe(p.fixedRate)} ${dom} vs ${frnIdx.name}` : `${domIdx.name} ${p.spread >= 0 ? "+" : ""}${bp} bp vs ${frnIdx.name}`;
+  const collateralCurrency = p.collateralCurrency === null ? undefined : (p.collateralCurrency ?? defaultCcsCollateralCurrency(dom, frn));
   return {
     id: p.id ?? nextTradeId("CCS"),
     name: p.name ?? `Cross-Currency-Swap ${dom}/${frn} ${tenorLabel} ${desc}${p.mtmReset ? " (MtM-Reset)" : ""}`.replace(/\s+/g, " ").trim(),
     type: "CrossCurrencySwap",
     counterparty: p.counterparty,
-    collateralCurrency: p.collateralCurrency,
+    collateralCurrency,
     legs,
     ...(p.mtmReset ? { mtmReset: { resettingLegIndex } } : {}),
   };
 }
 
 /**
+ * Default index of an FRA from its period length: an IBOR index of the
+ * currency whose tenor equals the period ("3x6" → 3M → EURIBOR-3M, "6x12" →
+ * EURIBOR-6M); falls back to the currency's standard floating index when no
+ * index with that tenor is registered.
+ */
+export function fraIndexForPeriod(currency: string, months: number): string {
+  const ccy = currency.toUpperCase();
+  const match = Object.values(RATE_INDICES).find((i) => i.currency === ccy && i.type === "IBOR" && i.tenor.toUpperCase() === `${months}M`);
+  return match?.name ?? getSwapConventions(ccy).floatIndex;
+}
+
+/**
  * Forward rate agreement. `start` is either a period string "3x6" (months from
  * the spot date of `valuationDate`, default today) or the explicit accrual
  * start date (then `end` is required, default start + index tenor).
- * `payReceive: "Pay"` = pay the fixed rate.
+ * `payReceive: "Pay"` = pay the fixed rate. Without an explicit `index` the
+ * index tenor follows the period length ("3x6" → EURIBOR-3M, "6x12" →
+ * EURIBOR-6M, see `fraIndexForPeriod`); an explicit `index` always wins.
  */
 export function makeFra(p: {
   id?: string;
@@ -561,22 +594,27 @@ export function makeFra(p: {
   name?: string;
 }): ForwardRateAgreement {
   const conv = getSwapConventions(p.currency);
-  const idx = getIndex(p.index ?? conv.floatIndex);
+  // Period form "3x6": months from spot; the index tenor follows the period length unless given explicitly (R3-2).
+  const period = typeof p.start === "string" ? /^\s*(\d+)\s*[xX×]\s*(\d+)\s*$/.exec(p.start) : null;
+  if (typeof p.start === "string" && !period) throw new Error(`Invalid FRA period "${p.start}" – expected e.g. "3x6"`);
+  let periodMonths: number | undefined;
+  if (period) periodMonths = Number(period[2]) - Number(period[1]);
+  else if (typeof p.start === "number" && p.end !== undefined) periodMonths = Math.round((p.end - p.start) / 30.4375);
+  const idx = getIndex(p.index ?? (periodMonths !== undefined && periodMonths > 0 ? fraIndexForPeriod(p.currency, periodMonths) : conv.floatIndex));
   const cal = getCalendar(idx.fixingCalendar);
   let startDate: SerialDate;
   let endDate: SerialDate;
   let label: string;
-  if (typeof p.start === "string") {
-    const m = /^\s*(\d+)\s*[xX×]\s*(\d+)\s*$/.exec(p.start);
-    if (!m) throw new Error(`Invalid FRA period "${p.start}" – expected e.g. "3x6"`);
+  if (period) {
     const val = p.valuationDate ?? today();
     const spot = conv.spotLag === 0 ? val : addBusinessDays(val, conv.spotLag, cal);
-    startDate = advance(spot, `${m[1]}M`, cal, "ModifiedFollowing", idx.endOfMonth);
-    endDate = p.end ?? advance(spot, `${m[2]}M`, cal, "ModifiedFollowing", idx.endOfMonth);
-    label = `${m[1]}x${m[2]}`;
+    startDate = advance(spot, `${period[1]}M`, cal, "ModifiedFollowing", idx.endOfMonth);
+    endDate = p.end ?? advance(spot, `${period[2]}M`, cal, "ModifiedFollowing", idx.endOfMonth);
+    label = `${period[1]}x${period[2]}`;
   } else {
-    startDate = p.start;
-    endDate = p.end ?? advance(p.start, idx.tenor, cal, "ModifiedFollowing", idx.endOfMonth);
+    const start = p.start as SerialDate;
+    startDate = start;
+    endDate = p.end ?? advance(start, idx.tenor, cal, "ModifiedFollowing", idx.endOfMonth);
     label = "";
   }
   if (endDate <= startDate) throw new Error("makeFra: end must be after start");

@@ -48,7 +48,17 @@ export function classifyError(err: unknown): ClassifiedError {
   }
   if (typeof e.statusCode === "number" && e.statusCode >= 400) {
     const status = e.statusCode;
-    return { status, message: status >= 500 ? "Internal server error" : String(e.message ?? "Request failed"), level: status >= 500 ? "error" : "none" };
+    // Application errors thrown with a status keep their domain `code`/`details` (TOO_MANY_PERIODS, PERIOD_BUDGET_EXCEEDED …);
+    // library codes (FST_*, ERR_*) stay internal.
+    const code = typeof e.code === "string" && !SYSTEM_CODE.test(e.code) ? e.code : undefined;
+    const details = (e as { details?: unknown }).details;
+    return {
+      status,
+      message: status >= 500 ? "Internal server error" : String(e.message ?? "Request failed"),
+      ...(code && status < 500 ? { code } : {}),
+      ...(code && status < 500 && details && typeof details === "object" ? { details: details as Record<string, unknown> } : {}),
+      level: status >= 500 ? "error" : "none",
+    };
   }
   if (isProgrammingError(err)) return { status: 400, message: "Invalid trade", code: "INVALID_TRADE", level: "warn" };
   if (isPricingError(err)) return { status: 422, message: err.message, code: err.code, ...(err.details ? { details: err.details } : {}), level: "none" };

@@ -1,9 +1,14 @@
 name: CI
 
+# Pushes to `main` and to `claude/**` working branches run directly; pull requests run only
+# when they target `main`. A PR from a `claude/**` branch of this repository is skipped by the
+# job-level `if` below because its push already ran (no double runs); PRs from forks or from
+# other branches still run on the pull_request event.
 on:
   push:
     branches: [main, "claude/**"]
   pull_request:
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -15,6 +20,7 @@ permissions:
 jobs:
   build-test:
     name: Build & test (Node ${{ matrix.node }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'claude/')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -30,6 +36,10 @@ jobs:
           cache: pnpm
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
+      - name: Generated version.ts is committed (no drift against package.json)
+        run: |
+          pnpm --filter @deriva/pricing-core run version:gen
+          git diff --exit-code -- packages/pricing-core/src/version.ts
       - name: Build pricing core (consumed by api/web)
         run: pnpm --filter @deriva/pricing-core run build
       - name: Typecheck
@@ -40,8 +50,8 @@ jobs:
         run: pnpm format:check
       - name: Unit & integration tests with coverage (core, api, web)
         run: pnpm -r run test -- --coverage
-      - name: Dependency audit (production, high+)
-        run: pnpm audit --prod --audit-level=high
+      - name: Dependency audit (production, high+; one retry for registry timeouts)
+        run: pnpm audit --prod --audit-level=high || (sleep 30 && pnpm audit --prod --audit-level=high)
         continue-on-error: false
       - name: Build API
         run: pnpm --filter @deriva/api run build

@@ -63,7 +63,20 @@ export const CURVE_QUOTE_TYPES = ["Deposit", "FRA", "Swap", "OIS", "Future", "Ba
 
 const dayCount = { type: "string", enum: [...DAY_COUNTS] } as const;
 const calendar = { type: "string", minLength: 1, maxLength: 40, description: 'Calendar id, e.g. "TARGET", "US", "UK", "TARGET+US"' } as const;
-const frequency = { type: "string", pattern: "^(\\d{1,3}[DWMYdwmy]|ZC)$", description: 'Coupon frequency as tenor ("1M", "3M", "6M", "1Y") or "ZC"' } as const;
+/**
+ * Coupon frequency. Upper-case tenor with a non-zero count or `ZC` (single
+ * zero-coupon period – the core's token for "term"). The number of periods a
+ * leg implies is bounded separately (`lib/limits.ts`: ≤ 1200 per leg →
+ * otherwise 400 `TOO_MANY_PERIODS`), so `1D` stays valid for short OIS legs
+ * but not for a 100-year swap.
+ */
+export const FREQUENCY_PATTERN = "^([1-9]\\d{0,2}[DWMY]|ZC)$";
+const frequency = {
+  type: "string",
+  pattern: FREQUENCY_PATTERN,
+  description:
+    'Coupon frequency as tenor ("1M", "3M", "6M", "1Y", "1W", "1D") or "ZC" (zero coupon); estimated periods per leg ≤ 1200, else 400 TOO_MANY_PERIODS',
+} as const;
 const rateIndex = { type: "string", minLength: 1, maxLength: 32, description: 'Floating-rate index, e.g. "EURIBOR-6M", "ESTR", "SOFR"' } as const;
 const rate = { type: "number", minimum: -1, maximum: 1, description: "Rate as decimal (0.03 = 3 %)" } as const;
 
@@ -87,8 +100,13 @@ const tradeBaseProperties = {
   status: { type: "string", enum: [...TRADE_STATUS], description: 'Lifecycle status; "Quoted" = firm quote valid until `quoteValidUntil`' },
   quoteValidUntil: { ...isoDate, description: 'Validity of a firm quote (status "Quoted"); informational' },
   uti: { type: "string", pattern: "^[A-Za-z0-9]{1,52}$", description: "Unique Transaction Identifier (EMIR Refit, ISO 23897) – reported in the EMIR export" },
-  cleared: { type: "boolean", description: "Centrally cleared (EMIR Art. 4/4a) – EMIR fields 31/32 (cleared, clearing obligation)" },
-  clearingMember: { ...shortText, description: "Clearing member when `cleared` (EMIR field 33)" },
+  cleared: { type: "boolean", description: "Centrally cleared (EMIR Art. 4/4a) – EMIR Refit ITS Table 2 field 31 (Cleared)" },
+  clearingObligation: {
+    type: "boolean",
+    description:
+      "Subject to the clearing obligation (Art. 4 EMIR: counterparty classification, product class, thresholds) – EMIR Refit ITS Table 2 field 30. Independent of `cleared` (voluntary clearing ⇒ false, mandatory but uncleared ⇒ true); omitted ⇒ reported as N/A, never derived from `cleared`",
+  },
+  clearingMember: { ...shortText, description: "Clearing member when `cleared` (EMIR Refit ITS Table 1, counterparty data)" },
 } as const;
 
 /** Step schedule `{ date, value }[]`: the last entry with `date` ≤ the period's accrual start applies. */
@@ -134,7 +152,7 @@ const legBaseProperties = {
 
 const legRequired = ["type", "payReceive", "notional", "currency", "effectiveDate", "terminationDate", "frequency", "dayCount", "calendar"] as const;
 
-export const fixedLegSchema = {
+const fixedLegSchemaBase = {
   type: "object",
   required: [...legRequired, "rate"],
   properties: {
@@ -146,7 +164,7 @@ export const fixedLegSchema = {
   additionalProperties: false,
 } as const;
 
-export const floatLegSchema = {
+const floatLegSchemaBase = {
   type: "object",
   required: [...legRequired, "index"],
   properties: {
@@ -170,19 +188,35 @@ export const floatLegSchema = {
   additionalProperties: false,
 } as const;
 
+/**
+ * Shared (named) schemas: every variant of the trade union and of the leg
+ * union is registered with `app.addSchema` under its `$id`, the unions
+ * reference them by `$ref`. Ajv resolves the `$ref`s for the `discriminator`
+ * check; in the OpenAPI document they become `components.schemas.<Name>` and
+ * `discriminator.mapping` (see `openApiTransform` in app.ts) instead of
+ * anonymous `def-N` entries with inline `oneOf` branches (N3-02).
+ */
+export const fixedLegSchema = { $id: "FixedLeg", title: "FixedLeg", ...fixedLegSchemaBase } as const;
+export const floatLegSchema = { $id: "FloatLeg", title: "FloatLeg", ...floatLegSchemaBase } as const;
+
 export const swapLegSchema = {
+  $id: "SwapLeg",
+  title: "SwapLeg",
+  description: "Swap leg, discriminated over `type`: Fixed (requires `rate`) or Float (requires `index`).",
   type: "object",
   required: ["type"],
   discriminator: { propertyName: "type" },
-  oneOf: [fixedLegSchema, floatLegSchema],
+  oneOf: [{ $ref: "FixedLeg#" }, { $ref: "FloatLeg#" }],
 } as const;
 
-const legs = { type: "array", items: swapLegSchema, minItems: 1, maxItems: 4 } as const;
+const legs = { type: "array", items: { $ref: "SwapLeg#" }, minItems: 1, maxItems: 4 } as const;
 
 // ---------------------------------------------------------------------------
 // Trade variants
 // ---------------------------------------------------------------------------
 export const interestRateSwapSchema = {
+  $id: "InterestRateSwap",
+  title: "InterestRateSwap",
   type: "object",
   required: ["id", "type", "legs"],
   properties: { type: { type: "string", enum: ["InterestRateSwap"] }, ...tradeBaseProperties, legs },
@@ -190,6 +224,8 @@ export const interestRateSwapSchema = {
 } as const;
 
 export const fraSchema = {
+  $id: "FRA",
+  title: "FRA",
   type: "object",
   required: ["id", "type", "payReceive", "notional", "currency", "index", "startDate", "endDate", "fixedRate"],
   properties: {
@@ -208,6 +244,8 @@ export const fraSchema = {
 } as const;
 
 export const capFloorSchema = {
+  $id: "CapFloor",
+  title: "CapFloor",
   type: "object",
   required: [
     "id",
@@ -254,6 +292,8 @@ export const capFloorSchema = {
 } as const;
 
 export const swaptionSchema = {
+  $id: "Swaption",
+  title: "Swaption",
   type: "object",
   required: ["id", "type", "payReceive", "payerReceiver", "expiryDate", "settlement", "underlying"],
   properties: {
@@ -264,7 +304,7 @@ export const swaptionSchema = {
     expiryDate: isoDate,
     settlement: { type: "string", enum: ["Physical", "Cash"] },
     cashSettlementConvention: { type: "string", enum: ["CollateralisedCashPrice", "IRR"] },
-    underlying: interestRateSwapSchema,
+    underlying: { $ref: "InterestRateSwap#" },
     model: { type: "string", enum: [...IR_MODELS] },
     volOverride: { type: "number", minimum: 0, maximum: 5 },
     shift: { type: "number", minimum: 0, maximum: 1 },
@@ -289,14 +329,16 @@ const fxForwardLegProperties = {
 const fxForwardRequired = ["buyCurrency", "buyAmount", "sellCurrency", "sellAmount", "deliveryDate"] as const;
 
 export const fxForwardSchema = {
+  $id: "FxForward",
+  title: "FxForward",
   type: "object",
   required: ["id", "type", ...fxForwardRequired],
   properties: { type: { type: "string", enum: ["FxForward"] }, ...tradeBaseProperties, ...fxForwardLegProperties },
   additionalProperties: false,
 } as const;
 
+// eslint's `varsIgnorePattern: "^_"` covers the destructured-away `id`.
 const { id: _omitId, ...fxSwapLegBase } = tradeBaseProperties;
-void _omitId;
 const fxSwapLegSchema = {
   type: "object",
   required: [...fxForwardRequired],
@@ -305,6 +347,8 @@ const fxSwapLegSchema = {
 } as const;
 
 export const fxSwapSchema = {
+  $id: "FxSwap",
+  title: "FxSwap",
   type: "object",
   required: ["id", "type", "nearLeg", "farLeg"],
   properties: { type: { type: "string", enum: ["FxSwap"] }, ...tradeBaseProperties, nearLeg: fxSwapLegSchema, farLeg: fxSwapLegSchema },
@@ -312,6 +356,8 @@ export const fxSwapSchema = {
 } as const;
 
 export const fxOptionSchema = {
+  $id: "FxOption",
+  title: "FxOption",
   type: "object",
   required: ["id", "type", "payReceive", "optionType", "pair", "strike", "notional", "expiryDate", "deliveryDate"],
   properties: {
@@ -344,6 +390,8 @@ export const fxOptionSchema = {
 } as const;
 
 export const crossCurrencySwapSchema = {
+  $id: "CrossCurrencySwap",
+  title: "CrossCurrencySwap",
   type: "object",
   required: ["id", "type", "legs"],
   properties: {
@@ -368,7 +416,7 @@ export const tradeSchema = {
   type: "object",
   required: ["type"],
   discriminator: { propertyName: "type" },
-  oneOf: [interestRateSwapSchema, fraSchema, capFloorSchema, swaptionSchema, fxForwardSchema, fxSwapSchema, fxOptionSchema, crossCurrencySwapSchema],
+  oneOf: TRADE_TYPES.map((t) => ({ $ref: `${t}#` })),
   examples: [
     {
       id: "IRS-DEMO",
@@ -405,6 +453,21 @@ export const tradeSchema = {
 
 /** Reference to the shared `Trade` schema (registered via `app.addSchema`). */
 export const tradeRef = { $ref: "Trade#" } as const;
+
+/** Every trade variant and leg schema, registered as named components (order: referenced before referencing is not required). */
+export const tradeVariantSchemas = [
+  fixedLegSchema,
+  floatLegSchema,
+  swapLegSchema,
+  interestRateSwapSchema,
+  fraSchema,
+  capFloorSchema,
+  swaptionSchema,
+  fxForwardSchema,
+  fxSwapSchema,
+  fxOptionSchema,
+  crossCurrencySwapSchema,
+] as const;
 
 // ---------------------------------------------------------------------------
 // Request bodies
@@ -449,6 +512,11 @@ export const hazardCurveSchema = {
       description: "Hazard rate per interval ending at times[i]",
     },
     recovery: { type: "number", minimum: 0, maximum: 1 },
+    warnings: {
+      type: "array",
+      items: { type: "string" },
+      description: "Bootstrap warnings (`HAZARD_FLOORED: …` for every pillar floored at 0 under `floorHazard`); informational on input",
+    },
   },
   additionalProperties: false,
 } as const;
@@ -489,6 +557,11 @@ export const hazardCurveBodySchema = {
     recovery: { type: "number", minimum: 0, exclusiveMaximum: 1 },
     valuationDate: { ...isoDate, description: "Default: market valuation date" },
     discountCurveId: { type: "string", maxLength: 64, description: "Discount curve for the premium/protection legs (default: DF ≡ 1)" },
+    floorHazard: {
+      type: "boolean",
+      description:
+        "Inverted CDS quotes (spread × maturity decreasing) imply a negative forward hazard rate. Default false: 422 `INVALID_CREDIT_CURVE` naming the pillar (`details.pillar`). true: floor that interval's hazard at 0 and report it in `warnings` (`HAZARD_FLOORED: …`); later pillars are solved on the floored curve, the floored quote itself does not reprice.",
+    },
   },
   additionalProperties: false,
 } as const;
@@ -503,7 +576,7 @@ export const xvaBodySchema = {
 export const governanceSchema = {
   type: "object",
   description:
-    "Bewertungs-Governance (IDW RS HFA 35 / MaRisk): Freigabestatus des Snapshots, Input-Quellen, Modellversion, Validierer. Alle Felder optional (Defaults: indicative, ctx.meta.source, Engine-Version).",
+    "Bewertungs-Governance (IFRS 13 / IDW RS HFA 47, MaRisk AT 4.3.5 und BTO 2.2.1): Freigabestatus des Snapshots, Input-Quellen, Modellversion, Validierer. Alle Felder optional (Defaults: indicative, ctx.meta.source, Engine-Version).",
   properties: {
     snapshotStatus: { type: "string", enum: ["indicative", "approved"] },
     inputSources: { type: "array", items: { type: "string", maxLength: 200 }, maxItems: 20 },
@@ -786,7 +859,12 @@ export const crossCurrencySwapParamsSchema = {
       additionalProperties: false,
     },
     frequency,
-    collateralCurrency: currency,
+    collateralCurrency: {
+      type: ["string", "null"],
+      pattern: currency.pattern,
+      description:
+        "CSA / collateral currency selecting the discount curves. Default (market practice, Bloomberg SWPM / LSEG IPA): USD when one leg is USD, otherwise the quote (second) currency of the pair – for EURUSD the USD-collateral EUR discount curve, so the fair basis spread reflects the quoted cross-currency basis. `null` = explicitly uncollateralised (both legs on their own OIS curves; the built trade carries no `collateralCurrency`).",
+    },
     counterparty: shortText,
     name: shortText,
   },
@@ -802,11 +880,16 @@ export const fraParamsSchema = {
     currency,
     notional: positiveNumber,
     payReceive: { ...payReceive, description: "Pay = pay the fixed rate" },
-    index: { ...rateIndex, description: "Default: the currency's IBOR index" },
+    index: {
+      ...rateIndex,
+      description:
+        'Default: the IBOR index of the currency whose tenor equals the period length ("3x6" → EURIBOR-3M, "6x12" → EURIBOR-6M; explicit `start`/`end`: rounded months between them), falling back to the currency\'s standard floating index when no such tenor is registered. An explicit `index` always wins.',
+    },
     start: {
       type: "string",
       pattern: "^(\\d{1,3}x\\d{1,3}|\\d{4}-\\d{2}-\\d{2})$",
-      description: 'Period "3x6" (months from the spot date of `valuationDate`) or ISO accrual start (then `end` applies, default start + index tenor)',
+      description:
+        'Period "3x6" (months from the spot date of `valuationDate`; the index tenor follows the period length unless `index` is given) or ISO accrual start (then `end` applies, default start + index tenor)',
     },
     end: isoDate,
     rate,
@@ -818,8 +901,10 @@ export const fraParamsSchema = {
   additionalProperties: false,
 } as const;
 
-const templateBranch = (template: string, params: unknown) =>
+const templateBranch = (id: string, template: string, params: unknown) =>
   ({
+    $id: id,
+    title: id,
     type: "object",
     required: ["template", "params"],
     properties: {
@@ -831,12 +916,18 @@ const templateBranch = (template: string, params: unknown) =>
     additionalProperties: false,
   }) as const;
 
+/** Named branches of the `from-template` body (registered as components, referenced by the discriminated body). */
+export const fromTemplateBranchSchemas = [
+  templateBranch("FromTemplateCrossCurrencySwap", "CrossCurrencySwap", crossCurrencySwapParamsSchema),
+  templateBranch("FromTemplateFra", "FRA", fraParamsSchema),
+] as const;
+
 export const fromTemplateBodySchema = {
   type: "object",
   required: ["template", "params"],
   description: "Discriminated over `template`; `params` mirrors the core builder's parameters.",
   discriminator: { propertyName: "template" },
-  oneOf: [templateBranch("CrossCurrencySwap", crossCurrencySwapParamsSchema), templateBranch("FRA", fraParamsSchema)],
+  oneOf: fromTemplateBranchSchemas.map((s) => ({ $ref: `${s.$id}#` })),
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -858,7 +949,15 @@ export const marketSnapshotSchema = {
     valuationDate: isoDate,
     meta: {
       type: "object",
-      properties: { source: shortText, snapshotTime: { type: "string", maxLength: 40 }, label: shortText },
+      properties: {
+        source: shortText,
+        snapshotTime: {
+          ...isoDateTime,
+          format: "date-time",
+          description: "ISO-8601 UTC timestamp of the market data cut (becomes the EMIR valuation timestamp when no explicit `timestamp` is given)",
+        },
+        label: shortText,
+      },
       additionalProperties: false,
     },
     discountCurveId: { ...idMap, description: "Discount curve id per currency" },
@@ -1015,6 +1114,46 @@ export const marketSnapshotRef = { $ref: "MarketSnapshot#" } as const;
 // ---------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------
+/**
+ * Machine-readable error codes of the API (`ErrorResponse.code`), by origin.
+ * `core` mirrors the pricing core's `PricingErrorCode` union (a `PricingError`
+ * thrown while pricing → 422; `INVALID_TIMESTAMP` → 400 on snapshot import),
+ * `api` are raised by the API layer itself. `WARNING_PREFIXES` are not errors:
+ * they prefix entries of `PricingResult.warnings[]` / `HazardCurve.warnings[]`
+ * on a 200 response.
+ */
+export const API_ERROR_CODES = {
+  core: [
+    "INVALID_TRADE",
+    "NON_FINITE_PV",
+    "MISSING_RATE",
+    "MISSING_FIXING",
+    "NO_DISCOUNT_CURVE",
+    "CURVE_NOT_FOUND",
+    "NO_FX_SPOT",
+    "UNKNOWN_INDEX",
+    "UNKNOWN_CALENDAR",
+    "UNSUPPORTED_TRADE_TYPE",
+    "INVALID_FREQUENCY",
+    "UNKNOWN_DAYCOUNT",
+    "TOO_MANY_PERIODS",
+    "VOL_MODEL_INCOMPATIBLE",
+    "INVALID_CREDIT_CURVE",
+    "INVALID_TIMESTAMP",
+  ],
+  api: [
+    "DOMAIN_ERROR",
+    "CSV_INVALID",
+    "CSV_ROW_INVALID",
+    "SNAPSHOT_MALFORMED",
+    "SNAPSHOT_INVALID",
+    "PERIOD_BUDGET_EXCEEDED",
+    "PRECONDITION_FAILED",
+    "PRECONDITION_REQUIRED",
+  ],
+} as const;
+export const WARNING_PREFIXES = ["MISSING_FIXING", "VOL_TYPE_CONVERTED", "HAZARD_FLOORED"] as const;
+
 export const errorResponseSchema = {
   $id: "ErrorResponse",
   title: "ErrorResponse",
@@ -1024,7 +1163,19 @@ export const errorResponseSchema = {
   properties: {
     error: { type: "string", description: "Human-readable message (never a stack trace)" },
     statusCode: { type: "integer" },
-    code: { type: "string", description: "Machine-readable domain code (422), e.g. MISSING_FIXING, NON_FINITE_PV, INVALID_TRADE" },
+    code: {
+      type: "string",
+      // `examples` (the full code list) is added to the OpenAPI document by `openApiTransform` – @fastify/swagger would collapse it to a single `example`.
+      description:
+        "Machine-readable code (stable; the complete list is in `examples`). " +
+        "422 domain errors of the pricing core: INVALID_TRADE (semantically invalid trade), NON_FINITE_PV, MISSING_RATE, MISSING_FIXING (policy `throw`), NO_DISCOUNT_CURVE, CURVE_NOT_FOUND, NO_FX_SPOT, UNKNOWN_INDEX, UNKNOWN_CALENDAR, UNSUPPORTED_TRADE_TYPE, " +
+        'INVALID_FREQUENCY (frequency that is not a positive tenor, e.g. "7Q"), UNKNOWN_DAYCOUNT (day count outside the supported conventions), ' +
+        "VOL_MODEL_INCOMPATIBLE (requested option model cannot be fed from the vol surface – e.g. Black on a non-positive forward or strike without shift), " +
+        "INVALID_CREDIT_CURVE (CDS quotes imply a negative hazard rate; `details.pillar`; avoid with `floorHazard`), INVALID_TIMESTAMP (non-ISO-8601 timestamp: 400 on snapshot import, 422 from the EMIR export), DOMAIN_ERROR (plain core error without code). " +
+        "400: INVALID_TRADE (programming error while pricing, reported as invalid trade), TOO_MANY_PERIODS (estimated coupon periods of one leg above the bound), CSV_INVALID (CSV import: unparsable file / header), SNAPSHOT_MALFORMED; 413 PERIOD_BUDGET_EXCEEDED; 412 PRECONDITION_FAILED; 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED. " +
+        "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID and INTERNAL_ERROR. " +
+        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0).",
+    },
     details: { type: "object", additionalProperties: true, description: "Structured context of a PricingError (trade id, curve id, …)" },
     requestId: { type: "string" },
     validation: { type: "array", items: { type: "object", additionalProperties: true }, description: "Ajv validation errors (400)" },
@@ -1042,14 +1193,15 @@ const commonErrors = {
   500: { ...errorRef, description: "Internal server error (generic message, details logged server-side)" },
 } as const;
 
-type ErrorStatus = 400 | 404 | 409 | 412 | 413 | 422;
+type ErrorStatus = 400 | 404 | 409 | 412 | 413 | 422 | 428;
 const ERROR_DESCRIPTIONS: Record<ErrorStatus, string> = {
-  400: "Schema validation failed (`validation[]`), malformed JSON or invalid trade shape",
+  400: "Schema validation failed (`validation[]`), malformed JSON, invalid trade shape, or a leg with more than the allowed coupon periods (`code: TOO_MANY_PERIODS`)",
   404: "Resource not found",
   409: "Conflict (resource already exists)",
   412: "Precondition failed (ETag mismatch)",
-  413: "Payload too large (body limit 5 MB)",
+  413: "Payload too large (body limit 5 MB) or compute budget exceeded (`code: PERIOD_BUDGET_EXCEEDED` – estimated coupon periods × valuations per request)",
   422: "Domain error – trade cannot be priced (`code`)",
+  428: "Precondition required – `If-Match` missing while the server runs with REQUIRE_IF_MATCH=1 (`code: PRECONDITION_REQUIRED`, `currentEtag`)",
 };
 
 /** Build `response` map: given success responses + selected error statuses + common errors. */
@@ -1076,13 +1228,18 @@ export const pricingResultSchema = {
     pv: num("PV in reporting currency, positive = asset to us"),
     legs: anyArray("LegResult[] (pv, pvReporting, annuity, cashflows[] with paymentDate/discountFactor/presentValue)"),
     analytics: anyObject(
-      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1). Dates live in `details`.",
+      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1). " +
+        "Caps/floors and swaptions: `model` (Bachelier | Black | ShiftedBlack), `volatility` in the model's own quotation, `volConverted` (\"yes\" when the surface vols were converted into that quotation because the requested model differs from the surface's vol type – then `warnings[]` carries `VOL_TYPE_CONVERTED:` and swaptions additionally report the unconverted `surfaceVolatility`). Dates live in `details`.",
     ),
     details: anyObject(
-      "Non-numeric details complementing `analytics`: ISO dates such as `spotDate` (FX), `fixingDate`/`settlementDate` (FRA), `maturity` (swaps)",
+      "Non-numeric details complementing `analytics`: ISO dates such as `spotDate` (FX; FX options additionally `standardDelivery` = spot date of the expiry, the market-standard delivery the trade's `deliveryDate` may deviate from), `fixingDate`/`settlementDate` (FRA), `maturity` (swaps)",
     ),
     accrued: num("Accrued interest in reporting currency"),
-    warnings: { type: "array", items: { type: "string" } },
+    warnings: {
+      type: "array",
+      items: { type: "string" },
+      description: "Pricer warnings (English); stable prefixes `MISSING_FIXING:`, `VOL_TYPE_CONVERTED:` (see `ErrorResponse.code`)",
+    },
     timingMs: num("Wall-clock pricing time (diagnostic, not part of any hash)"),
   },
   additionalProperties: true,
@@ -1206,7 +1363,8 @@ export const portfolioReportSchema = {
 
 export const emirRecordSchema = {
   type: "object",
-  description: "EMIR-Refit valuation record (Table 2, fields 21–26 valuation, 31–33 clearing).",
+  description:
+    "EMIR-Refit valuation record (ITS (EU) 2022/1860 Table 2: 21 valuation amount, 22 valuation currency, 23 valuation timestamp, 24 valuation method, 25 delta, 26 collateral portfolio indicator; 30 clearing obligation, 31 cleared; clearing member from Table 1).",
   properties: {
     uti: { type: "string", description: "From `?uti=` map, else the trade's `uti`" },
     tradeId: { type: "string" },
@@ -1216,13 +1374,21 @@ export const emirRecordSchema = {
     notionalCurrency: currency,
     valuationAmount: num("Valuation amount"),
     valuationCurrency: currency,
-    valuationTimestamp: { type: "string" },
-    valuationMethod: { type: "string", enum: ["MTMA", "MTMO", "CCPV"] },
-    delta: num("Delta of the position (options / collateralised trades)"),
-    collateralPortfolioIndicator: { type: "string", enum: ["TRUE", "FALSE"] },
+    valuationTimestamp: {
+      ...isoDateTime,
+      description: "Field 23 – ISO-8601 UTC (`timestamp` → snapshot `meta.snapshotTime` → `asOf` → 17:00 UTC of the valuation date)",
+    },
+    valuationMethod: { type: "string", enum: ["MTMA", "MTMO", "CCPV"], description: "Field 24" },
+    delta: num("Field 25 – delta of the position (options / collateralised trades)"),
+    collateralPortfolioIndicator: { type: "string", enum: ["TRUE", "FALSE"], description: "Field 26" },
     cleared: { type: "string", enum: ["TRUE", "FALSE"], description: "Field 31 – from the trade's `cleared`" },
-    clearingObligation: { type: "string", enum: ["Y", "N"], description: "Field 32 – derived: cleared → Y" },
-    clearingMember: { type: "string", description: "Field 33 – the trade's `clearingMember`" },
+    clearingObligation: {
+      type: "string",
+      enum: ["Y", "N", "N/A"],
+      description:
+        "Field 30 – from the trade's `clearingObligation` (true → Y, false → N), else the reporter default `?clearingObligation=`; N/A when neither is given – never derived from `cleared`",
+    },
+    clearingMember: { type: "string", description: "Table 1 – the trade's `clearingMember`" },
   },
   additionalProperties: true,
 } as const;

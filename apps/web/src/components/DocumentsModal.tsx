@@ -19,9 +19,10 @@ import {
 } from "@deriva/pricing-core";
 import { fmtDate, fmtMoney } from "../lib/format.js";
 import { germanizeDocValue, germanizeParagraph, translatePricingError } from "../lib/i18n.js";
+import { whatIfExportQuestion } from "../lib/portfolio-export.js";
 import { downloadText } from "../lib/portfolio-io.js";
 import { tradeMaturity } from "../lib/trade-ops.js";
-import { type DocKind, reportInputsFor, useStore } from "../state/store.js";
+import { type DocKind, reportInputsFor, useStore, whatIfActive, whatIfLabel } from "../state/store.js";
 import { DateInput } from "./DateInput.js";
 import { Modal } from "./Modal.js";
 import { NumInput } from "./NumInput.js";
@@ -30,6 +31,26 @@ export type { DocKind };
 
 const INTERNAL_ROW = /marge|margin|ertrag der bank|bankmarge|deckungsbeitrag|interne/i;
 const REQUIRED_ROW = /anfänglicher (negativer )?marktwert|initial market value|kosten|einstiegskosten/i;
+
+/** Marker line for documents generated under an active what-if (stress) market (R3-F1). */
+export function whatIfDocMarker(label: string): string {
+  return `WHAT-IF ${label} – Stress-Markt, kein Kundendokument, nicht prüfungsfähig`;
+}
+
+/**
+ * Customer view of the cost-transparency rule: the bank-margin formula stays in
+ * the auditor report; the client document explains the initial market value only (R3-F8).
+ */
+export function customerCostRule(p: string): string {
+  if (!/Marge der Bank/.test(p)) return p;
+  const head = p.split(/Marge der Bank/)[0]!.replace(/[;:,\s]+$/, "");
+  return `${head}. Anfänglicher Marktwert aus Kundensicht = Fair Value (Sicht Kunde) − Transaktionspreis; ein negativer Wert bedeutet, dass der Kunde bei Abschluss eine Marge trägt (BGH XI ZR 33/10, XI ZR 378/13).`;
+}
+
+/** A row value that is prose rather than a figure – rendered as a wrapping text cell (R3-05). */
+export function isLongText(v: string): boolean {
+  return v.length > 60 || /[.;:] [A-ZÄÖÜa-z]/.test(v);
+}
 
 /** Customer mode: drop internal margin lines but keep the legally required initial market value / cost figures. */
 export function filterForCustomer(doc: GeneratedDocument, customer: boolean): GeneratedDocument {
@@ -45,13 +66,21 @@ export function filterForCustomer(doc: GeneratedDocument, customer: boolean): Ge
   return { ...doc, sections, markdown: toMarkdown({ ...doc, sections }) };
 }
 
+export interface PolishOptions {
+  /** Customer mode: the methodology of a termsheet is cut to snapshot, framework and the customer cost rule (R3-F8). */
+  customer?: boolean;
+  /** Active what-if label – stamped into subtitle and Markdown (R3-F1). */
+  whatIfLabel?: string;
+}
+
 /**
- * UI-side polish of core documents (N-07 / N-22): German decimal commas in
- * every cell and – for termsheets – the legally required initial market value
- * (BGH XI ZR 33/10) in the "Indikative Bewertung" section when the report
- * carries a cost-transparency block. The Markdown is regenerated accordingly.
+ * UI-side polish of core documents (N-07 / N-22 / R3-06): German decimal commas
+ * in every cell, methodology prose without code identifiers, and – for
+ * termsheets – the legally required initial market value (BGH XI ZR 33/10) in
+ * the "Indikative Bewertung" section when the report carries a
+ * cost-transparency block. The Markdown is regenerated accordingly.
  */
-export function polishDocument(doc: GeneratedDocument, kind: DocKind, report: ValuationReport): GeneratedDocument {
+export function polishDocument(doc: GeneratedDocument, kind: DocKind, report: ValuationReport, opts: PolishOptions = {}): GeneratedDocument {
   const ct = report.costTransparency;
   const sections = doc.sections.map((sec) => {
     let rows = sec.rows?.map(([k, v]) => [k, germanizeDocValue(v, k)] as [string, string]);
@@ -64,14 +93,24 @@ export function polishDocument(doc: GeneratedDocument, kind: DocKind, report: Va
         ],
       ];
     }
+    let paragraphs = sec.paragraphs?.map(germanizeParagraph);
+    if (opts.customer && paragraphs) {
+      paragraphs = paragraphs.map(customerCostRule);
+      // Customer termsheet: three methodology sentences – snapshot, valuation framework, cost rule (R3-F8).
+      if (kind === "Termsheet" && /methodik/i.test(sec.heading)) {
+        const framework = paragraphs.find((p) => /Multi-Curve|Bewertungsrahmen|Diskontierung/i.test(p) && !/^Snapshot/.test(p));
+        paragraphs = paragraphs.filter((p) => /^Snapshot/.test(p) || p === framework || /Kostentransparenz/.test(p));
+      }
+    }
     return {
       ...sec,
       rows,
-      paragraphs: sec.paragraphs?.map(germanizeParagraph),
+      paragraphs,
       table: sec.table ? { ...sec.table, rows: sec.table.rows.map((r) => r.map((c, j) => (j === 0 ? c : germanizeDocValue(c, r[0] ?? "")))) } : undefined,
     };
   });
-  const out = { ...doc, sections };
+  const subtitle = opts.whatIfLabel ? `${doc.subtitle} · ${whatIfDocMarker(opts.whatIfLabel)}` : doc.subtitle;
+  const out = { ...doc, subtitle, sections };
   return { ...out, markdown: toMarkdown(out) };
 }
 
@@ -137,7 +176,11 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
   const customer = useStore((s) => s.customerMode);
   const reportingCurrency = useStore((s) => s.reportingCurrency);
   const valuationDate = useStore((s) => s.valuationDate);
+  const whatIf = useStore((s) => s.whatIf);
   const perspective = useStore((s) => reportInputsFor(s, trade.id).perspective);
+  // Documents under an active what-if carry a stress-market marker and require confirmation before they leave the screen (R3-F1).
+  const wiLabel = whatIfActive(whatIf) ? whatIfLabel(whatIf) : undefined;
+  const polish = useMemo(() => ({ customer, whatIfLabel: wiLabel }), [customer, wiLabel]);
   const [inputs, setInputs] = useState<SuitabilityInputs>({ ...DEFAULT_INPUTS, transactionPrice: report.costTransparency?.transactionPrice ?? 0 });
   const [generated, setGenerated] = useState<{ doc: GeneratedDocument | null; error: string | null }>({ doc: null, error: null });
   const set = (patch: Partial<SuitabilityInputs>) => setInputs((i) => ({ ...i, ...patch }));
@@ -166,11 +209,11 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
   const termsheet = useMemo<{ doc: GeneratedDocument | null; error: string | null }>(() => {
     if (kind !== "Termsheet") return { doc: null, error: null };
     try {
-      return { doc: polishDocument(filterForCustomer(generateTermsheet(market, trade, pricing, report), customer), kind, report), error: null };
+      return { doc: polishDocument(filterForCustomer(generateTermsheet(market, trade, pricing, report), customer), kind, report, polish), error: null };
     } catch (e) {
       return { doc: null, error: translatePricingError(e) };
     }
-  }, [kind, market, trade, pricing, report, customer]);
+  }, [kind, market, trade, pricing, report, customer, polish]);
 
   const confirmation = useMemo<{ doc: GeneratedDocument | null; error: string | null }>(() => {
     if (kind !== "Confirmation") return { doc: null, error: null };
@@ -190,11 +233,11 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
         confirmationDate: conf.confirmationDate,
         reference: conf.reference.trim() || undefined,
       });
-      return { doc: polishDocument(filterForCustomer(doc, customer), kind, report), error: null };
+      return { doc: polishDocument(filterForCustomer(doc, customer), kind, report, polish), error: null };
     } catch (e) {
       return { doc: null, error: translatePricingError(e) };
     }
-  }, [kind, conf, market, trade, pricing, report, customer]);
+  }, [kind, conf, market, trade, pricing, report, customer, polish]);
 
   const kidDoc = useMemo<{ doc: GeneratedDocument | null; error: string | null }>(() => {
     if (kind !== "KID") return { doc: null, error: null };
@@ -209,11 +252,11 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
         perspective: report.costTransparency?.perspective ?? perspective,
         scenarioSet: STANDARD_SCENARIOS,
       };
-      return { doc: polishDocument(filterForCustomer(generateKid(market, trade, pricing, scen, opts), customer), kind, report), error: null };
+      return { doc: polishDocument(filterForCustomer(generateKid(market, trade, pricing, scen, opts), customer), kind, report, polish), error: null };
     } catch (e) {
       return { doc: null, error: translatePricingError(e) };
     }
-  }, [kind, kid, market, trade, pricing, report, reportingCurrency, customer, perspective]);
+  }, [kind, kid, market, trade, pricing, report, reportingCurrency, customer, perspective, polish]);
 
   const current = kind === "Termsheet" ? termsheet : kind === "Confirmation" ? confirmation : kind === "KID" ? kidDoc : generated;
   const doc = current.doc;
@@ -223,14 +266,21 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
     try {
       const scen = runScenarios(market, [trade], STANDARD_SCENARIOS, reportingCurrency).results;
       setGenerated({
-        doc: polishDocument(filterForCustomer(generateSuitabilityStatement(market, trade, pricing, report, inputs, scen), customer), kind, report),
+        doc: polishDocument(filterForCustomer(generateSuitabilityStatement(market, trade, pricing, report, inputs, scen), customer), kind, report, polish),
         error: null,
       });
     } catch (e) {
       setGenerated({ doc: null, error: translatePricingError(e) });
     }
   };
+  /** Under what-if the user confirms before a document is printed or saved (R3-F1). */
+  const confirmWhatIf = (what: string) => !wiLabel || window.confirm(whatIfExportQuestion(wiLabel, what));
+  const saveMarkdown = () => {
+    if (!doc || !confirmWhatIf("Das Dokument")) return;
+    downloadText(`${trade.id}-${kind.toLowerCase()}${wiLabel ? "-whatif" : ""}.md`, doc.markdown, "text/markdown;charset=utf-8");
+  };
   const print = () => {
+    if (!confirmWhatIf("Das Dokument")) return;
     document.body.classList.add("print-doc");
     const done = () => {
       document.body.classList.remove("print-doc");
@@ -258,7 +308,7 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
           <span className="grow" />
           {doc && (
             <>
-              <button className="btn" onClick={() => downloadText(`${trade.id}-${kind.toLowerCase()}.md`, doc.markdown, "text/markdown;charset=utf-8")}>
+              <button className="btn" onClick={saveMarkdown} data-testid="doc-markdown">
                 ⤓ Markdown
               </button>
               <button className="btn primary" onClick={print} data-testid="doc-print">
@@ -470,16 +520,21 @@ export function DocumentsModal({ kind, trade, pricing, report, onClose }: Props)
           {error}
         </div>
       )}
-      {doc && <DocumentBody doc={doc} />}
+      {doc && <DocumentBody doc={doc} whatIfLabel={wiLabel} />}
       {!doc && !error && kind === "Geeignetheitserklaerung" && <div className="empty">Angaben ausfüllen und „Erklärung erzeugen“ klicken.</div>}
     </Modal>
   );
 }
 
-/** Sections → cards; printable. */
-export function DocumentBody({ doc }: { doc: GeneratedDocument }) {
+/** Sections → cards; printable. Long row values wrap as text cells (R3-05); a what-if marker prints as a banner (R3-F1). */
+export function DocumentBody({ doc, whatIfLabel: wi }: { doc: GeneratedDocument; whatIfLabel?: string }) {
   return (
     <div className="doc" data-testid="document-body">
+      {wi && (
+        <div className="doc-whatif" role="alert" data-testid="doc-whatif-banner">
+          ⚠ Stress-Markt: {whatIfDocMarker(wi)}. Die ausgewiesenen Barwerte beruhen auf verschobenen Marktdaten – nicht an Kunden weitergeben.
+        </div>
+      )}
       <div className="doc-head">
         <h1>{doc.title}</h1>
         <div className="muted small">{doc.subtitle}</div>
@@ -493,12 +548,12 @@ export function DocumentBody({ doc }: { doc: GeneratedDocument }) {
             </p>
           ))}
           {sec.rows && sec.rows.length > 0 && (
-            <table className="grid-table">
+            <table className="grid-table doc-rows">
               <tbody>
                 {sec.rows.map(([k, v], i) => (
                   <tr key={`${k}-${i}`} style={{ cursor: "default" }}>
                     <td className="muted">{k}</td>
-                    <td className="num">{v}</td>
+                    <td className={isLongText(v) ? "text" : "num"}>{v}</td>
                   </tr>
                 ))}
               </tbody>
@@ -520,7 +575,7 @@ export function DocumentBody({ doc }: { doc: GeneratedDocument }) {
                   {sec.table.rows.map((r, i) => (
                     <tr key={i} style={{ cursor: "default" }}>
                       {r.map((c, j) => (
-                        <td key={j} className={j > 0 ? "num" : ""}>
+                        <td key={j} className={j > 0 ? (isLongText(c) ? "text" : "num") : isLongText(c) ? "text" : ""}>
                           {c}
                         </td>
                       ))}

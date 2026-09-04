@@ -5,6 +5,8 @@ import { ContextMenu, type ContextMenuState } from "../components/ContextMenu.js
 import { EChart, negColor, posColor } from "../components/EChart.js";
 import { Term } from "../components/InfoTip.js";
 import { Modal } from "../components/Modal.js";
+import { menuKeyNav, usePopover } from "../components/Popover.js";
+import { useMediaQuery } from "../hooks/useMediaQuery.js";
 import { navRowProps, useTableNav } from "../hooks/useTableNav.js";
 import { keysOf } from "../hotkeys/keymap.js";
 import {
@@ -22,14 +24,28 @@ import {
 import { fmtCompact, fmtDate, fmtMoney, signClass } from "../lib/format.js";
 import { translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { downloadPortfolioReport } from "../lib/portfolio-export.js";
-import { CSV_IMPORT_TEMPLATES, type CsvTradeType, csvTemplateText, downloadText, tradesFromCsv, tradesFromJson, tradesToJson } from "../lib/portfolio-io.js";
+import {
+  CSV_IMPORT_TEMPLATES,
+  CSV_TRADE_TYPES,
+  type CsvTradeType,
+  csvErrorsText,
+  csvTemplateText,
+  downloadText,
+  tradesFromCsv,
+  tradesFromJson,
+  tradesToJson,
+} from "../lib/portfolio-io.js";
 import { quoteExpired, tradeTypeBadge } from "../lib/trade-ops.js";
+import { utiValid } from "../lib/validate-trade.js";
 import { type DuplicateStrategy, LS_KEYS, STATUS_LABELS, deleteWithUndo, readLocal, useStore, writeLocal, type TradeStatus } from "../state/store.js";
 
 type SortKey = "id" | "type" | "notional" | "maturity" | "pv" | "dv01" | "cpty" | "book" | "status";
 const SORT_KEYS: SortKey[] = ["id", "type", "notional", "maturity", "pv", "dv01", "cpty", "book", "status"];
 
 export const ONBOARDING_EXAMPLES = ["irs 10y pay 3.1% 10m", "cap 5y 3% 8m", "fxf eurusd -2m 1.1725 2027-03-15"];
+
+/** Below this width the blotter toolbar collapses its filters into a popover and shows icon buttons (R3-09 / N-12). */
+export const COMPACT_TOOLBAR_QUERY = "(max-width: 1400px)";
 
 /** Status badge; a firm quote past its validity date carries an extra "abgelaufen" badge. */
 export function StatusBadge({ status, expired }: { status: Trade["status"]; expired?: boolean }) {
@@ -122,7 +138,7 @@ interface BlotterPrefs {
   filter: TypeFilter;
   hideIndications: boolean;
   noCpty: boolean;
-  /** Only trades without a UTI (EMIR reporting gap). */
+  /** Only trades without a (valid) UTI (EMIR reporting gap, R3-12). */
   noUti: boolean;
   group: GroupKey;
 }
@@ -165,6 +181,125 @@ function ImportStrategyDialog({ count, onPick, onClose }: { count: number; onPic
   );
 }
 
+/** Every rejected CSV row with its reason – scrollable, downloadable (R3-F7). */
+function CsvErrorsDialog({
+  errors,
+  accepted,
+  onContinue,
+  onClose,
+}: {
+  errors: { row: number; msg: string }[];
+  accepted: number;
+  onContinue: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Modal
+      title={`CSV-Import: ${errors.length} ${errors.length === 1 ? "Zeile" : "Zeilen"} übersprungen`}
+      onClose={onClose}
+      width={640}
+      className="csv-errors"
+      testId="csv-errors"
+      footer={
+        <div className="row" style={{ width: "100%" }}>
+          <button
+            className="btn"
+            onClick={() => downloadText("deriva-import-fehler.csv", csvErrorsText(errors), "text/csv;charset=utf-8")}
+            data-testid="csv-errors-save"
+          >
+            ⤓ Fehlerliste als CSV
+          </button>
+          <span className="grow" />
+          <button className="btn ghost" onClick={onClose}>
+            Abbrechen
+          </button>
+          <button className="btn primary" onClick={onContinue} data-testid="csv-errors-continue" disabled={accepted === 0}>
+            {accepted > 0 ? `${accepted} gültige ${accepted === 1 ? "Zeile" : "Zeilen"} importieren` : "Keine gültige Zeile"}
+          </button>
+        </div>
+      }
+    >
+      <p className="small" style={{ marginTop: 0 }}>
+        Zeilennummern beziehen sich auf die Datei (Kopfzeile = Zeile 1). Fehlende Pflichtspalten stehen in der Meldung; Spaltennamen dürfen deutsch oder
+        englisch sein.
+      </p>
+      <div className="table-scroll">
+        <table className="grid-table compact" data-testid="csv-errors-table">
+          <thead>
+            <tr>
+              <th className="num">Zeile</th>
+              <th>Meldung</th>
+            </tr>
+          </thead>
+          <tbody>
+            {errors.map((e) => (
+              <tr key={e.row} style={{ cursor: "default" }}>
+                <td className="num">{e.row + 1}</td>
+                <td>{e.msg}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Modal>
+  );
+}
+
+/** Valuation badge with the warnings/error popover of one row – a registered popover layer (R3-02). */
+function ValuationCell({ row, customer }: { row: BlotterRow; customer: boolean }) {
+  const [open, setOpen] = useState(false);
+  const anchor = useRef<HTMLSpanElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
+  const toggle = useRef<HTMLButtonElement>(null);
+  usePopover(open, () => setOpen(false), { anchor, panel, restoreTo: toggle });
+  const r = row;
+  if (!r.error && !(r.warnings.length && !customer)) return <span className="badge ok">OK</span>;
+  return (
+    <span ref={anchor} className="anchor" style={{ position: "relative", display: "inline-flex" }}>
+      {r.error ? (
+        <button
+          ref={toggle}
+          className="badge neg as-btn"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          title={translateCoreMessage(r.error)}
+          data-testid="valuation-error"
+        >
+          Fehler
+        </button>
+      ) : (
+        <button
+          ref={toggle}
+          className="badge warn as-btn"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          title={r.warnings.map(translateCoreMessage).join("\n")}
+        >
+          ⚠ {r.warnings.length}
+        </button>
+      )}
+      {open && (
+        <div ref={panel} className="popover warnings" role="dialog" aria-label="Bewertungshinweise">
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <b className="small">{r.t.id}</b>
+            <button className="btn ghost xs" onClick={() => setOpen(false)} aria-label="Schließen">
+              ✕
+            </button>
+          </div>
+          <ul className="small">
+            {r.error && <li className="neg">{translateCoreMessage(r.error)}</li>}
+            {r.warnings.map((w) => (
+              <li key={w}>{translateCoreMessage(w)}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </span>
+  );
+}
+
 export function Blotter() {
   const s = useStore(
     useShallow((st) => ({
@@ -181,6 +316,7 @@ export function Blotter() {
   );
   const act = useStore.getState;
   const customer = s.customerMode;
+  const compact = useMediaQuery(COMPACT_TOOLBAR_QUERY);
   const [prefs, setPrefs] = useState<BlotterPrefs>(() => readPrefs());
   const { sort, filter, hideIndications, noCpty, noUti, group } = prefs;
   const updPrefs = (patch: Partial<BlotterPrefs>) =>
@@ -193,13 +329,27 @@ export function Blotter() {
   const [cols, setCols] = useState<BlotterColKey[]>(() => readBlotterColumns());
   const [colsOpen, setColsOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
-  const [warnOpen, setWarnOpen] = useState<string | null>(null);
+  const [filterOpen, setFilterOpen] = useState(false);
   const [menu, setMenu] = useState<ContextMenuState | null>(null);
   const [pendingImport, setPendingImport] = useState<{ trades: Trade[]; duplicates: number; source: string } | null>(null);
+  const [csvErrors, setCsvErrors] = useState<{ errors: { row: number; msg: string }[]; trades: Trade[] } | null>(null);
   const tableRef = useRef<HTMLTableElement>(null);
+  // Popover anchors / panels / toggles (R3-02)
   const exportRef = useRef<HTMLSpanElement>(null);
+  const exportPanel = useRef<HTMLDivElement>(null);
+  const exportBtn = useRef<HTMLButtonElement>(null);
+  const colsRef = useRef<HTMLSpanElement>(null);
+  const colsPanel = useRef<HTMLDivElement>(null);
+  const colsBtn = useRef<HTMLButtonElement>(null);
+  const filterRef = useRef<HTMLSpanElement>(null);
+  const filterPanel = useRef<HTMLDivElement>(null);
+  const filterBtn = useRef<HTMLButtonElement>(null);
+  usePopover(exportOpen, () => setExportOpen(false), { anchor: exportRef, panel: exportPanel, restoreTo: exportBtn });
+  usePopover(colsOpen, () => setColsOpen(false), { anchor: colsRef, panel: colsPanel, restoreTo: colsBtn });
+  usePopover(filterOpen && compact, () => setFilterOpen(false), { anchor: filterRef, panel: filterPanel, restoreTo: filterBtn });
 
   const rows = useMemo(() => buildBlotterRows(s.trades, s.results, s.market, s.reportingCurrency), [s.trades, s.results, s.market, s.reportingCurrency]);
+  const utiMissing = (t: Trade) => !t.uti?.trim() || !utiValid(t.uti);
 
   const filtered = useMemo(
     () =>
@@ -212,7 +362,7 @@ export function Blotter() {
         })
         .filter((r) => !hideIndications || (r.t.status ?? "Indication") !== "Indication")
         .filter((r) => !noCpty || !r.t.counterparty?.trim())
-        .filter((r) => !noUti || !r.t.uti?.trim())
+        .filter((r) => !noUti || utiMissing(r.t))
         .filter(
           (r) =>
             !q ||
@@ -238,14 +388,6 @@ export function Blotter() {
   useEffect(() => {
     tableRef.current?.querySelector<HTMLElement>("tr.selected")?.scrollIntoView?.({ block: "nearest" });
   }, [s.selectedId]);
-  useEffect(() => {
-    if (!exportOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (exportRef.current && !exportRef.current.contains(e.target as Node)) setExportOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [exportOpen]);
 
   const totalPv = rows.reduce((x, r) => x + (r.pv ?? 0), 0);
   const totalDv01 = rows.reduce((x, r) => x + (r.dv01 ?? 0), 0);
@@ -274,10 +416,12 @@ export function Blotter() {
     return [...m.entries()];
   }, [rows]);
   const withoutCpty = rows.filter((r) => !r.t.counterparty?.trim()).length;
-  const withoutUti = rows.filter((r) => !r.t.uti?.trim()).length;
+  const withoutUti = rows.filter((r) => utiMissing(r.t)).length;
+  const invalidUti = rows.filter((r) => r.t.uti?.trim() && !utiValid(r.t.uti)).length;
   const expiredQuotes = rows.filter((r) => quoteExpired(r.t, s.valuationDate)).length;
   const warnCount = rows.filter((r) => r.warnings.length > 0 || r.error).length;
   const errorCount = rows.filter((r) => r.error).length;
+  const activeFilters = (filter !== "all" ? 1 : 0) + (hideIndications ? 1 : 0) + (noCpty ? 1 : 0) + (noUti ? 1 : 0) + (group !== "none" ? 1 : 0);
 
   const toggleSort = (key: SortKey) => updPrefs({ sort: sort.key === key ? { key, dir: sort.dir === 1 ? -1 : 1 } : { key, dir: 1 } });
   const ariaSort = (key: SortKey): "ascending" | "descending" | "none" => (sort.key === key ? (sort.dir === 1 ? "ascending" : "descending") : "none");
@@ -312,7 +456,7 @@ export function Blotter() {
     const missingUti = records.filter((r) => !r.uti).length;
     downloadText(`emir-valuations-${toISO(s.valuationDate)}.csv`, emirCsv(records), "text/csv;charset=utf-8");
     act().showToast(
-      `EMIR-Bewertungen exportiert (${records.length}${errorCount ? `, ${errorCount} fehlerhafte Trades ausgelassen` : ""}${missingUti ? `, ${missingUti} ohne UTI` : ""})`,
+      `EMIR-Bewertungen exportiert (${records.length}${errorCount ? `, ${errorCount} fehlerhafte Trades ausgelassen` : ""}${missingUti ? `, ${missingUti} ohne UTI` : ""}${invalidUti ? `, ${invalidUti} mit ungültiger UTI` : ""})`,
     );
   };
   /** Import with duplicate handling: ask when ids collide, otherwise import directly. */
@@ -344,13 +488,17 @@ export function Blotter() {
       act().showToast(`Import fehlgeschlagen: ${translatePricingError(e)}`);
     }
   };
+  /** CSV: every rejected row is listed in a dialog (R3-F7); valid rows are imported after the user continues. */
   const importCsv = async (file: File) => {
     try {
-      const res = tradesFromCsv(await file.text(), { valuationDate: s.valuationDate });
-      if (res.errors.length)
-        act().showToast(`CSV: ${res.errors.length} Zeile(n) übersprungen – z. B. Zeile ${res.errors[0]!.row}: ${res.errors[0]!.msg}`, { ms: 8000 });
+      const res = tradesFromCsv(await file.text(), { valuationDate: s.valuationDate, fxSpots: s.market.fxSpots });
+      if (res.errors.length) {
+        act().showToast(`CSV: ${res.errors.length} Zeile(n) übersprungen – Details im Dialog`, { ms: 5000 });
+        setCsvErrors({ errors: res.errors, trades: res.trades });
+        return;
+      }
       if (res.trades.length) stageImport(res.trades, "CSV");
-      else if (!res.errors.length) act().showToast("CSV enthält keine Trades");
+      else act().showToast("CSV enthält keine Trades");
     } catch (e) {
       act().showToast(`CSV-Import fehlgeschlagen: ${translatePricingError(e)}`);
     }
@@ -430,6 +578,7 @@ export function Blotter() {
         className={selected ? "selected" : ""}
         {...navRowProps(selected, { trade: true })}
         aria-current={selected ? "true" : undefined}
+        data-id={r.t.id}
         onClick={() => act().select(r.t.id)}
         onDoubleClick={() => openTrade(r.t.id)}
         onContextMenu={(e) => contextMenu(e, r.t)}
@@ -475,44 +624,7 @@ export function Blotter() {
         )}
         {show("valuation") && (
           <td className="val-cell" onClick={(e) => e.stopPropagation()}>
-            {r.error ? (
-              <button
-                className="badge neg as-btn"
-                onClick={() => setWarnOpen(warnOpen === r.t.id ? null : r.t.id)}
-                aria-expanded={warnOpen === r.t.id}
-                title={translateCoreMessage(r.error)}
-                data-testid="valuation-error"
-              >
-                Fehler
-              </button>
-            ) : r.warnings.length && !customer ? (
-              <button
-                className="badge warn as-btn"
-                onClick={() => setWarnOpen(warnOpen === r.t.id ? null : r.t.id)}
-                aria-expanded={warnOpen === r.t.id}
-                title={r.warnings.map(translateCoreMessage).join("\n")}
-              >
-                ⚠ {r.warnings.length}
-              </button>
-            ) : (
-              <span className="badge ok">OK</span>
-            )}
-            {warnOpen === r.t.id && (r.error || r.warnings.length > 0) && (
-              <div className="popover warnings" role="dialog" aria-label="Bewertungshinweise" onKeyDown={(e) => e.key === "Escape" && setWarnOpen(null)}>
-                <div className="row" style={{ justifyContent: "space-between" }}>
-                  <b className="small">{r.t.id}</b>
-                  <button className="btn ghost xs" onClick={() => setWarnOpen(null)} aria-label="Schließen">
-                    ✕
-                  </button>
-                </div>
-                <ul className="small">
-                  {r.error && <li className="neg">{translateCoreMessage(r.error)}</li>}
-                  {r.warnings.map((w) => (
-                    <li key={w}>{translateCoreMessage(w)}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            <ValuationCell row={r} customer={customer} />
           </td>
         )}
       </tr>
@@ -527,6 +639,60 @@ export function Blotter() {
       {show("dv01") && <td className={`num ${signClass(g.dv01)}`}>{fmtMoney(g.dv01)}</td>}
       {(show("status") || show("valuation")) && <td colSpan={(show("status") ? 1 : 0) + (show("valuation") ? 1 : 0)} />}
     </tr>
+  );
+
+  /** Type filter, chips and grouping – inline on wide screens, inside the "Filter ▾" popover in compact mode. */
+  const filterControls = (
+    <>
+      <div className="seg" role="group" aria-label="Typfilter">
+        {TYPE_FILTERS.map((f) => (
+          <button key={f.id} className={filter === f.id ? "active" : ""} aria-pressed={filter === f.id} onClick={() => updPrefs({ filter: f.id })}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+      <button
+        className={`chip ${hideIndications ? "active" : ""}`}
+        onClick={() => updPrefs({ hideIndications: !hideIndications })}
+        aria-pressed={hideIndications}
+        title="Nur gebuchte Trades anzeigen"
+      >
+        {hideIndications ? "✓ " : ""}Indikationen ausblenden
+      </button>
+      {!customer && withoutCpty > 0 && (
+        <button className={`chip ${noCpty ? "active" : ""}`} onClick={() => updPrefs({ noCpty: !noCpty })} aria-pressed={noCpty} title="Trades ohne Kontrahent">
+          {noCpty ? "✓ " : ""}ohne Kontrahent ({withoutCpty})
+        </button>
+      )}
+      {!customer && withoutUti > 0 && (
+        <button
+          className={`chip ${noUti ? "active" : ""}`}
+          onClick={() => updPrefs({ noUti: !noUti })}
+          aria-pressed={noUti}
+          title={invalidUti ? "Trades ohne UTI oder mit ungültiger UTI (EMIR-Meldelücke, ISO 23897)" : "Trades ohne UTI (EMIR-Meldelücke)"}
+          data-testid="filter-no-uti"
+        >
+          {noUti ? "✓ " : ""}
+          {invalidUti ? "ohne/ungültige UTI" : "ohne UTI"} ({withoutUti})
+        </button>
+      )}
+      <label className="row" style={{ gap: 4 }}>
+        <span className="muted xs">Gruppieren</span>
+        <select
+          className="inline"
+          value={group}
+          aria-label="Gruppieren nach"
+          data-testid="group-select"
+          onChange={(e) => updPrefs({ group: e.target.value as GroupKey })}
+        >
+          {GROUP_OPTIONS.filter((g) => !(customer && (g.key === "cpty" || g.key === "book"))).map((g) => (
+            <option key={g.key} value={g.key}>
+              {g.label}
+            </option>
+          ))}
+        </select>
+      </label>
+    </>
   );
 
   return (
@@ -602,72 +768,59 @@ export function Blotter() {
       <div className="card">
         <h3>
           Blotter
-          <span className="right row wrap toolbar">
-            <div className="seg" role="group" aria-label="Typfilter">
-              {TYPE_FILTERS.map((f) => (
-                <button key={f.id} className={filter === f.id ? "active" : ""} aria-pressed={filter === f.id} onClick={() => updPrefs({ filter: f.id })}>
-                  {f.label}
+          <span className={`right row wrap toolbar blotter-toolbar ${compact ? "compact" : ""}`} data-testid="blotter-toolbar">
+            {compact ? (
+              <span className="anchor" ref={filterRef} style={{ position: "relative", display: "inline-flex" }}>
+                <button
+                  ref={filterBtn}
+                  className={`btn ghost ${activeFilters ? "active" : ""}`}
+                  onClick={() => setFilterOpen((v) => !v)}
+                  aria-expanded={filterOpen}
+                  aria-haspopup="true"
+                  title="Filter und Gruppierung"
+                  data-testid="filter-menu-btn"
+                >
+                  ⚲ Filter ▾{activeFilters > 0 && <span className="badge count filter-count">{activeFilters}</span>}
                 </button>
-              ))}
-            </div>
-            <button
-              className={`chip ${hideIndications ? "active" : ""}`}
-              onClick={() => updPrefs({ hideIndications: !hideIndications })}
-              aria-pressed={hideIndications}
-              title="Nur gebuchte Trades anzeigen"
-            >
-              {hideIndications ? "✓ " : ""}Indikationen ausblenden
-            </button>
-            {!customer && withoutCpty > 0 && (
-              <button
-                className={`chip ${noCpty ? "active" : ""}`}
-                onClick={() => updPrefs({ noCpty: !noCpty })}
-                aria-pressed={noCpty}
-                title="Trades ohne Kontrahent"
-              >
-                {noCpty ? "✓ " : ""}ohne Kontrahent ({withoutCpty})
-              </button>
+                {filterOpen && (
+                  <div ref={filterPanel} className="popover filters" role="group" aria-label="Filter und Gruppierung" data-testid="filter-popover">
+                    <div className="row wrap">{filterControls}</div>
+                    <div className="row" style={{ justifyContent: "flex-end", gap: 6 }}>
+                      <button className="btn ghost xs" onClick={resetFilters}>
+                        Filter zurücksetzen
+                      </button>
+                      <button className="btn ghost xs" onClick={() => setFilterOpen(false)}>
+                        Schließen
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </span>
+            ) : (
+              filterControls
             )}
-            {!customer && withoutUti > 0 && (
-              <button
-                className={`chip ${noUti ? "active" : ""}`}
-                onClick={() => updPrefs({ noUti: !noUti })}
-                aria-pressed={noUti}
-                title="Trades ohne UTI (EMIR-Meldelücke)"
-                data-testid="filter-no-uti"
-              >
-                {noUti ? "✓ " : ""}ohne UTI ({withoutUti})
-              </button>
-            )}
-            <label className="row" style={{ gap: 4 }}>
-              <span className="muted xs">Gruppieren</span>
-              <select
-                className="inline"
-                value={group}
-                aria-label="Gruppieren nach"
-                data-testid="group-select"
-                onChange={(e) => updPrefs({ group: e.target.value as GroupKey })}
-              >
-                {GROUP_OPTIONS.filter((g) => !(customer && (g.key === "cpty" || g.key === "book"))).map((g) => (
-                  <option key={g.key} value={g.key}>
-                    {g.label}
-                  </option>
-                ))}
-              </select>
-            </label>
             <input
-              className="mono inline search"
-              placeholder={customer ? "Suche (ID, Name)" : "Suche (ID, Name, Kontrahent, Buch)"}
+              className={`mono inline search ${compact ? "compact" : ""}`}
+              placeholder={customer ? "Suche (ID, Name)" : compact ? "Suche" : "Suche (ID, Name, Kontrahent, Buch)"}
               aria-label="Blotter durchsuchen"
               value={q}
               onChange={(e) => setQ(e.target.value)}
             />
-            <span className="col-chooser">
-              <button className="btn ghost" onClick={() => setColsOpen((v) => !v)} aria-expanded={colsOpen} aria-haspopup="true" title="Spalten wählen">
-                ▦ Spalten
+            <span className="col-chooser" ref={colsRef}>
+              <button
+                ref={colsBtn}
+                className="btn ghost"
+                onClick={() => setColsOpen((v) => !v)}
+                aria-expanded={colsOpen}
+                aria-haspopup="true"
+                aria-label="Spalten wählen"
+                title="Spalten wählen"
+                data-testid="cols-btn"
+              >
+                ▦{!compact && " Spalten"}
               </button>
               {colsOpen && (
-                <div className="popover cols" role="group" aria-label="Spaltenauswahl" onKeyDown={(e) => e.key === "Escape" && setColsOpen(false)}>
+                <div ref={colsPanel} className="popover cols" role="group" aria-label="Spaltenauswahl" data-testid="cols-popover">
                   {BLOTTER_COLUMNS.filter((c) => !(customer && c.internal)).map((c) => (
                     <label key={c.key} className="check">
                       <input type="checkbox" checked={cols.includes(c.key)} disabled={c.key === "id"} onChange={() => toggleCol(c.key)} /> {c.label}
@@ -681,17 +834,19 @@ export function Blotter() {
             </span>
             <span className="anchor" ref={exportRef}>
               <button
+                ref={exportBtn}
                 className="btn ghost"
                 onClick={() => setExportOpen((v) => !v)}
                 aria-expanded={exportOpen}
                 aria-haspopup="menu"
+                aria-label="Export und Import"
                 title="Export und Import"
                 data-testid="export-menu-btn"
               >
-                ⤓ Export ▾
+                ⤓{!compact && " Export"} ▾
               </button>
               {exportOpen && (
-                <div className="popover export-menu" role="menu" aria-label="Export und Import" onKeyDown={(e) => e.key === "Escape" && setExportOpen(false)}>
+                <div ref={exportPanel} className="popover export-menu" role="menu" aria-label="Export und Import" onKeyDown={menuKeyNav}>
                   <button
                     role="menuitem"
                     className="item"
@@ -733,8 +888,8 @@ export function Blotter() {
                     className="item"
                     data-testid="export-portfolio-json"
                     onClick={() => {
-                      downloadPortfolioReport("json");
                       setExportOpen(false);
+                      downloadPortfolioReport("json");
                     }}
                     title={`Portfolio-Report: PV/DV01 je Kontrahent, Buch und Typ mit Snapshot-ID und Hashes (${keysOf("export.portfolio")})`}
                   >
@@ -745,8 +900,8 @@ export function Blotter() {
                     className="item"
                     data-testid="export-portfolio-md"
                     onClick={() => {
-                      downloadPortfolioReport("md");
                       setExportOpen(false);
+                      downloadPortfolioReport("md");
                     }}
                     title="Portfolio-Report als Markdown (druckbar)"
                   >
@@ -777,7 +932,7 @@ export function Blotter() {
                     role="menuitem"
                     className="item"
                     style={{ cursor: "pointer" }}
-                    title="CSV mit Spalte „Typ“ (IRS / FXF / CAP) importieren – Spaltennamen deutsch oder englisch"
+                    title={`CSV mit Spalte „Typ“ (${CSV_TRADE_TYPES.join(" / ")}) importieren – Spaltennamen deutsch oder englisch, Fehlzeilen werden aufgelistet`}
                   >
                     ⤒ CSV importieren
                     <input
@@ -802,6 +957,7 @@ export function Blotter() {
                       key={k}
                       role="menuitem"
                       className="item xs"
+                      data-testid={`csv-template-${k.toLowerCase()}`}
                       onClick={() => {
                         downloadText(`deriva-import-vorlage-${k.toLowerCase()}.csv`, csvTemplateText(k), "text/csv;charset=utf-8");
                         setExportOpen(false);
@@ -885,6 +1041,18 @@ export function Blotter() {
           count={pendingImport.duplicates}
           onPick={(st) => runImport(pendingImport.trades, st, pendingImport.source)}
           onClose={() => setPendingImport(null)}
+        />
+      )}
+      {csvErrors && (
+        <CsvErrorsDialog
+          errors={csvErrors.errors}
+          accepted={csvErrors.trades.length}
+          onContinue={() => {
+            const trades = csvErrors.trades;
+            setCsvErrors(null);
+            if (trades.length) stageImport(trades, "CSV");
+          }}
+          onClose={() => setCsvErrors(null)}
         />
       )}
     </div>

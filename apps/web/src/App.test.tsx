@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App.js";
+import { parseQuickEntry } from "./lib/quick-parser.js";
 import { newTradeTemplate } from "./lib/templates.js";
 import { useStore } from "./state/store.js";
 
@@ -197,10 +198,14 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Rückgängig" }));
     expect(useStore.getState().trades.length).toBe(n);
   });
-  it("Ctrl+Shift+T generates the report implicitly and opens the termsheet (N-22)", async () => {
+  it("chord o t generates the report implicitly and opens the termsheet (N-22 / R3-01)", async () => {
     render(<App />);
     act(() => useStore.getState().select("IRS-0001"));
+    // the former Ctrl+Shift+T is browser-reserved and must do nothing
     fireEvent.keyDown(window, { key: "T", ctrlKey: true, shiftKey: true });
+    expect(useStore.getState().docKind).toBeNull();
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "t" });
     expect(useStore.getState().view).toBe("report");
     expect(useStore.getState().reportStamp).not.toBeNull();
     expect(useStore.getState().docKind).toBe("Termsheet");
@@ -219,8 +224,15 @@ describe("App", () => {
     render(<App />);
     act(() => useStore.getState().select("IRS-0001"));
     act(() => useStore.getState().setView("report"));
-    fireEvent.keyDown(window, { key: "R", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "r" });
     expect(screen.getByTestId("audit-hashes")).toBeInTheDocument();
+    // methodology and market table carry German labels only – no raw identifiers / interpolation ids (R3-06)
+    const meth = screen.getByTestId("methodology").textContent ?? "";
+    expect(meth).not.toMatch(/\b[a-z]+[A-Z]\w+\b/);
+    expect(meth).not.toMatch(/ModifiedFollowing|ShortFront|MISSING_FIXING|smile vol at strike|Float EURIBOR/);
+    expect(screen.getByTestId("market-table").textContent).toMatch(/log-linear \(DF\)/);
+    expect(screen.getByTestId("market-table").textContent).not.toMatch(/logLinear/);
     expect(screen.getByTestId("report-governance").textContent).toMatch(/Snapshot indikativ/);
     expect(screen.getByTestId("sign-rule").textContent).toMatch(/Perspektive Kunde/);
     expect(screen.queryByTestId("report-stale")).toBeNull();
@@ -310,8 +322,14 @@ describe("App", () => {
     act(() => useStore.getState().removeTrade(ccs.id));
     act(() => useStore.getState().removeTrade(fra.id));
   });
-  it("step-up table: adding a coupon step writes rateSchedule and the analytics show both par rates", async () => {
+  it("step-up table: adding a coupon step writes rateSchedule and the analytics show both par rates; a schedule entry at the start date is the base, not 'Stufe 1' (R3-10)", async () => {
     render(<App />);
+    // quick-entry step-up: the core writes {start, 2.5 %} + steps – the editor shows 2 Stufen, not 3
+    const stepped = parseQuickEntry("irs 5y pay 2.5% 10m step 2.5/3.0/3.5", useStore.getState().valuationDate).trade!;
+    act(() => useStore.getState().addTrade({ ...stepped, id: "STEP-T1" }, { select: true, goToPricing: true }));
+    expect(screen.getByTestId("coupon-schedule-0").textContent).toMatch(/2 Stufen/);
+    expect(screen.getByTestId("coupon-schedule-0").textContent).toMatch(/2,500 % \(Basis\)/);
+    act(() => useStore.getState().removeTrade("STEP-T1"));
     act(() => useStore.getState().select("IRS-0002"));
     act(() => useStore.getState().setView("pricing"));
     const before = useStore.getState().trades.find((t) => t.id === "IRS-0002")!;
@@ -340,9 +358,10 @@ describe("App", () => {
     expect(document.querySelectorAll('tr[data-nav="trade"]').length).toBe(withoutUti);
     fireEvent.click(chip);
     act(() => useStore.getState().updateTrade(fra));
-    // KID via hotkey (report generated implicitly), Confirmation via button
+    // KID via chord o k (report generated implicitly), Confirmation via button
     act(() => useStore.getState().select("IRS-0001"));
-    fireEvent.keyDown(window, { key: "K", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "k" });
     expect(useStore.getState().docKind).toBe("KID");
     expect(useStore.getState().view).toBe("report");
     const modal = await screen.findByTestId("documents-modal");
@@ -394,7 +413,8 @@ describe("App", () => {
     expect(screen.getByTestId("hazard-pillars").textContent).toMatch(/Hazard-Kurve/);
     act(() => useStore.getState().select("IRS-0001"));
     act(() => useStore.getState().setView("report"));
-    fireEvent.keyDown(window, { key: "R", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "r" });
     await waitFor(() => expect(screen.getByTestId("cva-sub").textContent).toMatch(/CDS-Termstruktur Landesbank A \(2 Pillars\)/));
     act(() => useStore.getState().setCdsCurve("Landesbank A", undefined));
     await waitFor(() => expect(screen.getByTestId("cva-sub").textContent).toMatch(/Kontrahent \d+ bp/));
@@ -434,10 +454,220 @@ describe("App", () => {
     fireEvent.click(screen.getByTestId("export-portfolio-md"));
     expect(click).toHaveBeenCalledTimes(1);
     expect(useStore.getState().toasts.some((t) => t.msg.includes("Portfolio-Report als Markdown"))).toBe(true);
-    fireEvent.keyDown(window, { key: "L", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "p" });
     expect(click).toHaveBeenCalledTimes(2);
+    // under an active what-if the download asks first (R3-F6) …
+    act(() => useStore.getState().setWhatIf({ ratesBp: 10 }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "p" });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(click).toHaveBeenCalledTimes(2);
+    confirm.mockReturnValue(true);
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "p" });
+    expect(click).toHaveBeenCalledTimes(3);
+    act(() => useStore.getState().resetWhatIf());
+    // … and an empty book yields a hint instead of a file
+    const trades = useStore.getState().trades;
+    act(() => useStore.setState({ trades: [], results: {} }));
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "p" });
+    expect(click).toHaveBeenCalledTimes(3);
+    expect(useStore.getState().toasts.some((t) => t.msg.includes("Kein Trade im Bestand"))).toBe(true);
+    act(() => useStore.setState({ trades }));
+    act(() => useStore.getState().repriceAll());
+    confirm.mockRestore();
     spy.mockRestore();
     click.mockRestore();
+  });
+  it("popovers are dialog layers: Esc closes the export menu wherever the focus is, background hotkeys are suspended, focus returns (R3-02)", async () => {
+    render(<App />);
+    const btn = screen.getByTestId("export-menu-btn");
+    act(() => btn.focus());
+    fireEvent.click(btn);
+    expect(screen.getByRole("menu", { name: "Export und Import" })).toBeInTheDocument();
+    expect(useStore.getState().popoverDepth).toBe(1);
+    // `t` must not toggle the theme while the menu is open
+    const theme = useStore.getState().theme;
+    fireEvent.keyDown(window, { key: "t" });
+    expect(useStore.getState().theme).toBe(theme);
+    // roving focus inside the menu
+    await waitFor(() => expect(document.activeElement?.getAttribute("role")).toBe("menuitem"));
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+    expect(document.activeElement?.getAttribute("role")).toBe("menuitem");
+    // Esc with the focus anywhere closes and returns focus to the toggle
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "Export und Import" })).toBeNull();
+    expect(useStore.getState().popoverDepth).toBe(0);
+    await waitFor(() => expect(document.activeElement).toBe(btn));
+    // click outside closes the column chooser
+    fireEvent.click(screen.getByTestId("cols-btn"));
+    expect(screen.getByTestId("cols-popover")).toBeInTheDocument();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByTestId("cols-popover")).toBeNull();
+    // date presets popover of a date field behaves the same
+    act(() => useStore.getState().select("IRS-0001"));
+    act(() => useStore.getState().setView("pricing"));
+    fireEvent.click(document.querySelector(".date-input .date-presets-btn")!);
+    expect(screen.getByRole("listbox", { name: "Datums-Vorlagen" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "t" });
+    expect(useStore.getState().theme).toBe(theme);
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "Datums-Vorlagen" })).toBeNull();
+    expect(useStore.getState().popoverDepth).toBe(0);
+  });
+  it("context menu returns the focus to the row it was opened on (R3-08); the live region exists before the first toast", async () => {
+    render(<App />);
+    expect(screen.getByTestId("toast-stack")).toHaveAttribute("aria-live", "polite");
+    expect(useStore.getState().toasts.length).toBe(0);
+    const row = document.querySelector<HTMLElement>('tr[data-id="IRS-0002"]')!;
+    act(() => row.focus());
+    fireEvent.contextMenu(row, { clientX: 100, clientY: 100 });
+    expect(screen.getByRole("menu", { name: "Kontextmenü" })).toBeInTheDocument();
+    await waitFor(() => expect(document.activeElement?.getAttribute("role")).toBe("menuitem"));
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "Kontextmenü" })).toBeNull();
+    await waitFor(() => expect(document.activeElement?.getAttribute("data-id")).toBe("IRS-0002"));
+  });
+  it("palette: an id-like query never jumps to another trade – exact match first, otherwise 'kein Trade' (R3-F5)", () => {
+    render(<App />);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const input = screen.getByRole("combobox", { name: "Befehl oder Schnelleingabe" }) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "FRA-0002" } });
+    expect(screen.getByTestId("palette-no-trade")).toHaveTextContent(/Kein Trade FRA-0002/);
+    expect(document.querySelectorAll("#palette-results .item").length).toBe(0); // no fuzzy FXF-0002
+    const view = useStore.getState().view;
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(useStore.getState().view).toBe(view); // nothing opened
+    expect(useStore.getState().selectedId).toBe("IRS-0001");
+    fireEvent.change(input, { target: { value: "IRS-0002" } });
+    expect(input.getAttribute("aria-activedescendant")).toBe("pal-opt-0");
+    expect(document.getElementById("pal-opt-0")?.textContent).toMatch(/^▸?IRS-0002 · /);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(useStore.getState().selectedId).toBe("IRS-0002");
+    expect(useStore.getState().paletteOpen).toBe(false);
+  });
+  it("documents under an active what-if carry a stress banner and ask before print/download; KID long texts wrap as text cells (R3-F1 / R3-05)", async () => {
+    render(<App />);
+    act(() => useStore.getState().select("COL-0001"));
+    act(() => useStore.getState().setWhatIf({ ratesBp: 10 }));
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "k" });
+    await screen.findByTestId("documents-modal");
+    expect(screen.getByTestId("doc-whatif-banner").textContent).toMatch(/What-if.*Zinsen \+10 bp/i);
+    expect(screen.getByTestId("document-body").textContent).toMatch(/WHAT-IF Zinsen \+10 bp/);
+    const textCells = document.querySelectorAll('[data-testid="document-body"] td.text');
+    expect(textCells.length).toBeGreaterThan(0);
+    expect(Array.from(textCells).some((td) => (td.textContent ?? "").length > 100)).toBe(true); // Zielmarkt / SRI-Herleitung
+    for (const td of document.querySelectorAll('[data-testid="document-body"] td.num')) expect((td.textContent ?? "").length).toBeLessThanOrEqual(60);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    fireEvent.click(screen.getByTestId("doc-markdown"));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(click).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("doc-print"));
+    expect(confirm).toHaveBeenCalledTimes(2);
+    confirm.mockRestore();
+    click.mockRestore();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(useStore.getState().docKind).toBeNull());
+    act(() => useStore.getState().resetWhatIf());
+    // without what-if: no banner
+    fireEvent.keyDown(window, { key: "o" });
+    fireEvent.keyDown(window, { key: "t" });
+    await screen.findByTestId("documents-modal");
+    expect(screen.queryByTestId("doc-whatif-banner")).toBeNull();
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(useStore.getState().modalDepth).toBe(0));
+    await new Promise((r) => setTimeout(r, 20));
+  });
+  it("hedge 'Zurücksetzen' asks first, offers undo and the export carries the stale marker (R3-F4)", async () => {
+    render(<App />);
+    act(() => useStore.getState().select("IRS-0001"));
+    act(() => useStore.getState().setView("hedge"));
+    fireEvent.change(screen.getByLabelText("Hedge Ratio"), { target: { value: "50" } });
+    expect(useStore.getState().hedgeRelationships["IRS-0001"]?.hedgeRatio).toBeCloseTo(0.5, 10);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    fireEvent.click(screen.getByTestId("hedge-reset"));
+    expect(useStore.getState().hedgeRelationships["IRS-0001"]).toBeDefined();
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByTestId("hedge-reset"));
+    expect(useStore.getState().hedgeRelationships["IRS-0001"]).toBeUndefined();
+    expect(screen.getByRole("button", { name: "Rückgängig" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Rückgängig" }));
+    expect(useStore.getState().hedgeRelationships["IRS-0001"]?.hedgeRatio).toBeCloseTo(0.5, 10);
+    confirm.mockRestore();
+    act(() => useStore.getState().removeHedgeRelationship("IRS-0001"));
+    act(() => useStore.setState({ undoStack: [] }));
+  });
+  it("curves: a turn-of-year date on/before the valuation date shows a validation message and disables 'Anwenden' (R3-F2); '+ FX-Punkte' adds a removable quote (Markt R3-6)", () => {
+    render(<App />);
+    act(() => useStore.getState().setView("curves"));
+    fireEvent.click(screen.getByRole("button", { name: "€STR" }));
+    fireEvent.change(screen.getByTestId("toy-bp"), { target: { value: "20" } });
+    const date = screen.getByLabelText("Turn-of-Year Datum") as HTMLInputElement;
+    act(() => date.focus());
+    fireEvent.focus(date);
+    fireEvent.change(date, { target: { value: "01.01.2020" } });
+    fireEvent.keyDown(date, { key: "Enter" });
+    expect(screen.getByTestId("toy-past")).toBeInTheDocument();
+    expect(screen.getByTestId("toy-apply")).toBeDisabled();
+    expect(useStore.getState().turnOfYear["EUR-ESTR"]).toBeUndefined();
+    fireEvent.click(screen.getByRole("button", { name: "EUR/USD CSA" }));
+    const rows = document.querySelectorAll('[data-testid="quotes-table"] tbody tr').length;
+    fireEvent.click(screen.getByTestId("add-fx-points"));
+    expect(document.querySelectorAll('[data-testid="quotes-table"] tbody tr').length).toBe(rows + 1);
+    expect(screen.getByTestId("added-quote")).toBeInTheDocument();
+    expect(useStore.getState().quotes.eurUsdXccy?.some((q) => q.type === "FxSwapPoints")).toBe(true);
+    expect(screen.getByTestId("market-modified-chip")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Quote .* entfernen$/ }));
+    expect(document.querySelectorAll('[data-testid="quotes-table"] tbody tr').length).toBe(rows);
+    act(() => useStore.getState().resetQuotes());
+    act(() => useStore.setState({ undoStack: [] }));
+  });
+  it("market: editing a swaption vol cell marks the market as modified, is undoable and resettable (Markt R3-4)", () => {
+    render(<App />);
+    act(() => useStore.getState().setView("market"));
+    const cell = screen.getByTestId("swaption-vol-cell") as HTMLInputElement;
+    const before = cell.value;
+    act(() => cell.focus());
+    fireEvent.focus(cell);
+    fireEvent.change(cell, { target: { value: "99" } });
+    fireEvent.keyDown(cell, { key: "Enter" });
+    expect(screen.getByTestId("swaption-vol-edited")).toBeInTheDocument();
+    expect(useStore.getState().baseMarket.swaptionVols?.EUR?.atm[0]![0]).toBeCloseTo(0.0099, 10);
+    expect(screen.getAllByText(/modifiziert/).length).toBeGreaterThan(0);
+    fireEvent.keyDown(window, { key: "z", ctrlKey: true });
+    expect(useStore.getState().volSurfaces.swaptionVols).toBeUndefined();
+    expect((screen.getByTestId("swaption-vol-cell") as HTMLInputElement).value).toBe(before);
+    fireEvent.change(screen.getByTestId("fx-vol-cell"), { target: { value: "12" } });
+    expect(screen.getByTestId("fx-vol-edited")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fx-vol-reset"));
+    expect(screen.queryByTestId("fx-vol-edited")).toBeNull();
+    act(() => useStore.setState({ undoStack: [] }));
+  });
+  it("editor: UTI is upper-cased and validated, Esc in a date field restores the old value (R3-10 / R3-12)", () => {
+    render(<App />);
+    act(() => useStore.getState().select("IRS-0001"));
+    act(() => useStore.getState().setView("pricing"));
+    const uti = screen.getByLabelText("UTI") as HTMLInputElement;
+    fireEvent.change(uti, { target: { value: "abc!" } });
+    expect(useStore.getState().trades.find((t) => t.id === "IRS-0001")?.uti).toBe("ABC!");
+    expect(screen.getByText(/ISO 23897/)).toBeInTheDocument();
+    fireEvent.change(uti, { target: { value: "" } });
+    const end = screen.getByLabelText("Enddatum") as HTMLInputElement;
+    const before = end.value;
+    act(() => end.focus());
+    fireEvent.focus(end);
+    fireEvent.change(end, { target: { value: "31.12.2040" } });
+    fireEvent.keyDown(end, { key: "Escape" });
+    fireEvent.blur(end);
+    expect(end.value).toBe(before);
+    expect(document.activeElement).not.toBe(end);
+    act(() => useStore.getState().undo());
+    act(() => useStore.setState({ undoStack: [] }));
   });
   it("no store writes during render: risk is filled by effects and views render without React warnings (N-26)", async () => {
     render(<App />);

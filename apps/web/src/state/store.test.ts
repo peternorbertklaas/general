@@ -18,7 +18,9 @@ import {
   quotesModified,
   reportInputsFor,
   reportingCurrencies,
+  sampleVolSurfaces,
   useStore,
+  volSurfaceCount,
 } from "./store.js";
 
 const VAL = parseISO("2026-09-03");
@@ -403,6 +405,102 @@ describe("store", () => {
     useStore.getState().setValuationDate("2026-09-03");
     useStore.getState().setTurnOfYear("EUR-ESTR", undefined);
     expect(marketModified(useStore.getState())).toBe(false);
+  });
+
+  it("interpolation and turn-of-year changes are undoable market entries; a jump on/before the valuation date is refused (R3-F2 / R3-F3)", () => {
+    const s = useStore.getState();
+    useStore.setState({ undoStack: [] });
+    expect(s.setInterpolation("EUR-ESTR", "monotoneConvex")).toBe(true);
+    let top = useStore.getState().undoStack.at(-1)!;
+    expect(top.kind).toBe("market");
+    expect(top.label).toBe("Interpolation EUR-ESTR log-linear (DF) → monoton-konvex (Hagan–West)");
+    expect(useStore.getState().setTurnOfYear("EUR-ESTR", { date: parseISO("2026-12-31"), bp: 20 })).toBe(true);
+    top = useStore.getState().undoStack.at(-1)!;
+    expect(top.kind).toBe("market");
+    expect(top.label).toBe("Turn-of-Year EUR-ESTR 31.12.2026 +20 bp");
+    // LIFO: the jump goes first, then the interpolation – the override is gone, no trade is touched
+    const tradesBefore = useStore.getState().trades;
+    expect(useStore.getState().undo()).toBe("Turn-of-Year EUR-ESTR 31.12.2026 +20 bp");
+    expect(useStore.getState().turnOfYear["EUR-ESTR"]).toBeUndefined();
+    expect(useStore.getState().interpolation["EUR-ESTR"]).toBe("monotoneConvex");
+    expect(useStore.getState().undo()).toMatch(/^Interpolation EUR-ESTR/);
+    expect(useStore.getState().interpolation["EUR-ESTR"]).toBeUndefined();
+    expect(useStore.getState().trades).toBe(tradesBefore);
+    expect(marketModified(useStore.getState())).toBe(false);
+    // past jump: refused, nothing stored, no undo entry
+    expect(useStore.getState().setTurnOfYear("EUR-ESTR", { date: parseISO("2020-01-01"), bp: 25 })).toBe(false);
+    expect(useStore.getState().setTurnOfYear("EUR-ESTR", { date: useStore.getState().valuationDate, bp: 25 })).toBe(false);
+    expect(useStore.getState().turnOfYear["EUR-ESTR"]).toBeUndefined();
+    expect(useStore.getState().undoStack.length).toBe(0);
+  });
+
+  it("vol surfaces are editable market data: override, modified flag, undo, reset, persistence (Markt R3-4)", () => {
+    const s = useStore.getState();
+    useStore.setState({ undoStack: [] });
+    const sample = sampleVolSurfaces();
+    const swpt = sample.swaptionVols.EUR!;
+    const before = useStore.getState().results["SWPT-0001"]!.result!.pv;
+    const bumped = { ...swpt, atm: swpt.atm.map((row) => row.map((v) => v + 0.001)) };
+    expect(s.setVolSurface("swaptionVols", "EUR", bumped, "Swaption-Vol EUR 1M×1Y 60,0 → 70,0 bp")).toBe(true);
+    let st = useStore.getState();
+    expect(volSurfaceCount(st.volSurfaces)).toBe(1);
+    expect(marketModified(st)).toBe(true);
+    expect(st.baseMarket.swaptionVols?.EUR?.atm[0]![0]).toBeCloseTo(swpt.atm[0]![0]! + 0.001, 12);
+    expect(st.results["SWPT-0001"]!.result!.pv).toBeGreaterThan(before); // long payer swaption gains with higher vol
+    expect(st.undoStack.at(-1)!.kind).toBe("vols");
+    // survives a valuation-date change and is persisted
+    expect(st.setValuationDate("2026-09-30")).toBe(true);
+    expect(useStore.getState().baseMarket.swaptionVols?.EUR?.atm[0]![0]).toBeCloseTo(swpt.atm[0]![0]! + 0.001, 12);
+    const saved = JSON.parse(localStorage.getItem(PERSIST_KEY)!) as { state: { volSurfaces: { swaptionVols?: Record<string, unknown> } } };
+    expect(saved.state.volSurfaces.swaptionVols?.EUR).toBeDefined();
+    useStore.getState().setValuationDate("2026-09-03");
+    // undo restores the sample surface
+    expect(useStore.getState().undo()).toBe("Swaption-Vol EUR 1M×1Y 60,0 → 70,0 bp");
+    st = useStore.getState();
+    expect(volSurfaceCount(st.volSurfaces)).toBe(0);
+    expect(st.baseMarket.swaptionVols?.EUR?.atm[0]![0]).toBeCloseTo(swpt.atm[0]![0]!, 12);
+    expect(st.results["SWPT-0001"]!.result!.pv).toBeCloseTo(before, 6);
+    // FX smile edit + reset
+    const fx = sample.fxVols.EURUSD!;
+    expect(st.setVolSurface("fxVols", "EURUSD", { ...fx, atm: fx.atm.map((v) => v + 0.01) }, "FX-Vol EURUSD 1M ATM 7,00 → 8,00 %")).toBe(true);
+    expect(marketModified(useStore.getState())).toBe(true);
+    useStore.getState().resetVolSurfaces();
+    expect(marketModified(useStore.getState())).toBe(false);
+    expect(useStore.getState().undoStack.at(-1)!.label).toBe("Vol-Flächen zurückgesetzt");
+    useStore.setState({ undoStack: [] });
+  });
+
+  it("removing a hedge documentation is undoable (R3-F4); popovers count separately from modals (R3-02)", () => {
+    const s = useStore.getState();
+    useStore.setState({ undoStack: [], hedgeRelationships: {} });
+    const rel = {
+      id: "HR-IRS-0001",
+      name: "Test",
+      type: "CashFlowHedge" as const,
+      hedgedItem: { description: "", currency: "EUR", notional: 1e7, kind: "FloatingRateLoan" as const, effectiveDate: VAL, maturityDate: VAL + 3650 },
+      hedgingInstrumentId: "IRS-0001",
+      designationDate: VAL,
+      hedgeRatio: 0.5,
+      method: "DollarOffset" as const,
+      accountingFramework: "IFRS9" as const,
+    };
+    s.setHedgeRelationship(rel);
+    s.removeHedgeRelationship("IRS-0001");
+    expect(useStore.getState().hedgeRelationships["IRS-0001"]).toBeUndefined();
+    expect(useStore.getState().undoStack.at(-1)).toMatchObject({ kind: "hedge", tradeId: "IRS-0001", label: "Sicherungsdokumentation IRS-0001 verworfen" });
+    expect(useStore.getState().undo()).toBe("Sicherungsdokumentation IRS-0001 verworfen");
+    expect(useStore.getState().hedgeRelationships["IRS-0001"]?.hedgeRatio).toBe(0.5);
+    s.removeHedgeRelationship("IRS-0001");
+    s.removeHedgeRelationship("IRS-0001"); // no-op, no extra undo entry
+    expect(useStore.getState().undoStack.filter((e) => e.kind === "hedge").length).toBe(1);
+    useStore.setState({ undoStack: [], hedgeRelationships: {} });
+    expect(useStore.getState().popoverDepth).toBe(0);
+    s.openPopover();
+    expect(useStore.getState().popoverDepth).toBe(1);
+    expect(useStore.getState().modalDepth).toBe(0);
+    s.closePopover();
+    s.closePopover();
+    expect(useStore.getState().popoverDepth).toBe(0);
   });
 
   it("CDS term structures are stored per counterparty and persisted (Markt)", () => {

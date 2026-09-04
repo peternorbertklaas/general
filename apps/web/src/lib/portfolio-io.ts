@@ -1,6 +1,19 @@
-import { type Trade, addTenor, makeCapFloor, makeFxForward, makeVanillaSwap, parseISO, toISO } from "@deriva/pricing-core";
+import {
+  type Trade,
+  addTenor,
+  makeCapFloor,
+  makeCrossCurrencySwap,
+  makeFra,
+  makeFxForward,
+  makeFxOption,
+  makeSwaption,
+  makeVanillaSwap,
+  parseISO,
+  toISO,
+} from "@deriva/pricing-core";
 import { parseDateInput } from "./date-parse.js";
 import { parseNumberInput } from "./num-parse.js";
+import { ccsCollateralCurrency } from "./templates.js";
 
 /**
  * Portfolio export/import helpers. Trades carry serial dates internally; the
@@ -114,9 +127,16 @@ export type CsvColumn =
   | "capFloor"
   | "strike"
   | "floorStrike"
+  | "expiry"
+  | "tenor"
+  | "optionType"
+  | "spread"
+  | "fxSpot"
+  | "period"
   | "status";
 
-export type CsvTradeType = "IRS" | "FXF" | "CAP";
+export type CsvTradeType = "IRS" | "FXF" | "CAP" | "SWPT" | "FXO" | "CCS" | "FRA";
+export const CSV_TRADE_TYPES: CsvTradeType[] = ["IRS", "FXF", "CAP", "SWPT", "FXO", "CCS", "FRA"];
 
 export interface CsvTemplate {
   type: CsvTradeType;
@@ -191,6 +211,45 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
       "Live",
     ],
   },
+  SWPT: {
+    type: "SWPT",
+    label: "Swaption",
+    columns: ["type", "id", "name", "counterparty", "book", "currency", "notional", "direction", "strike", "expiry", "tenor", "status"],
+    example: ["SWPT", "SWPT-1001", "Payer-Swaption 1Y×5Y", "Landesbank A", "Treasury", "EUR", "10000000", "Payer", "3,00 %", "1Y", "5Y", "Live"],
+  },
+  FXO: {
+    type: "FXO",
+    label: "FX-Option",
+    columns: ["type", "id", "name", "counterparty", "book", "pair", "optionType", "notional", "strike", "expiry", "status"],
+    example: ["FXO", "FXO-1001", "EUR-Put/USD-Call Wareneinkauf", "Commerzbank", "Einkauf", "EURUSD", "Put", "3000000", "1,1500", "2027-06-15", "Live"],
+  },
+  CCS: {
+    type: "CCS",
+    label: "Cross-Currency-Swap",
+    columns: ["type", "id", "name", "counterparty", "book", "pair", "notional", "spread", "rate", "fxSpot", "direction", "start", "maturity", "status"],
+    example: [
+      "CCS",
+      "CCS-1001",
+      "CCS EUR/USD 5Y",
+      "Commerzbank",
+      "USD-Finanzierung",
+      "EURUSD",
+      "10000000",
+      "-20",
+      "",
+      "1,17",
+      "Receive",
+      "2026-09-07",
+      "5Y",
+      "Live",
+    ],
+  },
+  FRA: {
+    type: "FRA",
+    label: "FRA",
+    columns: ["type", "id", "name", "counterparty", "book", "currency", "notional", "direction", "rate", "period", "start", "maturity", "index", "status"],
+    example: ["FRA", "FRA-1001", "FRA EUR 3x6", "DZ BANK", "Liquidität", "EUR", "10000000", "Pay", "2,20 %", "3x6", "", "", "EURIBOR-3M", "Live"],
+  },
 };
 
 /** Header aliases accepted without an explicit mapping (German / English / Bloomberg-ish). */
@@ -262,6 +321,21 @@ const HEADER_ALIASES: Record<string, CsvColumn> = {
   capstrike: "strike",
   floorstrike: "floorStrike",
   "floor-strike": "floorStrike",
+  expiry: "expiry",
+  verfall: "expiry",
+  expirydate: "expiry",
+  tenor: "tenor",
+  swaplaufzeit: "tenor",
+  optiontype: "optionType",
+  optionstyp: "optionType",
+  "call/put": "optionType",
+  spread: "spread",
+  basisspread: "spread",
+  fxspot: "fxSpot",
+  spot: "fxSpot",
+  kassakurs: "fxSpot",
+  period: "period",
+  periode: "period",
   status: "status",
 };
 
@@ -337,7 +411,10 @@ const STATUS_MAP: Record<string, Trade["status"]> = {
  * FXF / CAP); `mapping` maps canonical column names to the file's header names
  * when they differ from the aliases.
  */
-export function tradesFromCsv(text: string, opts: { mapping?: Partial<Record<CsvColumn, string>>; valuationDate: number }): CsvImportResult {
+export function tradesFromCsv(
+  text: string,
+  opts: { mapping?: Partial<Record<CsvColumn, string>>; valuationDate: number; fxSpots?: Record<string, number> },
+): CsvImportResult {
   const lines = text
     .replace(/^\uFEFF/, "")
     .split(/\r?\n/)
@@ -351,7 +428,7 @@ export function tradesFromCsv(text: string, opts: { mapping?: Partial<Record<Csv
     const key = h.trim().toLowerCase();
     return reverse.get(key) ?? HEADER_ALIASES[key] ?? (Object.values(HEADER_ALIASES).includes(key as CsvColumn) ? (key as CsvColumn) : undefined);
   });
-  if (!columns.includes("type")) throw new Error("Spalte „Typ“ fehlt (IRS / FXF / CAP)");
+  if (!columns.includes("type")) throw new Error(`Spalte „Typ“ fehlt (${CSV_TRADE_TYPES.join(" / ")})`);
   const trades: Trade[] = [];
   const errors: { row: number; msg: string }[] = [];
   for (let r = 1; r < lines.length; r++) {
@@ -361,7 +438,7 @@ export function tradesFromCsv(text: string, opts: { mapping?: Partial<Record<Csv
       if (c && cells[i] !== undefined && cells[i] !== "") rec[c] = cells[i];
     });
     try {
-      const t = tradeFromRecord(rec, opts.valuationDate, r);
+      const t = tradeFromRecord(rec, opts.valuationDate, r, { fxSpots: opts.fxSpots });
       trades.push(t);
     } catch (e) {
       errors.push({ row: r, msg: (e as Error).message });
@@ -370,7 +447,13 @@ export function tradesFromCsv(text: string, opts: { mapping?: Partial<Record<Csv
   return { trades, errors, columns: columns.filter((c): c is CsvColumn => c !== undefined) };
 }
 
-function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate: number, row: number): Trade {
+/** Error list of an import as CSV (Zeile;Meldung) – downloadable from the error dialog (R3-F7). */
+export function csvErrorsText(errors: { row: number; msg: string }[]): string {
+  const cell = (s: string) => (/[;"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
+  return `\uFEFFZeile;Meldung\r\n${errors.map((e) => `${e.row + 1};${cell(e.msg)}`).join("\r\n")}\r\n`;
+}
+
+function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate: number, row: number, opts?: { fxSpots?: Record<string, number> }): Trade {
   const type = (rec.type ?? "").toUpperCase().replace(/[^A-Z]/g, "");
   const id = rec.id?.trim() || `${type || "TRD"}-CSV-${String(row).padStart(4, "0")}`;
   const common: Partial<Trade> & { id: string } = { id };
@@ -443,7 +526,102 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     });
     return { ...t, ...common, name: common.name ?? t.name } as Trade;
   }
-  throw new Error(`Unbekannter Typ „${rec.type ?? ""}“ (erlaubt: IRS, FXF, CAP)`);
+  if (type === "SWPT" || type === "SWAPTION") {
+    const notional = num(rec.notional);
+    const strike = rateOf(rec.strike ?? rec.rate);
+    if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
+    if (strike === undefined) throw new Error("Strike fehlt");
+    const expiryRaw = (rec.expiry ?? "").trim();
+    if (!expiryRaw) throw new Error("Verfall fehlt (Tenor „1Y“ oder Datum)");
+    const expiry = /^\d+[dwmy]$/i.test(expiryRaw) ? expiryRaw.toUpperCase() : dateOf(expiryRaw, valuationDate);
+    if (expiry === undefined) throw new Error(`Verfall „${expiryRaw}“ nicht lesbar`);
+    const tenor = (rec.tenor ?? rec.maturity ?? "").trim().toUpperCase();
+    if (!/^\d+[DWMY]$/.test(tenor)) throw new Error("Swap-Laufzeit fehlt (z. B. 5Y)");
+    const dir = (rec.direction ?? "Payer").toLowerCase();
+    const t = makeSwaption({
+      id,
+      counterparty: common.counterparty,
+      currency: (rec.currency ?? "EUR").toUpperCase(),
+      notional,
+      payerReceiver: /^(rec|receive|receiver|r|empf)/.test(dir) ? "Receiver" : "Payer",
+      strike,
+      expiry,
+      tenor,
+      valuationDate,
+    });
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  if (type === "FXO" || type === "FXOPTION" || type === "OPTION") {
+    const pair = (rec.pair ?? `${rec.buyCurrency ?? ""}${rec.sellCurrency ?? ""}`).toUpperCase().replace(/[^A-Z]/g, "");
+    if (!/^[A-Z]{6}$/.test(pair)) throw new Error("Währungspaar fehlt (z. B. EURUSD)");
+    const notional = num(rec.notional);
+    const strike = num(rec.strike);
+    if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
+    if (strike === undefined || strike <= 0) throw new Error("Strike fehlt");
+    const expiry = dateOf(rec.expiry ?? rec.maturity, valuationDate);
+    if (expiry === undefined) throw new Error("Verfall fehlt");
+    const optionType = /^(put|p|verkauf)/i.test((rec.optionType ?? rec.direction ?? "Call").trim()) ? "Put" : "Call";
+    const t = makeFxOption({ id, counterparty: common.counterparty, pair, optionType, notional, strike, expiryDate: expiry });
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  if (type === "CCS" || type === "XCCY" || type === "CROSSCURRENCYSWAP") {
+    const pair = (rec.pair ?? "").toUpperCase().replace(/[^A-Z]/g, "");
+    if (!/^[A-Z]{6}$/.test(pair)) throw new Error("Währungspaar fehlt (z. B. EURUSD)");
+    const notional = num(rec.notional);
+    if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
+    const spreadRaw = num(rec.spread);
+    const spread = spreadRaw === undefined ? 0 : Math.abs(spreadRaw) >= 1 ? spreadRaw / 1e4 : spreadRaw;
+    const fixedRate = rateOf(rec.rate);
+    const fxSpot = num(rec.fxSpot) ?? opts?.fxSpots?.[pair];
+    if (fxSpot === undefined || fxSpot <= 0) throw new Error("FX-Spot fehlt (Spalte „fxSpot“, z. B. 1,17)");
+    if (!rec.maturity) throw new Error("Laufzeit fehlt (z. B. 5Y)");
+    const tenor = rec.maturity.trim().toUpperCase();
+    if (!/^\d+[DWMY]$/.test(tenor)) throw new Error(`Laufzeit „${rec.maturity}“ nicht lesbar (Tenor, z. B. 5Y)`);
+    const dir = (rec.direction ?? "Receive").toLowerCase();
+    const t = makeCrossCurrencySwap({
+      id,
+      counterparty: common.counterparty,
+      pair,
+      domesticNotional: notional,
+      fxSpot,
+      spread,
+      fixedRate,
+      effectiveDate: start,
+      tenor,
+      domesticPayReceive: /^(pay|payer|p|zahl)/.test(dir) ? "Pay" : "Receive",
+      collateralCurrency: ccsCollateralCurrency(pair),
+    });
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  if (type === "FRA") {
+    const notional = num(rec.notional);
+    const rate = rateOf(rec.rate);
+    if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
+    if (rate === undefined) throw new Error("Festsatz fehlt");
+    const period = (rec.period ?? "").trim();
+    const dir = (rec.direction ?? "Pay").toLowerCase();
+    const payReceive = /^(rec|receive|receiver|r|erhalten|empf)/.test(dir) ? "Receive" : "Pay";
+    const base = {
+      id,
+      counterparty: common.counterparty,
+      currency: (rec.currency ?? "EUR").toUpperCase(),
+      notional,
+      payReceive,
+      rate,
+      index: rec.index?.toUpperCase(),
+    } as const;
+    let t: Trade;
+    if (/^\d{1,2}\s*[xX×]\s*\d{1,2}$/.test(period)) t = makeFra({ ...base, start: period.replace(/\s+/g, "").toLowerCase(), valuationDate });
+    else {
+      const startDate = dateOf(rec.start, valuationDate);
+      const endDate = dateOf(rec.maturity, startDate ?? valuationDate);
+      if (startDate === undefined || endDate === undefined) throw new Error("FRA-Periode fehlt (z. B. „3x6“ oder Start- und Enddatum)");
+      if (endDate <= startDate) throw new Error("FRA: Ende muss nach dem Start liegen");
+      t = makeFra({ ...base, start: startDate, end: endDate, valuationDate });
+    }
+    return { ...t, ...common, name: common.name ?? t.name } as Trade;
+  }
+  throw new Error(`Unbekannter Typ „${rec.type ?? ""}“ (erlaubt: ${CSV_TRADE_TYPES.join(", ")})`);
 }
 
 /** CSV template text (header + example row) for one trade type. */

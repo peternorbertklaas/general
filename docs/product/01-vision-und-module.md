@@ -10,7 +10,7 @@ Capmatix, den Treasury-Management-Systemen und Excel + QuantLib schließt:
 | Lücke | Heute | DERIVA |
 |---|---|---|
 | **Geschwindigkeit im Kundengespräch** | Bloomberg ist tastaturschnell, aber 24–28 TUSD/Seat und Terminal-Ästhetik; Web-Tools sind maus- und formularlastig | Command Palette + Schnelleingabe (`irs 10y pay 3.1% 10m`), Vim-/GitHub-artige Chord-Hotkeys, Live-What-if per Tastendruck |
-| **Bewertungstransparenz** | Kurven-Defaults sind Black-Box (SWDF), TMS liefern „MtM intern" | Jede Zahl herleitbar: Kurvenaufbau, Pillars, Cashflow-Tabelle mit DF, Modellangabe, Methodikbeschreibung – prüferfest (IFRS 13, IDW RS HFA 35) |
+| **Bewertungstransparenz** | Kurven-Defaults sind Black-Box (SWDF), TMS liefern „MtM intern" | Jede Zahl herleitbar: Kurvenaufbau, Pillars, Cashflow-Tabelle mit DF, Modellangabe, Methodikbeschreibung – prüferfest (IFRS 13, IDW RS HFA 47) |
 | **Kunden- und Prozesssicht** | Bank-Tools bewerten aus Institutssicht; Prozess-Tools (Captano/Capmatix) ohne eigenen Bewertungskern | Fair Value vs. Angebotspreis (anfänglicher Marktwert, Marge in bp), CVA/DVA, MiFID-II-Kostenausweis – für Bank *und* Kunde |
 
 **Zielgruppen (Personas):**

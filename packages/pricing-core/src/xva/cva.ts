@@ -1,6 +1,7 @@
 import { type Curve } from "../curves/curve.js";
 import { type SerialDate, addTenor } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
+import { PricingError } from "../errors.js";
 import { brent } from "../math/rootfind.js";
 import { type FixedLeg, type FloatLeg, type FxForward, type InterestRateSwap, type Trade } from "../instruments/types.js";
 import { tradeMaturityDate } from "../instruments/trade-dates.js";
@@ -79,6 +80,21 @@ export interface HazardCurve {
   /** Hazard rate (continuous, per year) of each interval ending at `times[i]`. */
   hazards: number[];
   recovery: number;
+  /** Set by `bootstrapHazardCurve` when a pillar was floored at 0 (`HAZARD_FLOORED: …`, R3-3). */
+  warnings?: string[];
+}
+
+export interface HazardBootstrapOptions {
+  /**
+   * A CDS term structure whose spreads fall too steeply (s_i·T_i decreasing)
+   * implies a negative forward hazard rate, i.e. a survival probability that
+   * increases with time (arbitrage / data error). Default (false): raise
+   * `PricingError("INVALID_CREDIT_CURVE")` naming the pillar. `true`: floor the
+   * hazard at 0 for that interval and record a `HAZARD_FLOORED` warning on the
+   * curve – later pillars are then solved on the floored curve, so their quotes
+   * still reprice while the floored quote does not.
+   */
+  floorHazard?: boolean;
 }
 
 /** Survival probability Q(t) = exp(−∫₀ᵗ λ) of a piecewise-constant hazard curve (flat extension beyond the last pillar). */
@@ -121,18 +137,37 @@ export function flatHazardCurve(hazard: number, recovery: number): HazardCurve {
  * (sequential bootstrap). `discount` defaults to DF ≡ 1 – a flat term
  * structure then reproduces λ = s / (1 − R) up to the quarterly discretisation
  * (relative error ≈ (λΔ)²/12). Quotes: `tenor` like "1Y", "5Y"; `spread` in
- * decimal (0.01 = 100bp).
+ * decimal (0.01 = 100bp). Negative hazards (inverted quotes) are rejected
+ * with `PricingError("INVALID_CREDIT_CURVE")` unless `opts.floorHazard` is set
+ * (R3-3, see `HazardBootstrapOptions`).
  */
-export function bootstrapHazardCurve(quotes: { tenor: string; spread: number }[], recovery: number, valuationDate: SerialDate, discount?: Curve): HazardCurve {
-  if (quotes.length === 0) throw new Error("bootstrapHazardCurve: at least one CDS quote is required");
-  if (!(recovery >= 0 && recovery < 1)) throw new Error(`bootstrapHazardCurve: recovery ${recovery} must be in [0, 1)`);
+export function bootstrapHazardCurve(
+  quotes: { tenor: string; spread: number }[],
+  recovery: number,
+  valuationDate: SerialDate,
+  discount?: Curve,
+  opts: HazardBootstrapOptions = {},
+): HazardCurve {
+  if (quotes.length === 0) throw new PricingError("INVALID_CREDIT_CURVE", "bootstrapHazardCurve: at least one CDS quote is required");
+  if (!(recovery >= 0 && recovery < 1)) {
+    throw new PricingError("INVALID_CREDIT_CURVE", `bootstrapHazardCurve: recovery ${recovery} must be in [0, 1)`, { recovery });
+  }
+  for (const q of quotes) {
+    if (!Number.isFinite(q.spread) || q.spread < 0) {
+      throw new PricingError("INVALID_CREDIT_CURVE", `bootstrapHazardCurve: CDS spread of ${q.tenor} must be a finite, non-negative number`, {
+        pillar: q.tenor,
+        spread: q.spread,
+      });
+    }
+  }
   const pillars = quotes
-    .map((q) => ({ t: yearFraction(valuationDate, addTenor(valuationDate, q.tenor), "ACT/365F"), s: q.spread }))
+    .map((q) => ({ t: yearFraction(valuationDate, addTenor(valuationDate, q.tenor), "ACT/365F"), s: q.spread, tenor: q.tenor }))
     .filter((p) => p.t > 0)
     .sort((a, b) => a.t - b.t);
   const df = (t: number) => (discount ? discount.df(valuationDate + Math.round(t * 365)) : 1);
   const times: number[] = [];
   const hazards: number[] = [];
+  const warnings: string[] = [];
   const lgd = 1 - recovery;
   const dt = 0.25;
   for (const p of pillars) {
@@ -169,10 +204,18 @@ export function bootstrapHazardCurve(quotes: { tenor: string; spread: number }[]
     } catch {
       h = brent(legs, -0.5, 5, { tolerance: 1e-12, maxIterations: 300 });
     }
+    if (h < 0) {
+      const detail = `pillar ${p.tenor} (t = ${p.t.toFixed(3)}y) implies a hazard rate of ${(h * 1e4).toFixed(1)}bp: the survival probability would increase over the interval (inverted CDS quotes)`;
+      if (!opts.floorHazard) {
+        throw new PricingError("INVALID_CREDIT_CURVE", `bootstrapHazardCurve: ${detail}`, { pillar: p.tenor, time: p.t, hazard: h, spread: p.s });
+      }
+      warnings.push(`HAZARD_FLOORED: ${detail} – floored at 0, the ${p.tenor} quote does not reprice`);
+      h = 0;
+    }
     times.push(p.t);
     hazards.push(h);
   }
-  return { times, hazards, recovery };
+  return { times, hazards, recovery, ...(warnings.length ? { warnings } : {}) };
 }
 
 /** Marginal default probability under a flat hazard rate. */

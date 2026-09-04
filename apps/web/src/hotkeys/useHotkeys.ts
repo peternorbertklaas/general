@@ -131,8 +131,10 @@ export function useHotkeys(handler: HotkeyHandler, opts: HotkeyOptions = {}) {
       const filter = optsRef.current.filter ?? (() => true);
       const editing = isTextEntry(e.target);
       const interactive = !editing && isEditable(e.target);
-      const single = HOTKEYS.filter((h) => keyList(h).every((k) => !k.includes(" ")));
-      const chords = HOTKEYS.filter((h) => keyList(h).some((k) => k.includes(" ")));
+      // A definition may mix a single combo with a chord alias ("mod+e" / "x c"): match each notation by its own kind.
+      const isChord = (k: string) => k.includes(" ");
+      const single = HOTKEYS.filter((h) => keyList(h).some((k) => !isChord(k)));
+      const chords = HOTKEYS.filter((h) => keyList(h).some(isChord));
 
       // Escape always cancels a pending chord.
       if (e.key === "Escape" && pending.current) {
@@ -145,7 +147,7 @@ export function useHotkeys(handler: HotkeyHandler, opts: HotkeyOptions = {}) {
         clearPending();
         for (const h of chords) {
           if (!filter(h)) continue;
-          for (const k of keyList(h)) {
+          for (const k of keyList(h).filter(isChord)) {
             const [first, second] = k.split(" ");
             if (first === prefix && second && eventMatches(e, parseCombo(second))) {
               e.preventDefault();
@@ -161,7 +163,7 @@ export function useHotkeys(handler: HotkeyHandler, opts: HotkeyOptions = {}) {
       for (const h of single) {
         if (editing && !h.global) continue;
         if (!filter(h)) continue;
-        for (const k of keyList(h)) {
+        for (const k of keyList(h).filter((x) => !isChord(x))) {
           const combo = parseCombo(k);
           // Enter/Space on a button, link or checkbox belong to that control (no double activation).
           if (interactive && ACTIVATION_KEYS.has(combo.key) && !combo.mod && !combo.alt) continue;
@@ -175,7 +177,13 @@ export function useHotkeys(handler: HotkeyHandler, opts: HotkeyOptions = {}) {
       }
       // Chord starters
       if (!editing && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        const starters = new Set(chords.filter(filter).flatMap((h) => keyList(h).map((k) => k.split(" ")[0]!)));
+        const starters = new Set(
+          chords.filter(filter).flatMap((h) =>
+            keyList(h)
+              .filter(isChord)
+              .map((k) => k.split(" ")[0]!),
+          ),
+        );
         const k = e.key.toLowerCase();
         if (starters.has(k)) {
           e.preventDefault();

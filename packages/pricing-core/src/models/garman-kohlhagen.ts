@@ -12,10 +12,22 @@ export interface FxOptionInputs {
   timeToExpiry: number;
   /** Time to delivery/settlement in years (>= expiry). Defaults to expiry. */
   timeToDelivery?: number;
-  /** Domestic (quote currency) continuously compounded rate. */
+  /** Domestic (quote currency) continuously compounded rate to delivery (payoff discount, delivery forward). */
   rd: number;
-  /** Foreign (base currency) continuously compounded rate. */
+  /** Foreign (base currency) continuously compounded rate to delivery. */
   rf: number;
+  /**
+   * Expiry-horizon rates driving the spot dynamics on [0, T] – the barrier
+   * drift b = rdExpiry − rfExpiry and the discounting of a rebate paid at the
+   * hit (R3-9). They are the rates to the *standard* delivery of the expiry
+   * (spot date of T), so `S·e^{(rdExpiry − rfExpiry)·T}` is the forward for
+   * that date. Default: the delivery-horizon rates rescaled by T_del/T, which
+   * equals the expiry-horizon rates exactly when the delivery is the standard
+   * one; for a non-standard (longer) lag the pricer supplies them from the
+   * curves so the extra carry only enters the payoff discount and forward.
+   */
+  rdExpiry?: number;
+  rfExpiry?: number;
 }
 
 export interface FxOptionResult {
@@ -161,31 +173,41 @@ export interface FxBarrierInputs extends FxOptionInputs {
  * and a knock-out worth its rebate (paid immediately unless `rebateAtExpiry`).
  *
  * Settlement lag: like `garmanKohlhagen` and `fxDigital` the payoff is
- * discounted to the delivery date and the forward is the delivery-date
- * forward. Internally the rates are rescaled to the expiry horizon,
- * r = −ln DF_d(T_del)/T and q = −ln DF_f(T_del)/T, so that e^{−rT} = DF_d(T_del)
- * and S·e^{(r−q)T} = F(T_del) while the barrier diffusion (σ√T) stays on the
- * expiry horizon. This keeps In + Out = Vanilla exactly when a delivery lag
- * is present.
+ * discounted to the delivery date (DF_d(T_del)) and struck against the
+ * delivery-date forward F(T_del), while the barrier diffusion (σ√T) and the
+ * spot drift run on the expiry horizon. The drift b = rdExpiry − rfExpiry and
+ * the rate discounting a rebate paid at the hit are the expiry-horizon rates
+ * (`FxOptionInputs.rdExpiry`/`rfExpiry`; default: delivery rates rescaled by
+ * T_del/T, exact for the standard delivery). The payoff is written on
+ * F_T(T_del) = c·S_T with the deterministic carry c = F(T_del)/(S·e^{bT})
+ * between the spot at expiry and the delivery forward, which the formulas
+ * absorb by pricing on the scaled spot S' = c·S and barrier H' = c·H (R3-9).
+ * In + Out = Vanilla holds exactly for every delivery lag.
  */
 export function fxBarrier(i: FxBarrierInputs): number {
-  const { type, spot: S, strike: X, vol, timeToExpiry: T, barrier: H, barrierType } = i;
+  const { type, strike: X, vol, timeToExpiry: T, barrierType } = i;
   const tDel = i.timeToDelivery ?? T;
-  // Rates scaled to the expiry horizon (see doc comment); for T <= 0 the expired branch below is used.
-  const scale = T > 0 ? tDel / T : 1;
-  const r = i.rd * scale;
-  const q = i.rf * scale;
   const K = i.rebate ?? 0;
-  const breachedNow = (barrierType.startsWith("Up") && S >= H) || (barrierType.startsWith("Down") && S <= H);
+  const breachedNow = (barrierType.startsWith("Up") && i.spot >= i.barrier) || (barrierType.startsWith("Down") && i.spot <= i.barrier);
   if (T <= 0 || vol <= 0) {
     // Expired: intrinsic on the delivery forward, discounted to delivery (as `garmanKohlhagen`),
     // subject to whether the barrier is currently breached.
     const alive = barrierType.endsWith("Out") ? !breachedNow : breachedNow;
-    const fwd = S * Math.exp((i.rd - i.rf) * tDel);
+    const fwd = i.spot * Math.exp((i.rd - i.rf) * tDel);
     if (alive) return Math.max((type === "Call" ? 1 : -1) * (fwd - X), 0) * Math.exp(-i.rd * tDel);
     return barrierType.endsWith("Out") ? K : 0;
   }
+  // Expiry-horizon rates: drift of the spot on [0, T] and discounting of rebates paid at the hit.
+  const scale = tDel / T;
+  const r = i.rdExpiry ?? i.rd * scale;
+  const q = i.rfExpiry ?? i.rf * scale;
   const b = r - q;
+  // Payoff discount and forward on the delivery horizon; the carry between S_T and F_T(T_del) scales spot and barrier.
+  const dfPay = Math.exp(-i.rd * tDel);
+  const fwdDel = i.spot * Math.exp((i.rd - i.rf) * tDel);
+  const c = fwdDel / (i.spot * Math.exp(b * T));
+  const S = i.spot * c;
+  const H = i.barrier * c;
   const sd = vol * Math.sqrt(T);
   const mu = (b - 0.5 * vol * vol) / (vol * vol);
   const lambda = Math.sqrt(mu * mu + (2 * r) / (vol * vol));
@@ -194,15 +216,18 @@ export function fxBarrier(i: FxBarrierInputs): number {
   const x2 = Math.log(S / H) / sd + (1 + mu) * sd;
   const y1 = Math.log((H * H) / (S * X)) / sd + (1 + mu) * sd;
   const y2 = Math.log(H / S) / sd + (1 + mu) * sd;
-  const eqT = Math.exp(-q * T);
-  const erT = Math.exp(-r * T);
+  // e^{−qT} = e^{−rT}·e^{bT} in the classical formulas; here the payoff discount is dfPay and S·e^{bT} = F(T_del).
+  const eqT = dfPay * Math.exp(b * T);
+  const erT = dfPay;
   const A = (phi: number) => phi * S * eqT * normCdf(phi * x1) - phi * X * erT * normCdf(phi * x1 - phi * sd);
   const B = (phi: number) => phi * S * eqT * normCdf(phi * x2) - phi * X * erT * normCdf(phi * x2 - phi * sd);
   const C = (phi: number, eta: number) =>
     phi * S * eqT * Math.pow(H / S, 2 * (mu + 1)) * normCdf(eta * y1) - phi * X * erT * Math.pow(H / S, 2 * mu) * normCdf(eta * y1 - eta * sd);
   const D = (phi: number, eta: number) =>
     phi * S * eqT * Math.pow(H / S, 2 * (mu + 1)) * normCdf(eta * y2) - phi * X * erT * Math.pow(H / S, 2 * mu) * normCdf(eta * y2 - eta * sd);
+  // Knock-in rebate paid at expiry (settled at delivery) when the barrier was never touched.
   const E = (eta: number) => K * erT * (normCdf(eta * x2 - eta * sd) - Math.pow(H / S, 2 * mu) * normCdf(eta * y2 - eta * sd));
+  // Knock-out rebate paid at the hit: discounted with the expiry-horizon rate r through λ.
   const F = (eta: number) => K * (Math.pow(H / S, mu + lambda) * normCdf(eta * z) + Math.pow(H / S, mu - lambda) * normCdf(eta * z - 2 * eta * lambda * sd));
 
   const isCall = type === "Call";
@@ -283,7 +308,10 @@ export function fxExoticGreeks(price: (inputs: FxOptionInputs) => number, i: FxO
     (price({ ...i, timeToExpiry: t - dt, timeToDelivery: Math.max(t - dt, tDel - dt) }) - price({ ...i, timeToExpiry: t + dt, timeToDelivery: tDel + dt })) /
     (2 * dt);
   const hR = 1e-4;
-  const rhoDomestic = (price({ ...i, rd: i.rd + hR }) - price({ ...i, rd: i.rd - hR })) / (2 * hR);
-  const rhoForeign = (price({ ...i, rf: i.rf + hR }) - price({ ...i, rf: i.rf - hR })) / (2 * hR);
+  // Explicit expiry-horizon rates move with the delivery rates (parallel shift of the curve).
+  const bumpRd = (h: number): FxOptionInputs => ({ ...i, rd: i.rd + h, ...(i.rdExpiry !== undefined ? { rdExpiry: i.rdExpiry + h } : {}) });
+  const bumpRf = (h: number): FxOptionInputs => ({ ...i, rf: i.rf + h, ...(i.rfExpiry !== undefined ? { rfExpiry: i.rfExpiry + h } : {}) });
+  const rhoDomestic = (price(bumpRd(hR)) - price(bumpRd(-hR))) / (2 * hR);
+  const rhoForeign = (price(bumpRf(hR)) - price(bumpRf(-hR))) / (2 * hR);
   return { spotDelta, gamma, vega, theta, rhoDomestic, rhoForeign };
 }

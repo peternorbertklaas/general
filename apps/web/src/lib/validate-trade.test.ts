@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { type Trade, parseISO } from "@deriva/pricing-core";
+import { type Trade, makeVanillaSwap, parseISO } from "@deriva/pricing-core";
 import { newTradeTemplate } from "./templates.js";
-import { hasErrors, issueFor, validateTrade } from "./validate-trade.js";
+import { hasErrors, issueFor, utiValid, validateTrade } from "./validate-trade.js";
 
 const VAL = parseISO("2026-09-03");
+const START = VAL + 2;
 
 describe("validate-trade (F-04)", () => {
   it("warns on implausible fixed rates and errors on non-positive notionals", () => {
@@ -36,6 +37,25 @@ describe("validate-trade (F-04)", () => {
     const issues = validateTrade({ ...t, deliveryDate: t.expiryDate - 5 });
     expect(issueFor(issues, "deliveryDate")?.msg).toMatch(/Lieferung/);
     expect(validateTrade({ ...t, deliveryDate: t.expiryDate }).some((i) => i.field === "deliveryDate")).toBe(false);
+  });
+  it("UTI: 1–52 characters A–Z / 0–9 (ISO 23897), otherwise a warning on field 'uti' (R3-12)", () => {
+    const base = makeVanillaSwap({
+      currency: "EUR",
+      notional: 1e6,
+      payReceiveFixed: "Pay",
+      fixedRate: 0.03,
+      effectiveDate: START,
+      maturity: "5Y",
+      counterparty: "X",
+    });
+    expect(validateTrade({ ...base, uti: "529900T8BM49AURSDO55CCS0001" }).filter((i) => i.field === "uti")).toEqual([]);
+    expect(validateTrade({ ...base, uti: "abc!" }).find((i) => i.field === "uti")).toMatchObject({ level: "warn", msg: expect.stringMatching(/ISO 23897/) });
+    expect(validateTrade({ ...base, uti: "A".repeat(53) }).find((i) => i.field === "uti")?.level).toBe("warn");
+    expect(validateTrade({ ...base, uti: "MIT LEERZEICHEN" }).find((i) => i.field === "uti")?.level).toBe("warn");
+    expect(validateTrade(base).find((i) => i.field === "uti")).toBeUndefined();
+    expect(utiValid("529900T8BM49AURSDO55")).toBe(true);
+    expect(utiValid("abc-1")).toBe(false);
+    expect(utiValid(undefined)).toBe(true);
   });
   it("collar floor above cap is an error, missing counterparty a warning", () => {
     const t = newTradeTemplate("cap", VAL);

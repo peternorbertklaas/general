@@ -4,7 +4,7 @@ import { buildApp, requestIdFrom } from "./app.js";
 import { samplePortfolio } from "./lib/store.js";
 import { datesToIso } from "./lib/dates.js";
 import { classifyError, describeError } from "./lib/errors.js";
-import { TRADE_TYPES } from "./schemas.js";
+import { API_ERROR_CODES, TRADE_TYPES, WARNING_PREFIXES } from "./schemas.js";
 
 let app: FastifyInstance;
 type Json = Record<string, unknown>;
@@ -562,7 +562,7 @@ describe("R-03 core surface round 3", () => {
     const created = await app2.inject({
       method: "POST",
       url: "/api/trades",
-      payload: { ...t, id: "CLR-1", cleared: true, clearingMember: "Eurex Clearing AG", uti: "UTIABC123" },
+      payload: { ...t, id: "CLR-1", cleared: true, clearingObligation: true, clearingMember: "Eurex Clearing AG", uti: "UTIABC123" },
     });
     expect(created.statusCode).toBe(201);
     const priceMap = encodeURIComponent(JSON.stringify({ "CLR-1": 0 }));
@@ -576,8 +576,9 @@ describe("R-03 core surface round 3", () => {
       uti: "UTIABC123",
       valuationMethod: "MTMA",
     });
+    // Without an explicit clearing obligation the field is N/A – never derived from `cleared` (N3-09).
     const other = recs.find((x) => x.tradeId === "IRS-0002")!;
-    expect(other).toMatchObject({ cleared: "FALSE", clearingObligation: "N", valuationMethod: "MTMO" });
+    expect(other).toMatchObject({ cleared: "FALSE", clearingObligation: "N/A", valuationMethod: "MTMO" });
     expect(other.clearingMember).toBeUndefined();
     const ts = await app2.inject({ method: "GET", url: "/api/emir/valuations?asOf=2026-09-03T17:00:00Z&timestamp=2026-09-03T18:30:00Z" });
     expect((ts.json() as { valuationTimestamp: string }[]).every((x) => x.valuationTimestamp === "2026-09-03T18:30:00Z")).toBe(true);
@@ -1080,4 +1081,215 @@ describe("R-04 core surface round 4", () => {
     expect(doc).toContain("FX forwards and FX swaps: `deltaAmount`");
     expect(doc).toContain("`deltaPct` = signed spot delta as a fraction of the notional");
   });
+});
+
+describe("R-05 core surface round 5 (error codes, vol conversion, hazard floor, CCS collateral, FRA index)", () => {
+  const post = (url: string, payload: Record<string, unknown>) => app.inject({ method: "POST", url, payload });
+  const trade = async (id: string) => (await app.inject({ method: "GET", url: `/api/trades/${id}` })).json().trade;
+
+  it("hazard curve: inverted CDS quotes → 422 INVALID_CREDIT_CURVE naming the pillar; floorHazard floors it and reports HAZARD_FLOORED", async () => {
+    const url = "/api/xva/hazard-curve";
+    // 1Y at 300bp, 3Y at 50bp: s·T falls from 3.0 to 1.5 → the 3Y interval would need a negative hazard; 5Y at 150bp (s·T = 7.5) is solvable again.
+    const inverted = [
+      { tenor: "1Y", spread: 0.03 },
+      { tenor: "3Y", spread: 0.005 },
+      { tenor: "5Y", spread: 0.015 },
+    ];
+    const rejected = await post(url, { quotes: inverted, recovery: 0.4 });
+    expect(rejected.statusCode, rejected.body).toBe(422);
+    expect(rejected.json()).toMatchObject({ statusCode: 422, code: "INVALID_CREDIT_CURVE", details: { pillar: "3Y" } });
+    expect(rejected.json().details.hazard).toBeLessThan(0);
+    expect(String(rejected.json().error)).toMatch(/inverted CDS quotes/);
+    const floored = await post(url, { quotes: inverted, recovery: 0.4, floorHazard: true });
+    expect(floored.statusCode, floored.body).toBe(200);
+    const curve = floored.json();
+    expect(curve.hazards[0]).toBeGreaterThan(0);
+    expect(curve.hazards[1]).toBe(0);
+    expect(curve.pillars[1]).toMatchObject({ tenor: "3Y", hazard: 0 });
+    // Survival stays flat over the floored interval and falls again afterwards.
+    expect(curve.pillars[1].survival).toBeCloseTo(curve.pillars[0].survival, 12);
+    expect(curve.pillars[2].survival).toBeLessThan(curve.pillars[1].survival);
+    expect(Array.isArray(curve.warnings)).toBe(true);
+    expect(curve.warnings).toHaveLength(1);
+    expect(curve.warnings[0]).toMatch(/^HAZARD_FLOORED: pillar 3Y/);
+    // A regular term structure carries no warnings at all, with or without the flag.
+    const regular = [
+      { tenor: "1Y", spread: 0.006 },
+      { tenor: "5Y", spread: 0.012 },
+    ];
+    expect((await post(url, { quotes: regular, recovery: 0.4, floorHazard: true })).json().warnings).toBeUndefined();
+    expect((await post(url, { quotes: regular, recovery: 0.4, floorHazard: "yes" })).statusCode).toBe(400);
+    // The bootstrapped curve (core fields incl. `warnings`) is accepted as term structure by /api/xva.
+    const t = await trade("IRS-0001");
+    const { times, hazards, recovery, warnings } = curve;
+    const xva = await post("/api/xva", { trade: t, credit: { cptyHazard: 0.02, cptyRecovery: 0.4, cptyHazardCurve: { times, hazards, recovery, warnings } } });
+    expect(xva.statusCode, xva.body).toBe(200);
+    expect(xva.json().cva).toBeGreaterThan(0);
+    const doc = JSON.stringify(app.swagger());
+    expect(doc).toContain('"floorHazard":{"type":"boolean"');
+    expect(doc).toContain("HAZARD_FLOORED");
+  });
+
+  it("from-template: CCS collateral defaults to USD / the quote currency and `null` builds an uncollateralised swap; FRA index follows the period (3x6 → EURIBOR-3M)", async () => {
+    const url = "/api/trades/from-template";
+    const ccs = (params: Record<string, unknown>) =>
+      post(url, { template: "CrossCurrencySwap", params: { domesticNotional: 1e7, spread: -0.002, effectiveDate: "2026-09-07", tenor: "5Y", ...params } });
+    const usd = await ccs({ pair: "EURUSD", fxSpot: 1.17 });
+    expect(usd.statusCode, usd.body).toBe(200);
+    expect(usd.json().trade.collateralCurrency).toBe("USD");
+    const gbp = await ccs({ pair: "EURGBP", foreignNotional: 8.5e6 });
+    expect(gbp.statusCode, gbp.body).toBe(200);
+    expect(gbp.json().trade.collateralCurrency).toBe("GBP");
+    const usdJpy = await ccs({ pair: "USDJPY", fxSpot: 150 });
+    expect(usdJpy.statusCode, usdJpy.body).toBe(200);
+    expect(usdJpy.json().trade.collateralCurrency).toBe("USD");
+    const explicit = await ccs({ pair: "EURUSD", fxSpot: 1.17, collateralCurrency: "EUR" });
+    expect(explicit.json().trade.collateralCurrency).toBe("EUR");
+    const uncollateralised = await ccs({ pair: "EURUSD", fxSpot: 1.17, collateralCurrency: null });
+    expect(uncollateralised.statusCode, uncollateralised.body).toBe(200);
+    expect(uncollateralised.json().trade.collateralCurrency).toBeUndefined();
+    expect("collateralCurrency" in uncollateralised.json().trade).toBe(false);
+    // The collateral choice changes the EUR discounting, hence the PV; both price and pass the trade schema.
+    const priced = async (collateralCurrency: string | null | undefined) =>
+      (await ccs({ pair: "EURUSD", fxSpot: 1.17, ...(collateralCurrency === undefined ? {} : { collateralCurrency }) })).json();
+    const [pvCsa, pvNone] = [(await price((await priced(undefined)).trade)).json().pv, (await price((await priced(null)).trade)).json().pv];
+    expect(typeof pvCsa).toBe("number");
+    expect(typeof pvNone).toBe("number");
+    expect(pvCsa).not.toBeCloseTo(pvNone, 0);
+    expect((await ccs({ pair: "EURUSD", fxSpot: 1.17, collateralCurrency: "usd" })).statusCode).toBe(400);
+    expect((await ccs({ pair: "EURUSD", fxSpot: 1.17, collateralCurrency: 1 })).statusCode).toBe(400);
+    const doc = JSON.stringify(app.swagger());
+    expect(doc).toContain('"collateralCurrency":{"type":["string","null"]');
+    expect(doc).toContain("USD when one leg is USD, otherwise the quote (second) currency");
+
+    const fra = (params: Record<string, unknown>) =>
+      post(url, { template: "FRA", params: { currency: "EUR", notional: 5e6, payReceive: "Pay", rate: 0.022, ...params } });
+    const fra3x6 = await fra({ start: "3x6" });
+    expect(fra3x6.statusCode, fra3x6.body).toBe(200);
+    expect(fra3x6.json().trade.index).toBe("EURIBOR-3M");
+    expect(fra3x6.json().trade.startDate).toMatch(/^2026-12-/);
+    expect(fra3x6.json().trade.endDate).toMatch(/^2027-03-/);
+    const p3x6 = await price(fra3x6.json().trade);
+    expect(p3x6.statusCode, p3x6.body).toBe(200);
+    expect(typeof p3x6.json().analytics.forwardRate).toBe("number");
+    expect(p3x6.json().details.fixingDate).toMatch(/^2026-12-/);
+    expect((await fra({ start: "3x9" })).json().trade.index).toBe("EURIBOR-6M");
+    expect((await fra({ start: "6x12" })).json().trade.index).toBe("EURIBOR-6M");
+    expect((await fra({ start: "3x6", index: "EURIBOR-6M" })).json().trade.index).toBe("EURIBOR-6M");
+    expect((await fra({ start: "2027-03-08", end: "2027-06-08" })).json().trade.index).toBe("EURIBOR-3M");
+    expect((await fra({ start: "2027-03-08", end: "2027-09-08" })).json().trade.index).toBe("EURIBOR-6M");
+    expect((await fra({ start: "3x6", currency: "USD" })).json().trade.index).toBe("SOFR");
+    expect(doc).toContain('(\\"3x6\\" → EURIBOR-3M, \\"6x12\\" → EURIBOR-6M');
+  });
+
+  it("pricing: a Black cap on the normal caplet surface prices ≈ Bachelier with VOL_TYPE_CONVERTED; Black on a negative strike → 422 VOL_MODEL_INCOMPATIBLE; FX options report details.standardDelivery", async () => {
+    const cap = await trade("CAP-0001");
+    const bachelier = (await price(cap)).json();
+    expect(bachelier.analytics.model).toBe("Bachelier");
+    expect(bachelier.analytics.volConverted).toBe("no");
+    expect(bachelier.warnings.some((w: string) => w.startsWith("VOL_TYPE_CONVERTED:"))).toBe(false);
+    const black = await price({ ...cap, model: "Black" });
+    expect(black.statusCode, black.body).toBe(200);
+    expect(black.json().analytics.model).toBe("Black");
+    expect(black.json().analytics.volConverted).toBe("yes");
+    const converted = black.json().warnings.filter((w: string) => w.startsWith("VOL_TYPE_CONVERTED:"));
+    expect(converted).toHaveLength(1);
+    expect(converted[0]).toMatch(/caplet/);
+    // Price-equivalent conversion per caplet: the Black PV reproduces the Bachelier PV (up to the vol root-finding tolerance).
+    expect(Math.abs(black.json().pv - bachelier.pv)).toBeLessThan(Math.abs(bachelier.pv) * 1e-4);
+    // Black vega is per vol point, Bachelier per bp – both finite and positive for a long cap.
+    expect(black.json().analytics.vega).toBeGreaterThan(0);
+    expect(bachelier.analytics.vega).toBeGreaterThan(0);
+    // The same conversion on a swaption exposes the unconverted surface vol.
+    const sw = await trade("SWPT-0001");
+    const swBlack = await price({ ...sw, model: "Black" });
+    expect(swBlack.statusCode, swBlack.body).toBe(200);
+    expect(swBlack.json().analytics.volConverted).toBe("yes");
+    expect(typeof swBlack.json().analytics.surfaceVolatility).toBe("number");
+    expect(swBlack.json().analytics.volatility).toBeGreaterThan(swBlack.json().analytics.surfaceVolatility);
+    expect(swBlack.json().warnings.some((w: string) => w.startsWith("VOL_TYPE_CONVERTED:"))).toBe(true);
+    expect(Math.abs(swBlack.json().pv - (await price(sw)).json().pv)).toBeLessThan(Math.abs(swBlack.json().pv) * 1e-4);
+    // Lognormal model on a non-positive strike without shift cannot be fed from the normal surface.
+    const incompatible = await price({ ...cap, model: "Black", strike: -0.01 });
+    expect(incompatible.statusCode, incompatible.body).toBe(422);
+    expect(incompatible.json()).toMatchObject({ statusCode: 422, code: "VOL_MODEL_INCOMPATIBLE" });
+    expect(typeof incompatible.json().requestId).toBe("string");
+    // ShiftedBlack with a sufficient shift is fine on the same strike.
+    expect((await price({ ...cap, model: "ShiftedBlack", shift: 0.03, strike: -0.01 })).statusCode).toBe(200);
+    const fxo = (await price(await trade("FXO-0001"))).json();
+    expect(fxo.details.standardDelivery).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(fxo.details.spotDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(fxo.details.standardDelivery > fxo.details.spotDate).toBe(true);
+  });
+
+  it("OpenAPI: ErrorResponse.code documents every core and API code, the warning prefixes and the analytics keys; README-listed codes are stable", () => {
+    const doc = app.swagger() as unknown as {
+      components: { schemas: Record<string, { properties?: Record<string, { description?: string; examples?: string[] }> }> };
+    };
+    const code = doc.components.schemas.ErrorResponse!.properties!.code! as { description?: string; examples?: string[]; example?: unknown };
+    // The full list (not a single collapsed `example`) is what SDK generators and Swagger UI show.
+    expect(code.example).toBeUndefined();
+    expect(code.examples).toEqual([...API_ERROR_CODES.core, ...API_ERROR_CODES.api]);
+    for (const c of [...API_ERROR_CODES.core, ...API_ERROR_CODES.api]) expect(code.description, c).toContain(c);
+    for (const c of ["INVALID_FREQUENCY", "UNKNOWN_DAYCOUNT", "TOO_MANY_PERIODS", "VOL_MODEL_INCOMPATIBLE", "INVALID_CREDIT_CURVE", "INVALID_TIMESTAMP"]) {
+      expect(API_ERROR_CODES.core).toContain(c);
+    }
+    for (const w of WARNING_PREFIXES) expect(code.description).toContain(`${w}:`);
+    // Warning prefixes are not error codes.
+    expect(code.examples).not.toContain("VOL_TYPE_CONVERTED");
+    expect(code.examples).not.toContain("HAZARD_FLOORED");
+    const json = JSON.stringify(doc);
+    expect(json).toContain("`volConverted`");
+    expect(json).toContain("`surfaceVolatility`");
+    expect(json).toContain("`standardDelivery`");
+    // The API-level codes the routes emit are all listed (kept in sync by hand – grep the routes when adding one).
+    for (const c of [
+      "CSV_INVALID",
+      "CSV_ROW_INVALID",
+      "SNAPSHOT_MALFORMED",
+      "SNAPSHOT_INVALID",
+      "PERIOD_BUDGET_EXCEEDED",
+      "PRECONDITION_FAILED",
+      "PRECONDITION_REQUIRED",
+    ]) {
+      expect(API_ERROR_CODES.api).toContain(c);
+    }
+  });
+
+  it("snapshot id: GET /api/market/snapshot ETag = X-Market-Snapshot-Id = report.audit.snapshotId, on the full market scope (a fixing changes it)", async () => {
+    const app2 = await buildApp({ logger: false });
+    const snapshotEtag = async () => String((await app2.inject({ method: "GET", url: "/api/market/snapshot" })).headers.etag);
+    const t = (await app2.inject({ method: "GET", url: "/api/trades/IRS-0002" })).json().trade;
+    const report = async () => app2.inject({ method: "POST", url: "/api/report", payload: { trade: t, includeRisk: false } });
+    const etag = await snapshotEtag();
+    const rep = await report();
+    expect(rep.statusCode).toBe(200);
+    const id = rep.json().audit.snapshotId as string;
+    expect(id).toMatch(/^[0-9a-f]{16}$/);
+    expect(etag).toBe(`"${id}"`);
+    expect(rep.headers["x-market-snapshot-id"]).toBe(id);
+    const portfolio = await app2.inject({ method: "POST", url: "/api/report/portfolio", payload: { trades: [t] } });
+    expect(portfolio.json().audit.snapshotId).toBe(id);
+    expect(portfolio.headers["x-market-snapshot-id"]).toBe(id);
+    expect((await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": `"${id}"` } })).statusCode).toBe(304);
+    // Full scope: an added fixing (not a curve node or spot) changes the id everywhere consistently.
+    const put = await app2.inject({ method: "PUT", url: "/api/market", payload: { fixings: [{ index: "EURIBOR-6M", date: "2026-09-01", value: 0.0205 }] } });
+    expect(put.statusCode, put.body).toBe(200);
+    const id2 = String(put.headers["x-market-snapshot-id"]);
+    expect(id2).not.toBe(id);
+    expect(put.json().snapshotId).toBe(id2);
+    expect(await snapshotEtag()).toBe(`"${id2}"`);
+    const rep2 = await report();
+    expect(rep2.json().audit.snapshotId).toBe(id2);
+    expect(rep2.headers["x-market-snapshot-id"]).toBe(id2);
+    expect((await app2.inject({ method: "GET", url: "/api/market/snapshot", headers: { "if-none-match": etag } })).statusCode).toBe(200);
+    // Re-importing the exported snapshot reproduces the same id (round trip through `deriva.market/1`).
+    const snap = (await app2.inject({ method: "GET", url: "/api/market/snapshot" })).json();
+    const app3 = await buildApp({ logger: false, seedPortfolio: false });
+    const imported = await app3.inject({ method: "PUT", url: "/api/market/snapshot", payload: snap });
+    expect(imported.statusCode, imported.body).toBe(200);
+    expect(imported.json().snapshotId).toBe(id2);
+    await app3.close();
+    await app2.close();
+  }, 60000);
 });

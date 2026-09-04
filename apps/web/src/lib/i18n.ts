@@ -31,6 +31,48 @@ const CORE_MESSAGES: Rule[] = [
     to: (m) => `${m[1]}-Modell: verschobener Forward/Strike nicht positiv${m[2]} – innerer Wert ohne Zeitwert`,
   },
   { re: /^FRA already settled$/, to: () => "FRA bereits abgerechnet" },
+  // Vol quotation conversion (core R3-1): "VOL_TYPE_CONVERTED: caplet surface X quotes normal vols but model Black was requested – vols converted to lognormal …"
+  {
+    re: /^VOL_TYPE_CONVERTED: (\w+) surface (\S+) quotes (normal|lognormal(?:, shift [\d.]+%)?) vols but model (\w+) was requested – vols converted to (normal|lognormal(?:, shift [\d.]+%)?) .*$/,
+    to: (m) =>
+      `Volatilität der ${m[1] === "caplet" ? "Caplet" : m[1] === "swaption" ? "Swaption" : m[1]}-Fläche ${m[2]} von ${quotationDe(m[3]!)}- in ${quotationDe(m[5]!)}-Quotierung umgerechnet (Modell ${m[4]}, preisäquivalent je Forward/Strike/Verfall)`,
+  },
+  { re: /^VOL_TYPE_CONVERTED: (.+)$/, to: (m) => `Volatilität zwischen Normal- und Lognormal-Quotierung umgerechnet (${m[1]})` },
+  {
+    re: /^A (shifted )?lognormal model cannot be fed from the (.+?) surface: shifted forward ([-\d.]+%) \/ strike ([-\d.]+%) is not positive.*$/,
+    to: (m) =>
+      `${m[1] ? "Shifted-" : ""}Lognormal-Modell nicht mit der ${quotationDe(m[2]!)}-Fläche vereinbar: verschobener Forward ${m[3]!.replace(".", ",")} / Strike ${m[4]!.replace(".", ",")} nicht positiv – Bachelier oder größeren Shift verwenden`,
+  },
+  {
+    re: /^Schedule with frequency (\S+) would have (\d+) periods \(limit (\d+)\).*$/,
+    to: (m) => `Zahlungsplan mit Frequenz ${m[1]} hätte ${m[2]} Perioden (Grenze ${m[3]}) – Laufzeit verkürzen oder längere Kuponfrequenz wählen`,
+  },
+  { re: /^Invalid frequency: (\S+) \(expected a tenor like .*\)$/, to: (m) => `Ungültige Frequenz: ${m[1]} (erwartet ein Tenor wie 3M, 6M, 1Y oder ZC)` },
+  { re: /^Invalid frequency: (\S+) \(tenor must be positive\)$/, to: (m) => `Ungültige Frequenz: ${m[1]} (Tenor muss positiv sein)` },
+  { re: /^bootstrapHazardCurve: at least one CDS quote is required$/, to: () => "CDS-Termstruktur: mindestens eine Quote erforderlich" },
+  {
+    re: /^bootstrapHazardCurve: recovery ([\d.]+) must be in \[0, 1\)$/,
+    to: (m) => `CDS-Termstruktur: Recovery ${m[1]!.replace(".", ",")} muss in [0, 1) liegen`,
+  },
+  {
+    re: /^bootstrapHazardCurve: CDS spread of (\S+) must be a finite, non-negative number$/,
+    to: (m) => `CDS-Termstruktur: Spread ${m[1]} muss eine endliche, nicht negative Zahl sein`,
+  },
+  {
+    re: /^bootstrapHazardCurve: pillar (\S+) \(t = ([\d.]+)y\) implies a hazard rate of ([-\d.]+)bp: the survival probability would increase.*$/,
+    to: (m) =>
+      `CDS-Termstruktur: Pillar ${m[1]} (t = ${m[2]!.replace(".", ",")} J) impliziert eine Hazard-Rate von ${m[3]!.replace(".", ",")} bp – Überlebenswahrscheinlichkeit würde steigen (inverse CDS-Quotes)`,
+  },
+  {
+    re: /^HAZARD_FLOORED: pillar (\S+) \(t = ([\d.]+)y\) implies a hazard rate of ([-\d.]+)bp.*floored at 0, the (\S+) quote does not reprice$/,
+    to: (m) =>
+      `Hazard-Rate am Pillar ${m[1]} (t = ${m[2]!.replace(".", ",")} J) wäre ${m[3]!.replace(".", ",")} bp (inverse CDS-Quotes) – auf 0 begrenzt, die ${m[4]}-Quote wird nicht exakt reproduziert`,
+  },
+  { re: /^HAZARD_FLOORED: (.+)$/, to: (m) => `Hazard-Rate auf 0 begrenzt (${m[1]})` },
+  {
+    re: /^(\S+) (".*"|\S+) is not an ISO-8601 date-time – EMIR field 23 needs YYYY-MM-DDThh:mm:ssZ$/,
+    to: (m) => `${m[1]} ${m[2]} ist kein ISO-8601-Zeitstempel – EMIR-Feld 23 erwartet JJJJ-MM-TTThh:mm:ssZ`,
+  },
   {
     re: /^Missing fixing for (\S+) on (\d{4}-\d{2}-\d{2}); used curve forward$/,
     to: (m) => `Fixing ${m[1]} vom ${isoToDe(m[2]!)} fehlt – Kurven-Forward verwendet`,
@@ -83,6 +125,25 @@ const CORE_MESSAGES: Rule[] = [
   { re: /^Swaption-replication.*flat hazard$/, to: () => "Swaption-Replikation (Sorensen–Bollier), konstante Hazard-Rate" },
 ];
 
+/** German labels of the curve interpolation methods – single source for curves view, report and documents (R3-06). */
+export const INTERPOLATION_DE: Record<string, string> = {
+  logLinear: "log-linear (DF)",
+  linearZero: "linear (Zero)",
+  cubicSplineZero: "kubischer Spline (Zero)",
+  flatForward: "flat forward",
+  monotoneConvex: "monoton-konvex (Hagan–West)",
+};
+
+/** Business-day conventions and stub types as they appear in methodology prose. */
+const CONVENTION_DE: Record<string, string> = {
+  ModifiedFollowing: "Modified Following",
+  ModifiedPreceding: "Modified Preceding",
+  ShortFront: "kurzer Stub vorne",
+  LongFront: "langer Stub vorne",
+  ShortBack: "kurzer Stub hinten",
+  LongBack: "langer Stub hinten",
+};
+
 /** Short English fragments inside method strings (also applied to document paragraphs, N-07). */
 const FRAGMENTS: [RegExp, string][] = [
   [/Swaption-replication/g, "Swaption-Replikation"],
@@ -94,20 +155,55 @@ const FRAGMENTS: [RegExp, string][] = [
   [/flat hazard/gi, "konstante Hazard-Rate"],
   [/\bat \(t, /g, "bei (t, "],
 ];
+/**
+ * Code identifiers that leak from analytics / cost-transparency objects into
+ * methodology prose ("Barwert (fairValue)", "marginBp/marginPct", "analytics.deltaAmount") – R3-06.
+ */
+const IDENTIFIERS: [RegExp, string | ((...m: string[]) => string)][] = [
+  [/\bmarginBp\s*\/\s*marginPct\b/g, "Marge in bp / % des Nominals"],
+  [/\bmarginBp\b/g, "Marge in bp"],
+  [/\bmarginPct\b/g, "Marge in %"],
+  [/\banalytics\.deltaAmount\b/g, "Delta-Betrag (Analytics)"],
+  [/\bdeltaAmount\b/g, "Delta-Betrag"],
+  [/\bdeltaPct\b/g, "Delta-Quote"],
+  [/\(fairValue\)/g, "(Fair Value)"],
+  [/\bfairValue\b/g, "Fair Value"],
+  [/\bMISSING_FIXING\b/g, "„Fixing fehlt“"],
+  [/\bPolicy „/g, "Regel „"],
+  [/\bFloat ([A-Z€][A-Z0-9€-]*)/g, "variabel $1"],
+  [/\bFix (\d)/g, "fest $1"],
+  [/\bStub (ShortFront|LongFront|ShortBack|LongBack)\b/g, (_m: string, s: string) => `Stub: ${CONVENTION_DE[s]}`],
+];
 function translateFragment(s: string): string {
   let out = s;
   for (const [re, to] of FRAGMENTS) out = out.replace(re, to);
   return out;
 }
+function translateIdentifiers(s: string): string {
+  let out = s;
+  for (const [re, to] of IDENTIFIERS) out = typeof to === "string" ? out.replace(re, to) : out.replace(re, to);
+  for (const [k, v] of Object.entries(INTERPOLATION_DE)) out = out.replace(new RegExp(`\\b${k}\\b`, "g"), v);
+  for (const [k, v] of Object.entries(CONVENTION_DE)) out = out.replace(new RegExp(`\\b${k}\\b`, "g"), v);
+  // Defensive fallback: any remaining camelCase identifier is rendered as spaced words ("spotDate" → "Spot Date").
+  out = out.replace(/\b[a-z]+(?:[A-Z][a-z0-9]*)+\b/g, (id) => id.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase()));
+  return out;
+}
 
-/** Free text from the core (document paragraphs): English method fragments → German, ISO dates → dd.mm.yyyy. */
+/** Free text from the core (document paragraphs): English method fragments → German, code identifiers → labels, ISO dates → dd.mm.yyyy. */
 export function germanizeParagraph(s: string): string {
-  return germanizeText(translateFragment(s));
+  return germanizeText(translateIdentifiers(translateFragment(s)));
 }
 
 function isoToDe(iso: string): string {
   const [y, m, d] = iso.split("-");
   return `${d}.${m}.${y}`;
+}
+
+/** "normal" / "lognormal" / "lognormal, shift 3.00%" → German quotation label. */
+function quotationDe(q: string): string {
+  if (q.startsWith("normal")) return "Normal";
+  const shift = /shift ([\d.]+%)/.exec(q);
+  return shift ? `Lognormal (Shift ${shift[1]!.replace(".", ",")})` : "Lognormal";
 }
 
 /** Translate a core (English) warning/error into German; unknown messages are passed through. */
@@ -134,6 +230,15 @@ export const PRICING_ERROR_CODES_DE: Record<string, string> = {
   UNKNOWN_INDEX: "Unbekannter Zinsindex",
   UNKNOWN_CALENDAR: "Unbekannter Kalender",
   UNSUPPORTED_TRADE_TYPE: "Nicht unterstützter Trade-Typ",
+  // core round 3
+  VOL_MODEL_INCOMPATIBLE: "Volatilitätsquotierung mit dem Modell unvereinbar",
+  INVALID_FREQUENCY: "Ungültige Kuponfrequenz",
+  UNKNOWN_DAYCOUNT: "Unbekannte Tageszählung",
+  TOO_MANY_PERIODS: "Zu viele Zahlungsperioden",
+  INVALID_CREDIT_CURVE: "Ungültige CDS-Termstruktur",
+  INVALID_TIMESTAMP: "Ungültiger Zeitstempel",
+  HAZARD_FLOORED: "Hazard-Rate auf 0 begrenzt",
+  VOL_TYPE_CONVERTED: "Volatilitätsquotierung umgerechnet",
 };
 
 /**

@@ -8,8 +8,25 @@ import {
   linearInterp,
   locate,
   monotoneConvexCoefficients,
+  monotoneConvexForward,
   monotoneConvexZero,
 } from "../math/interpolation.js";
+
+/**
+ * Provenance of an `InterpolatedCurve`, stored under `meta.source` (R3-7):
+ * "bootstrap" – built by `bootstrapCurve` from market quotes, "import" – pillars
+ * taken from a snapshot / vendor file (`deserializeMarket`), "flat" – synthetic
+ * flat curve (`flatCurve`). The valuation report's methodology text describes
+ * the curve construction from this key instead of claiming a bootstrap for
+ * every curve.
+ */
+export type CurveSource = "bootstrap" | "import" | "flat";
+
+/** `meta.source` of a curve as `CurveSource` (undefined for curves without provenance). */
+export function curveSource(c: Curve): CurveSource | undefined {
+  const s = (c as Partial<InterpolatedCurve>).meta?.source;
+  return s === "bootstrap" || s === "import" || s === "flat" ? s : undefined;
+}
 
 /**
  * Discount / zero curve abstraction. All curves are anchored at a reference
@@ -72,15 +89,21 @@ export type CurveExtrapolation = "flatForward" | "flatZero";
 
 /**
  * Jump of the instantaneous forward over a short window (turn-of-year effect):
- * between `date` and `date + days` (default 1 calendar day) the instantaneous
- * forward is raised by `bp` basis points on top of the interpolated curve.
- * Discount factors after the window carry the accumulated adjustment
- * exp(−bp·1e-4·days/365).
+ * between `date` and `date + days` the instantaneous forward is raised by `bp`
+ * basis points on top of the interpolated curve. Discount factors after the
+ * window carry the accumulated adjustment exp(−bp·1e-4·days/365).
+ *
+ * The jump is a **calendar** effect: `rolledTo` (constant-curve roll, theta
+ * and `daysForward` scenarios) keeps it on its calendar date instead of
+ * moving it with the curve (R3-6). `bootstrapCurve` resolves a missing `days`
+ * to the business-day span over the turn on the index calendar (e.g. Thu
+ * 31 Dec 2026 → Mon 4 Jan 2027 = 4 days, see `turnOfYearWindow`); a curve
+ * constructed directly without `days` uses one calendar day.
  */
 export interface ForwardJump {
   date: SerialDate;
   bp: number;
-  /** Length of the window in calendar days (default 1). */
+  /** Length of the window in calendar days (default 1 for directly constructed curves; bootstrap: business-day span). */
   days?: number;
 }
 
@@ -94,7 +117,7 @@ export interface InterpolatedCurveOptions {
   /** Default: "flatForward" for df-based interpolations, "flatZero" for zero-rate interpolations. */
   extrapolation?: CurveExtrapolation;
   dayCount?: DayCountConvention;
-  /** Optional metadata like index name, collateral. */
+  /** Optional metadata like index name, collateral; `source` (see `CurveSource`) records the provenance. */
   meta?: Record<string, string>;
   /** Turn-of-year (or other) forward jumps layered on the interpolated curve. */
   forwardJumps?: ForwardJump[];
@@ -176,12 +199,28 @@ export class InterpolatedCurve implements Curve {
     return -(this.logDfs[1]! - this.logDfs[0]!) / (this.times[1]! - this.times[0]!);
   }
 
-  /** Discount factor beyond the last pillar according to the extrapolation setting. */
+  /**
+   * Discount factor beyond the last pillar according to the extrapolation
+   * setting. "flatForward" continues the *instantaneous* forward at the last
+   * pillar: for monotone convex this is f(t_n) of the Hagan–West scheme (so
+   * the forward is continuous across the last pillar, R3-5); for the
+   * piecewise-constant-forward interpolations (log-linear, flat-forward) the
+   * last interval's forward, which is the instantaneous forward there.
+   */
   private extrapolatedDf(t: number): number {
     const n = this.times.length;
     if (this.extrapolation === "flatZero" || n < 2) return Math.exp(-this.zeros[n - 1]! * t);
-    const f = -(this.logDfs[n - 1]! - this.logDfs[n - 2]!) / (this.times[n - 1]! - this.times[n - 2]!);
-    return this.dfs[n - 1]! * Math.exp(-f * (t - this.times[n - 1]!));
+    return this.dfs[n - 1]! * Math.exp(-this.lastForward() * (t - this.times[n - 1]!));
+  }
+
+  /** Instantaneous forward at the last pillar (flat-forward extrapolation rate). */
+  private lastForward(): number {
+    const n = this.times.length;
+    if (this.interpolation === "monotoneConvex") {
+      if (!this.mcCoeffs) this.mcCoeffs = monotoneConvexCoefficients(this.times, this.zeros);
+      return monotoneConvexForward(this.times, this.mcCoeffs, this.times[n - 1]!);
+    }
+    return -(this.logDfs[n - 1]! - this.logDfs[n - 2]!) / (this.times[n - 1]! - this.times[n - 2]!);
   }
 
   /**
@@ -289,7 +328,6 @@ export class InterpolatedCurve implements Curve {
   }
 
   private rebuild(nodes: CurveNode[], referenceDate = this.referenceDate): InterpolatedCurve {
-    const delta = referenceDate - this.referenceDate;
     return new InterpolatedCurve({
       id: this.id,
       currency: this.currency,
@@ -299,8 +337,10 @@ export class InterpolatedCurve implements Curve {
       extrapolation: this.extrapolation,
       dayCount: this.dayCount,
       meta: this.meta,
-      // Constant-curve roll moves the jump windows with the curve; a re-anchoring at the same date keeps them.
-      forwardJumps: this.forwardJumps.map((j) => ({ ...j, date: j.date + delta })),
+      // Forward jumps are calendar events (turn of year): they stay on their dates under every rebuild,
+      // including the constant-curve roll (R3-6). A window that has passed the new reference date no
+      // longer contributes (only the overlap with [0, t] counts).
+      forwardJumps: this.forwardJumps.map((j) => ({ ...j })),
     });
   }
 
@@ -319,6 +359,10 @@ export class InterpolatedCurve implements Curve {
     return this.rebuildWithZeros(zeros);
   }
 
+  /**
+   * Constant-curve roll: nodes keep their tenor (zero rate per time), forward
+   * jumps keep their calendar date (see `ForwardJump`).
+   */
   rolledTo(newReferenceDate: SerialDate): InterpolatedCurve {
     const delta = newReferenceDate - this.referenceDate;
     if (delta === 0) return this;
@@ -410,12 +454,12 @@ export interface CurveJson {
   forwardJumps?: { date: string | number; bp: number; days?: number }[];
 }
 
-/** Build a flat curve at a continuously compounded zero rate (testing / quick what-ifs). */
+/** Build a flat curve at a continuously compounded zero rate (testing / quick what-ifs); `meta.source = "flat"`. */
 export function flatCurve(id: string, currency: string, referenceDate: SerialDate, rate: number, dayCount: DayCountConvention = "ACT/365F"): InterpolatedCurve {
   const nodes: CurveNode[] = [1, 2, 5, 10, 20, 30, 50].map((y) => {
     const d = referenceDate + Math.round(y * 365.25);
     const t = yearFraction(referenceDate, d, dayCount);
     return { date: d, df: Math.exp(-rate * t) };
   });
-  return new InterpolatedCurve({ id, currency, referenceDate, nodes, interpolation: "logLinear", dayCount });
+  return new InterpolatedCurve({ id, currency, referenceDate, nodes, interpolation: "logLinear", dayCount, meta: { source: "flat" } });
 }

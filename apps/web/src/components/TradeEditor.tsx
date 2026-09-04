@@ -20,6 +20,7 @@ import { annuityAmortisation, frequencyMonths, parseSchedulePaste, scheduleValue
 import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
 import { LS_KEYS, STATUS_LABELS, TRADE_STATUSES, readLocal, useStore, writeLocal } from "../state/store.js";
 import { DateInput } from "./DateInput.js";
+import { FieldLabelContext, useFieldLabel } from "./FieldLabel.js";
 import { NumInput, OptNumInput } from "./NumInput.js";
 
 export { NumInput, OptNumInput };
@@ -29,12 +30,17 @@ interface Props {
   onChange: (t: Trade) => void;
 }
 
-/** Form field with label; `issue` renders aria-invalid styling + message under the field. */
+/**
+ * Form field with label; `issue` renders aria-invalid styling + message under
+ * the field. The label is published via `FieldLabelContext`, so every
+ * `Select` / `NumInput` / `DateInput` inside gets it as accessible name unless
+ * it carries an explicit `ariaLabel` (R3-03).
+ */
 function Field({ label, children, span2, issue, hint }: { label: string; children: React.ReactNode; span2?: boolean; issue?: TradeIssue; hint?: string }) {
   return (
     <div className={`field ${span2 ? "span-2" : ""} ${issue ? (issue.level === "error" ? "invalid" : "warn") : ""}`}>
       <label>{label}</label>
-      {children}
+      <FieldLabelContext.Provider value={label}>{children}</FieldLabelContext.Provider>
       {issue && (
         <span className={`field-msg ${issue.level}`} role={issue.level === "error" ? "alert" : undefined}>
           {issue.msg}
@@ -58,8 +64,9 @@ function Select<T extends string>({
   invalid?: boolean;
   ariaLabel?: string;
 }) {
+  const label = useFieldLabel(ariaLabel);
   return (
-    <select value={value} onChange={(e) => onChange(e.target.value as T)} aria-invalid={invalid || undefined} aria-label={ariaLabel}>
+    <select value={value} onChange={(e) => onChange(e.target.value as T)} aria-invalid={invalid || undefined} aria-label={label}>
       {options.map((o) => {
         const v = typeof o === "string" ? o : o.v;
         const l = typeof o === "string" ? o : o.l;
@@ -181,13 +188,17 @@ function legPeriodStarts(leg: SwapLeg): number[] {
  */
 function CouponScheduleEditor({ leg, legIndex, onChange }: { leg: SwapLeg; legIndex: number; onChange: (patch: LegPatch) => void }) {
   const isFixed = leg.type === "Fixed";
-  const base = isFixed ? leg.rate : (leg.spread ?? 0);
-  const entries: { date: number; value: number }[] = isFixed
+  const all: { date: number; value: number }[] = isFixed
     ? (leg.rateSchedule ?? []).map((e) => ({ date: e.date, value: e.rate }))
     : (leg.spreadSchedule ?? []).map((e) => ({ date: e.date, value: e.spread }));
+  // A schedule entry on/before the start date is the base coupon itself (core builders write it that way) –
+  // it is shown as "Basis", not as "Stufe 1" (R3-10); it is kept on commit so the core semantics stay unchanged.
+  const baseEntries = all.filter((e) => e.date <= leg.effectiveDate);
+  const entries = all.filter((e) => e.date > leg.effectiveDate);
+  const base = baseEntries.length ? baseEntries[baseEntries.length - 1]!.value : isFixed ? leg.rate : (leg.spread ?? 0);
   const on = entries.length > 0;
   const commit = (list: { date: number; value: number }[]) => {
-    const sorted = [...list].sort((a, b) => a.date - b.date);
+    const sorted = [...(list.length ? baseEntries : []), ...list].sort((a, b) => a.date - b.date);
     if (isFixed) onChange({ rateSchedule: sorted.length ? sorted.map((e) => ({ date: e.date, rate: e.value })) : undefined });
     else onChange({ spreadSchedule: sorted.length ? sorted.map((e) => ({ date: e.date, spread: e.value })) : undefined });
   };
@@ -610,13 +621,15 @@ export function TradeEditor({ trade, onChange }: Props) {
       <div className="form-section" role="heading" aria-level={4}>
         Regulatorik (EMIR Refit)
       </div>
-      <Field label="UTI" span2 hint="Unique Transaction Identifier (ISO 23897) – Pflichtfeld im EMIR-Bewertungsexport">
+      <Field label="UTI" span2 issue={iss("uti")} hint="Unique Transaction Identifier (ISO 23897, 1–52 Zeichen A–Z/0–9) – Pflichtfeld im EMIR-Bewertungsexport">
         <input
           className="mono"
           value={trade.uti ?? ""}
           placeholder="z. B. 529900T8BM49AURSDO55…"
-          onChange={(e) => upd({ uti: e.target.value.trim() || undefined })}
+          onChange={(e) => upd({ uti: e.target.value.trim().toUpperCase() || undefined })}
           aria-label="UTI"
+          aria-invalid={iss("uti") ? true : undefined}
+          maxLength={60}
           spellCheck={false}
         />
       </Field>
@@ -686,7 +699,14 @@ export function TradeEditor({ trade, onChange }: Props) {
           }
         />
       </Field>
-      <Field label="Collateral (CSA)" hint="Diskontkurve nach Besicherung">
+      <Field
+        label="Collateral (CSA)"
+        hint={
+          trade.type === "CrossCurrencySwap" && !trade.collateralCurrency
+            ? "ohne CSA keine Xccy-Basis – jedes Leg wird auf seiner eigenen OIS-Kurve diskontiert"
+            : "Diskontkurve nach Besicherung"
+        }
+      >
         <Select
           value={(trade.collateralCurrency ?? "") as string}
           options={[{ v: "", l: "unbesichert" }, ...CCYS.map((c) => ({ v: c, l: `${c}-CSA` }))]}

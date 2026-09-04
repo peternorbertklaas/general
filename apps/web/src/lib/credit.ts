@@ -25,11 +25,38 @@ export function normaliseCdsQuotes(quotes: CdsQuote[]): CdsQuote[] {
     .map((x) => x.q);
 }
 
+export interface HazardCurveResult {
+  curve?: HazardCurve;
+  /** Core warnings (e.g. `HAZARD_FLOORED`) or the bootstrap error message, untranslated. */
+  warnings: string[];
+}
+
 /**
  * Hazard term structure of a counterparty from its CDS quotes (core
- * `bootstrapHazardCurve`), or undefined when no usable quote exists or the
- * bootstrap fails.
+ * `bootstrapHazardCurve` with `floorHazard`, so inverted quotes yield a floored
+ * pillar plus a `HAZARD_FLOORED` warning instead of no curve). `curve` is
+ * undefined when no usable quote exists or the bootstrap still fails; the
+ * failure reason is returned in `warnings`.
  */
+export function hazardCurveResult(
+  cdsCurves: Record<string, CdsQuote[]>,
+  counterparty: string | undefined,
+  recovery: number,
+  valuationDate: number,
+  discount?: Curve,
+): HazardCurveResult {
+  if (!counterparty) return { warnings: [] };
+  const quotes = normaliseCdsQuotes(cdsCurves[counterparty] ?? []);
+  if (quotes.length === 0) return { warnings: [] };
+  try {
+    const curve = bootstrapHazardCurve(quotes, recovery, valuationDate, discount, { floorHazard: true });
+    return { curve, warnings: curve.warnings ?? [] };
+  } catch (e) {
+    return { warnings: [e instanceof Error ? e.message : String(e)] };
+  }
+}
+
+/** Convenience: the curve only (report XVA). */
 export function hazardCurveFor(
   cdsCurves: Record<string, CdsQuote[]>,
   counterparty: string | undefined,
@@ -37,12 +64,5 @@ export function hazardCurveFor(
   valuationDate: number,
   discount?: Curve,
 ): HazardCurve | undefined {
-  if (!counterparty) return undefined;
-  const quotes = normaliseCdsQuotes(cdsCurves[counterparty] ?? []);
-  if (quotes.length === 0) return undefined;
-  try {
-    return bootstrapHazardCurve(quotes, recovery, valuationDate, discount);
-  } catch {
-    return undefined;
-  }
+  return hazardCurveResult(cdsCurves, counterparty, recovery, valuationDate, discount).curve;
 }

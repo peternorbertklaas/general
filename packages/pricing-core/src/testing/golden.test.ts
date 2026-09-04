@@ -1,11 +1,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { type CurveQuote, bootstrapCurve } from "../curves/bootstrap.js";
 import { flatCurve } from "../curves/curve.js";
 import { parseISO, toISO } from "../dates/date.js";
 import { makeFxForward } from "../instruments/builders.js";
 import { type CapFloor, type InterestRateSwap, type Swaption } from "../instruments/types.js";
 import { type MarketContext } from "../market/market-context.js";
+import { SAMPLE_CURVE_IDS, SAMPLE_QUOTES, buildSampleMarket } from "../market/sample-market.js";
 import { bachelierGreeks, black76 } from "../models/black.js";
 import { garmanKohlhagen } from "../models/garman-kohlhagen.js";
 import { priceTrade } from "../pricing/price.js";
@@ -372,5 +374,52 @@ describe("golden master – cap on the flat curve", () => {
       expectRel(cf.presentValue, e.presentValue, `caplet ${i} PV`);
     });
     expectRel(res.pv, g.expected.pv, "cap PV");
+  });
+});
+
+describe("golden master – sample-market €STR OIS bootstrap (calendar, payment lag, log-linear interpolation)", () => {
+  interface G {
+    inputs: { valuationDate: string; curveId: string; index: string; quotes: CurveQuote[] };
+    expected: {
+      spotDate: string;
+      spotDf: number;
+      pillars: { tenor: string; rate: number; accrualEnd: string; date: string; time: number; df: number; zero: number; method: "closed-form" | "bisection" }[];
+      closedFormPillars: string[];
+    };
+    quantlib?: { status?: string };
+  }
+  const g = golden<G>("sample-market-bootstrap");
+  const val = parseISO(g.inputs.valuationDate);
+
+  it("the JSON quotes are the sample-market quotes (no silent drift between reference and engine inputs)", () => {
+    expect(g.inputs.quotes).toEqual(SAMPLE_QUOTES.eurOis);
+    expect(g.expected.closedFormPillars).toEqual(["1W", "1M", "3M", "6M", "9M", "1Y"]);
+    // QuantLib block: pending until the script is run with the bindings (documented in tools/README.md)
+    expect(g.quantlib?.status ?? "pending").toMatch(/pending|done/);
+  });
+
+  it("standalone bootstrap reproduces the spot node and every pillar DF (closed form ≤ 1Y, bisection > 1Y) and reprices all quotes", () => {
+    const res = bootstrapCurve(val, { id: g.inputs.curveId, currency: "EUR", index: g.inputs.index, quotes: g.inputs.quotes });
+    const curve = res.curve;
+    const nodes = curve.nodes();
+    expect(toISO(nodes[0]!.date)).toBe(g.expected.spotDate);
+    expectRel(nodes[0]!.df, g.expected.spotDf, "spot DF", 1e-12);
+    expect(nodes).toHaveLength(g.expected.pillars.length + 1);
+    g.expected.pillars.forEach((p, i) => {
+      const n = nodes[i + 1]!;
+      expect(toISO(n.date)).toBe(p.date);
+      // ≤ 1Y pillars are exact closed forms – demand near machine precision; the bisection pillars 1e-9.
+      expectRel(n.df, p.df, `DF ${p.tenor}`, p.method === "closed-form" ? 1e-12 : 1e-9);
+      expectRel(curve.zeroRate(n.date), p.zero, `zero ${p.tenor}`, 1e-8);
+      expectRel(curve.time(n.date), p.time, `time ${p.tenor}`, 1e-12);
+    });
+    for (const r of res.residuals) expect(Math.abs(r.residual)).toBeLessThan(1e-9);
+    expect(res.residuals).toHaveLength(g.inputs.quotes.length);
+  });
+
+  it("the sample market's EUR-ESTR curve is that curve (same pillars, same DFs)", () => {
+    const ctx = buildSampleMarket(val);
+    const c = ctx.curves[SAMPLE_CURVE_IDS.eurOis]!;
+    for (const p of g.expected.pillars) expectRel(c.df(parseISO(p.date)), p.df, `sample DF ${p.tenor}`, 1e-9);
   });
 });

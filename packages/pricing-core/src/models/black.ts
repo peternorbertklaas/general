@@ -107,6 +107,62 @@ export function lognormalToNormalVol(forward: number, strike: number, timeToExpi
   return impliedNormalVol("Call", forward, strike, timeToExpiry, p, blackVol * Math.max(Math.abs(f), 1e-4));
 }
 
+/**
+ * Convert a normal (Bachelier) vol to the equivalent (shifted) lognormal Black
+ * vol at the given forward/strike/expiry by matching the undiscounted call
+ * price (exact via root search). Requires `forward + shift > 0` and
+ * `strike + shift > 0`; the caller decides how to treat the incompatible case.
+ */
+export function normalToLognormalVol(forward: number, strike: number, timeToExpiry: number, normalVol: number, shift = 0): number {
+  const f = forward + shift;
+  const k = strike + shift;
+  if (!(f > 0) || !(k > 0)) throw new Error(`normalToLognormalVol: shifted forward/strike must be positive (F ${f}, K ${k})`);
+  const p = bachelier("Call", forward, strike, normalVol, timeToExpiry);
+  const guess = normalVol / f;
+  return impliedBlackVol("Call", f, k, timeToExpiry, p, Math.min(Math.max(guess, 1e-4), 5));
+}
+
+/** Vol quotation of a surface / model: normal (absolute) or (shifted) lognormal. */
+export type IrVolQuotation = { kind: "normal" } | { kind: "lognormal"; shift: number };
+
+/**
+ * Convert an interest-rate vol between quotations (normal ↔ lognormal with any
+ * shift) by price equivalence at (forward, strike, expiry): the undiscounted
+ * call value under `from` is re-implied under `to`. Identity when both
+ * quotations agree. When the exact root search fails (premium numerically at
+ * intrinsic for deep out-of-the-money strikes) the first-order approximation
+ * σ_LN ≈ σ_N / (F + shift) (and its inverse) is used. Throws when a lognormal
+ * quotation is requested for a non-positive shifted forward or strike.
+ */
+export function convertIrVol(vol: number, from: IrVolQuotation, to: IrVolQuotation, forward: number, strike: number, timeToExpiry: number): number {
+  if (from.kind === to.kind && (from.kind === "normal" || (to.kind === "lognormal" && from.shift === to.shift))) return vol;
+  if (to.kind === "lognormal" && (!(forward + to.shift > 0) || !(strike + to.shift > 0))) {
+    throw new Error(`convertIrVol: lognormal quotation needs positive shifted forward/strike (F ${forward + to.shift}, K ${strike + to.shift})`);
+  }
+  if (!(timeToExpiry > 0) || !(vol > 0)) {
+    // No time value → any vol reproduces the intrinsic value; return the first-order equivalent.
+    return approxConvert(vol, from, to, forward);
+  }
+  try {
+    const price =
+      from.kind === "normal"
+        ? bachelier("Call", forward, strike, vol, timeToExpiry)
+        : black76("Call", forward + from.shift, strike + from.shift, vol, timeToExpiry);
+    if (to.kind === "normal") return impliedNormalVol("Call", forward, strike, timeToExpiry, price, Math.max(approxConvert(vol, from, to, forward), 1e-6));
+    const f = forward + to.shift;
+    const k = strike + to.shift;
+    return impliedBlackVol("Call", f, k, timeToExpiry, price, Math.min(Math.max(approxConvert(vol, from, to, forward), 1e-4), 5));
+  } catch {
+    return approxConvert(vol, from, to, forward);
+  }
+}
+
+/** First-order vol conversion σ_N ≈ σ_LN · (F + shift). */
+function approxConvert(vol: number, from: IrVolQuotation, to: IrVolQuotation, forward: number): number {
+  const normal = from.kind === "normal" ? vol : vol * Math.max(Math.abs(forward + from.shift), 1e-4);
+  return to.kind === "normal" ? normal : normal / Math.max(Math.abs(forward + to.shift), 1e-4);
+}
+
 /** Shifted-lognormal Black (displaced diffusion), common for EUR caps/swaptions with e.g. 3% shift. */
 export function shiftedBlack76(type: OptionType, forward: number, strike: number, vol: number, timeToExpiry: number, shift: number): number {
   return black76(type, forward + shift, strike + shift, vol, timeToExpiry);

@@ -2,7 +2,7 @@ import { toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
 import { type Cashflow, type FxForward, type FxOption, type FxSwap, type LegResult, type PricingResult } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve, getFxSpot } from "../market/market-context.js";
-import { fxRateAtValuationDate, fxSpotDate, pipFactor } from "../market/fx-spot.js";
+import { fxRateAtValuationDate, fxSpotDate, fxSpotDateFrom, pipFactor } from "../market/fx-spot.js";
 import { type FxOptionInputs, fxBarrier, fxDigital, fxExoticGreeks, garmanKohlhagen } from "../models/garman-kohlhagen.js";
 import { fxVolAtStrike } from "../models/fx-vol-surface.js";
 
@@ -186,6 +186,12 @@ export function priceFxSwap(ctx: MarketContext, trade: FxSwap, reportingCurrency
  * PVs in quote currency and converted to the reporting currency at the
  * today rate. Greeks of barriers and digitals are finite differences of the
  * closed forms (`analytics.greeksMethod`), vanilla Greeks are analytic.
+ *
+ * Non-standard delivery (R3-9): when `deliveryDate` is not the spot date of
+ * the expiry, the barrier drift and the discounting of a rebate paid at the
+ * hit are taken from the curves on the expiry horizon (`rdExpiry`/`rfExpiry`
+ * = rates to the standard delivery of the expiry), so the extra carry of the
+ * longer lag only enters the payoff discount and the delivery forward.
  */
 export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurrency?: string): PricingResult {
   const { base, quote } = splitPair(trade.pair);
@@ -216,6 +222,16 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
     }
   }
   const inputs: FxOptionInputs = { type: trade.optionType, spot, strike: trade.strike, vol, timeToExpiry: tExp, timeToDelivery: tDel, rd, rf };
+  // Expiry-horizon rates for barriers with a non-standard delivery lag (see doc comment).
+  const standardDelivery = fxSpotDateFrom(trade.expiryDate, base, quote);
+  let deliveryConvention = "standard";
+  if (trade.barrier && tExp > 0 && trade.deliveryDate !== standardDelivery && standardDelivery > val) {
+    const dfQStd = getDiscountCurve(ctx, quote, trade.collateralCurrency).df(standardDelivery);
+    const fwdStd = fxForwardRate(ctx, base, quote, standardDelivery, trade.collateralCurrency);
+    inputs.rdExpiry = -Math.log(dfQStd) / tExp;
+    inputs.rfExpiry = inputs.rdExpiry - Math.log(fwdStd / spot) / tExp;
+    deliveryConvention = "non-standard";
+  }
   const gk = garmanKohlhagen(inputs);
   let premiumPerUnit = gk.premiumDomestic;
   let kind = "Vanilla";
@@ -321,9 +337,11 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
       greeksMethod,
       d1: gk.d1,
       d2: gk.d2,
+      /** "standard" when delivery = spot date of the expiry; barriers with a "non-standard" lag use expiry-horizon drift/rebate rates (R3-9). */
+      deliveryConvention,
     },
-    /** Spot settlement date (T+2 / T+1 on the pair calendar), ISO. */
-    details: { spotDate: toISO(spotDate) },
+    /** Spot settlement date (T+2 / T+1 on the pair calendar), ISO; `standardDelivery` = spot date of the expiry. */
+    details: { spotDate: toISO(spotDate), standardDelivery: toISO(standardDelivery) },
     warnings,
   };
 }

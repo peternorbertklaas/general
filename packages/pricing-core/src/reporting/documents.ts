@@ -1,5 +1,6 @@
 import { yearFraction } from "../dates/daycount.js";
 import { formatDateDe, formatDateTimeDe, formatDe, formatPctDe } from "../format.js";
+import { bdcLabelDe, stubLabelDe } from "../instruments/labels.js";
 import { tradeMaturityDate } from "../instruments/trade-dates.js";
 import { type FixedLeg, type FloatLeg, type PricingResult, type SwapLeg, type Trade } from "../instruments/types.js";
 import { type MarketContext } from "../market/market-context.js";
@@ -604,13 +605,13 @@ export function generateConfirmation(
 function conventionSummary(t: Trade): string {
   const legs: SwapLeg[] = t.type === "InterestRateSwap" || t.type === "CrossCurrencySwap" ? t.legs : t.type === "Swaption" ? t.underlying.legs : [];
   if (legs.length === 0) {
-    if (t.type === "CapFloor") return `${t.businessDayConvention ?? "ModifiedFollowing"}, Kalender ${t.calendar}, ${t.dayCount}`;
+    if (t.type === "CapFloor") return `${bdcLabelDe(t.businessDayConvention)}, Kalender ${t.calendar}, ${t.dayCount}`;
     return "Geschäftstage gemäß Rahmenvertrag / Marktusance des Währungspaars";
   }
   return legs
     .map(
       (l, i) =>
-        `Leg ${i + 1}: ${l.businessDayConvention ?? "ModifiedFollowing"}, ${l.calendar}, Stub ${l.stub ?? "ShortFront"}${l.paymentLag ? `, Zahlungsverzug ${l.paymentLag} GT` : ""}`,
+        `Leg ${i + 1}: ${bdcLabelDe(l.businessDayConvention)}, ${l.calendar}, ${stubLabelDe(l.stub)}${l.paymentLag ? `, Zahlungsverzug ${l.paymentLag} GT` : ""}`,
     )
     .join("; ");
 }

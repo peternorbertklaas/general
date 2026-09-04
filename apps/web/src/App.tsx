@@ -80,6 +80,8 @@ export function App() {
       whatIf: st.whatIf,
       quotes: st.quotes,
       interpolation: st.interpolation,
+      turnOfYear: st.turnOfYear,
+      volSurfaces: st.volSurfaces,
       valuationDate: st.valuationDate,
       reportingCurrency: st.reportingCurrency,
       tradesCount: st.trades.length,
@@ -356,7 +358,8 @@ export function App() {
   const dialogOpen = s.paletteOpen || s.helpOpen || s.modalDepth > 0;
   const hotkeyFilter = useCallback((def: HotkeyDef) => {
     const st = useStore.getState();
-    const anyDialog = st.paletteOpen || st.helpOpen || st.modalDepth > 0 || st.valDateOpen;
+    // Popovers (Export ▾, Spalten, Datums-Vorlagen) suspend background hotkeys like dialogs (R3-02).
+    const anyDialog = st.paletteOpen || st.helpOpen || st.modalDepth > 0 || st.popoverDepth > 0 || st.valDateOpen;
     if (!anyDialog) return true;
     if (def.id === "escape") return true;
     if (st.helpOpen && def.id === "help") return true;
@@ -536,43 +539,42 @@ export function App() {
 
       {s.paletteOpen && <CommandPalette onHotkey={onHotkey} />}
       {s.helpOpen && <HotkeyOverlay />}
-      {s.toasts.length > 0 && (
-        <div
-          className="toast-stack"
-          role="status"
-          aria-live="polite"
-          onMouseEnter={() => setToastHover(true)}
-          onMouseLeave={() => setToastHover(false)}
-          data-testid="toast-stack"
-        >
-          {s.toasts.map((t) => (
-            <div key={t.id} className={`toast ${t.action ? "with-action" : ""}`}>
-              <span className="msg" onClick={() => act().dismissToast(t.id)}>
-                {t.msg}
-                {t.count > 1 && (
-                  <span className="badge count" aria-label={`${t.count}-mal`}>
-                    ×{t.count}
-                  </span>
-                )}
-              </span>
-              {t.action && (
-                <button
-                  className="btn xs"
-                  onClick={() => {
-                    t.action!.run();
-                    act().dismissToast(t.id);
-                  }}
-                >
-                  {t.action.label}
-                </button>
+      {/* The live region is mounted from the start so screen readers announce the very first toast (R3-08). */}
+      <div
+        className="toast-stack"
+        role="status"
+        aria-live="polite"
+        onMouseEnter={() => setToastHover(true)}
+        onMouseLeave={() => setToastHover(false)}
+        data-testid="toast-stack"
+      >
+        {s.toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.action ? "with-action" : ""}`}>
+            <span className="msg" onClick={() => act().dismissToast(t.id)}>
+              {t.msg}
+              {t.count > 1 && (
+                <span className="badge count" aria-label={`${t.count}-mal`}>
+                  ×{t.count}
+                </span>
               )}
-              <button className="close" onClick={() => act().dismissToast(t.id)} aria-label="Meldung schließen">
-                ✕
+            </span>
+            {t.action && (
+              <button
+                className="btn xs"
+                onClick={() => {
+                  t.action!.run();
+                  act().dismissToast(t.id);
+                }}
+              >
+                {t.action.label}
               </button>
-            </div>
-          ))}
-        </div>
-      )}
+            )}
+            <button className="close" onClick={() => act().dismissToast(t.id)} aria-label="Meldung schließen">
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
     </>
   );
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseISO } from "@deriva/pricing-core";
-import { extractCounterparty, isGrammarToken, parseQuickEntry } from "./quick-parser.js";
+import { QUICK_ENTRY_EXAMPLES, extractCounterparty, isGrammarToken, parseQuickEntry, parseValuationDateCommand } from "./quick-parser.js";
 
 const VAL = parseISO("2026-09-03");
 
@@ -143,10 +143,56 @@ describe("quick entry parser", () => {
     expect(r.description).toMatch(/Staffel/);
     expect(parseQuickEntry("irs 5y pay 10m step 2,0/2,5", VAL).trade?.type === "InterestRateSwap").toBe(true);
   });
+  it("names FX trades with German dates, honours `fixed` for CCS and accepts JPY strikes without decimals (R3-11, Markt R3-5)", () => {
+    const SPOTS = { fxSpots: { EURUSD: 1.17, EURJPY: 171.4 } };
+    expect(parseQuickEntry("fxf eurusd -2m 1.1725 2027-03-15", VAL).trade?.name).toBe("Verkauf EUR/USD 15.03.2027");
+    expect(parseQuickEntry("fxo eurusd put 1.15 3m 2027-06-15", VAL).trade?.name).toBe("EUR-Put/USD-Call 15.06.2027");
+    expect(parseQuickEntry("fxo eurusd put 1.15 3m 9m", VAL).trade?.name).toBe("EUR-Put/USD-Call 9M");
+    expect(parseQuickEntry("fxs eurusd 1m 1.1625 1.18 2027-09-06", VAL).trade?.name).toBe("FX-Swap EUR/USD 06.09.2027");
+    for (const ex of QUICK_ENTRY_EXAMPLES) expect(parseQuickEntry(ex, VAL, SPOTS).trade?.name ?? "").not.toMatch(/\d{4}-\d{2}-\d{2}/);
+    // fixed-vs-float CCS
+    const fixed = parseQuickEntry("ccs eurusd 5y fixed 3% 10m", VAL, SPOTS);
+    expect(fixed.ok).toBe(true);
+    if (fixed.trade?.type === "CrossCurrencySwap") {
+      const fixedLeg = fixed.trade.legs.find((l) => l.type === "Fixed");
+      expect(fixedLeg && (fixedLeg as { rate: number }).rate).toBeCloseTo(0.03, 10);
+      expect(fixedLeg?.currency).toBe("EUR");
+      expect(fixed.trade.collateralCurrency).toBe("USD");
+    }
+    expect(fixed.description).toMatch(/Fest 3,00 %/);
+    const basis = parseQuickEntry("ccs eurusd 5y -20bp 10m", VAL, SPOTS);
+    expect(basis.trade?.type === "CrossCurrencySwap" && basis.trade.legs.every((l) => l.type === "Float")).toBe(true);
+    expect(basis.trade?.collateralCurrency).toBe("USD");
+    // JPY strike without decimals, plausibility against the spot
+    const jpy = parseQuickEntry("fxo eurjpy call 175 1m 6m", VAL, SPOTS);
+    expect(jpy.ok).toBe(true);
+    expect(jpy.trade?.type === "FxOption" && jpy.trade.strike).toBe(175);
+    expect(jpy.trade?.type === "FxOption" && jpy.trade.notional).toBe(1_000_000);
+    expect(parseQuickEntry("fxo eurusd call 175 1m 6m", VAL, SPOTS).error).toMatch(/Strike 175,00 passt nicht zum Spot EUR\/USD 1,1700/);
+    expect(parseQuickEntry("fxf eurusd 2m 117 6m", VAL, SPOTS).error).toMatch(/passt nicht zum Spot/);
+    expect(parseQuickEntry("fxo eurusd call 175 1m 6m", VAL).ok).toBe(true); // no spot known → accepted
+  });
+  it("FRA index follows the period length via the core builder (Markt R3-2)", () => {
+    const indexOf = (input: string) => {
+      const t = parseQuickEntry(input, VAL).trade;
+      return t?.type === "FRA" ? t.index : undefined;
+    };
+    expect(indexOf("fra 3x6 pay 2.2% 10m")).toBe("EURIBOR-3M");
+    expect(indexOf("fra 6x12 rec 2.5 5m")).toBe("EURIBOR-6M");
+    expect(parseQuickEntry("fra 3x6 pay 2.2% 10m", VAL).description).toMatch(/EURIBOR-3M/);
+  });
   it("reports errors for incomplete input", () => {
     expect(parseQuickEntry("irs pay 3%", VAL).ok).toBe(false);
     expect(parseQuickEntry("cap 5y", VAL).ok).toBe(false);
     expect(parseQuickEntry("hello world", VAL).ok).toBe(false);
+    // "step" without a list is an error, not a silent plain swap (R3-10)
+    expect(parseQuickEntry("irs 5y pay 2.5% 10m step", VAL).error).toMatch(/step ohne Stufen/);
+    expect(parseQuickEntry("irs 5y pay 2.5% 10m step 2.5/3.0", VAL).ok).toBe(true);
+    // impossible calendar dates are not offered as a valuation-date command (R3-13)
+    expect(parseValuationDateCommand("stichtag 31.12.2026")).toBe("2026-12-31");
+    expect(parseValuationDateCommand("stichtag 2026-12-31")).toBe("2026-12-31");
+    expect(parseValuationDateCommand("stichtag 31.02.2026")).toBeUndefined();
+    expect(parseValuationDateCommand("stichtag 2026-02-30")).toBeUndefined();
   });
   it("@Kontrahent takes the rest of the phrase until the next grammar token (N-15)", () => {
     expect(parseQuickEntry("collar 7y 3,5/1,5 6m @Kunde GmbH", VAL).trade?.counterparty).toBe("Kunde GmbH");

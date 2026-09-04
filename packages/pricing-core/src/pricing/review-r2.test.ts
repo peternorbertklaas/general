@@ -194,7 +194,7 @@ describe("R2-6 – methodology text is generated from the valuation switches", (
     expect(m.some((l) => l.startsWith("Fixings") && l.includes("Policy „curve“") && l.includes("kein fehlendes Fixing"))).toBe(true);
     expect(m.some((l) => l.includes("30E/360") && l.includes("TARGET"))).toBe(true);
     expect(m.some((l) => l.startsWith("IFRS-13-Einstufung"))).toBe(true);
-    expect(m.some((l) => l.startsWith("Bewertungsrahmen: IFRS 13 / IDW RS HFA 35"))).toBe(true);
+    expect(m.some((l) => l.startsWith("Bewertungsrahmen: IFRS 13 / IDW RS HFA 47") && l.includes("HFA 35 (Hedge-Accounting-Modul)"))).toBe(true);
     // policy "throw" and a seasoned swap with missing fixings are reflected
     const seasoned = makeVanillaSwap({
       currency: "EUR",
@@ -241,18 +241,19 @@ describe("R2-6 – methodology text is generated from the valuation switches", (
       settlement: "Cash",
     });
     const ms = methodologyFor(sw, ctx, priceTrade(ctx, sw, "EUR"));
-    expect(ms.some((l) => l.includes("Modell Bachelier") && l.includes("SABR") && l.includes("CollateralisedCashPrice") && l.includes("verwendete Vol"))).toBe(
-      true,
-    );
+    expect(
+      ms.some((l) => l.includes("Modell Bachelier") && l.includes("SABR") && l.includes("Collateralised Cash Price") && l.includes("verwendete Vol")),
+    ).toBe(true);
     const cap = makeCapFloor({ currency: "EUR", notional: 1e7, capFloor: "Cap", strike: 0.03, effectiveDate: spot, maturity: "5Y" });
     expect(
       methodologyFor({ ...cap, model: "Black", volOverride: 0.3 }, ctx, priceTrade(ctx, { ...cap, model: "Black", volOverride: 0.3 }, "EUR")).some(
-        (l) => l.includes("Modell Black") && l.includes("Override-Vol"),
+        (l) => l.includes("Modell Black") && l.includes("Volatilitätsvorgabe"),
       ),
     ).toBe(true);
     const vanilla = makeFxOption({ pair: "EURUSD", optionType: "Call", notional: 1e6, strike: 1.18, expiryDate: parseISO("2027-09-03") });
     const mv = methodologyFor(vanilla, ctx, priceTrade(ctx, vanilla, "USD"));
-    expect(mv.some((l) => l.includes("T+2") && l.includes("Delta-Konvention Forward") && l.includes("Greeks analytisch"))).toBe(true);
+    // sample surfaces are quoted in spot delta (R3-8)
+    expect(mv.some((l) => l.includes("T+2") && l.includes("Delta-Konvention Spot") && l.includes("Greeks analytisch"))).toBe(true);
     const barrier = { ...vanilla, barrier: { type: "UpOut" as const, level: 1.25 } };
     const mb = methodologyFor(barrier, ctx, priceTrade(ctx, barrier, "USD"));
     expect(mb.some((l) => l.includes("Reiner-Rubinstein") && l.includes("finiten Differenzen") && l.includes("Lieferdatum"))).toBe(true);

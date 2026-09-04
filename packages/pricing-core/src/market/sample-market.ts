@@ -265,6 +265,124 @@ export const SAMPLE_EUR_CAPLET_VOLS: CapletVolSurface = {
   ],
 };
 
+/**
+ * USD SOFR swaption cube (normal vols, indicative). Keyed `USD` in
+ * `MarketContext.swaptionVols` – the swaption pricer, CVA and vega buckets look
+ * surfaces up by the fixed leg's currency.
+ */
+export const SAMPLE_USD_SWAPTION_VOLS: SwaptionVolSurface = {
+  id: "USD-SWAPTION-NORMAL",
+  currency: "USD",
+  volType: "Normal",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  tenors: [1, 2, 3, 5, 7, 10, 15, 20, 30],
+  // USD normal vols run 10–20 bp above EUR (higher rate level); short expiry × short tenor highest.
+  atm: [
+    [0.0092, 0.0095, 0.0096, 0.0095, 0.0093, 0.009, 0.0086, 0.0083, 0.0078],
+    [0.0094, 0.0097, 0.0098, 0.0096, 0.0094, 0.0091, 0.0086, 0.0083, 0.0078],
+    [0.0096, 0.0098, 0.0099, 0.0097, 0.0095, 0.0092, 0.0087, 0.0083, 0.0078],
+    [0.0098, 0.0099, 0.0099, 0.0097, 0.0095, 0.0092, 0.0087, 0.0083, 0.0077],
+    [0.0098, 0.0098, 0.0098, 0.0096, 0.0094, 0.0091, 0.0086, 0.0082, 0.0076],
+    [0.0097, 0.0097, 0.0096, 0.0094, 0.0092, 0.0089, 0.0084, 0.008, 0.0075],
+    [0.0093, 0.0093, 0.0092, 0.009, 0.0088, 0.0085, 0.008, 0.0077, 0.0072],
+    [0.0089, 0.0089, 0.0088, 0.0086, 0.0084, 0.0081, 0.0077, 0.0074, 0.0069],
+    [0.0084, 0.0084, 0.0083, 0.0081, 0.0079, 0.0077, 0.0073, 0.007, 0.0066],
+    [0.0077, 0.0077, 0.0076, 0.0074, 0.0072, 0.007, 0.0067, 0.0064, 0.0061],
+    [0.0071, 0.0071, 0.007, 0.0068, 0.0066, 0.0064, 0.0062, 0.006, 0.0057],
+  ],
+  sabr: {
+    "1x5": { beta: 0.5, rho: -0.15, nu: 0.3, shift: 0.03 },
+    "5x5": { beta: 0.5, rho: -0.2, nu: 0.27, shift: 0.03 },
+    "10x10": { beta: 0.5, rho: -0.25, nu: 0.22, shift: 0.03 },
+  },
+};
+
+/** GBP SONIA swaption cube (normal vols, indicative), keyed `GBP`. */
+export const SAMPLE_GBP_SWAPTION_VOLS: SwaptionVolSurface = {
+  id: "GBP-SWAPTION-NORMAL",
+  currency: "GBP",
+  volType: "Normal",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  tenors: [1, 2, 3, 5, 7, 10, 15, 20, 30],
+  atm: [
+    [0.0088, 0.009, 0.0091, 0.009, 0.0088, 0.0085, 0.0081, 0.0078, 0.0073],
+    [0.009, 0.0092, 0.0093, 0.0091, 0.0089, 0.0086, 0.0081, 0.0078, 0.0073],
+    [0.0092, 0.0093, 0.0094, 0.0092, 0.009, 0.0087, 0.0082, 0.0078, 0.0073],
+    [0.0093, 0.0094, 0.0094, 0.0092, 0.009, 0.0087, 0.0082, 0.0078, 0.0072],
+    [0.0093, 0.0093, 0.0093, 0.0091, 0.0089, 0.0086, 0.0081, 0.0077, 0.0071],
+    [0.0092, 0.0092, 0.0091, 0.0089, 0.0087, 0.0084, 0.0079, 0.0075, 0.007],
+    [0.0088, 0.0088, 0.0087, 0.0085, 0.0083, 0.008, 0.0075, 0.0072, 0.0067],
+    [0.0084, 0.0084, 0.0083, 0.0081, 0.0079, 0.0076, 0.0072, 0.0069, 0.0064],
+    [0.0079, 0.0079, 0.0078, 0.0076, 0.0074, 0.0072, 0.0068, 0.0065, 0.0061],
+    [0.0072, 0.0072, 0.0071, 0.0069, 0.0067, 0.0065, 0.0062, 0.0059, 0.0056],
+    [0.0066, 0.0066, 0.0065, 0.0063, 0.0061, 0.0059, 0.0057, 0.0055, 0.0052],
+  ],
+  sabr: {
+    "1x5": { beta: 0.5, rho: -0.15, nu: 0.3, shift: 0.03 },
+    "5x5": { beta: 0.5, rho: -0.2, nu: 0.27, shift: 0.03 },
+    "10x10": { beta: 0.5, rho: -0.25, nu: 0.22, shift: 0.03 },
+  },
+};
+
+/**
+ * USD SOFR caplet surface (normal vols on the 3M compounded SOFR forward,
+ * indicative). Keyed `USD-SOFR` (`${currency}-${index}`) – the cap/floor and
+ * leg pricers look up `${ccy}-${index}` first and fall back to `${ccy}`.
+ */
+export const SAMPLE_USD_CAPLET_VOLS: CapletVolSurface = {
+  id: "USD-SOFR-CAPLET-NORMAL",
+  currency: "USD",
+  index: "SOFR",
+  volType: "Normal",
+  expiries: [0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  strikes: [0.01, 0.02, 0.03, 0.035, 0.04, 0.05, 0.06, 0.07],
+  vols: [
+    [0.0078, 0.0075, 0.0072, 0.0072, 0.0073, 0.0077, 0.0082, 0.0088],
+    [0.0084, 0.0081, 0.0078, 0.0078, 0.0079, 0.0082, 0.0087, 0.0093],
+    [0.009, 0.0087, 0.0084, 0.0084, 0.0085, 0.0088, 0.0092, 0.0097],
+    [0.0092, 0.0089, 0.0086, 0.0086, 0.0087, 0.0089, 0.0093, 0.0098],
+    [0.009, 0.0087, 0.0084, 0.0084, 0.0085, 0.0087, 0.009, 0.0094],
+    [0.0086, 0.0083, 0.008, 0.008, 0.0081, 0.0083, 0.0086, 0.009],
+    [0.008, 0.0077, 0.0074, 0.0074, 0.0075, 0.0077, 0.008, 0.0083],
+    [0.0072, 0.0069, 0.0066, 0.0066, 0.0067, 0.0069, 0.0072, 0.0075],
+    [0.0066, 0.0063, 0.006, 0.006, 0.0061, 0.0063, 0.0066, 0.0069],
+  ],
+};
+
+/** GBP SONIA caplet surface (normal vols, indicative), keyed `GBP-SONIA`. */
+export const SAMPLE_GBP_CAPLET_VOLS: CapletVolSurface = {
+  id: "GBP-SONIA-CAPLET-NORMAL",
+  currency: "GBP",
+  index: "SONIA",
+  volType: "Normal",
+  expiries: [0.5, 1, 2, 3, 5, 7, 10, 15, 20],
+  strikes: [0.01, 0.02, 0.03, 0.035, 0.04, 0.05, 0.06, 0.07],
+  vols: [
+    [0.0074, 0.0071, 0.0068, 0.0068, 0.0069, 0.0073, 0.0078, 0.0084],
+    [0.008, 0.0077, 0.0074, 0.0074, 0.0075, 0.0078, 0.0083, 0.0089],
+    [0.0086, 0.0083, 0.008, 0.008, 0.0081, 0.0084, 0.0088, 0.0093],
+    [0.0088, 0.0085, 0.0082, 0.0082, 0.0083, 0.0085, 0.0089, 0.0094],
+    [0.0086, 0.0083, 0.008, 0.008, 0.0081, 0.0083, 0.0086, 0.009],
+    [0.0082, 0.0079, 0.0076, 0.0076, 0.0077, 0.0079, 0.0082, 0.0086],
+    [0.0076, 0.0073, 0.007, 0.007, 0.0071, 0.0073, 0.0076, 0.0079],
+    [0.0068, 0.0065, 0.0062, 0.0062, 0.0063, 0.0065, 0.0068, 0.0071],
+    [0.0062, 0.0059, 0.0056, 0.0056, 0.0057, 0.0059, 0.0062, 0.0065],
+  ],
+};
+
+/**
+ * Sample FX surfaces (R3-8): every surface declares its ATM and delta
+ * convention explicitly. Market convention (Reiswich–Wystup 2010, Clark 2011,
+ * Bloomberg OVML) is a spot delta for expiries ≤ 1Y and a forward delta
+ * beyond, ATM delta-neutral straddle; the surface type carries one delta
+ * convention per surface, so the sample surfaces are quoted in spot delta
+ * throughout (the 2Y–5Y rows are therefore an approximation of the forward-
+ * delta market quotes – indicative data). The interbank convention for EUR
+ * crosses (EURGBP, EURCHF, EURJPY) and USDJPY is a *premium-adjusted* spot
+ * delta (premium in the base currency); the sample surfaces keep the
+ * unadjusted spot delta for simplicity – switch `deltaConvention` to
+ * "PremiumAdjustedSpot" when loading real quotes.
+ */
 export const SAMPLE_EURUSD_VOLS: FxVolSurface = {
   id: "EURUSD-VOL",
   pair: "EURUSD",
@@ -274,6 +392,9 @@ export const SAMPLE_EURUSD_VOLS: FxVolSurface = {
   bf25: [0.0015, 0.0017, 0.002, 0.0022, 0.0025, 0.0027, 0.003, 0.003],
   rr10: [0.0035, 0.0045, 0.0055, 0.0065, 0.0075, 0.008, 0.0085, 0.0085],
   bf10: [0.005, 0.0055, 0.0065, 0.0072, 0.008, 0.0085, 0.009, 0.009],
+  // EURUSD: unadjusted spot delta ≤ 1Y (premium in USD), delta-neutral ATM.
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
 };
 
 export const SAMPLE_EURGBP_VOLS: FxVolSurface = {
@@ -283,6 +404,9 @@ export const SAMPLE_EURGBP_VOLS: FxVolSurface = {
   atm: [0.055, 0.057, 0.059, 0.061, 0.063, 0.066],
   rr25: [0.001, 0.0015, 0.002, 0.0025, 0.003, 0.003],
   bf25: [0.0012, 0.0015, 0.0018, 0.002, 0.0022, 0.0025],
+  // Spot delta (interbank: premium-adjusted spot – see the note above).
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
 };
 
 export const SAMPLE_EURCHF_VOLS: FxVolSurface = {
@@ -292,6 +416,44 @@ export const SAMPLE_EURCHF_VOLS: FxVolSurface = {
   atm: [0.05, 0.052, 0.054, 0.056, 0.058, 0.061],
   rr25: [-0.004, -0.0045, -0.005, -0.0055, -0.006, -0.006],
   bf25: [0.0015, 0.0018, 0.002, 0.0022, 0.0025, 0.0027],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
+};
+
+/** GBPUSD (cable): unadjusted spot delta ≤ 1Y, premium in USD; positive RR (GBP calls bid). */
+export const SAMPLE_GBPUSD_VOLS: FxVolSurface = {
+  id: "GBPUSD-VOL",
+  pair: "GBPUSD",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 5],
+  atm: [0.078, 0.079, 0.08, 0.081, 0.083, 0.086],
+  rr25: [-0.004, -0.0045, -0.005, -0.0055, -0.006, -0.006],
+  bf25: [0.0018, 0.002, 0.0022, 0.0025, 0.0028, 0.003],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
+};
+
+/** USDJPY: JPY calls bid (negative RR), pronounced smile; spot delta (interbank: premium-adjusted). */
+export const SAMPLE_USDJPY_VOLS: FxVolSurface = {
+  id: "USDJPY-VOL",
+  pair: "USDJPY",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 5],
+  atm: [0.095, 0.097, 0.099, 0.101, 0.103, 0.105],
+  rr25: [-0.012, -0.013, -0.014, -0.015, -0.015, -0.015],
+  bf25: [0.0025, 0.0028, 0.003, 0.0033, 0.0035, 0.0035],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
+};
+
+/** EURJPY: negative RR (JPY calls bid), spot delta (interbank: premium-adjusted). */
+export const SAMPLE_EURJPY_VOLS: FxVolSurface = {
+  id: "EURJPY-VOL",
+  pair: "EURJPY",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 5],
+  atm: [0.088, 0.09, 0.092, 0.094, 0.096, 0.099],
+  rr25: [-0.009, -0.01, -0.011, -0.012, -0.012, -0.012],
+  bf25: [0.0022, 0.0025, 0.0027, 0.003, 0.0032, 0.0032],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
 };
 
 /**
@@ -345,9 +507,18 @@ export function buildSampleMarket(valuationDate: SerialDate = parseISO("2026-09-
     ...(hasXccy ? { collateralDiscountCurveId: { "EUR|USD": SAMPLE_CURVE_IDS.eurUsdXccy } } : {}),
     fxSpots: { ...quotes.fxSpots },
     fixings: [],
-    swaptionVols: { EUR: SAMPLE_EUR_SWAPTION_VOLS },
-    capletVols: { "EUR-EURIBOR-6M": SAMPLE_EUR_CAPLET_VOLS },
-    fxVols: { EURUSD: SAMPLE_EURUSD_VOLS, EURGBP: SAMPLE_EURGBP_VOLS, EURCHF: SAMPLE_EURCHF_VOLS },
+    // Surfaces keyed the way the pricers look them up: swaption cubes by currency, caplet
+    // surfaces by `${ccy}-${index}` (fallback `${ccy}`), FX surfaces by pair (either quotation).
+    swaptionVols: { EUR: SAMPLE_EUR_SWAPTION_VOLS, USD: SAMPLE_USD_SWAPTION_VOLS, GBP: SAMPLE_GBP_SWAPTION_VOLS },
+    capletVols: { "EUR-EURIBOR-6M": SAMPLE_EUR_CAPLET_VOLS, "USD-SOFR": SAMPLE_USD_CAPLET_VOLS, "GBP-SONIA": SAMPLE_GBP_CAPLET_VOLS },
+    fxVols: {
+      EURUSD: SAMPLE_EURUSD_VOLS,
+      EURGBP: SAMPLE_EURGBP_VOLS,
+      EURCHF: SAMPLE_EURCHF_VOLS,
+      GBPUSD: SAMPLE_GBPUSD_VOLS,
+      USDJPY: SAMPLE_USDJPY_VOLS,
+      EURJPY: SAMPLE_EURJPY_VOLS,
+    },
     credit: {
       "CPTY-A": { hazardRate: 0.01, recovery: 0.4 },
       "CPTY-B": { hazardRate: 0.025, recovery: 0.4 },

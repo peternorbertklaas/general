@@ -1,13 +1,288 @@
 import { useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { type Fixing, type MarketSnapshotJson, deserializeMarket, serializeMarket, survivalProbability, toISO, validateMarket } from "@deriva/pricing-core";
+import {
+  type CapletVolSurface,
+  type Fixing,
+  type FxVolSurface,
+  type MarketSnapshotJson,
+  type SwaptionVolSurface,
+  deserializeMarket,
+  serializeMarket,
+  survivalProbability,
+  toISO,
+  validateMarket,
+} from "@deriva/pricing-core";
 import { DateInput } from "../components/DateInput.js";
 import { NumInput } from "../components/NumInput.js";
-import { CDS_TENORS, hazardCurveFor, normaliseCdsQuotes, tenorYears } from "../lib/credit.js";
+import { CDS_TENORS, hazardCurveResult, normaliseCdsQuotes, tenorYears } from "../lib/credit.js";
 import { fmtBp, fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
-import { type CdsQuote, DEFAULT_REPORT_INPUTS, marketModified, useStore } from "../state/store.js";
+import { type CdsQuote, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, useStore } from "../state/store.js";
+
+/** Expiry in years → "1M" / "3M" / "2Y" (also weeks for FX). */
+export function expiryLabel(e: number): string {
+  if (e < 1 / 4) return `${Math.round(e * 52)}W`;
+  if (e < 1) return `${Math.round(e * 12)}M`;
+  return `${e}Y`;
+}
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/** Editable swaption ATM cube (Normal vol in bp) – cell edits are undoable and mark the market as modified (R3-4). */
+function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurface }) {
+  const act = useStore.getState;
+  const sample = sampleVolSurfaces().swaptionVols[id];
+  const edited = !same(surface, sample);
+  const volMin = Math.min(...surface.atm.flat());
+  const volMax = Math.max(...surface.atm.flat());
+  const setCell = (i: number, j: number, v: number) => {
+    const next: SwaptionVolSurface = { ...surface, atm: surface.atm.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
+    const label = `Swaption-Vol ${id} ${expiryLabel(surface.expiries[i]!)}×${surface.tenors[j]}Y ${fmtNum(surface.atm[i]![j]! * 1e4, 1)} → ${fmtNum(v * 1e4, 1)} bp`;
+    if (!act().setVolSurface("swaptionVols", id, next, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+  };
+  return (
+    <div className="card" data-testid="swaption-vol-card">
+      <h3>
+        Swaption-ATM-Vols {id} (Normal, bp){" "}
+        <span className="right row wrap" style={{ gap: 6 }}>
+          <span className="muted xs">Expiry × Tenor · editierbar · SABR-Smile für {Object.keys(surface.sabr ?? {}).length} Punkte</span>
+          {edited && (
+            <>
+              <span className="badge warn" data-testid="swaption-vol-edited">
+                geändert
+              </span>
+              <button
+                className="btn ghost xs"
+                onClick={() => act().setVolSurface("swaptionVols", id, undefined, `Swaption-Vols ${id} zurückgesetzt`)}
+                data-testid="swaption-vol-reset"
+                title="Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"
+              >
+                Zurücksetzen
+              </button>
+            </>
+          )}
+        </span>
+      </h3>
+      <div
+        className="heat editable"
+        style={{ gridTemplateColumns: `70px repeat(${surface.tenors.length}, 1fr)` }}
+        role="table"
+        aria-label={`Swaption-ATM-Vols ${id}`}
+        aria-rowcount={surface.expiries.length + 1}
+        aria-colcount={surface.tenors.length + 1}
+      >
+        <div role="row" style={{ display: "contents" }}>
+          <div className="head" role="columnheader" aria-label="Expiry ↓ / Tenor →" />
+          {surface.tenors.map((t) => (
+            <div key={t} className="head mono" role="columnheader">
+              {t}Y
+            </div>
+          ))}
+        </div>
+        {surface.expiries.map((e, i) => (
+          <div key={e} role="row" style={{ display: "contents" }}>
+            <div className="head mono" role="rowheader" style={{ textAlign: "right" }}>
+              {expiryLabel(e)}
+            </div>
+            {surface.atm[i]!.map((v, j) => {
+              const a = (v - volMin) / (volMax - volMin || 1);
+              const cellEdited = sample ? sample.atm[i]?.[j] !== v : true;
+              return (
+                <div key={j} className={`cell ${cellEdited ? "edited" : ""}`} role="cell" style={{ background: heatBg("--accent", a) }}>
+                  <NumInput
+                    inline
+                    value={v}
+                    scale={1e4}
+                    step={1}
+                    digits={1}
+                    min={0.0001}
+                    ariaLabel={`Swaption-Vol ${expiryLabel(e)} × ${surface.tenors[j]}Y`}
+                    testId={i === 0 && j === 0 ? "swaption-vol-cell" : undefined}
+                    onChange={(x) => setCell(i, j, x)}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Editable FX smile (ATM / RR / BF per expiry, in %). */
+function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVolSurface; keys: string[]; onSelect: (k: string) => void }) {
+  const act = useStore.getState;
+  const sample = sampleVolSurfaces().fxVols[id];
+  const edited = !same(surface, sample);
+  type Row = "atm" | "rr25" | "bf25" | "rr10" | "bf10";
+  const ROWS: { k: Row; label: string }[] = [
+    { k: "atm", label: "ATM" },
+    { k: "rr25", label: "25Δ RR" },
+    { k: "bf25", label: "25Δ BF" },
+    { k: "rr10", label: "10Δ RR" },
+    { k: "bf10", label: "10Δ BF" },
+  ];
+  const setCell = (k: Row, i: number, v: number) => {
+    const arr = surface[k];
+    if (!arr) return;
+    const next: FxVolSurface = { ...surface, [k]: arr.map((x, idx) => (idx === i ? v : x)) };
+    const label = `FX-Vol ${id} ${expiryLabel(surface.expiries[i]!)} ${ROWS.find((r) => r.k === k)!.label} ${fmtNum(arr[i]! * 100, 2)} → ${fmtNum(v * 100, 2)} %`;
+    if (!act().setVolSurface("fxVols", id, next, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+  };
+  return (
+    <div className="card" data-testid="fx-vol-card">
+      <h3>
+        FX-Vol-Fläche (%, editierbar)
+        <span className="right row wrap" style={{ gap: 6 }}>
+          {edited && (
+            <>
+              <span className="badge warn" data-testid="fx-vol-edited">
+                geändert
+              </span>
+              <button
+                className="btn ghost xs"
+                onClick={() => act().setVolSurface("fxVols", id, undefined, `FX-Vols ${id} zurückgesetzt`)}
+                data-testid="fx-vol-reset"
+                title="Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"
+              >
+                Zurücksetzen
+              </button>
+            </>
+          )}
+          <div className="seg" role="group" aria-label="Währungspaar">
+            {keys.map((k) => (
+              <button key={k} className={k === id ? "active" : ""} aria-pressed={k === id} onClick={() => onSelect(k)}>
+                {k.slice(0, 3)}/{k.slice(3)}
+              </button>
+            ))}
+          </div>
+        </span>
+      </h3>
+      <div className="table-scroll">
+        <table className="grid-table compact">
+          <thead>
+            <tr>
+              <th>Expiry</th>
+              {ROWS.filter((r) => surface[r.k]).map((r) => (
+                <th key={r.k} className="num">
+                  {r.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {surface.expiries.map((e, i) => (
+              <tr key={e} style={{ cursor: "default" }}>
+                <td className="mono">{expiryLabel(e)}</td>
+                {ROWS.filter((r) => surface[r.k]).map((r) => {
+                  const v = surface[r.k]![i]!;
+                  const cellEdited = sample ? sample[r.k]?.[i] !== v : true;
+                  return (
+                    <td key={r.k} className={`num vol-cell ${cellEdited ? "edited" : ""}`}>
+                      <span style={{ display: "inline-block", width: 84 }}>
+                        <NumInput
+                          inline
+                          value={v}
+                          scale={100}
+                          step={0.1}
+                          digits={2}
+                          unit="%"
+                          ariaLabel={`FX-Vol ${expiryLabel(e)} ${r.label}`}
+                          testId={i === 0 && r.k === "atm" ? "fx-vol-cell" : undefined}
+                          onChange={(x) => setCell(r.k, i, x)}
+                        />
+                      </span>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/** Editable caplet surface (Normal vol in bp, expiry × strike). */
+function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface }) {
+  const act = useStore.getState;
+  const sample = sampleVolSurfaces().capletVols[id];
+  const edited = !same(surface, sample);
+  const setCell = (i: number, j: number, v: number) => {
+    const next: CapletVolSurface = { ...surface, vols: surface.vols.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
+    const label = `Caplet-Vol ${id} ${expiryLabel(surface.expiries[i]!)} @ ${fmtNum(surface.strikes[j]! * 100, 2)} % ${fmtNum(surface.vols[i]![j]! * 1e4, 0)} → ${fmtNum(v * 1e4, 0)} bp`;
+    if (!act().setVolSurface("capletVols", id, next, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+  };
+  return (
+    <div className="card" data-testid="caplet-vol-card">
+      <h3>
+        Caplet-Vols {surface.index} (Normal, bp, editierbar)
+        <span className="right row wrap" style={{ gap: 6 }}>
+          <span className="muted xs">Expiry × Strike</span>
+          {edited && (
+            <>
+              <span className="badge warn" data-testid="caplet-vol-edited">
+                geändert
+              </span>
+              <button
+                className="btn ghost xs"
+                onClick={() => act().setVolSurface("capletVols", id, undefined, `Caplet-Vols ${id} zurückgesetzt`)}
+                data-testid="caplet-vol-reset"
+                title="Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"
+              >
+                Zurücksetzen
+              </button>
+            </>
+          )}
+        </span>
+      </h3>
+      <div className="table-scroll" style={{ maxHeight: 320 }}>
+        <table className="grid-table compact">
+          <thead>
+            <tr>
+              <th>Expiry</th>
+              {surface.strikes.map((k) => (
+                <th key={k} className="num">
+                  {fmtNum(k * 100, 2)} %
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {surface.expiries.map((e, i) => (
+              <tr key={e} style={{ cursor: "default" }}>
+                <td className="mono">{expiryLabel(e)}</td>
+                {surface.vols[i]!.map((v, j) => {
+                  const cellEdited = sample ? sample.vols[i]?.[j] !== v : true;
+                  return (
+                    <td key={j} className={`num vol-cell ${cellEdited ? "edited" : ""}`}>
+                      <span style={{ display: "inline-block", width: 62 }}>
+                        <NumInput
+                          inline
+                          value={v}
+                          scale={1e4}
+                          step={1}
+                          digits={0}
+                          min={0.0001}
+                          ariaLabel={`Caplet-Vol ${expiryLabel(e)} Strike ${fmtNum(surface.strikes[j]! * 100, 2)} %`}
+                          testId={i === 0 && j === 0 ? "caplet-vol-cell" : undefined}
+                          onChange={(x) => setCell(i, j, x)}
+                        />
+                      </span>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
 
 const FIXING_INDICES = ["EURIBOR-1M", "EURIBOR-3M", "EURIBOR-6M", "EURIBOR-12M", "ESTR", "SOFR", "SONIA", "SARON", "TONA"];
 
@@ -40,7 +315,11 @@ function CreditCard() {
     setQuotes([...quotes, { tenor, spread: quotes[quotes.length - 1]?.spread ?? 0.01 }]);
   };
   const discount = m.curves[m.discountCurveId.EUR ?? ""];
-  const hazard = useMemo(() => hazardCurveFor(cdsCurves, cpty, recovery, m.valuationDate, discount), [cdsCurves, cpty, recovery, m.valuationDate, discount]);
+  const hazardRes = useMemo(
+    () => hazardCurveResult(cdsCurves, cpty, recovery, m.valuationDate, discount),
+    [cdsCurves, cpty, recovery, m.valuationDate, discount],
+  );
+  const hazard = hazardRes.curve;
   const sorted = normaliseCdsQuotes(quotes);
   return (
     <div className="card" data-testid="credit-card">
@@ -165,6 +444,15 @@ function CreditCard() {
             <div className="muted xs" style={{ margin: "6px 0 8px" }} data-testid="hazard-pillars">
               Hazard-Kurve: {hazard.times.map((t, i) => `${fmtNum(t, 1)} J → ${fmtBp(hazard.hazards[i], 0)}`).join(" · ")} · Recovery{" "}
               {fmtPct(hazard.recovery, 0)} · diskontiert mit {discount?.id ?? "DF = 1"}
+            </div>
+          )}
+          {hazardRes.warnings.length > 0 && (
+            <div className="warning" style={{ margin: "6px 0 8px" }} data-testid="hazard-warnings">
+              <ul className="small" style={{ margin: 0, paddingLeft: 16 }}>
+                {hazardRes.warnings.map((w) => (
+                  <li key={w}>{translateCoreMessage(w)}</li>
+                ))}
+              </ul>
             </div>
           )}
         </>
@@ -355,14 +643,30 @@ export function heatGridKeyNav(e: React.KeyboardEvent<HTMLDivElement>): void {
 }
 
 export function MarketView() {
-  const s = useStore(useShallow((st) => ({ baseMarket: st.baseMarket, valuationDate: st.valuationDate, quotes: st.quotes, interpolation: st.interpolation })));
+  const s = useStore(
+    useShallow((st) => ({
+      baseMarket: st.baseMarket,
+      valuationDate: st.valuationDate,
+      quotes: st.quotes,
+      interpolation: st.interpolation,
+      turnOfYear: st.turnOfYear,
+      volSurfaces: st.volSurfaces,
+    })),
+  );
   const act = useStore.getState;
   const m = s.baseMarket;
-  const swpt = m.swaptionVols?.EUR;
+  const swptKeys = Object.keys(m.swaptionVols ?? {});
+  const [swptSel, setSwptSel] = useState(swptKeys[0] ?? "EUR");
+  const swptId = swptKeys.includes(swptSel) ? swptSel : swptKeys[0];
+  const swpt = swptId ? m.swaptionVols?.[swptId] : undefined;
   const fxKeys = Object.keys(m.fxVols ?? {});
   const [fxSel, setFxSel] = useState(fxKeys[0] ?? "EURUSD");
-  const fxv = m.fxVols?.[fxSel];
-  const capv = Object.values(m.capletVols ?? {})[0];
+  const fxId = fxKeys.includes(fxSel) ? fxSel : fxKeys[0];
+  const fxv = fxId ? m.fxVols?.[fxId] : undefined;
+  const capKeys = Object.keys(m.capletVols ?? {});
+  const [capSel, setCapSel] = useState(capKeys[0] ?? "");
+  const capId = capKeys.includes(capSel) ? capSel : capKeys[0];
+  const capv = capId ? m.capletVols?.[capId] : undefined;
   const modified = marketModified(s);
 
   const setSpot = (pair: string, v: number) => {
@@ -371,9 +675,6 @@ export function MarketView() {
     if (!act().setQuotes({ ...s.quotes, fxSpots: { ...s.quotes.fxSpots, [pair]: v } }, `Spot ${pair} ${fmtNum(v, 4)}`))
       act().setMarket({ ...m, fxSpots: { ...m.fxSpots, [pair]: v } });
   };
-  const volMin = swpt ? Math.min(...swpt.atm.flat()) : 0;
-  const volMax = swpt ? Math.max(...swpt.atm.flat()) : 1;
-
   return (
     <div className="stack">
       <div className="grid cols-3 market-grid">
@@ -444,7 +745,10 @@ export function MarketView() {
                 onClick={() => {
                   act().resetQuotes();
                   for (const id of Object.keys(act().interpolation)) act().setInterpolation(id, undefined);
+                  for (const id of Object.keys(act().turnOfYear)) act().setTurnOfYear(id, undefined);
+                  act().resetVolSurfaces();
                 }}
+                data-testid="market-reset"
               >
                 Markt zurücksetzen
               </button>
@@ -489,123 +793,44 @@ export function MarketView() {
 
       <FixingsEditor />
 
-      {swpt && (
-        <div className="card">
-          <h3>
-            Swaption-ATM-Vols EUR (Normal, bp){" "}
-            <span className="right muted xs">Expiry × Tenor · SABR-Smile-Parameter für {Object.keys(swpt.sabr ?? {}).join(", ")}</span>
-          </h3>
-          <div
-            className="heat"
-            style={{ gridTemplateColumns: `70px repeat(${swpt.tenors.length}, 1fr)` }}
-            role="table"
-            aria-label="Swaption-ATM-Vols"
-            aria-rowcount={swpt.expiries.length + 1}
-            aria-colcount={swpt.tenors.length + 1}
-          >
-            <div role="row" style={{ display: "contents" }}>
-              <div className="head" role="columnheader" aria-label="Expiry ↓ / Tenor →" />
-              {swpt.tenors.map((t) => (
-                <div key={t} className="head mono" role="columnheader">
-                  {t}Y
-                </div>
-              ))}
-            </div>
-            {swpt.expiries.map((e, i) => (
-              <div key={e} role="row" style={{ display: "contents" }}>
-                <div className="head mono" role="rowheader" style={{ textAlign: "right" }}>
-                  {e < 1 ? `${Math.round(e * 12)}M` : `${e}Y`}
-                </div>
-                {swpt.atm[i]!.map((v, j) => {
-                  const a = (v - volMin) / (volMax - volMin || 1);
-                  return (
-                    <div key={j} className="cell" role="cell" style={{ background: heatBg("--accent", a) }}>
-                      {fmtNum(v * 1e4, 1)}
-                    </div>
-                  );
-                })}
+      {swpt && swptId && (
+        <>
+          {swptKeys.length > 1 && (
+            <div className="row wrap" style={{ gap: 8 }}>
+              <span className="muted xs">Swaption-Cube</span>
+              <div className="seg" role="group" aria-label="Swaption-Cube Währung">
+                {swptKeys.map((k) => (
+                  <button key={k} className={k === swptId ? "active" : ""} aria-pressed={k === swptId} onClick={() => setSwptSel(k)}>
+                    {k}
+                  </button>
+                ))}
               </div>
-            ))}
-          </div>
-        </div>
+            </div>
+          )}
+          <SwaptionVolCard id={swptId} surface={swpt} />
+        </>
       )}
 
       <div className="grid cols-2">
-        {fxv && (
-          <div className="card">
-            <h3>
-              FX-Vol-Fläche
-              <span className="right">
-                <div className="seg" role="group" aria-label="Währungspaar">
-                  {fxKeys.map((k) => (
-                    <button key={k} className={k === fxSel ? "active" : ""} aria-pressed={k === fxSel} onClick={() => setFxSel(k)}>
-                      {k.slice(0, 3)}/{k.slice(3)}
-                    </button>
-                  ))}
-                </div>
-              </span>
-            </h3>
-            <div className="table-scroll">
-              <table className="grid-table">
-                <thead>
-                  <tr>
-                    <th>Expiry</th>
-                    <th className="num">ATM %</th>
-                    <th className="num">25Δ RR</th>
-                    <th className="num">25Δ BF</th>
-                    <th className="num">10Δ RR</th>
-                    <th className="num">10Δ BF</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {fxv.expiries.map((e, i) => (
-                    <tr key={e} style={{ cursor: "default" }}>
-                      <td className="mono">{e < 1 / 4 ? `${Math.round(e * 52)}W` : e < 1 ? `${Math.round(e * 12)}M` : `${e}Y`}</td>
-                      <td className="num">{fmtNum(fxv.atm[i]! * 100, 2)}</td>
-                      <td className="num">{fmtNum(fxv.rr25[i]! * 100, 2)}</td>
-                      <td className="num">{fmtNum(fxv.bf25[i]! * 100, 2)}</td>
-                      <td className="num muted">{fxv.rr10 ? fmtNum(fxv.rr10[i]! * 100, 2) : "–"}</td>
-                      <td className="num muted">{fxv.bf10 ? fmtNum(fxv.bf10[i]! * 100, 2) : "–"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+        {fxv && fxId && <FxVolCard id={fxId} surface={fxv} keys={fxKeys} onSelect={setFxSel} />}
+        {capv && capId && (
+          <div className="stack">
+            {capKeys.length > 1 && (
+              <div className="seg" role="group" aria-label="Caplet-Fläche">
+                {capKeys.map((k) => (
+                  <button key={k} className={k === capId ? "active" : ""} aria-pressed={k === capId} onClick={() => setCapSel(k)}>
+                    {k}
+                  </button>
+                ))}
+              </div>
+            )}
+            <CapletVolCard id={capId} surface={capv} />
           </div>
         )}
-        {capv && (
-          <div className="card">
-            <h3>
-              Caplet-Vols {capv.index} (Normal, bp) <span className="right muted xs">Expiry × Strike</span>
-            </h3>
-            <div className="table-scroll" style={{ maxHeight: 320 }}>
-              <table className="grid-table">
-                <thead>
-                  <tr>
-                    <th>Expiry</th>
-                    {capv.strikes.map((k) => (
-                      <th key={k} className="num">
-                        {fmtNum(k * 100, 2)} %
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {capv.expiries.map((e, i) => (
-                    <tr key={e} style={{ cursor: "default" }}>
-                      <td className="mono">{e < 1 ? `${Math.round(e * 12)}M` : `${e}Y`}</td>
-                      {capv.vols[i]!.map((v, j) => (
-                        <td key={j} className="num">
-                          {fmtNum(v * 1e4, 0)}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
+      </div>
+      <div className="muted xs">
+        Vol-Flächen sind Teil des Marktes: Änderungen zählen als „Markt modifiziert“, werden lokal gespeichert, überleben den Stichtagswechsel und sind mit{" "}
+        <kbd>Ctrl</kbd>+<kbd>Z</kbd> rückgängig; „Zurücksetzen“ an der Karte oder „Markt zurücksetzen“ stellt den Sample-Markt wieder her.
       </div>
     </div>
   );

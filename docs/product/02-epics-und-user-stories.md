@@ -117,7 +117,7 @@ Rollen: **Berater** (Firmenkunden-Sales), **Treasurer** (Kunde), **Risk** (Markt
 - **US-7.2** ✅ Als Entwickler möchte ich Datumsangaben als ISO-8601 senden und empfangen, ohne Serial-Dates kennen zu müssen.
 - **US-7.3** ✅ Als Entwickler möchte ich Kurven per API aus eigenen Quotes bootstrappen (Preview oder in Snapshot ersetzen), Spots/Fixings setzen und den Bewertungstag wechseln.
 - **US-7.4** ✅ Als Entwickler möchte ich Cashflows als CSV über `POST /api/report?format=csv` erhalten.
-- **US-7.5** ✅ Als Entwickler möchte ich Trade-CRUD mit Validierung durch Probe-Bewertung.
+- **US-7.5** ✅ Als Entwickler möchte ich Trade-CRUD mit Validierung durch Probe-Bewertung sowie einen Batch-Import als JSON-Array oder CSV (`content-type: text/csv`, eine Spaltenvorlage je Produkttyp über `?type=`, deutsche Zahlen- und Datumsformate, Fehler je Zeile).
 - **US-7.9** ✅ Als Entwickler möchte ich JSON-Schema-Validierung aller Request-Bodies (Trades als diskriminierte Union mit typisierten Enum-Feldern, Risiko, Szenarien, XVA, Report, Marktdaten, Bootstrap, Snapshot-Import) mit 400-Antworten inkl. Validierungsdetails und Request-ID, damit fehlerhafte Aufrufe früh und verständlich scheitern.
   AK: `Fixed`-Leg ohne `rate` → 400, `status: "Bogus"` → 400, jeder Sample-Trade der Builder passiert das Schema (`apps/api/src/contract.test.ts`).
 - **US-7.10** ✅ Als Entwickler möchte ich einen OpenAPI-Vertrag mit `operationId`, Response- und Fehlerschemas (400/404/409/412/422/429), `servers` und Vertragstest, Snapshot-ID-Header (`X-Market-Snapshot-Id`) auf Bewertungsantworten, `If-None-Match` → 304 und `If-Match` auf DELETE, sowie einheitliche Fehlerobjekte mit `code` (`PricingError` → 422).

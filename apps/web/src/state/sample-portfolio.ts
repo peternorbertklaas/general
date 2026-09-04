@@ -175,7 +175,8 @@ function sampleTrades(valuationDate: number): Trade[] {
         effectiveDate: spot,
         tenor: "5Y",
         counterparty: "Commerzbank",
-        collateralCurrency: "EUR",
+        // USD CSA → EUR leg on EUR-ESTR-USDCSA: the Xccy basis is priced, fair spread ≈ market basis (Markt R3-1).
+        collateralCurrency: "USD",
       }),
       name: "CCS EUR/USD 5Y €STR −20 bp vs SOFR",
       book: "USD-Finanzierung",

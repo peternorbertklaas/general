@@ -41,6 +41,13 @@ const chord = async (page, k) => {
   await page.keyboard.press(k);
   await wait(400);
 };
+/** Document / report chords ("o t" termsheet, "o r" report …) – the former Ctrl+Shift combos are browser-reserved (R3-01). */
+const chordO = async (page, k) => {
+  await page.keyboard.press("o");
+  await page.keyboard.press(k);
+  await wait(500);
+};
+const themeOf = (page) => page.evaluate(() => document.documentElement.dataset.theme);
 const noOverflow = async (page) =>
   page.evaluate(() => {
     const main = document.querySelector(".main");
@@ -97,10 +104,32 @@ try {
     "utf8",
   );
   const tradesBefore = Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]);
+  // Export menu is a popover layer (R3-02): background hotkeys suspended, Esc closes from anywhere, focus returns to the toggle
+  const themeBefore = await themeOf(page);
   await page.locator('[data-testid="export-menu-btn"]').click();
   await wait(150);
   check((await page.locator('[role="menu"][aria-label="Export und Import"] [role="menuitem"]').count()) >= 5, "export menu lists export/import entries (N-12)");
+  check((await page.locator('[data-testid="csv-template-swpt"]').count()) === 1, "CSV templates include Swaption (N16)");
+  check((await page.locator('[data-testid="csv-template-ccs"]').count()) === 1, "CSV templates include CCS (N16)");
+  await page.keyboard.press("t");
+  await wait(150);
+  check((await themeOf(page)) === themeBefore, "background hotkey t is suspended while the export menu is open (R3-02)");
+  await page.keyboard.press("Escape");
+  await wait(300);
+  check((await page.locator('[role="menu"][aria-label="Export und Import"]').count()) === 0, "Esc closes the export menu (R3-02)");
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "export-menu-btn",
+    "export menu returns focus to its toggle (R3-02)",
+  );
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
   await page.locator('[data-testid="import-csv"]').setInputFiles(csvPath);
+  await wait(800);
+  // rejected rows are listed in a dialog (R3-F7); the valid rows are imported after "weiter"
+  check((await page.locator('[data-testid="csv-errors"]').count()) === 1, "CSV import lists rejected rows in a dialog (R3-F7)");
+  check((await page.locator('[data-testid="csv-errors-table"] tbody tr').count()) === 1, "error dialog lists the rejected FXF row");
+  check((await page.locator('[data-testid="csv-errors-table"]').innerText()).includes("Kauf-/Verkaufswährung fehlt"), "error dialog names the reason");
+  await page.locator('[data-testid="csv-errors-continue"]').click();
   await wait(800);
   const tradesAfterCsv = Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]);
   check(tradesAfterCsv === tradesBefore + 1, `CSV import adds the valid IRS row (${tradesBefore} → ${tradesAfterCsv})`);
@@ -110,6 +139,8 @@ try {
   await page.locator('[data-testid="export-menu-btn"]').click();
   await wait(150);
   await page.locator('[data-testid="import-csv"]').setInputFiles(csvPath);
+  await wait(600);
+  await page.locator('[data-testid="csv-errors-continue"]').click();
   await wait(600);
   check((await page.locator('[data-testid="import-strategy"]').count()) === 1, "duplicate ids open the import strategy dialog");
   await page.locator('[data-testid="import-skip"]').click();
@@ -346,6 +377,16 @@ try {
   await page.keyboard.press("0");
   await wait(300);
   check(!(await page.locator('[data-testid="market-chip"]').innerText()).includes("What-if"), "0 alias resets what-if");
+  // Esc in a number field cancels the edit (R3-10)
+  const rateField = page.locator('input[aria-label="Festsatz Leg 1"]');
+  const rateBefore = await rateField.inputValue();
+  await rateField.click();
+  await rateField.fill("9");
+  await wait(150);
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check((await rateField.inputValue()) === rateBefore, `Esc restores the number field (${rateBefore})`);
+  check((await page.locator('[data-testid="pv-value"]').innerText()) === pvBefore, "Esc in the number field leaves the PV unchanged");
 
   // FX option analytics: sane values, no raw keys, strike as price (N-01)
   await page.keyboard.press("Control+k");
@@ -395,6 +436,14 @@ try {
   const ccsId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
   check(/^CCS-\d{4}$/.test(ccsId), `CCS created via palette with readable id (${ccsId})`);
   check((await page.locator(".kpi .label", { hasText: "Fairer Basis-Spread" }).count()) === 1, "CCS key metric is the fair basis spread");
+  // USD CSA is the default → the Xccy basis is priced: fair spread ≈ market basis (−20 bp), not ≈ 0 (Markt R3-1)
+  const fairSpreadTxt = await page.evaluate(() => {
+    const label = Array.from(document.querySelectorAll(".kpi .label")).find((l) => l.textContent?.includes("Fairer Basis-Spread"));
+    return label?.parentElement?.querySelector(".value")?.textContent ?? "";
+  });
+  const fairSpread = Number(fairSpreadTxt.replace(/\s|bp/g, "").replace("−", "-").replace(",", "."));
+  check(Number.isFinite(fairSpread) && fairSpread < -10 && fairSpread > -30, `CCS fair basis spread ≈ −20 bp under USD CSA (${fairSpreadTxt})`);
+  check((await page.locator('select[aria-label="Collateral-Währung"]').inputValue()) === "USD", "CCS quick entry sets the USD CSA");
   check((await page.locator("label.check", { hasText: "Interim" }).count()) === 1, "CCS editor offers the interim notional exchange");
   check((await page.locator('select[aria-label="MtM-Reset"]').inputValue()) === "1", "quick entry 'mtm' selects the resetting leg");
   check((await page.locator('input[aria-label="UTI"]').count()) === 1, "Regulatorik section with UTI field in the editor");
@@ -405,6 +454,11 @@ try {
   const fraId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
   check(/^FRA-\d{4}$/.test(fraId), `n r creates an FRA (${fraId})`);
   check((await page.locator('select[aria-label="Index"]').count()) === 1, "FRA editor has an index select");
+  check((await page.locator('select[aria-label="Richtung"]').count()) === 1, "FRA direction select carries the field label as accessible name (R3-03)");
+  check(
+    (await page.evaluate(() => Array.from(document.querySelectorAll(".form select")).filter((s) => !s.getAttribute("aria-label")).length)) === 0,
+    "no select without accessible name in the editor (R3-03)",
+  );
   check(/Fixing-Datum \d{2}\.\d{2}\.\d{4}/.test(await page.locator('[data-testid="pricing-details"]').innerText()), "FRA header shows the fixing date");
   // back to the new IRS
   await page.keyboard.press("Control+k");
@@ -426,9 +480,15 @@ try {
   // Report: generate, audit line, governance, perspective, what-if badge, documents
   await chord(page, "r");
   check((await page.locator('[data-testid="report-generate-btn"]').count()) === 1, "report requires explicit generation");
-  await page.keyboard.press("Control+Shift+R");
-  await wait(600);
-  check((await page.locator('[data-testid="audit-hashes"]').count()) === 1, "report audit line");
+  await chordO(page, "r");
+  check((await page.locator('[data-testid="audit-hashes"]').count()) === 1, "report audit line (o r)");
+  const methodology = await page.locator('[data-testid="methodology"]').innerText();
+  check(!/\b[a-z]+[A-Z]\w+\b/.test(methodology), "methodology paragraphs carry no camelCase identifiers (R3-06)");
+  check(!/ModifiedFollowing|ShortFront|MISSING_FIXING|Float EURIBOR/.test(methodology), "methodology paragraphs are German (R3-06)");
+  check(
+    /log-linear \(DF\)|monoton-konvex|linear \(Zero\)/.test(await page.locator('[data-testid="market-table"]').innerText()),
+    "market table shows interpolation labels (R3-06)",
+  );
   check((await page.locator('[data-testid="audit-hashes"]').innerText()).includes("deriva-pricing-core"), "engine version shown");
   check((await page.locator('[data-testid="report-governance"]').innerText()).includes("indikativ"), "governance line shows snapshot status");
   check((await page.locator('[data-testid="perspective-seg"] button[aria-pressed="true"]').innerText()) === "Kunde", "default perspective is Kunde");
@@ -455,19 +515,28 @@ try {
   await page.keyboard.press("]");
   await wait(400);
   check((await page.locator('[data-testid="report-whatif-badge"]').count()) === 1, "what-if badge on report");
+  // documents under what-if carry the stress banner (R3-F1) and ask before print/download
+  await page.locator('[data-testid="open-termsheet"]').click();
+  await wait(500);
+  check((await page.locator('[data-testid="doc-whatif-banner"]').count()) === 1, "termsheet under what-if shows the stress-market banner (R3-F1)");
+  check((await page.locator('[data-testid="document-body"]').innerText()).includes("WHAT-IF"), "termsheet subtitle carries the WHAT-IF marker (R3-F1)");
+  page.once("dialog", (d) => d.dismiss());
+  await page.locator('[data-testid="doc-print"]').click();
+  await wait(300);
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "print under what-if asks for confirmation (dismissed → still open)");
+  await page.keyboard.press("Escape");
+  await wait(300);
   await page.keyboard.press("\\");
   await wait(300);
   // quote change → stale + "modifiziert" (N-18)
-  await page.keyboard.press("Control+Shift+R");
-  await wait(400);
+  await chordO(page, "r");
   await chord(page, "c");
   await page.locator("button.btn", { hasText: "Quotes +10 bp" }).click();
   await wait(500);
   await chord(page, "r");
   await wait(300);
   check((await page.locator('[data-testid="report-stale"]').count()) === 1, "quote change flags the report as stale (N-18)");
-  await page.keyboard.press("Control+Shift+R");
-  await wait(500);
+  await chordO(page, "r");
   check(
     (await page.locator('[data-testid="report-header"]').innerText()).includes("modifiziert"),
     "report header says modifiziert after a quote change (N-18)",
@@ -475,12 +544,11 @@ try {
   await page.keyboard.press("Control+z");
   await wait(400);
   check((await page.locator(".toast", { hasText: "Rückgängig: Quotes" }).count()) === 1, "Ctrl+Z undoes the quote change (N-14)");
-  await page.keyboard.press("Control+Shift+R");
-  await wait(400);
-  // Termsheet via hotkey, with initial market value and German numbers
-  await page.locator('[data-testid="open-termsheet"]').click();
-  await wait(400);
-  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "termsheet modal opens");
+  await chordO(page, "r");
+  // Termsheet via chord o t (R3-01), with initial market value and German numbers
+  await chordO(page, "t");
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "o t opens the termsheet modal (R3-01)");
+  check((await page.locator('[data-testid="doc-whatif-banner"]').count()) === 0, "no what-if banner without a what-if");
   check((await page.locator('[data-testid="document-body"] .doc-section').count()) >= 2, "termsheet sections rendered");
   const docText = await page.locator('[data-testid="document-body"]').innerText();
   check(docText.includes("Anfänglicher Marktwert"), "termsheet carries the initial market value (N-22)");
@@ -507,23 +575,48 @@ try {
   await page.keyboard.press("Escape");
   await wait(300);
   check((await page.locator('[data-testid="documents-modal"]').count()) === 0, "esc closes the modal");
+  await page.locator('[data-testid="open-termsheet"]').focus();
+  await page.locator('[data-testid="open-termsheet"]').click();
+  await wait(300);
+  await page.keyboard.press("Escape");
+  await wait(300);
   check((await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "open-termsheet", "modal returns focus to the opener (N-03)");
-  await page.keyboard.press("Control+Shift+G");
-  await wait(400);
-  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "Ctrl+Shift+G opens the suitability statement (N-22)");
+  await chordO(page, "g");
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "o g opens the suitability statement (N-22 / R3-01)");
   await page.locator('[data-testid="suitability-generate"]').click();
   await wait(500);
   check((await page.locator('[data-testid="document-body"]').count()) === 1, "suitability statement generated");
   await page.keyboard.press("Escape");
   await wait(200);
-  // KID (Basisinformationsblatt) via hotkey and Confirmation via button
-  await page.keyboard.press("Control+Shift+K");
-  await wait(600);
-  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "Ctrl+Shift+K opens the KID modal");
+  // KID (Basisinformationsblatt) via chord o k and Confirmation via button
+  await chordO(page, "k");
+  await wait(200);
+  check((await page.locator('[data-testid="documents-modal"]').count()) === 1, "o k opens the KID modal");
   check((await page.locator('[data-testid="kid-form"]').count()) === 1, "KID form with manufacturer / holding period");
   const kidText = await page.locator('[data-testid="document-body"]').innerText();
   check(kidText.includes("Basisinformationsblatt"), "KID document rendered");
   check(!/\d{4}-\d{2}-\d{2}/.test(kidText), "KID uses German dates");
+  // long text cells wrap: no horizontal overflow of the modal body, text cells exist (R3-05)
+  const kidLayout = await page.evaluate(() => {
+    const body = document.querySelector('[data-testid="documents-modal"] .modal-body');
+    return {
+      overflow: body ? body.scrollWidth - body.clientWidth : 999,
+      textCells: document.querySelectorAll('[data-testid="document-body"] td.text').length,
+      tallest: Math.max(...Array.from(document.querySelectorAll('[data-testid="document-body"] td.text')).map((td) => td.getBoundingClientRect().height)),
+    };
+  });
+  check(kidLayout.overflow <= 1, `KID long text cells do not widen the modal (overflow ${kidLayout.overflow} px, R3-05)`);
+  check(
+    kidLayout.textCells > 0 && kidLayout.tallest > 30,
+    `KID long texts wrap onto several lines (${kidLayout.textCells} cells, tallest ${Math.round(kidLayout.tallest)} px)`,
+  );
+  await page.evaluate(() => document.body.classList.add("print-doc"));
+  await page.emulateMedia({ media: "print" });
+  await wait(300);
+  const kidPrintWidth = await page.evaluate(() => document.body.scrollWidth);
+  check(kidPrintWidth <= 1600, `KID print width stays within the page (${kidPrintWidth} px, R3-05)`);
+  await page.emulateMedia({ media: "screen" });
+  await page.evaluate(() => document.body.classList.remove("print-doc"));
   await page.locator('[data-testid="kid-holding-period"]').fill("3");
   await page.keyboard.press("Enter");
   await wait(400);
@@ -537,11 +630,17 @@ try {
   await page.keyboard.press("Escape");
   await wait(300);
   await page.screenshot({ path: join(outDir, "view-Report.png") });
-  // Print emulation of the report
+  // Print emulation of the report: inputs print as static text (value visible, no frame) – R3-04
   await page.emulateMedia({ media: "print" });
   await wait(300);
   check((await page.locator(".report-print-header").isVisible()) === true, "print header visible in print media");
-  check((await page.locator('[data-testid="offer-pv"]').isVisible()) === false, "inputs hidden in print");
+  const offerPrint = await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="offer-pv"]');
+    const cs = el ? getComputedStyle(el) : null;
+    return { display: cs?.display, border: cs?.borderStyle, value: el?.value };
+  });
+  check(offerPrint.display !== "none" && offerPrint.value === "25.000", `report input prints its value as text (${offerPrint.value})`);
+  check(offerPrint.border === "none", `report input prints without a frame (${offerPrint.border})`);
   await page.screenshot({ path: join(outDir, "05-report-print.png"), fullPage: true });
   await page.emulateMedia({ media: "screen" });
 
@@ -574,6 +673,31 @@ try {
   await wait(300);
   check((await page.locator('[data-testid="hedge-stale"]').count()) === 1, "changed hedge ratio flags the result as stale (N-20)");
   check((await page.locator('[data-testid="hedge-export"]').count()) === 1, "hedge documentation export button");
+  // Hedge print: number fields print their values (R3-04)
+  await page.emulateMedia({ media: "print" });
+  await wait(300);
+  const hedgePrint = await page.evaluate(() => {
+    const ratio = document.querySelector('input[aria-label="Hedge Ratio"]');
+    const notional = document.querySelector('input[aria-label="Nominal Grundgeschäft"]');
+    const vis = (el) => !!el && getComputedStyle(el).display !== "none" && el.getBoundingClientRect().width > 0;
+    return {
+      ratioVisible: vis(ratio),
+      ratio: ratio?.value,
+      notionalVisible: vis(notional),
+      notional: notional?.value,
+      header: document.querySelector(".hedge .report-print-header")?.textContent ?? "",
+    };
+  });
+  check(hedgePrint.ratioVisible && hedgePrint.ratio === "50", `hedge print shows the hedge ratio (${hedgePrint.ratio}) (R3-04)`);
+  check(hedgePrint.notionalVisible && /\d/.test(hedgePrint.notional ?? ""), `hedge print shows the hedged-item notional (${hedgePrint.notional}) (R3-04)`);
+  check(hedgePrint.header.includes("ERGEBNIS VERALTET"), "hedge print header carries the stale marker");
+  await page.screenshot({ path: join(outDir, "08-hedge-print.png"), fullPage: true });
+  await page.emulateMedia({ media: "screen" });
+  // "Zurücksetzen" asks first (R3-F4)
+  page.once("dialog", (d) => d.dismiss());
+  await page.locator('[data-testid="hedge-reset"]').click();
+  await wait(300);
+  check((await page.locator('input[aria-label="Hedge Ratio"]').inputValue()) === "50", "hedge reset dismissed → documentation kept (R3-F4)");
   check((await page.locator('[data-testid="hedge-amortisation"]').count()) === 1, "hedged item offers the amortisation select");
   check((await page.locator('[data-testid="hedge-designation"]').count()) === 0, "designation select hidden for linear instruments");
   // option instrument: designation select, freeze-vol checkbox, cost of hedging card
@@ -599,8 +723,48 @@ try {
     check((await crumb(page)).includes(name), `view ${name}`);
     await page.screenshot({ path: join(outDir, `view-${name}.png`) });
   }
-  // Curves: interpolation override survives a valuation-date change (N-23), quotes flagged as modified
+  // Curves: quotes card is not clipped at 1600 px with the inspector open (N-10 / R3-09)
   await chord(page, "c");
+  const quotesFit = await page.evaluate(() => {
+    const t = document.querySelector('[data-testid="quotes-table"]');
+    const wrap = t?.parentElement;
+    return wrap ? { inner: wrap.scrollWidth, outer: wrap.clientWidth, inspector: !!document.querySelector(".inspector") } : null;
+  });
+  check(
+    !!quotesFit && quotesFit.inspector && quotesFit.inner <= quotesFit.outer + 1,
+    `quotes table fits its card with the inspector open (${quotesFit?.inner} ≤ ${quotesFit?.outer})`,
+  );
+  // Turn-of-year in the past → validation, not a silent no-op (R3-F2)
+  await page.locator('[data-testid="toy-bp"]').fill("20");
+  await page.keyboard.press("Enter");
+  const toyDate = page.locator('input[aria-label="Turn-of-Year Datum"]');
+  await toyDate.click();
+  await toyDate.fill("01.01.2020");
+  await page.keyboard.press("Enter");
+  await wait(300);
+  check((await page.locator('[data-testid="toy-past"]').count()) === 1, "turn-of-year in the past shows a validation message (R3-F2)");
+  check((await page.locator('[data-testid="toy-apply"]').isDisabled()) === true, "turn-of-year in the past disables Anwenden (R3-F2)");
+  check((await page.locator('[data-testid="toy-badge"]').count()) === 0, "no turn-of-year badge for a past date");
+  await toyDate.click();
+  await toyDate.fill("31.12.2026");
+  await page.keyboard.press("Enter");
+  await page.locator('[data-testid="toy-bp"]').fill("0");
+  await page.keyboard.press("Enter");
+  await wait(200);
+  // "+ FX-Punkte" adds a removable FX-swap-points quote to the collateral curve (Markt R3-6)
+  await page.locator('[aria-label="Kurve"] button', { hasText: "EUR/USD CSA" }).click();
+  await wait(300);
+  const quoteRows = await page.locator('[data-testid="quotes-table"] tbody tr').count();
+  await page.locator('[data-testid="add-fx-points"]').click();
+  await wait(600);
+  check((await page.locator('[data-testid="quotes-table"] tbody tr').count()) === quoteRows + 1, "+ FX-Punkte adds a quote row (R3-6)");
+  check((await page.locator('[data-testid="added-quote"]').count()) === 1, "added FX-points row is marked and removable");
+  await page.locator('[data-testid="added-quote"] button[aria-label^="Quote"]').click();
+  await wait(400);
+  check((await page.locator('[data-testid="quotes-table"] tbody tr').count()) === quoteRows, "added quote can be removed again");
+  await page.locator('[aria-label="Kurve"] button', { hasText: "€STR" }).click();
+  await wait(300);
+  // Curves: interpolation override survives a valuation-date change (N-23), quotes flagged as modified
   await page.locator('[data-testid="interp-select"]').selectOption("linearZero");
   await wait(500);
   check((await page.locator(".card h3", { hasText: "EUR-ESTR" }).first().innerText()).includes("linear (Zero)"), "interpolation override applied");
@@ -677,6 +841,21 @@ try {
   check((await page.locator('[data-testid="hazard-pillars"]').count()) === 1, "hazard pillars shown for the CDS term structure");
   await page.locator('[data-testid="cds-table"] button[aria-label^="CDS-Quote 1 entfernen"]').click();
   await wait(200);
+  // Market: vol surfaces are editable – a cell edit marks the market as modified, Ctrl+Z reverts (Markt R3-4)
+  const volCell = page.locator('[data-testid="swaption-vol-cell"]');
+  const volBefore = await volCell.inputValue();
+  await volCell.click();
+  await volCell.fill("99");
+  await page.keyboard.press("Enter");
+  await wait(500);
+  check((await page.locator('[data-testid="swaption-vol-edited"]').count()) === 1, "editing a swaption vol cell flags the surface as geändert (R3-4)");
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"), "vol edit marks the market as modified (R3-4)");
+  await page.keyboard.press("Control+z");
+  await wait(500);
+  check((await page.locator(".toast", { hasText: "Rückgängig: Swaption-Vol" }).count()) === 1, "Ctrl+Z undoes the vol edit with a typed label (N-14)");
+  check((await volCell.inputValue()) === volBefore, `vol cell restored after undo (${volBefore})`);
+  check((await page.locator('[data-testid="fx-vol-cell"]').count()) === 1, "FX smile rows are editable");
+  check((await page.locator('[data-testid="caplet-vol-cell"]').count()) === 1, "caplet surface cells are editable");
 
   // Toast stack is capped at four (N-09)
   await chord(page, "b");
@@ -759,11 +938,22 @@ try {
   await wait(200);
   check((await page.locator('[role="dialog"][aria-label="Tastenkürzel"]').count()) === 0, "esc closes overlay");
 
-  // Context menu: roving focus with aria-activedescendant (N-06)
+  // Context menu: roving focus with aria-activedescendant (N-06), focus returns to the row (R3-08)
+  const firstRow = page.locator('tr[data-nav="trade"]').first();
+  await firstRow.focus();
+  const rowId = await firstRow.getAttribute("data-id");
   await page.locator("td.id-cell").first().click({ button: "right" });
   await wait(200);
   check((await page.locator('[role="menu"][aria-activedescendant]').count()) === 1, "context menu carries aria-activedescendant");
   check((await page.evaluate(() => document.activeElement?.getAttribute("role"))) === "menuitem", "context menu focuses the active menuitem");
+  await page.keyboard.press("Escape");
+  await wait(300);
+  check((await page.evaluate(() => document.activeElement?.getAttribute("data-id"))) === rowId, `context menu returns focus to the row (${rowId}) (R3-08)`);
+  // Palette: id-like query without an exact match does not jump to another trade (R3-F5)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("FRA-0099");
+  await wait(200);
+  check((await page.locator('[data-testid="palette-no-trade"]').count()) === 1, "palette says 'Kein Trade FRA-0099' instead of a fuzzy hit (R3-F5)");
   await page.keyboard.press("Escape");
   await wait(200);
 
@@ -785,6 +975,22 @@ try {
     check(o.page && o.main, `1280px no horizontal overflow (${name})`);
     if (name === "Blotter" || name === "Pricing" || name === "Kurven") await page.screenshot({ path: join(outDir, `1280-${name}.png`) });
   }
+  // 1280 px: the blotter toolbar collapses into one row (filter popover, icon buttons) – R3-09 / N-12
+  await chord(page, "b");
+  const toolbar = await page.evaluate(() => {
+    const tb = document.querySelector('[data-testid="blotter-toolbar"]');
+    return { height: tb?.getBoundingClientRect().height ?? 999, filterBtn: !!document.querySelector('[data-testid="filter-menu-btn"]') };
+  });
+  check(toolbar.filterBtn && toolbar.height <= 40, `1280px blotter toolbar is a single row (${Math.round(toolbar.height)} px)`);
+  await page.locator('[data-testid="filter-menu-btn"]').click();
+  await wait(200);
+  check((await page.locator('[data-testid="filter-popover"] [data-testid="group-select"]').count()) === 1, "filter popover holds the grouping select");
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check((await page.locator('[data-testid="filter-popover"]').count()) === 0, "Esc closes the filter popover");
+  await chord(page, "r");
+  const reportFit = await noOverflow(page);
+  check(reportFit.main, "1280px report market table does not overflow (R3-09)");
 
   check(errors.length === 0, `page errors: ${errors.join(" | ")}`);
   const relevantConsole = consoleErrors.filter((m) => !/favicon|ResizeObserver loop/.test(m));

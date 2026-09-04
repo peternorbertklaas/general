@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NumInput } from "./NumInput.js";
 
 function Harness({ initial, scale, step, unit, onSpy }: { initial: number; scale?: number; step?: number; unit?: string; onSpy: (v: number) => void }) {
@@ -71,6 +71,26 @@ describe("NumInput (F-03)", () => {
     expect(spy).toHaveBeenLastCalledWith(expect.closeTo(0.0025, 10));
     fireEvent.blur(input);
     expect(input.value).toBe("0,25");
+  });
+  it("Esc restores the value the field had on focus and leaves the field; Enter commits (R3-10)", () => {
+    const spy = vi.fn();
+    render(<Harness initial={0.025} scale={100} step={0.005} unit="%" onSpy={spy} />);
+    const input = screen.getByLabelText("feld") as HTMLInputElement;
+    act(() => input.focus());
+    fireEvent.change(input, { target: { value: "3,15" } });
+    expect(spy).toHaveBeenLastCalledWith(expect.closeTo(0.0315, 10));
+    fireEvent.keyDown(input, { key: "Escape" });
+    fireEvent.blur(input);
+    expect(spy).toHaveBeenLastCalledWith(expect.closeTo(0.025, 10));
+    expect(input.value).toBe("2,5");
+    expect(document.activeElement).not.toBe(input);
+    // Enter keeps the typed value
+    act(() => input.focus());
+    fireEvent.change(input, { target: { value: "3,15" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.blur(input);
+    expect(spy).toHaveBeenLastCalledWith(expect.closeTo(0.0315, 10));
+    expect(input.value).toBe("3,15");
   });
   it("arrow keys step (Shift ×10) and invalid text sets aria-invalid", () => {
     const spy = vi.fn();

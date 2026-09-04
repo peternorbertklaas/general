@@ -7,7 +7,7 @@ FRAs, Caps/Floors/Collars, Swaptions (physisch, Cash/CCP), FX-Forwards/-Swaps, F
 und Cross-Currency-Swaps mit Multi-Curve-Framework (OIS-Diskontierung, Collateral-Kurven, Futures/Basis/XCCY-Inputs),
 Bachelier/shifted Black + SABR-Smile, Garman-Kohlhagen mit Delta-Smile, und liefert Sensitivitäten (Zero, Par, Vega-Buckets),
 Szenarien (inkl. EBA-IRRBB), CVA/DVA für alle Instrumente, Hedge Accounting (IFRS 9 / HGB § 254) und prüfungsfähige
-Bewertungsreports mit Hashes (IFRS 13 / IDW RS HFA 35, MiFID-II-Kostentransparenz, EMIR-Refit-Felder, Termsheet, Geeignetheitserklärung).
+Bewertungsreports mit Hashes (IFRS 13 / IDW RS HFA 47, MiFID-II-Kostentransparenz, EMIR-Refit-Felder, Termsheet, Geeignetheitserklärung).
 
 Entstanden aus einer Markt- und Wettbewerbsanalyse (LPA Captano/Capmatix, Bloomberg SWPM/OVML, Numerix, Quantifi,
 Murex, TMS-Anbieter, QuantLib/ORE) – siehe [`docs/research`](docs/research).
@@ -22,7 +22,7 @@ docs/quality            Bewertungsrubrik, Review-Berichte und Scorecards des Orc
 docs/research           Video-Ausgangspunkt, LPA-Analyse, Wettbewerber, Domäne/Methodik/Regulatorik
 docs/product            Vision & Module, Epics & User Stories, UI-Konzept & Hotkeys
 docs/architecture       Architektur (C4), Architecture Decision Records
-docs/compliance         Regulatorik-Mapping: Anforderung → Feature → Evidenz → Status (MiFID II, IFRS 13/IDW RS HFA 35, IFRS 9/HGB, EMIR, BGH, MaRisk, DORA)
+docs/compliance         Regulatorik-Mapping: Anforderung → Feature → Evidenz → Status (MiFID II, IFRS 13/IDW RS HFA 47, IFRS 9/HGB § 254/IDW RS HFA 35, EMIR, BGH, MaRisk, DORA)
 ```
 
 ## Quickstart
@@ -72,18 +72,48 @@ curl -s localhost:4000/api/price -H 'content-type: application/json' -d '{
 ```
 
 Weitere Endpunkte: `POST /api/risk`, `/api/risk/par`, `/api/risk/par/portfolio`, `/api/risk/vega` (`dimension`, `smile`; Swaption-Cube, Caplet- und FX-Vol-Fläche), `POST /api/scenarios` (`includeHistorical`), `GET /api/scenarios/standard|historical`,
-`POST /api/scenarios/grid`, `POST /api/xva` (`credit.cptyHazardCurve`), `POST /api/xva/hazard-curve` (CDS-Spreads → Hazard-Kurve),
+`POST /api/scenarios/grid`, `POST /api/xva` (`credit.cptyHazardCurve`), `POST /api/xva/hazard-curve` (CDS-Spreads → Hazard-Kurve; invertierte Quotes → 422 `INVALID_CREDIT_CURVE` oder mit `floorHazard: true` Hazard 0 plus `warnings` `HAZARD_FLOORED:`),
 `POST /api/hedge/effectiveness` (`designationSnapshot`, `freezeDesignationVol`), `/api/hedge/hypothetical` (`designation`, Tilgungspläne), `POST /api/report` (`?format=csv`; `perspective`, `governance`),
 `POST /api/report/portfolio` (Buchebene: PV/DV01/Theta/FX-Delta je Trade und nach Kontrahent/Buch/Produktart; `groupBy`, `?format=md`),
-`POST /api/documents/termsheet|suitability|confirmation|kid` (`?format=md`), `GET/POST/PUT/DELETE /api/trades` (+ `/import`, `/from-template` für CrossCurrencySwap/FRA-Builder),
+`POST /api/documents/termsheet|suitability|confirmation|kid` (`?format=md`), `GET/POST/PUT/DELETE /api/trades` (+ `/import` als JSON-Array oder CSV mit `content-type: text/csv` und `?type=` – eine Spaltenvorlage je Produkttyp, Zeilen laufen durch die Core-Builder, Fehler je Zeile –, `/from-template` für CrossCurrencySwap/FRA-Builder – CCS `collateralCurrency` default USD, sonst Quote-Währung des Paars, `null` = unbesichert; FRA-Index folgt der Periode, `3x6` → EURIBOR-3M),
 `GET /api/market/curves/:id`, `POST /api/market/bootstrap` (Quotes inkl. `FxSwapPoints`, `turnOfYear`, `globalSweeps`, `monotoneConvex`), `GET/PUT /api/market/snapshot` (`forwardJumps`),
 `GET /api/emir/valuations?format=csv&asOf=&timestamp=&method=&uti=&transactionPrice=` (inkl. Clearing-Felder), `GET /api/audit`, `GET /api/health/ready`.
 
-**Vertrag:** Alle Bodies (inkl. Snapshot-Import) sind JSON-Schema-validiert; Trades sind eine diskriminierte Union über `type` mit typisierten Enum-Feldern – ein
-`Fixed`-Leg ohne `rate` oder `status: "Bogus"` ergibt 400 statt `pv: null`. Jede Route hat eine `operationId` und dokumentierte Antworten (2xx, 400/404/409/412/422/429).
-Fehler kommen einheitlich als `{ error, code?, statusCode, validation?, requestId }` (Domänenfehler 422 mit `code`, z. B. `MISSING_FIXING`).
-Trades tragen ETags (`If-Match` auf PUT/DELETE → 412, `If-None-Match` auf GET → 304); jede bewertungsbezogene Antwort trägt `X-Market-Snapshot-Id`
+**Vertrag (40 Operationen, OpenAPI 3.1.0):** Alle Bodies (inkl. Snapshot-Import) sind JSON-Schema-validiert; Trades sind eine diskriminierte Union über `type` mit typisierten Enum-Feldern – ein
+`Fixed`-Leg ohne `rate` oder `status: "Bogus"` ergibt 400 statt `pv: null`. Jede Route hat eine `operationId` und dokumentierte Antworten (2xx, 400/404/409/412/413/422/428/429);
+`components.schemas` sind benannt (`Trade`, `InterestRateSwap`, …, `SwapLeg`, `MarketSnapshot`, `ErrorResponse`) und tragen `discriminator.mapping`.
+Fehler kommen einheitlich als `{ error, code?, details?, statusCode, validation?, requestId }` (Domänenfehler 422 mit `code`, z. B. `MISSING_FIXING`). Die Codes sind stabil und in `ErrorResponse.code` (`examples` + Beschreibung) dokumentiert:
+Core-Codes `INVALID_TRADE`, `NON_FINITE_PV`, `MISSING_RATE`, `MISSING_FIXING`, `NO_DISCOUNT_CURVE`, `CURVE_NOT_FOUND`, `NO_FX_SPOT`, `UNKNOWN_INDEX`, `UNKNOWN_CALENDAR`, `UNSUPPORTED_TRADE_TYPE`, `INVALID_FREQUENCY` (z. B. `7Q`), `UNKNOWN_DAYCOUNT`, `VOL_MODEL_INCOMPATIBLE` (Black auf nicht-positivem Forward/Strike ohne Shift), `INVALID_CREDIT_CURVE` (invertierte CDS-Quotes, `details.pillar`), `INVALID_TIMESTAMP` (400 beim Snapshot-Import, 422 im EMIR-Export);
+API-Codes `TOO_MANY_PERIODS` (400), `PERIOD_BUDGET_EXCEEDED` (413), `CSV_INVALID`/`CSV_ROW_INVALID`, `SNAPSHOT_MALFORMED` (400), `SNAPSHOT_INVALID` (422), `PRECONDITION_FAILED` (412), `PRECONDITION_REQUIRED` (428), `DOMAIN_ERROR`.
+Keine Fehler, sondern Präfixe in `warnings[]` einer 200-Antwort: `MISSING_FIXING:`, `VOL_TYPE_CONVERTED:` (z. B. `model: "Black"` auf der Normal-Caplet-Fläche – PV ≈ Bachelier, `analytics.volConverted: "yes"`), `HAZARD_FLOORED:`.
+Trades tragen ETags (`If-Match` auf PUT/DELETE → 412 bei Abweichung, mit `REQUIRE_IF_MATCH=1` Pflicht → 428 ohne Header; `If-None-Match` auf GET → 304); jede bewertungsbezogene Antwort trägt `X-Market-Snapshot-Id`
 (identisch mit `audit.snapshotId` im Report) und `X-Request-Id` (eine eingehende `x-request-id` wird übernommen).
+
+**Rechenbudget:** Alle Bewertungen laufen synchron. Die API schätzt vor dem Rechnen die Kuponperioden: je Leg ≤ 1200 (`frequency: "1D"` über 100 Jahre → 400 `TOO_MANY_PERIODS` in < 50 ms),
+je Request ≤ 20 000 Perioden über alle Trades und ≤ 500 000 Perioden × Bewertungen (Szenarien, Grid-Zellen, Bucket-Risiko) → sonst 413 `PERIOD_BUDGET_EXCEEDED`; Body ≤ 5 MB, `trades` ≤ 5000.
+Grenzen per `MAX_PERIODS_PER_LEG`, `MAX_PERIODS_PER_REQUEST`, `MAX_WEIGHTED_PERIODS_PER_REQUEST` einstellbar.
+
+### CSV-Import (`POST /api/trades/import`, `content-type: text/csv`)
+
+`?type=` wählt die Spaltenvorlage; Trennzeichen `;`, `,` oder Tab (automatisch erkannt), deutsche oder englische Zahlen (`10.000.000,50`, `3,10 %`, `-20 bp`, `0.031`),
+Daten ISO oder `TT.MM.JJJJ`, Tenors (`5Y`), Spaltennamen case-insensitiv mit deutschen Aliassen (Kontrahent, Nominal, Währung, Festsatz, Startdatum, Laufzeit …).
+Zeilen laufen durch die Core-Builder (Marktkonventionen der Währung); jede Zeile erscheint im Ergebnis (`imported` | `skipped` | `rejected` mit `row` und `reason`), `?mode=upsert` ersetzt vorhandene IDs.
+Gemeinsame optionale Spalten: `id`, `name`, `counterparty`, `book`, `uti`. Die vollständigen Vorlagen (Pflicht-/Optionalspalten, Beispielzeile) stehen in der OpenAPI-Beschreibung der Route und in `apps/api/src/lib/csv-import.ts`.
+
+| `type`              | Pflichtspalten                                                                      | Wichtige optionale Spalten                                         |
+| ------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `InterestRateSwap`  | `currency notional payReceive fixedRate effectiveDate maturity`                     | `index spread fixedFrequency floatFrequency collateralCurrency`    |
+| `FxForward`         | `pair baseAmount rate deliveryDate`                                                 | – (`baseAmount` mit Vorzeichen: + kauft die Basiswährung)          |
+| `CapFloor`          | `currency notional capFloor strike effectiveDate maturity`                          | `floorStrike index longShort`                                      |
+| `Swaption`          | `currency notional payerReceiver strike expiry tenor`                               | `settlement longShort`                                             |
+| `FxOption`          | `pair optionType notional strike expiryDate`                                        | `deliveryDate longShort`                                           |
+| `CrossCurrencySwap` | `pair domesticNotional effectiveDate tenor` (+ `fxSpot` **oder** `foreignNotional`) | `spread fixedRate domesticPayReceive frequency collateralCurrency` |
+| `FRA`               | `currency notional payReceive start rate`                                           | `index end collateralCurrency` (`start` als `3x9` oder Datum)      |
+
+```bash
+printf 'currency;notional;payReceive;fixedRate;effectiveDate;maturity;id\nEUR;10.000.000;Pay;3,10 %%;2026-09-07;10Y;IRS-CSV-1\n' \
+  | curl -s 'localhost:4000/api/trades/import?type=InterestRateSwap' -H 'content-type: text/csv' --data-binary @-
+```
 
 ## Bibliothek direkt nutzen
 

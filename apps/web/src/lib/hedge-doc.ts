@@ -25,16 +25,23 @@ export function hedgeDocMarkdown(
   rel: HedgeRelationship,
   trade: Trade,
   rep: HedgeEffectivenessReport | null,
-  opts: { valuationDate: number; ccy: string; generatedAt?: string },
+  opts: { valuationDate: number; ccy: string; generatedAt?: string; stale?: boolean },
 ): string {
   const item = rel.hedgedItem;
   const lines: string[] = [];
   lines.push(`# Sicherungsdokumentation – ${rel.name}`);
   lines.push("");
   lines.push(
-    `Erstellt ${opts.generatedAt ?? new Date().toLocaleString("de-DE")} · Bewertungstag ${fmtDate(opts.valuationDate)} · Reporting-Währung ${opts.ccy}`,
+    `Erstellt ${opts.generatedAt ?? new Date().toLocaleString("de-DE")} · Bewertungstag ${fmtDate(opts.valuationDate)} · Reporting-Währung ${opts.ccy}${opts.stale ? " · ERGEBNIS VERALTET" : ""}`,
   );
   lines.push("");
+  if (opts.stale) {
+    // The effectiveness result refers to earlier inputs (R3-F4) – the exported document says so.
+    lines.push(
+      "> **Ergebnis veraltet** – Hedge Ratio, Grundgeschäft, Designation oder Marktdaten wurden nach dem Effektivitätstest geändert. Bitte erneut testen, bevor diese Dokumentation abgelegt wird.",
+    );
+    lines.push("");
+  }
   lines.push("## Sicherungsbeziehung");
   lines.push("");
   lines.push("| Merkmal | Wert |");
@@ -70,7 +77,9 @@ export function hedgeDocMarkdown(
   if (rep) {
     lines.push("## Effektivitätstest");
     lines.push("");
-    lines.push(`**Ergebnis nach designierter Methode (${METHOD_DE[rep.method] ?? rep.method}): ${verdict(rep)}.**`);
+    lines.push(
+      `**Ergebnis nach designierter Methode (${METHOD_DE[rep.method] ?? rep.method}): ${verdict(rep)}.**${opts.stale ? " _(veraltet – Eingaben nach dem Test geändert)_" : ""}`,
+    );
     lines.push("");
     lines.push("| Test | Ergebnis | Kennzahl |");
     lines.push("|---|---|---|");

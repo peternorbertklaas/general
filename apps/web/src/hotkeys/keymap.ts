@@ -7,10 +7,16 @@
  *  - chords (sequence):  "g b" (press g, then b within 900ms) – Vim/GitHub-style
  *  - aliases:            keys may be an array – every entry triggers the same action
  *                        (layout-neutral alternatives such as "]" and "+").
+ *
+ * Rule (R3-01): no combination from the browser reservation list below. Chromium
+ * executes reserved commands (Ctrl+T/N/W, Ctrl+Shift+T/N/W, Ctrl+Tab) before the
+ * page sees `keydown`, and the DevTools shortcuts (Ctrl+Shift+I/J/C, Firefox
+ * Ctrl+Shift+K/E/S) cannot be prevented either. Documents, report and exports
+ * therefore live on chords: `o …` (öffnen), `x …` (Export), `y …` (yank/kopieren).
  */
 export type ViewId = "blotter" | "pricing" | "curves" | "scenarios" | "market" | "report" | "compare" | "hedge";
 
-export type HotkeyGroup = "Navigation" | "Aktionen" | "Bewertung" | "Ansicht" | "Blotter";
+export type HotkeyGroup = "Navigation" | "Aktionen" | "Dokumente & Export" | "Bewertung" | "Ansicht" | "Blotter";
 
 export interface HotkeyDef {
   id: string;
@@ -23,6 +29,43 @@ export interface HotkeyDef {
   /** Hidden from palette / help (internal aliases such as Alt+n or Escape). */
   hidden?: boolean;
 }
+
+/**
+ * Key combinations that browsers reserve or that open developer tools – never
+ * bind them (Chromium reserved commands, Chrome/Edge/Firefox/Safari DevTools and
+ * window shortcuts). Checked by `useHotkeys.test.ts` against every definition.
+ */
+export const BROWSER_RESERVED_COMBOS: ReadonlySet<string> = new Set([
+  "mod+t",
+  "mod+n",
+  "mod+w",
+  "mod+q",
+  "mod+tab",
+  "mod+shift+tab",
+  "mod+shift+t", // restore closed tab (all browsers)
+  "mod+shift+n", // incognito / private window
+  "mod+shift+w", // close window
+  "mod+shift+q", // quit (Linux)
+  "mod+shift+i", // DevTools
+  "mod+shift+j", // DevTools console (Chrome)
+  "mod+shift+c", // DevTools inspect (Chrome), Firefox inspector
+  "mod+shift+k", // Firefox web console
+  "mod+shift+e", // Firefox network monitor
+  "mod+shift+s", // Firefox screenshot / debugger
+  "mod+shift+m", // Firefox responsive design mode, Chrome profile menu
+  "mod+shift+b", // bookmarks bar / library
+  "mod+shift+o", // bookmark manager
+  "mod+shift+d", // bookmark all tabs / Firefox bookmarks sidebar
+  "mod+shift+a", // Firefox add-ons, Chrome tab search
+  "mod+shift+p", // Firefox private window, Chrome system print dialog
+  "mod+shift+r", // hard reload
+  "mod+shift+h", // Firefox history
+  "mod+shift+y", // Firefox downloads
+  "mod+shift+l", // Safari sidebar
+  "mod+shift+delete", // clear browsing data
+  "mod+shift+g", // find previous
+  "mod+shift+f", // Firefox: search all files (DevTools)
+]);
 
 /** Labels of the "new trade" templates – referenced by the keymap and the palette (single label source). */
 export const TEMPLATE_LABELS = {
@@ -71,16 +114,17 @@ export const HOTKEYS: HotkeyDef[] = [
   { id: "new.fxs", keys: "n x", label: TEMPLATE_LABELS.fxs, group: "Aktionen" },
   { id: "new.ccs", keys: "n z", label: TEMPLATE_LABELS.ccs, group: "Aktionen" },
   { id: "new.fra", keys: "n r", label: TEMPLATE_LABELS.fra, group: "Aktionen" },
-  { id: "undo", keys: "mod+z", label: "Rückgängig (Trades, Quotes)", group: "Aktionen", global: true },
-  { id: "export.csv", keys: "mod+e", label: "Cashflows als CSV exportieren", group: "Aktionen", global: true },
-  { id: "export.blotter", keys: "mod+shift+e", label: "Blotter als CSV exportieren", group: "Aktionen", global: true },
-  { id: "copy.indication", keys: "mod+shift+c", label: "Indikation als Text kopieren", group: "Aktionen", global: true },
-  { id: "report.generate", keys: "mod+shift+r", label: "Report erzeugen (Zeitstempel fixieren)", group: "Aktionen", global: true },
-  { id: "doc.termsheet", keys: "mod+shift+t", label: "Termsheet öffnen", group: "Aktionen", global: true },
-  { id: "doc.suitability", keys: "mod+shift+g", label: "Geeignetheitserklärung öffnen", group: "Aktionen", global: true },
-  { id: "doc.kid", keys: "mod+shift+k", label: "Basisinformationsblatt (KID) öffnen", group: "Aktionen", global: true },
-  { id: "doc.confirmation", keys: "mod+shift+f", label: "Confirmation (Geschäftsbestätigung) öffnen", group: "Aktionen", global: true },
-  { id: "export.portfolio", keys: "mod+shift+l", label: "Portfolio-Report exportieren (JSON + Markdown)", group: "Aktionen", global: true },
+  { id: "undo", keys: "mod+z", label: "Rückgängig (Trades, Quotes, Markt, Hedge)", group: "Aktionen", global: true },
+  // Documents, report and exports: chords only (browser-safe, R3-01). "o" = öffnen, "x" = Export, "y" = kopieren.
+  { id: "report.generate", keys: "o r", label: "Report erzeugen (Zeitstempel fixieren)", group: "Dokumente & Export" },
+  { id: "doc.termsheet", keys: "o t", label: "Termsheet öffnen", group: "Dokumente & Export" },
+  { id: "doc.suitability", keys: "o g", label: "Geeignetheitserklärung öffnen", group: "Dokumente & Export" },
+  { id: "doc.kid", keys: "o k", label: "Basisinformationsblatt (KID) öffnen", group: "Dokumente & Export" },
+  { id: "doc.confirmation", keys: "o c", label: "Confirmation (Geschäftsbestätigung) öffnen", group: "Dokumente & Export" },
+  { id: "export.portfolio", keys: "o p", label: "Portfolio-Report exportieren (JSON + Markdown)", group: "Dokumente & Export" },
+  { id: "export.csv", keys: ["mod+e", "x c"], label: "Cashflows als CSV exportieren", group: "Dokumente & Export", global: true },
+  { id: "export.blotter", keys: "x b", label: "Blotter als CSV exportieren", group: "Dokumente & Export" },
+  { id: "copy.indication", keys: "y i", label: "Indikation als Text kopieren", group: "Dokumente & Export" },
   { id: "duplicate", keys: "d", label: "Trade duplizieren", group: "Blotter" },
   { id: "delete", keys: ["shift+d", "delete"], label: "Trade löschen (mit Rückgängig)", group: "Blotter" },
   { id: "down", keys: "j", label: "Nächster Trade", group: "Blotter" },

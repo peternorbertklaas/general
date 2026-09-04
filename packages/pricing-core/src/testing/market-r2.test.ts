@@ -462,6 +462,7 @@ describe("N5 – EMIR valuation record: UTI, delta, timestamp, clearing", () => 
     });
     swap.uti = "E02XYZ00000000000000000000000000000000001";
     swap.cleared = true;
+    swap.clearingObligation = true;
     swap.clearingMember = "LCH-MEMBER-1";
     swap.status = "Quoted";
     swap.quoteValidUntil = VAL + 1;
@@ -478,6 +479,7 @@ describe("N5 – EMIR valuation record: UTI, delta, timestamp, clearing", () => 
       {
         ...swap,
         cleared: undefined,
+        clearingObligation: undefined,
         legs: swap.legs.map((l) => ({ ...l, payReceive: l.payReceive === "Pay" ? "Receive" : "Pay" })) as InterestRateSwap["legs"],
       },
       priceTrade(ctx, swap, "EUR"),
@@ -485,7 +487,13 @@ describe("N5 – EMIR valuation record: UTI, delta, timestamp, clearing", () => 
     );
     expect(rec2.delta).toBe(-1);
     expect(rec2.cleared).toBe("FALSE");
-    expect(rec2.clearingObligation).toBe("N");
+    // N3-09: the clearing obligation is never derived from `cleared` – unknown → "N/A"
+    expect(rec2.clearingObligation).toBe("N/A");
+    expect(emirValuationRecord(ctx, { ...swap, cleared: true, clearingObligation: undefined }, priceTrade(ctx, swap, "EUR")).clearingObligation).toBe("N/A");
+    expect(emirValuationRecord(ctx, { ...swap, cleared: false, clearingObligation: true }, priceTrade(ctx, swap, "EUR")).clearingObligation).toBe("Y");
+    expect(
+      emirValuationRecord(ctx, { ...swap, clearingObligation: undefined }, priceTrade(ctx, swap, "EUR"), { clearingObligation: false }).clearingObligation,
+    ).toBe("N");
     expect(rec2.valuationMethod).toBe("MTMA");
     expect(rec2.valuationTimestamp).toBe("2026-09-03T18:00:00Z");
     expect(rec2.uti).toBe("OVERRIDE");
@@ -719,17 +727,20 @@ describe("N12 – FxSwapPoints quotes and turn-of-year jumps", () => {
     const res = bootstrapCurve(VAL, { id: "EUR-ESTR-TOY", currency: "EUR", index: "ESTR", quotes: SAMPLE_QUOTES.eurOis, turnOfYear: [{ date: toy, bp: 15 }] });
     for (const r of res.residuals) expect(Math.abs(r.residual)).toBeLessThan(1e-9);
     const curve = res.curve;
-    expect(curve.forwardJumps).toEqual([{ date: toy, bp: 15, days: undefined }]);
+    // R3-6: default window = business-day span over the turn on TARGET (Thu 31.12.2026 → Mon 04.01.2027 = 4 days)
+    expect(curve.forwardJumps).toEqual([{ date: toy, bp: 15, days: 4 }]);
     const before = curve.forwardRate(toy - 1, toy, "ACT/360");
     const over = curve.forwardRate(toy, toy + 1, "ACT/360");
-    const after = curve.forwardRate(toy + 1, toy + 2, "ACT/360");
+    const overWindow = curve.forwardRate(toy, toy + 4, "ACT/360");
+    const after = curve.forwardRate(toy + 4, toy + 5, "ACT/360");
     expect((over - before) * 1e4).toBeCloseTo(15 * (360 / 365), 1);
+    expect((overWindow - before) * 1e4).toBeCloseTo(15 * (360 / 365), 1);
     expect(Math.abs(after - before) * 1e4).toBeLessThan(0.5);
     // the plain curve has no jump, and the year-end pillars agree (the quotes are unchanged)
     const plain = ctx.curves[SAMPLE_CURVE_IDS.eurOis]!;
     expect(Math.abs(plain.forwardRate(toy, toy + 1, "ACT/360") - plain.forwardRate(toy - 1, toy, "ACT/360")) * 1e4).toBeLessThan(0.5);
-    // roll / JSON / snapshot keep the jump
-    expect(curve.rolledTo(VAL + 10).forwardJumps[0]!.date).toBe(toy + 10);
+    // roll / JSON / snapshot keep the jump – on its calendar date (R3-6: the turn is a calendar event)
+    expect(curve.rolledTo(VAL + 10).forwardJumps[0]!.date).toBe(toy);
     const back = InterpolatedCurve.fromJSON(curve.toJSON());
     expect(back.forwardRate(toy, toy + 1, "ACT/360")).toBeCloseTo(over, 12);
     const snap = deserializeMarket(serializeMarket({ ...ctx, curves: { [curve.id]: curve }, discountCurveId: { EUR: curve.id } }));

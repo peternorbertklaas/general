@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { TEMPLATE_IDS } from "../lib/templates.js";
 import { enterAllowed, eventMatches, isEditable, isTextEntry, parseCombo } from "./useHotkeys.js";
-import { HOTKEYS, TEMPLATE_LABELS, VIEW_HOTKEYS, VISIBLE_HOTKEYS, isMac, keyList, keyTokens, keysText } from "./keymap.js";
+import { BROWSER_RESERVED_COMBOS, HOTKEYS, TEMPLATE_LABELS, VIEW_HOTKEYS, VISIBLE_HOTKEYS, isMac, keyList, keyTokens, keysText } from "./keymap.js";
 
 function ev(key: string, mods: Partial<KeyboardEvent> = {}): KeyboardEvent {
   return { key, code: "", ctrlKey: false, metaKey: false, shiftKey: false, altKey: false, ...mods } as KeyboardEvent;
@@ -32,10 +32,11 @@ describe("hotkey matching", () => {
     expect(eventMatches(ev("k"), parseCombo("shift+k"))).toBe(false);
     expect(eventMatches(ev(" "), parseCombo("space"))).toBe(true);
   });
-  it("mod+shift+e (Blotter-Export) is distinct from mod+e (Cashflows)", () => {
-    expect(eventMatches(ev("E", { ctrlKey: true, shiftKey: true }), parseCombo("mod+shift+e"))).toBe(true);
+  it("mod+e (Cashflows) does not fire on mod+shift+e and the blotter export lives on a chord", () => {
     expect(eventMatches(ev("E", { ctrlKey: true, shiftKey: true }), parseCombo("mod+e"))).toBe(false);
-    expect(eventMatches(ev("e", { ctrlKey: true }), parseCombo("mod+shift+e"))).toBe(false);
+    expect(eventMatches(ev("e", { ctrlKey: true }), parseCombo("mod+e"))).toBe(true);
+    expect(keyList(def("export.blotter"))).toEqual(["x b"]);
+    expect(keyList(def("export.csv"))).toEqual(["mod+e", "x c"]);
   });
   it("keymap has unique ids and unique key notations across all aliases", () => {
     const ids = new Set(HOTKEYS.map((h) => h.id));
@@ -66,22 +67,36 @@ describe("hotkey matching", () => {
     // every "new." hotkey points at an existing template
     for (const h of HOTKEYS.filter((x) => x.id.startsWith("new."))) expect(TEMPLATE_IDS as string[], h.id).toContain(h.id.slice(4));
   });
-  it("document / export hotkeys are registered once and free of collisions (KID = mod+shift+k)", () => {
-    expect(HOTKEYS.filter((h) => keyList(h).includes("mod+shift+k")).map((h) => h.id)).toEqual(["doc.kid"]);
-    expect(HOTKEYS.filter((h) => keyList(h).includes("mod+shift+f")).map((h) => h.id)).toEqual(["doc.confirmation"]);
-    expect(HOTKEYS.filter((h) => keyList(h).includes("mod+shift+l")).map((h) => h.id)).toEqual(["export.portfolio"]);
-    // shift+k (customer mode) and mod+k (palette) stay distinct from mod+shift+k
-    const kid = parseCombo("mod+shift+k");
-    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), kid)).toBe(true);
-    expect(eventMatches(ev("K", { shiftKey: true }), kid)).toBe(false);
-    expect(eventMatches(ev("k", { ctrlKey: true }), kid)).toBe(false);
-    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), parseCombo("shift+k"))).toBe(false);
-    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), parseCombo("mod+k"))).toBe(false);
-    for (const id of ["doc.kid", "doc.confirmation", "export.portfolio"])
+  it("documents, report and exports live on the o / x / y chords (R3-01)", () => {
+    expect(keyList(def("doc.termsheet"))).toEqual(["o t"]);
+    expect(keyList(def("doc.suitability"))).toEqual(["o g"]);
+    expect(keyList(def("doc.kid"))).toEqual(["o k"]);
+    expect(keyList(def("doc.confirmation"))).toEqual(["o c"]);
+    expect(keyList(def("export.portfolio"))).toEqual(["o p"]);
+    expect(keyList(def("report.generate"))).toEqual(["o r"]);
+    expect(keyList(def("copy.indication"))).toEqual(["y i"]);
+    // the chord starters are not bound as single keys
+    for (const starter of ["o", "x", "y", "g", "n"])
+      expect(
+        HOTKEYS.some((h) => keyList(h).includes(starter)),
+        starter,
+      ).toBe(false);
+    for (const id of ["doc.kid", "doc.confirmation", "export.portfolio", "report.generate", "copy.indication"])
       expect(
         VISIBLE_HOTKEYS.some((h) => h.id === id),
         id,
       ).toBe(true);
+    // shift+k (customer mode) and mod+k (palette) stay distinct
+    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), parseCombo("shift+k"))).toBe(false);
+    expect(eventMatches(ev("K", { ctrlKey: true, shiftKey: true }), parseCombo("mod+k"))).toBe(false);
+  });
+  it("no hotkey uses a browser-reserved or DevTools combination (R3-01)", () => {
+    const all = HOTKEYS.flatMap((h) => keyList(h).flatMap((k) => k.split(" ")));
+    for (const combo of all) expect(BROWSER_RESERVED_COMBOS.has(combo.toLowerCase()), combo).toBe(false);
+    // no mod+shift+<letter> at all – every such combination is taken by at least one browser
+    for (const combo of all) expect(/^mod\+shift\+[a-z]$/.test(combo), combo).toBe(false);
+    for (const must of ["mod+shift+t", "mod+shift+n", "mod+shift+w", "mod+shift+k", "mod+shift+b", "mod+shift+j", "mod+shift+c", "mod+shift+i", "mod+shift+r"])
+      expect(BROWSER_RESERVED_COMBOS.has(must), must).toBe(true);
   });
   it("renders key tokens and alias text", () => {
     expect(keyTokens("g p")).toEqual([["G"], ["P"]]);

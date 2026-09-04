@@ -52,6 +52,8 @@ export const METRICS: Record<string, MetricDef> = {
   strike: { label: "Strike", fmt: (v, c) => (isFx(c) ? fmtNum(v, 4) : fmtPct(v, 4)) },
   floorStrike: { label: "Floor-Strike", fmt: pct4 },
   volatility: { label: "Volatilität", fmt: vol },
+  /** Core R3: vol as quoted on the surface before a normal ↔ lognormal conversion for the requested model. */
+  surfaceVolatility: { label: "Volatilität (Fläche, Original-Quotierung)", fmt: vol },
   impliedVol: { label: "Implizite Vol", fmt: vol },
   expiryYears: { label: "Zeit bis Verfall", fmt: (v) => fmtYears(v) },
   tenorYears: { label: "Swap-Laufzeit", fmt: (v) => fmtYears(v) },
@@ -127,6 +129,8 @@ const TEXT_METRICS: Record<string, { label: string; values?: Record<string, stri
   isFixed: { label: "Fixing erfolgt", values: { yes: "ja", no: "nein" } },
   ndf: { label: "NDF", values: { yes: "ja", no: "nein" } },
   mtmReset: { label: "MtM-Reset", values: { yes: "ja", no: "nein" } },
+  volConverted: { label: "Vol-Quotierung umgerechnet (Normal ↔ Lognormal)", values: { yes: "ja", no: "nein" } },
+  deliveryConvention: { label: "Lieferkonvention", values: { standard: "Standard (Spot-Lag)", "non-standard": "abweichend" } },
 };
 
 /** Keys never shown as rows: duplicated elsewhere or purely internal model terms. */
@@ -264,5 +268,5 @@ export const METRIC_DEFINITIONS: Record<string, string> = {
   perspective:
     "Perspektive: Aus wessen Sicht Barwert und Transaktionspreis angegeben sind. „Kunde“ = das Geschäft ist die Position des Kunden (Beispielportfolio), „Bank“ = Buchung aus Sicht der Bank.",
   governance:
-    "Bewertungs-Governance (IDW RS HFA 35, MaRisk AT 4.3): Status des Markt-Snapshots (indikativ / freigegeben), Datenquellen, Modellversion und ggf. Validierer.",
+    "Bewertungs-Governance (IFRS 13 / IDW RS HFA 47, MaRisk AT 4.3.5): Status des Markt-Snapshots (indikativ / freigegeben), Datenquellen, Modellversion und ggf. Validierer.",
 };

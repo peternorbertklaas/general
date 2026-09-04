@@ -9,6 +9,7 @@ import swaggerUi from "@fastify/swagger-ui";
 import Fastify, { LogController, type FastifyInstance, type FastifyServerOptions } from "fastify";
 import { toISO } from "@deriva/pricing-core";
 import { classifyError } from "./lib/errors.js";
+import { type ComputeLimits, defaultLimits, registerComputeLimits } from "./lib/limits.js";
 import { AuditLog, MarketStore, TradeStore, samplePortfolio } from "./lib/store.js";
 import { registerAuditRoutes } from "./routes/audit.js";
 import { registerHedgeRoutes } from "./routes/hedge.js";
@@ -19,7 +20,15 @@ import { registerPortfolioReportRoutes } from "./routes/portfolio-report.js";
 import { registerPricingRoutes } from "./routes/pricing.js";
 import { registerSnapshotRoutes } from "./routes/snapshot.js";
 import { registerTradeRoutes } from "./routes/trades.js";
-import { errorResponseSchema, marketSnapshotSchema, responses, tradeSchema } from "./schemas.js";
+import {
+  API_ERROR_CODES,
+  errorResponseSchema,
+  fromTemplateBranchSchemas,
+  marketSnapshotSchema,
+  responses,
+  tradeSchema,
+  tradeVariantSchemas,
+} from "./schemas.js";
 
 declare module "fastify" {
   interface FastifyContextConfig {
@@ -39,6 +48,10 @@ export interface AppOptions {
   swaggerUi?: boolean;
   /** Suppress per-request "incoming request"/"request completed" logs (default: NODE_ENV=production). */
   disableRequestLogging?: boolean;
+  /** Compute bounds per request (default from env / `defaultLimits()`, see lib/limits.ts). */
+  limits?: Partial<ComputeLimits>;
+  /** `PUT`/`DELETE /api/trades/:id` without `If-Match` → 428 Precondition Required (default: env REQUIRE_IF_MATCH=1). */
+  requireIfMatch?: boolean;
 }
 
 export interface AppContext {
@@ -46,6 +59,50 @@ export interface AppContext {
   trades: TradeStore;
   audit: AuditLog;
   version: string;
+  limits: ComputeLimits;
+  requireIfMatch: boolean;
+}
+
+const BODY_LIMIT = 5 * 1024 * 1024;
+
+/**
+ * Post-processing of the generated OpenAPI 3.1 document: every discriminated
+ * union whose branches are `$ref`s gets an explicit `discriminator.mapping`
+ * (tag value → component). Ajv rejects `mapping` in the validation schema, so
+ * it is derived here from the referenced components' tag `enum`. Likewise
+ * `ErrorResponse.code` gets the complete code list as JSON-Schema `examples`
+ * (3.1 keyword; @fastify/swagger would collapse a schema-level `examples`
+ * array into one `example`).
+ */
+export function openApiTransform<T extends { components?: { schemas?: Record<string, unknown> } }>(doc: T): T {
+  const schemas = doc.components?.schemas ?? {};
+  const errorCode = (schemas.ErrorResponse as { properties?: { code?: Record<string, unknown> } } | undefined)?.properties?.code;
+  if (errorCode) {
+    delete errorCode.example;
+    errorCode.examples = [...API_ERROR_CODES.core, ...API_ERROR_CODES.api];
+  }
+  const tagOf = (ref: string, tag: string): string | undefined => {
+    const name = ref.replace(/^#\/components\/schemas\//, "");
+    const comp = schemas[name] as { properties?: Record<string, { enum?: unknown[] }> } | undefined;
+    const e = comp?.properties?.[tag]?.enum;
+    return Array.isArray(e) && e.length === 1 && typeof e[0] === "string" ? e[0] : undefined;
+  };
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (!node || typeof node !== "object") return;
+    const n = node as { discriminator?: { propertyName?: string; mapping?: Record<string, string> }; oneOf?: { $ref?: string }[] };
+    if (n.discriminator?.propertyName && Array.isArray(n.oneOf) && !n.discriminator.mapping) {
+      const mapping: Record<string, string> = {};
+      for (const b of n.oneOf) {
+        const tag = b.$ref ? tagOf(b.$ref, n.discriminator.propertyName) : undefined;
+        if (tag && b.$ref) mapping[tag] = b.$ref;
+      }
+      if (Object.keys(mapping).length === n.oneOf.length) n.discriminator.mapping = mapping;
+    }
+    for (const v of Object.values(n)) walk(v);
+  };
+  walk(doc);
+  return doc;
 }
 
 function readVersion(): string {
@@ -76,13 +133,22 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     logController: new LogController({ disableRequestLogging: opts.disableRequestLogging ?? isProduction() }),
     requestIdHeader: false,
     genReqId: (raw) => requestIdFrom(raw.headers["x-request-id"]),
-    bodyLimit: 5 * 1024 * 1024,
+    bodyLimit: BODY_LIMIT,
     ajv: {
       // `discriminator` enables the tagged `oneOf` trade schema; unknown properties are rejected (400) instead of silently stripped.
       customOptions: { discriminator: true, removeAdditional: false },
     },
   });
-  const ctx: AppContext = { market: new MarketStore(), trades: new TradeStore(), audit: new AuditLog(), version: readVersion() };
+  const ctx: AppContext = {
+    market: new MarketStore(),
+    trades: new TradeStore(),
+    audit: new AuditLog(),
+    version: readVersion(),
+    limits: { ...defaultLimits(), ...opts.limits },
+    requireIfMatch: opts.requireIfMatch ?? process.env.REQUIRE_IF_MATCH === "1",
+  };
+  // CSV uploads (`POST /api/trades/import`, content-type text/csv) arrive as a string under the same body limit; the route maps them to trades.
+  app.addContentTypeParser("text/csv", { parseAs: "string", bodyLimit: BODY_LIMIT }, (_req, body, done) => done(null, body));
   if (opts.seedPortfolio ?? true) {
     for (const t of samplePortfolio(ctx.market.get().valuationDate)) ctx.trades.upsert(t);
   }
@@ -101,12 +167,25 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(rateLimit, { max: opts.rateLimitMax ?? 600, timeWindow: "1 minute" });
   await app.register(swagger, {
+    // Named components: shared schemas keep their `$id` (Trade, MarketSnapshot, ErrorResponse, InterestRateSwap, …) instead of `def-N`.
+    refResolver: {
+      buildLocalReference: (json: { $id?: string; title?: string }, _base: unknown, _fragment: unknown, i: number) => {
+        if (!json.title && json.$id) json.title = json.$id;
+        return json.$id ?? json.title ?? `def-${i}`;
+      },
+    },
+    transformObject: (doc) => ("openapiObject" in doc ? openApiTransform(doc.openapiObject) : doc.swaggerObject),
     openapi: {
-      openapi: "3.0.3",
+      // 3.1: JSON-Schema-2020-12 keywords used by the validation schemas (numeric exclusiveMinimum/Maximum, propertyNames, examples) are valid as-is.
+      openapi: "3.1.0",
       info: {
         title: "DERIVA Pricing API",
         description:
-          "Bewertung von Zins- und Währungsderivaten: Kurven, Pricing, Sensitivitäten, Szenarien, XVA, Bewertungsreports, EMIR-Export, Markt-Snapshots. Datumsangaben als ISO-8601 (YYYY-MM-DD). Alle Request-Bodies werden per JSON-Schema validiert (400 mit `validation`-Details); Trades sind eine diskriminierte Union über `type`. Jede Antwort trägt `X-Request-Id`; bewertungsbezogene Antworten zusätzlich `X-Market-Snapshot-Id` (identisch mit `audit.snapshotId` im Report).",
+          `Bewertung von Zins- und Währungsderivaten: Kurven, Pricing, Sensitivitäten, Szenarien, XVA, Bewertungsreports, EMIR-Export, Markt-Snapshots. Datumsangaben als ISO-8601 (YYYY-MM-DD). Alle Request-Bodies werden per JSON-Schema validiert (400 mit \`validation\`-Details); Trades sind eine diskriminierte Union über \`type\`. Jede Antwort trägt \`X-Request-Id\`; bewertungsbezogene Antworten zusätzlich \`X-Market-Snapshot-Id\` (identisch mit \`audit.snapshotId\` im Report). ` +
+          `Rechenbudget: geschätzte Kuponperioden je Leg ≤ ${ctx.limits.maxPeriodsPerLeg} (sonst 400 \`TOO_MANY_PERIODS\`), je Request ≤ ${ctx.limits.maxPeriodsPerRequest} Perioden über alle Trades und ≤ ${ctx.limits.maxWeightedPeriodsPerRequest} Perioden × Bewertungen (Szenarien, Grid-Zellen, Bucket-Risiko; sonst 413 \`PERIOD_BUDGET_EXCEEDED\`); Body ≤ 5 MB; alle Bewertungen laufen synchron – große Anfragen sind zu stückeln.` +
+          (ctx.requireIfMatch
+            ? " `PUT`/`DELETE /api/trades/:id` verlangen `If-Match` (428 ohne Header)."
+            : " `If-Match` auf `PUT`/`DELETE /api/trades/:id` ist optional (REQUIRE_IF_MATCH=1 erzwingt es mit 428)."),
         version: ctx.version,
         license: { name: "MIT" },
       },
@@ -127,7 +206,9 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     app.get("/docs/json", { schema: { hide: true } }, async () => app.swagger());
   }
 
-  // Shared schemas → OpenAPI components.
+  // Shared schemas → named OpenAPI components (Trade union + every variant, leg union, template branches, snapshot, error envelope).
+  for (const s of tradeVariantSchemas) app.addSchema(s);
+  for (const s of fromTemplateBranchSchemas) app.addSchema(s);
   app.addSchema(tradeSchema);
   app.addSchema(marketSnapshotSchema);
   app.addSchema(errorResponseSchema);
@@ -136,6 +217,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     reply.header("x-request-id", req.id);
     if (req.routeOptions?.config?.marketHeader) reply.header("x-market-snapshot-id", ctx.market.snapshotId());
   });
+  registerComputeLimits(app, ctx, ctx.limits);
 
   app.get(
     "/api/health",

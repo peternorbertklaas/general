@@ -1,3 +1,5 @@
+import { normalizeDayCount } from "../dates/daycount.js";
+import { frequencyPerYear } from "../dates/schedule.js";
 import { PricingError } from "../errors.js";
 import { type MarketContext } from "../market/market-context.js";
 import { type FixedLeg, type FloatLeg, type FxForward, type PricingResult, type SwapLeg, type Trade } from "../instruments/types.js";
@@ -10,6 +12,57 @@ import { priceSwaption } from "./swaption-pricer.js";
 const isNum = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
 const isStr = (x: unknown): x is string => typeof x === "string" && x.length > 0;
 
+/** Message of a `PricingError` (with its code) or a plain error, for the problem list. */
+function describe(e: unknown): string {
+  if (e instanceof PricingError) return `${e.code} – ${e.message}`;
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** Positive finite notional / amount (R3-4: negative or zero notionals were silently accepted). */
+function checkPositive(value: unknown, what: string, out: string[]): void {
+  if (!isNum(value)) out.push(`${what} must be a finite number`);
+  else if (value <= 0) out.push(`${what} must be positive (got ${value})`);
+}
+
+/** Frequency string accepted by the schedule builder (R3-4: "7Q" / "0M" used to surface as plain errors). */
+function checkFrequency(freq: unknown, what: string, out: string[]): void {
+  if (!isStr(freq)) {
+    out.push(`${what} missing`);
+    return;
+  }
+  try {
+    frequencyPerYear(freq);
+  } catch (e) {
+    out.push(`${what} "${freq}" invalid (${describe(e)})`);
+  }
+}
+
+/** Day-count string known to `normalizeDayCount`. */
+function checkDayCount(dc: unknown, what: string, out: string[], optional = false): void {
+  if (dc === undefined && optional) return;
+  if (!isStr(dc)) {
+    out.push(`${what} missing`);
+    return;
+  }
+  try {
+    normalizeDayCount(dc);
+  } catch (e) {
+    out.push(`${what} "${dc}" unknown (${describe(e)})`);
+  }
+}
+
+/** Optional vol override: must be a positive finite number when given (R3-4a). */
+function checkVolOverride(v: unknown, what: string, out: string[]): void {
+  if (v === undefined) return;
+  if (!isNum(v) || v <= 0) out.push(`${what} must be a positive finite number (got ${String(v)})`);
+}
+
+/** Optional lognormal shift: non-negative finite number when given. */
+function checkShift(v: unknown, what: string, out: string[]): void {
+  if (v === undefined) return;
+  if (!isNum(v) || v < 0) out.push(`${what} must be a non-negative finite number (got ${String(v)})`);
+}
+
 function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
   if (!l || typeof l !== "object") {
     out.push(`${path}: leg missing`);
@@ -17,15 +70,26 @@ function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
   }
   if (l.type !== "Fixed" && l.type !== "Float") out.push(`${path}.type must be "Fixed" or "Float"`);
   if (l.payReceive !== "Pay" && l.payReceive !== "Receive") out.push(`${path}.payReceive must be "Pay" or "Receive"`);
-  if (!isNum(l.notional)) out.push(`${path}.notional must be a finite number`);
+  checkPositive(l.notional, `${path}.notional`, out);
   if (!isStr(l.currency)) out.push(`${path}.currency missing`);
   if (!isNum(l.effectiveDate) || !isNum(l.terminationDate)) out.push(`${path}: effectiveDate / terminationDate must be serial dates`);
   else if (l.terminationDate <= l.effectiveDate) out.push(`${path}: terminationDate must be after effectiveDate`);
-  if (!isStr(l.frequency)) out.push(`${path}.frequency missing`);
-  if (!isStr(l.dayCount)) out.push(`${path}.dayCount missing`);
+  checkFrequency(l.frequency, `${path}.frequency`, out);
+  checkDayCount(l.dayCount, `${path}.dayCount`, out);
   if (!isStr(l.calendar)) out.push(`${path}.calendar missing`);
+  if (l.paymentLag !== undefined && (!Number.isInteger(l.paymentLag) || l.paymentLag < 0)) {
+    out.push(`${path}.paymentLag must be a non-negative integer number of business days (got ${String(l.paymentLag)})`);
+  }
   if (l.type === "Fixed" && !isNum((l as FixedLeg).rate)) out.push(`${path}.rate (fixed rate) missing or not a finite number`);
-  if (l.type === "Float" && !isStr((l as FloatLeg).index)) out.push(`${path}.index (floating index) missing`);
+  if (l.type === "Float") {
+    const fl = l as FloatLeg;
+    if (!isStr(fl.index)) out.push(`${path}.index (floating index) missing`);
+    if (fl.capRate !== undefined && !isNum(fl.capRate)) out.push(`${path}.capRate must be a finite number`);
+    if (fl.floorRate !== undefined && !isNum(fl.floorRate)) out.push(`${path}.floorRate must be a finite number`);
+    if (isNum(fl.capRate) && isNum(fl.floorRate) && fl.capRate < fl.floorRate) {
+      out.push(`${path}: embedded capRate (${fl.capRate}) must not be below floorRate (${fl.floorRate})`);
+    }
+  }
 }
 
 function checkFxLeg(l: Omit<FxForward, "type" | "id"> | undefined, path: string, out: string[]): void {
@@ -34,13 +98,17 @@ function checkFxLeg(l: Omit<FxForward, "type" | "id"> | undefined, path: string,
     return;
   }
   if (!isStr(l.buyCurrency) || !isStr(l.sellCurrency)) out.push(`${path}: buyCurrency / sellCurrency missing`);
-  if (!isNum(l.buyAmount) || !isNum(l.sellAmount)) out.push(`${path}: buyAmount / sellAmount must be finite numbers`);
+  checkPositive(l.buyAmount, `${path}.buyAmount`, out);
+  checkPositive(l.sellAmount, `${path}.sellAmount`, out);
   if (!isNum(l.deliveryDate)) out.push(`${path}.deliveryDate must be a serial date`);
 }
 
 /**
  * Structural validation of a trade (required fields, finite numbers, date
- * order). Returns a list of problems (empty = valid); `priceTrade` throws a
+ * order, R3-4: positive notionals, non-negative payment lags, valid frequency
+ * and day-count strings, positive vol overrides, strike order of collars and
+ * embedded caps/floors, exactly one fixed leg under a swaption). Returns a
+ * list of problems (empty = valid); `priceTrade` throws a
  * `PricingError("INVALID_TRADE")` with this list instead of producing a null
  * or NaN PV.
  */
@@ -55,32 +123,48 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
       else trade.legs.forEach((l, i) => checkLeg(l, `${path}.legs[${i}]`, out));
       break;
     case "FRA":
-      if (!isNum(trade.notional)) out.push(`${path}.notional must be a finite number`);
+      checkPositive(trade.notional, `${path}.notional`, out);
       if (!isStr(trade.currency)) out.push(`${path}.currency missing`);
       if (!isStr(trade.index)) out.push(`${path}.index missing`);
       if (!isNum(trade.startDate) || !isNum(trade.endDate)) out.push(`${path}: startDate / endDate must be serial dates`);
       else if (trade.endDate <= trade.startDate) out.push(`${path}: endDate must be after startDate`);
       if (!isNum(trade.fixedRate)) out.push(`${path}.fixedRate must be a finite number`);
+      checkDayCount(trade.dayCount, `${path}.dayCount`, out, true);
       break;
     case "CapFloor":
       if (!["Cap", "Floor", "Collar"].includes(trade.capFloor)) out.push(`${path}.capFloor must be Cap, Floor or Collar`);
-      if (!isNum(trade.notional)) out.push(`${path}.notional must be a finite number`);
+      checkPositive(trade.notional, `${path}.notional`, out);
       if (!isStr(trade.currency)) out.push(`${path}.currency missing`);
       if (!isStr(trade.index)) out.push(`${path}.index missing`);
       if (!isNum(trade.effectiveDate) || !isNum(trade.terminationDate)) out.push(`${path}: effectiveDate / terminationDate must be serial dates`);
       else if (trade.terminationDate <= trade.effectiveDate) out.push(`${path}: terminationDate must be after effectiveDate`);
-      if (!isStr(trade.frequency)) out.push(`${path}.frequency missing`);
-      if (!isStr(trade.dayCount)) out.push(`${path}.dayCount missing`);
+      checkFrequency(trade.frequency, `${path}.frequency`, out);
+      checkDayCount(trade.dayCount, `${path}.dayCount`, out);
       if (!isStr(trade.calendar)) out.push(`${path}.calendar missing`);
       if (!isNum(trade.strike)) out.push(`${path}.strike must be a finite number`);
-      if (trade.capFloor === "Collar" && trade.floorStrike !== undefined && !isNum(trade.floorStrike)) out.push(`${path}.floorStrike must be a finite number`);
+      if (trade.capFloor === "Collar" && trade.floorStrike !== undefined) {
+        if (!isNum(trade.floorStrike)) out.push(`${path}.floorStrike must be a finite number`);
+        else if (isNum(trade.strike) && trade.floorStrike > trade.strike) {
+          out.push(`${path}: collar floorStrike (${trade.floorStrike}) must not exceed the cap strike (${trade.strike})`);
+        }
+      }
+      checkVolOverride(trade.volOverride, `${path}.volOverride`, out);
+      checkShift(trade.shift, `${path}.shift`, out);
       break;
     case "Swaption":
       if (trade.payerReceiver !== "Payer" && trade.payerReceiver !== "Receiver") out.push(`${path}.payerReceiver must be Payer or Receiver`);
       if (trade.settlement !== "Physical" && trade.settlement !== "Cash") out.push(`${path}.settlement must be Physical or Cash`);
       if (!isNum(trade.expiryDate)) out.push(`${path}.expiryDate must be a serial date`);
       if (!trade.underlying || trade.underlying.type !== "InterestRateSwap") out.push(`${path}.underlying must be an InterestRateSwap`);
-      else out.push(...validateTrade(trade.underlying, `${path}.underlying`));
+      else {
+        out.push(...validateTrade(trade.underlying, `${path}.underlying`));
+        const legs = Array.isArray(trade.underlying.legs) ? trade.underlying.legs : [];
+        const fixed = legs.filter((l) => l?.type === "Fixed").length;
+        if (fixed !== 1) out.push(`${path}.underlying must have exactly one Fixed leg (found ${fixed})`);
+        if (!legs.some((l) => l?.type === "Float")) out.push(`${path}.underlying must have a Float leg`);
+      }
+      checkVolOverride(trade.volOverride, `${path}.volOverride`, out);
+      checkShift(trade.shift, `${path}.shift`, out);
       break;
     case "FxForward":
       checkFxLeg(trade, path, out);
@@ -93,10 +177,11 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
       if (!isStr(trade.pair) || trade.pair.replace("/", "").length !== 6) out.push(`${path}.pair must be a 6-letter currency pair`);
       if (trade.optionType !== "Call" && trade.optionType !== "Put") out.push(`${path}.optionType must be Call or Put`);
       if (!isNum(trade.strike) || trade.strike <= 0) out.push(`${path}.strike must be a positive finite number`);
-      if (!isNum(trade.notional)) out.push(`${path}.notional must be a finite number`);
+      checkPositive(trade.notional, `${path}.notional`, out);
       if (!isNum(trade.expiryDate) || !isNum(trade.deliveryDate)) out.push(`${path}: expiryDate / deliveryDate must be serial dates`);
       else if (trade.deliveryDate < trade.expiryDate) out.push(`${path}: deliveryDate must not be before expiryDate`);
       if (trade.barrier && (!isNum(trade.barrier.level) || trade.barrier.level <= 0)) out.push(`${path}.barrier.level must be a positive finite number`);
+      checkVolOverride(trade.volOverride, `${path}.volOverride`, out);
       break;
     default:
       out.push(`${path}.type "${String((trade as { type?: unknown }).type)}" is not supported`);

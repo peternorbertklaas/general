@@ -1,4 +1,4 @@
-import { type BusinessDayConvention, type Calendar, addBusinessDays, adjust, advance, getCalendar } from "../dates/calendar.js";
+import { type BusinessDayConvention, type Calendar, type CalendarId, addBusinessDays, adjust, advance, getCalendar } from "../dates/calendar.js";
 import { type SerialDate, addTenor, immDate, nextImmDate, parseISO } from "../dates/date.js";
 import { type DayCountConvention, yearFraction } from "../dates/daycount.js";
 import { type CrossCurrencySwap, type FloatLeg, type InterestRateSwap } from "../instruments/types.js";
@@ -124,9 +124,14 @@ export interface BootstrapSpec {
   pillarMergeToleranceDays?: number;
   /**
    * Turn-of-year jumps: the instantaneous forward over the window starting at
-   * `date` (default one calendar day, e.g. 31 Dec → 1 Jan) is raised by `bp`
-   * on top of the interpolated curve; the pillars are re-solved so every
-   * quote still reprices (see `ForwardJump`).
+   * `date` is raised by `bp` on top of the interpolated curve; the pillars are
+   * re-solved so every quote still reprices (see `ForwardJump`). Without
+   * `days` the window is the business-day span over the turn on the index
+   * calendar – from the last business day on/before `date` to the next
+   * business day (Thu 31 Dec 2026 → Mon 4 Jan 2027 = 4 calendar days), which
+   * is the period the market's turn premium on the overnight rate refers to
+   * (R3-6, `turnOfYearWindow`). `date` itself is moved to that last business
+   * day when it falls on a holiday.
    */
   turnOfYear?: { date: SerialDate; bp: number; days?: number }[];
   /**
@@ -422,7 +427,7 @@ export function bootstrapCurve(valuationDate: SerialDate, spec: BootstrapSpec): 
   }
 
   const residuals: BootstrapResult["residuals"] = [];
-  const forwardJumps: ForwardJump[] | undefined = spec.turnOfYear?.map((t) => ({ date: t.date, bp: t.bp, days: t.days }));
+  const forwardJumps = resolveTurnOfYear(spec.turnOfYear, idx.fixingCalendar);
   const buildCurve = (ns: CurveNode[]) =>
     new InterpolatedCurve({
       id: spec.id,
@@ -431,7 +436,8 @@ export function bootstrapCurve(valuationDate: SerialDate, spec: BootstrapSpec): 
       nodes: ns,
       interpolation,
       dayCount,
-      meta: { index: idx.name },
+      // `source: "bootstrap"` drives the methodology text (R3-7, see `CurveSource`).
+      meta: { index: idx.name, source: "bootstrap" },
       forwardJumps,
     });
 
@@ -706,6 +712,28 @@ function makeXccyBasisInstrument(
     type: "CrossCurrencySwap",
     legs: [leg(domIdx, spec.currency, "Receive", SOLVER_NOTIONAL, q.spread), leg(forIdx, q.foreignCurrency, "Pay", SOLVER_NOTIONAL * q.fxSpot, 0)],
   };
+}
+
+/**
+ * Turn-of-year window on a calendar: the jump starts on the last business day
+ * on or before `date` and lasts until the next business day, i.e. it covers
+ * the overnight period the market's turn premium is quoted for (31 Dec → first
+ * business day of January, including the weekend / 1 January holiday).
+ */
+export function turnOfYearWindow(date: SerialDate, calendar: CalendarId | Calendar): { date: SerialDate; days: number } {
+  const cal = getCalendar(calendar);
+  const start = adjust(date, "Preceding", cal);
+  const end = addBusinessDays(start, 1, cal);
+  return { date: start, days: end - start };
+}
+
+/** Resolve the forward jumps of a spec: explicit `days` win, otherwise the business-day span on `calendar`. */
+function resolveTurnOfYear(turnOfYear: BootstrapSpec["turnOfYear"], calendar: CalendarId): ForwardJump[] | undefined {
+  return turnOfYear?.map((t) => {
+    if (t.days !== undefined) return { date: t.date, bp: t.bp, days: t.days };
+    const w = turnOfYearWindow(t.date, calendar);
+    return { date: w.date, bp: t.bp, days: w.days };
+  });
 }
 
 /** Unadjusted helper for callers that need the spot date of a currency. */
