@@ -55,6 +55,44 @@ export const CSV_TRADE_TYPES = [
 ] as const;
 export type CsvTradeType = (typeof CSV_TRADE_TYPES)[number];
 
+/**
+ * Type token of the workstation's CSV templates per API template (Markt R9-4): the leading `type` column every
+ * API template file carries (`csvTemplateText`) so the same file imports in the Blotter, which reads the type from
+ * the row. The API reader accepts the column when its token matches `?type=` (or the `?type=` value itself) and
+ * rejects a mismatching row – the file's own type never overrides the query parameter silently.
+ */
+export const CSV_TYPE_TOKENS: Record<CsvTradeType, string> = {
+  InterestRateSwap: "IRS",
+  FxForward: "FXF",
+  CapFloor: "CAP",
+  Swaption: "SWPT",
+  FxOption: "FXO",
+  CrossCurrencySwap: "CCS",
+  FRA: "FRA",
+  FxSwap: "FXS",
+  BasisSwap: "BASIS",
+  AmortisingSwap: "AMORT",
+  ImmSwap: "IMM",
+};
+/** Pseudo column of every template: the workstation's type token (header `type`, `typ` or `produkt`). */
+export const TYPE_COLUMN = "type";
+const normalizeTypeToken = (s: string): string => s.toUpperCase().replace(/[^A-Z]/g, "");
+
+/**
+ * Why a row's `type` cell does not fit the template (`undefined` = fits or empty): accepted are the workstation's
+ * token (`IRS` for `?type=InterestRateSwap`) and the `?type=` value itself, case-insensitively. The message names the
+ * `?type=` the row belongs to when its token is one of the eleven templates.
+ */
+export function csvTypeMismatch(cell: string, template: CsvTemplate): string | undefined {
+  const token = normalizeTypeToken(cell);
+  if (!token || token === CSV_TYPE_TOKENS[template.type] || token === normalizeTypeToken(template.type)) return undefined;
+  const other = CSV_TRADE_TYPES.find((t) => CSV_TYPE_TOKENS[t] === token || normalizeTypeToken(t) === token);
+  return (
+    `type: "${cell.trim()}" does not match ?type=${template.type} (accepted: ${CSV_TYPE_TOKENS[template.type]}, ${template.type})` +
+    (other ? ` – import this row with ?type=${other}` : "")
+  );
+}
+
 /** Columns every template accepts (applied to the built trade). */
 const COMMON_COLUMNS = ["id", "name", "counterparty", "book", "uti"] as const;
 /** Optional columns shared by the fixed/float swap templates (vanilla, amortising, IMM). */
@@ -324,6 +362,8 @@ const normalizeHeader = (h: string): string =>
 /** Map a header cell to a canonical column of the template (or undefined when unknown). */
 function canonicalColumn(header: string, template: CsvTemplate): string | undefined {
   const key = normalizeHeader(header);
+  // The workstation's type column (R9-4) is a pseudo column of every template – checked against `?type=`, never mapped onto the trade.
+  if (key === "type" || key === "typ" || key === "produkt") return TYPE_COLUMN;
   const known = [...template.required, ...template.optional];
   const direct = known.find((c) => c.toLowerCase() === key);
   if (direct) return direct;
@@ -763,6 +803,12 @@ export function csvToTrades(text: string, type: CsvTradeType, valuationDate: num
     columns.forEach((col, j) => {
       if (col && cells[j] !== undefined && cells[j] !== "") record[col] = cells[j]!;
     });
+    // A `type` cell that names another template is a row error (R9-4) – `?type=` stays authoritative, nothing is imported under the wrong template.
+    const mismatch = record[TYPE_COLUMN] !== undefined ? csvTypeMismatch(record[TYPE_COLUMN], template) : undefined;
+    if (mismatch) {
+      out.rejected.push({ row: rowNo, reason: mismatch });
+      return;
+    }
     try {
       const built = compact(buildTrade(new Row(record, template), valuationDate));
       const extras: Partial<Trade> = {};
@@ -779,24 +825,35 @@ export function csvToTrades(text: string, type: CsvTradeType, valuationDate: num
   return out;
 }
 
+/** The optional `type` column of every template file (R9-4) – documented once in the OpenAPI description and the request-body schema. */
+export const TYPE_COLUMN_NOTE =
+  "Every template file starts with an optional `type` column carrying the workstation's type token (`IRS`, `FXF`, `CAP`, `SWPT`, `FXO`, `CCS`, `FRA`, `FXS`, `BASIS`, `AMORT`, `IMM` – also accepted: the `?type=` value itself, case-insensitively; header aliases `typ`, `produkt`), so the same file imports in the workstation's Blotter, which reads the type from the row (Markt R9-4). The API ignores a matching or empty cell and rejects a row whose token names another template (`rejected`, reason `type: \"FXF\" does not match ?type=InterestRateSwap …`) – `?type=` stays authoritative, nothing is imported under the wrong template.";
+
 /** Markdown documentation of the templates (OpenAPI description and docs). */
 export function csvTemplatesMarkdown(): string {
   const lines = [
-    "CSV import (`content-type: text/csv`, `?type=<Template>`): header row, `;`/`,`/tab separated, German or plain numbers (`10.000.000,50`, `3,15 %`, `-20 bp`; a single dot is the decimal point, dots are thousands separators with a decimal comma or from two groups on), dates ISO or `DD.MM.YYYY`, tenors `5Y`. Common optional columns: `id`, `name`, `counterparty`, `book`, `uti`; unknown columns (the workstation's `type`, `status`, `frequency`, `amortisation`) are ignored. Rows are mapped through the core builders and each built trade is checked against the `Trade` schema; a row that cannot be mapped or whose trade violates the schema is listed as `rejected` (`code: CSV_ROW_INVALID`) with its row number – it never fails the other rows. `?type=` names the template; `BasisSwap`, `AmortisingSwap` and `ImmSwap` build `InterestRateSwap` trades. " +
+    "CSV import (`content-type: text/csv`, `?type=<Template>`): header row, `;`/`,`/tab separated, German or plain numbers (`10.000.000,50`, `3,15 %`, `-20 bp`; a single dot is the decimal point, dots are thousands separators with a decimal comma or from two groups on), dates ISO or `DD.MM.YYYY`, tenors `5Y`. Common optional columns: `id`, `name`, `counterparty`, `book`, `uti`; unknown columns (the workstation's `status`, `frequency`, `amortisation`) are ignored. " +
+      `${TYPE_COLUMN_NOTE} ` +
+      "Rows are mapped through the core builders and each built trade is checked against the `Trade` schema; a row that cannot be mapped or whose trade violates the schema is listed as `rejected` (`code: CSV_ROW_INVALID`) with its row number – it never fails the other rows. `?type=` names the template; `BasisSwap`, `AmortisingSwap` and `ImmSwap` build `InterestRateSwap` trades. " +
       `The eleven workstation templates (\`apps/web/src/lib/portfolio-io.ts\`, header and example row) import through the matching \`?type=\` unchanged (Markt R8-4): aliases \`tenor\` ↔ \`maturity\`, \`expiry\` ↔ \`expiryDate\`, \`period\` (FRA), \`buyCurrency\`/\`buyAmount\`/\`sellCurrency\`/\`sellAmount\` (FX forward), \`direction\`/\`rate\`/\`start\`/\`collateral\` (swaps, CCS). ${SPREAD_UNIT_NOTE}`,
     "",
   ];
   for (const t of Object.values(CSV_TEMPLATES)) {
     const builds = t.tradeType === t.type ? "" : ` (builds \`${t.tradeType}\`)`;
     lines.push(
-      `- **${t.type}**${builds} – required: ${t.required.map((c) => `\`${c}\``).join(", ")}; optional: ${t.optional.map((c) => `\`${c}\``).join(", ")}. ${t.notes}`,
+      `- **${t.type}**${builds} (\`type\` token \`${CSV_TYPE_TOKENS[t.type]}\`) – required: ${t.required.map((c) => `\`${c}\``).join(", ")}; optional: ${t.optional.map((c) => `\`${c}\``).join(", ")}. ${t.notes}`,
     );
   }
+  lines.push("", "Template files (`type` column first, then the required and optional columns; header + example row):", "");
+  for (const type of CSV_TRADE_TYPES) lines.push("```", `# ?type=${type}`, csvTemplateText(type).trimEnd(), "```");
   return lines.join("\n");
 }
 
-/** Template file (header + example row) for one type, semicolon separated. */
+/**
+ * Template file (header + example row) for one type, semicolon separated – with the leading `type` column and the
+ * workstation's token in the example row (R9-4), so the file also imports in the Blotter.
+ */
 export function csvTemplateText(type: CsvTradeType): string {
   const t = CSV_TEMPLATES[type];
-  return `${[...t.required, ...t.optional].join(";")}\n${t.example.join(";")}\n`;
+  return `${[TYPE_COLUMN, ...t.required, ...t.optional].join(";")}\n${[CSV_TYPE_TOKENS[type], ...t.example].join(";")}\n`;
 }

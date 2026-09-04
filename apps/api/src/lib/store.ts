@@ -38,7 +38,7 @@ import {
 } from "@deriva/pricing-core";
 
 export type { CustomCalendarJson };
-import { type BootstrapBody, resolveBootstrap, toCurveBuildSpec } from "./curve-specs.js";
+import { type BootstrapBody, type RuntimeCurveQuotes, resolveBootstrap, toCurveBuildSpec } from "./curve-specs.js";
 
 /** Vol surfaces set through `PUT /api/market` (per key) – re-applied after a sample-market rebuild (N8-01). */
 export type VolOverrides = Pick<MarketContext, "swaptionVols" | "capletVols" | "fxVols">;
@@ -75,9 +75,11 @@ export interface MarketRepository {
   /**
    * Move the market to a new valuation date (N8-01). Sample mode: rebuild the sample market and carry over user
    * state – runtime curves are re-bootstrapped from their remembered quotes, discount / collateral mappings and vol
-   * overrides re-applied, user fixings, FX fixings, spots, spot dates, credit and the fixing policy kept. Import mode:
-   * roll the imported market (`rollMarket`, constant zero curves) unless `discardImport` asks for the sample market.
-   * Whatever cannot be carried over is named in `warnings` (`MARKET_STATE_DROPPED:`).
+   * overrides re-applied, user fixings, FX fixings, spots, spot dates, credit and the fixing policy kept; a
+   * re-bootstrapped runtime curve gets the discount-curve rule of `POST /api/market/curves` again (N9-03). Import
+   * mode: roll the imported market (`rollMarket`, constant zero curves; `meta.snapshotTime` dropped and the label
+   * marked `(rolled to <date>)`, N9-02) unless `discardImport` asks for the sample market. Whatever cannot be
+   * carried over is named in `warnings` (`MARKET_STATE_DROPPED:`).
    */
   rebuild(valuationDate: number, opts?: RebuildOptions): RebuildResult;
   /** Current market quotes per sample curve (basis for par-risk re-bootstrapping and rebuilds). */
@@ -87,6 +89,13 @@ export interface MarketRepository {
    * set, any other id is kept as a runtime curve (re-bootstrapped on rebuild, bumped by par risk). Always tracked.
    */
   rememberCurve(body: BootstrapBody): void;
+  /**
+   * Remember the bootstrap spec of a curve the imported snapshot carries in its `quotes` envelope (Markt R9-1): the
+   * curve stays the snapshot's, the spec serves par risk (`parRiskSpecs`) and a later sample rebuild.
+   */
+  rememberQuotes(entry: RuntimeCurveQuotes): void;
+  /** Runtime curves with remembered quotes in load order – the snapshot envelope's `quotes` (R9-1). */
+  listQuotes(): RuntimeCurveQuotes[];
   /** Remember vol surfaces set per key through `PUT /api/market` so a sample-market rebuild re-applies them. */
   rememberVols(vols: VolOverrides): void;
   /** Bootstrap specs of every curve with known quotes (sample curves + runtime curves) for `parRisk`. */
@@ -168,6 +177,14 @@ export class MarketStore implements MarketRepository {
     this.runtimeCurves.delete(body.spec.id);
     this.runtimeCurves.set(body.spec.id, { spec: body.spec, ...(body.isDiscountCurve !== undefined ? { isDiscountCurve: body.isDiscountCurve } : {}) });
   }
+  rememberQuotes(entry: RuntimeCurveQuotes): void {
+    // Same slot as a curve loaded through `POST /api/market/curves`; the id is the curve's (validated by `quotesProblems`).
+    this.runtimeCurves.delete(entry.curveId);
+    this.runtimeCurves.set(entry.curveId, { spec: { ...entry.spec, id: entry.curveId } });
+  }
+  listQuotes(): RuntimeCurveQuotes[] {
+    return [...this.runtimeCurves].map(([curveId, body]) => ({ curveId, spec: body.spec }));
+  }
   rememberVols(vols: VolOverrides): void {
     this.volOverrides = {
       ...(vols.swaptionVols || this.volOverrides.swaptionVols
@@ -187,8 +204,11 @@ export class MarketStore implements MarketRepository {
     const warnings: string[] = [];
     if (this.origin === "import" && !opts.discardImport) {
       // Import mode: the snapshot is the market – roll its curves to the new date (constant zero curves, the core's
-      // theta roll); spots, fixings, vols, mappings and credit stay as imported. Nothing is dropped.
-      this.ctx = rollMarket(prev, valuationDate - prev.valuationDate);
+      // theta roll); spots, fixings, vols, mappings and credit stay as imported. Nothing is dropped – except the
+      // snapshot's own timestamp (N9-02): `meta.snapshotTime` described the imported state, not the rolled one, and
+      // would put EMIR field 23 months before the valuation date; the label says what happened.
+      const rolled = rollMarket(prev, valuationDate - prev.valuationDate);
+      this.ctx = { ...rolled, meta: rolledMeta(rolled.meta, valuationDate) };
       return { market: this.ctx, warnings };
     }
     if (this.origin === "import") {
@@ -209,12 +229,14 @@ export class MarketStore implements MarketRepository {
       ...(prev.fxSpotDates ? { fxSpotDates: prev.fxSpotDates } : {}),
       ...(prev.missingFixingPolicy ? { missingFixingPolicy: prev.missingFixingPolicy } : {}),
     };
-    // Runtime curves (`POST /api/market/curves`, N8-01): re-bootstrap from the remembered quotes, in insertion order.
+    // Runtime curves (`POST /api/market/curves` or the `quotes` envelope, N8-01): re-bootstrap from the remembered quotes, in insertion order.
+    const rebuilt: { curve: Curve; body: BootstrapBody }[] = [];
     for (const [id, body] of [...this.runtimeCurves]) {
       try {
         const { spec } = resolveBootstrap(m, body);
         const curve: Curve = bootstrapCurve(valuationDate, spec).curve;
         m = { ...m, curves: { ...m.curves, [curve.id]: curve } };
+        rebuilt.push({ curve, body });
       } catch (e) {
         this.runtimeCurves.delete(id);
         warnings.push(dropped(`curve ${id} could not be re-bootstrapped for ${toISO(valuationDate)} (${(e as Error).message})`));
@@ -222,9 +244,25 @@ export class MarketStore implements MarketRepository {
     }
     // Discount / collateral mappings of the previous market survive where their curve still exists.
     const discountCurveId = { ...m.discountCurveId };
+    const lostDiscount: [string, string][] = [];
     for (const [ccy, curveId] of Object.entries(prev.discountCurveId)) {
       if (m.curves[curveId]) discountCurveId[ccy] = curveId;
-      else if (!fresh.discountCurveId[ccy]) warnings.push(dropped(`discountCurveId.${ccy} = ${curveId} (curve not in the rebuilt market)`));
+      else if (!fresh.discountCurveId[ccy]) lostDiscount.push([ccy, curveId]);
+    }
+    // N9-03: a re-bootstrapped runtime curve gets the rule of `POST /api/market/curves` again – `isDiscountCurve: false`
+    // never, otherwise "first curve of a currency without a discount curve" (in load order). An explicit `true` set the
+    // mapping when the curve was loaded and it was carried over above; a mapping changed later through `PUT /api/market`
+    // is not overridden here.
+    for (const { curve, body } of rebuilt) {
+      if (body.isDiscountCurve !== false && !discountCurveId[curve.currency]) discountCurveId[curve.currency] = curve.id;
+    }
+    for (const [ccy, curveId] of lostDiscount) {
+      const replacement = discountCurveId[ccy];
+      warnings.push(
+        dropped(
+          `discountCurveId.${ccy} = ${curveId} (curve not in the rebuilt market${replacement ? `; ${replacement} is now the discount curve of ${ccy}` : ""})`,
+        ),
+      );
     }
     const collateralDiscountCurveId = { ...(m.collateralDiscountCurveId ?? {}) };
     for (const [key, curveId] of Object.entries(prev.collateralDiscountCurveId ?? {})) {
@@ -241,6 +279,26 @@ export class MarketStore implements MarketRepository {
     this.ctx = m;
     return { market: m, warnings };
   }
+}
+
+/** Label suffix of a rolled import (`… (rolled to 2026-12-01)`); a second roll replaces the first mark. */
+const ROLLED_SUFFIX_RE = / \(rolled to \d{4}-\d{2}-\d{2}\)$/;
+
+/**
+ * Snapshot metadata after an import roll (N9-02), the same rule the core's `rollMarket` applies since R9 (kept here
+ * so the API's contract holds against any core version): `meta.snapshotTime` is dropped unless it already dates the
+ * new valuation date – it timestamps the imported state, not the rolled one, and `emirValuationTimestamp` would
+ * prefer it over the new date (field 23) – and an existing label is marked `(rolled to <date>)`. Idempotent: a
+ * label the core already marked, or one marked by an earlier roll, carries a single mark for the latest date.
+ * `source` and other keys are kept; a snapshot without a label gets none.
+ */
+export function rolledMeta(meta: MarketContext["meta"], valuationDate: number): NonNullable<MarketContext["meta"]> {
+  const iso = toISO(valuationDate);
+  const { snapshotTime, label, ...rest } = meta ?? {};
+  const out: NonNullable<MarketContext["meta"]> = { ...rest };
+  if (snapshotTime !== undefined && snapshotTime.slice(0, 10) === iso) out.snapshotTime = snapshotTime;
+  if (label !== undefined) out.label = `${label.replace(ROLLED_SUFFIX_RE, "")} (rolled to ${iso})`;
+  return out;
 }
 
 const fixingKey = (f: Fixing) => `${f.index.toUpperCase()}@${f.date}`;
@@ -337,16 +395,17 @@ export class RegisterStore {
     return [...this.calendars.values()].sort((a, b) => a.id.localeCompare(b.id));
   }
   /**
-   * Hash of the register as exported in the snapshot envelope (N8-03). The register is not part of the market's
-   * snapshot id, but it is part of the `GET /api/market/snapshot` representation – so the export ETag carries it.
-   * Empty string when nothing is registered (an untouched export keeps `ETag = "<snapshotId>"`).
+   * Hash of the envelope as exported with the snapshot (N8-03): the register plus – since R9-1 – the `quotes` of
+   * the market store's runtime curves. Neither is part of the market's snapshot id, but both are part of the
+   * `GET /api/market/snapshot` representation – so the export ETag carries them. Empty string when the envelope is
+   * empty (an untouched export keeps `ETag = "<snapshotId>"`).
    */
-  hash(): string {
+  hash(quotes: RuntimeCurveQuotes[] = []): string {
     const indices = this.listIndices();
     const conventions = this.listConventions();
     const calendars = this.listCalendars();
-    if (!indices.length && !conventions.length && !calendars.length) return "";
-    return hashString(stableStringify({ indices, conventions, calendars })).slice(0, 16);
+    if (!indices.length && !conventions.length && !calendars.length && !quotes.length) return "";
+    return hashString(stableStringify({ indices, conventions, calendars, quotes })).slice(0, 16);
   }
 }
 

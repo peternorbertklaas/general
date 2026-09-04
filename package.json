@@ -1,6 +1,6 @@
 {
   "name": "deriva-monorepo",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "DERIVA – moderne Plattform zur Bewertung von Zins- und Währungsderivaten (Pricing-Core, API, Web-UI mit Hotkeys)",
   "license": "MIT",

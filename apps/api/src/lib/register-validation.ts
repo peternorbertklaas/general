@@ -6,7 +6,11 @@
  *   with `pendingIndices`) before a single entry is registered, so a bad second entry registers nothing (the
  *   core register is additive and has no rollback). Calendars that are themselves part of the envelope are
  *   not registered yet when the indices and conventions are checked – for those checks the envelope's
- *   calendar ids are substituted by a known calendar, the ids having been validated with their own entry.
+ *   calendar ids are substituted by a known calendar, the ids having been validated with their own entry;
+ *   composite ids (`CZ-X9+TARGET`) are substituted per component (N9-01), so an export with joint calendars
+ *   re-imports into a fresh process.
+ * - `quotesProblems`: the `quotes` envelope (bootstrap specs of runtime curves, Markt R9-1) must name curves of
+ *   the snapshot and registered (or envelope) indices.
  * - `collateralMappingProblems`: `collateralDiscountCurveId["<ccy>|<csa>"]` must name a curve of `<ccy>` –
  *   discounting EUR cash flows on a CZK curve moved a 10Y payer by +19 % without a warning (N8-02). The
  *   core's `validateMarket` checks only `discountCurveId`, so the API adds the check for `PUT /api/market`
@@ -20,10 +24,12 @@ import {
   type RateIndex,
   type SwapConventions,
   isBuiltInCalendar,
+  knownIndices,
   validateCustomCalendar,
   validateRateIndex,
   validateSwapConventions,
 } from "@deriva/pricing-core";
+import { type RuntimeCurveQuotes } from "./curve-specs.js";
 
 export const CALENDAR_ENDPOINT_HINT = "register it with POST /api/market/calendars";
 
@@ -48,8 +54,20 @@ export interface EnvelopeProblem {
   builtIn?: boolean;
 }
 
-/** A calendar id that is pending in the same envelope is replaced by a calendar the core knows (the id itself is checked with its own entry). */
-const substitute = (id: string, pending: Set<string>): string => (pending.has(id.trim().toUpperCase()) ? "TARGET" : id);
+/**
+ * A calendar id that is pending in the same envelope is replaced by a calendar the core knows (the id itself is
+ * checked with its own entry). Composite ids (`CZ-X9+TARGET`, joint calendar – N9-01) are split at `+`: every
+ * pending component is dropped, the known components stay (`CZ-X9+TARGET` → `TARGET`, `CZ-X9+US` → `US`); an id
+ * made of pending components only (`CZ-X9`, `CZ-X9+HU-X9`) becomes `TARGET`. Unknown components stay and are
+ * reported by the core's validator as before.
+ */
+export function substitutePendingCalendar(id: string, pending: Set<string>): string {
+  const parts = id.split("+");
+  if (!parts.some((p) => pending.has(p.trim().toUpperCase()))) return id;
+  const kept = parts.filter((p) => !pending.has(p.trim().toUpperCase()));
+  return kept.length ? kept.join("+") : "TARGET";
+}
+const substitute = substitutePendingCalendar;
 
 /**
  * Problems of an envelope as a whole (empty = every entry will register). The rules are the core's
@@ -91,6 +109,31 @@ export function envelopeProblems(env: EnvelopeInput): EnvelopeProblem[] {
         problem: withCalendarHint(problem).replace(/\(registerRateIndex first\)/, "(add it to the envelope's indices or POST /api/market/indices first)"),
       });
     }
+  }
+  return problems;
+}
+
+/**
+ * `problems[]` of the snapshot envelope's `quotes` (Markt R9-1): every entry must name a curve of the snapshot,
+ * `spec.id`/`spec.currency` must agree with it, `spec.index` must be a registered index or one of the envelope's
+ * `indices`, and no curve may carry two specs. The quotes themselves are taken as given – a spec that does not
+ * bootstrap surfaces at `POST /api/risk/par` (422) or as `MARKET_STATE_DROPPED:` on the next sample rebuild.
+ */
+export function quotesProblems(m: Pick<MarketContext, "curves">, quotes: RuntimeCurveQuotes[], pendingIndices: Pick<RateIndex, "name">[] = []): string[] {
+  const problems: string[] = [];
+  const known = new Set([...knownIndices().map((ix) => ix.name), ...pendingIndices.map((ix) => ix.name.toUpperCase())]);
+  const seen = new Set<string>();
+  for (const { curveId, spec } of quotes) {
+    const curve = m.curves[curveId];
+    if (!curve) problems.push(`quotes: curve ${curveId} is not in the snapshot's curves`);
+    else if (spec.currency.toUpperCase() !== curve.currency)
+      problems.push(`quotes: curve ${curveId} is denominated in ${curve.currency}, its spec in ${spec.currency}`);
+    if (spec.id !== curveId) problems.push(`quotes: curve ${curveId}: spec.id ${spec.id} does not match curveId`);
+    if (!known.has(spec.index.toUpperCase())) {
+      problems.push(`quotes: curve ${curveId}: index ${spec.index} is not registered (add it to the envelope's indices or POST /api/market/indices first)`);
+    }
+    if (seen.has(curveId)) problems.push(`quotes: curve ${curveId} has more than one spec`);
+    seen.add(curveId);
   }
   return problems;
 }

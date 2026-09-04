@@ -23,6 +23,7 @@ import { registerTradeRoutes } from "./routes/trades.js";
 import {
   API_ERROR_CODES,
   csvRequestBody,
+  curveBuildSpecSchema,
   customCalendarSchema,
   errorResponseSchema,
   fromTemplateBranchSchemas,
@@ -292,7 +293,8 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   for (const s of tradeVariantSchemas) app.addSchema(s);
   for (const s of fromTemplateBranchSchemas) app.addSchema(s);
   app.addSchema(tradeSchema);
-  // Register entries (referenced by the snapshot envelope's `calendars` / `indices` / `conventions`, ADR-027) before the snapshot schema.
+  // Register entries (referenced by the snapshot envelope's `calendars` / `indices` / `conventions` / `quotes`, ADR-027) before the snapshot schema.
+  app.addSchema(curveBuildSpecSchema);
   app.addSchema(customCalendarSchema);
   app.addSchema(rateIndexSchema);
   app.addSchema(swapConventionsSchema);

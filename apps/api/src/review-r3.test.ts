@@ -388,7 +388,8 @@ describe("N16 CSV import (text/csv, one column template per type)", () => {
     expect(() => parseCsvDate("next week")).toThrow(/not a date/);
     for (const type of CSV_TRADE_TYPES) {
       const text = csvTemplateText(type);
-      expect(text.split("\n")[0]!.split(";")).toEqual([...CSV_TEMPLATES[type].required, ...CSV_TEMPLATES[type].optional]);
+      // Since R9-4 the template file leads with the workstation's `type` column (see review-r9.test.ts).
+      expect(text.split("\n")[0]!.split(";")).toEqual(["type", ...CSV_TEMPLATES[type].required, ...CSV_TEMPLATES[type].optional]);
       expect(CSV_TEMPLATES[type].example).toHaveLength(CSV_TEMPLATES[type].required.length + CSV_TEMPLATES[type].optional.length);
       const built = csvToTrades(text, type, 20699);
       expect(built.rejected, `${type}: ${JSON.stringify(built.rejected)}`).toEqual([]);

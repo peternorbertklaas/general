@@ -160,6 +160,9 @@ describe("N8-01 a valuation-date change keeps the user's market state", () => {
     const app2 = await buildApp({ logger: false, seedPortfolio: false });
     expect((await app2.inject({ method: "POST", url: "/api/market/curves", payload: { spec: oisSpec("NOK", "NOWA", 0.045) } })).statusCode).toBe(200);
     const snap = (await app2.inject({ method: "GET", url: "/api/market/snapshot" })).json() as Json;
+    // Round-8 snapshot format: without the `quotes` envelope (R9-1) NOK-NOWA cannot be re-bootstrapped by `discardImport` – the
+    // case this test is about. With `quotes` the curve and everything built on it survive the rebuild (review-r9.test.ts).
+    delete snap.quotes;
     const app3 = await buildApp({ logger: false, seedPortfolio: false });
     expect((await app3.inject({ method: "PUT", url: "/api/market/snapshot", payload: snap })).statusCode).toBe(200);
     const basis = {
@@ -211,7 +214,8 @@ describe("N8-01 a valuation-date change keeps the user's market state", () => {
     const m = await market(app3);
     expect((m.curves as unknown[]).length).toBe(snap.curves.length);
     expect((m.fxSpots as Record<string, number>).EURUSD).toBe(1.2345);
-    expect((m.meta as Json).label).toBe("IMPORTED-R8");
+    // Since R9 (N9-02) the roll marks the label; the imported name stays its stem.
+    expect((m.meta as Json).label).toBe("IMPORTED-R8 (rolled to 2026-10-01)");
     expect(m.discountCurveId.NOK).toBe("NOK-NOWA");
     expect((await app3.inject({ method: "GET", url: "/api/market/curves/NOK-NOWA" })).json().referenceDate).toBe("2026-10-01");
     // A swap in the rolled import still prices.
@@ -454,8 +458,11 @@ describe("Markt R8-3 par risk for every curve with known quotes", () => {
     expect(portfolio.statusCode, portfolio.body).toBe(200);
     expect(portfolio.json()[0]).toMatchObject({ curvesWithoutQuotes: [], warnings: [] });
     expect((portfolio.json()[0].curves as { curveId: string }[]).map((c) => c.curveId)).toEqual(["NOK-NOWA"]);
-    // Imported into a fresh instance the curve has no quotes: reported, not zeroed silently.
-    const snap = (await app2.inject({ method: "GET", url: "/api/market/snapshot" })).json();
+    // Imported into a fresh instance without the `quotes` envelope (round-8 format – since R9-1 the export carries the
+    // quotes and the import keeps par risk complete, see review-r9.test.ts) the curve has no quotes: reported, not zeroed silently.
+    const snap = (await app2.inject({ method: "GET", url: "/api/market/snapshot" })).json() as Json;
+    expect((snap.quotes as unknown[]).map((q) => (q as { curveId: string }).curveId)).toEqual(["NOK-NOWA"]);
+    delete snap.quotes;
     const app3 = await buildApp({ logger: false, seedPortfolio: false });
     expect((await app3.inject({ method: "PUT", url: "/api/market/snapshot", payload: snap })).statusCode).toBe(200);
     const missing = await app3.inject({ method: "POST", url: "/api/risk/par", payload: { trade, reportingCurrency: "NOK" } });

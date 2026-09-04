@@ -1,6 +1,6 @@
 {
   "name": "@deriva/pricing-core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pricing engine for interest rate and FX derivatives: calendars, day counts, schedules, multi-curve bootstrapping, IRS/OIS/FRA/Cap/Floor/Swaption, FX forward/option/CCS, sensitivities and scenarios.",
   "license": "MIT",
   "type": "module",

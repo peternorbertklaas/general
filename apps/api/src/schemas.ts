@@ -207,7 +207,7 @@ const floatLegSchemaBase = {
       minimum: 0,
       maximum: 10,
       description:
-        "RFR compounding lockout (R8, N8-7): the fixing of the business day `end − lockoutDays` (fixing calendar of the index) applies to the remaining `lockoutDays` business days of the period (2–5 days in SOFR/€STR loan documentation); default 0",
+        "RFR compounding lockout (R8 N8-7, counting aligned with ISDA 2021 / QuantLib `OvernightIndexedCoupon(lockoutDays)` in R9, Quant N9-1): the last `lockoutDays` business days of the period (fixing calendar of the index) all carry the fixing of the business day before the lockout window – with `lockoutDays: 1` the last day repeats the previous day's fixing (2–5 days in SOFR/€STR loan documentation); default 0. Not combinable with `lookbackDays` / `observationShift`.",
     },
   },
   additionalProperties: false,
@@ -413,7 +413,7 @@ export const fxOptionSchema = {
           type: "string",
           enum: ["hit", "expiry"],
           description:
-            'Knock-out rebate convention (R8, N7-5): `hit` = the rebate is paid when the barrier is touched (a decided knock-out is then worth 0, the rebate having been paid), `expiry` = paid at the delivery date (rebate·DF). Default: the model\'s convention (rebate at expiry for the live option, rebate·DF for decided knocks) with `analytics.rebateAt: "default"`',
+            'Knock-out rebate convention (R8, N7-5): `hit` = the rebate is paid when the barrier is touched (a decided knock-out is then worth 0, the rebate having been paid), `expiry` = paid at the delivery date (rebate·DF). Default since R9 (Quant N7-5 rest): `hit` – the QuantLib convention, continuous at the barrier; `analytics.rebateAt` reports the convention applied (`hit` | `expiry`). Before 0.3.0 an omitted `rebateAt` valued the live option with the rebate at expiry and a decided knock with rebate·DF (`analytics.rebateAt: "default"`).',
         },
       },
       additionalProperties: false,
@@ -916,6 +916,95 @@ export const marketPutSchema = {
   additionalProperties: false,
 } as const;
 
+/**
+ * Bootstrap specification of one curve – `spec` of `POST /api/market/bootstrap|curves` and, since R9-1, the `spec`
+ * of every `quotes` envelope entry of the snapshot (the shape the store remembers for par risk and rebuilds).
+ */
+export const curveBuildSpecSchema = {
+  $id: "CurveBuildSpec",
+  title: "CurveBuildSpec",
+  description:
+    "Bootstrap specification of a curve: id, currency, projected index and market quotes (Deposit / FRA / Future / Swap / OIS / BasisSwap / XccyBasis / FxSwapPoints), optional interpolation, day count, spot lag, dual-curve `discountCurveId`, `referenceCurveIds`, turn-of-year jumps, sweeps and pillar merging – the body `spec` of `POST /api/market/bootstrap|curves` and the `spec` of a snapshot's `quotes` entry (ADR-027 R9). Curve ids are resolved against the market the spec is used with.",
+  type: "object",
+  required: ["id", "currency", "index", "quotes"],
+  properties: {
+    id: { type: "string", minLength: 1, maxLength: 64 },
+    currency,
+    index: {
+      ...rateIndex,
+      description:
+        'Floating-rate index the curve projects, e.g. "EURIBOR-6M", "ESTR", "SOFR", "NOWA" – any registered index (`GET /api/market` lists `currencies` and `indices`; further indices and currencies are registered with `POST /api/market/indices` / `POST /api/market/conventions`). An unregistered name answers 422 `UNKNOWN_INDEX`.',
+    },
+    interpolation: { type: "string", enum: [...INTERPOLATIONS] },
+    dayCount,
+    discountCurveId: {
+      type: "string",
+      maxLength: 64,
+      description: "Curve id used for discounting during the bootstrap (dual-curve); not the snapshot mapping – see `isDiscountCurve`",
+    },
+    referenceCurveIds: { type: "array", items: { type: "string", maxLength: 64 }, maxItems: 50 },
+    spotLag: { type: "integer", minimum: 0, maximum: 5 },
+    turnOfYear: {
+      type: "array",
+      maxItems: 50,
+      description: "Turn-of-year forward jumps: instantaneous forward over [date, date + days) raised by `bp`; pillars re-solved so every quote reprices",
+      items: {
+        type: "object",
+        required: ["date", "bp"],
+        properties: { date: isoDate, bp: { type: "number", minimum: -1000, maximum: 1000 }, days: { type: "integer", minimum: 1, maximum: 366 } },
+        additionalProperties: false,
+      },
+    },
+    globalSweeps: {
+      type: "integer",
+      minimum: 0,
+      maximum: 50,
+      description: "Global re-solve sweeps after the sequential pass (default 6 for cubicSplineZero/monotoneConvex, 0 otherwise)",
+    },
+    pillarMergeToleranceDays: {
+      type: "integer",
+      minimum: 0,
+      maximum: 60,
+      description: "Merge quotes whose pillars fall within this many days (default 0 = off); dropped quotes are reported in `mergedQuotes`",
+    },
+    quotes: {
+      type: "array",
+      minItems: 1,
+      maxItems: 200,
+      items: {
+        type: "object",
+        required: ["type"],
+        properties: {
+          type: { type: "string", enum: [...CURVE_QUOTE_TYPES] },
+          tenor: { type: "string", maxLength: 8 },
+          start: { type: "string", maxLength: 12 },
+          end: { type: "string", maxLength: 12 },
+          rate: { type: "number", minimum: -0.1, maximum: 1 },
+          price: { type: "number", minimum: 50, maximum: 110 },
+          convexityBp: { type: "number" },
+          spread: { type: "number", minimum: -0.1, maximum: 0.1 },
+          otherIndex: rateIndex,
+          otherCurveId: { type: "string", maxLength: 64 },
+          foreignCurrency: currency,
+          foreignDiscountCurveId: { type: "string", maxLength: 64 },
+          foreignProjectionCurveId: { type: "string", maxLength: 64 },
+          domesticProjectionCurveId: { type: "string", maxLength: 64 },
+          fxSpot: { ...positiveNumber, description: "XccyBasis / FxSwapPoints: spot of the pair (1 domestic = fxSpot foreign)" },
+          domesticIndex: rateIndex,
+          foreignIndex: rateIndex,
+          points: { type: "number", description: "FxSwapPoints: forward points in pips (outright = spot + points / pipFactor)" },
+          pair: { ...currencyPair, description: "FxSwapPoints: pair whose base or quote currency is the curve currency" },
+          pipFactor: { type: "number", exclusiveMinimum: 0, description: "FxSwapPoints: pip denominator (default 10 000; 100 for JPY quotes)" },
+          otherDiscountCurveId: { type: "string", maxLength: 64, description: "FxSwapPoints: discount curve id of the other currency of the pair" },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  additionalProperties: false,
+} as const;
+export const curveBuildSpecRef = { $ref: "CurveBuildSpec#" } as const;
+
 export const bootstrapBodySchema = {
   type: "object",
   required: ["spec"],
@@ -924,87 +1013,9 @@ export const bootstrapBodySchema = {
     isDiscountCurve: {
       type: "boolean",
       description:
-        '`POST /api/market/curves` only: make the bootstrapped curve the discount curve of its currency (`discountCurveId[currency]`). Default (omitted): the mapping is set when the currency has no discount curve yet – the first curve of a new currency becomes its discount curve, as in the workstation\'s "+ Kurve" (Markt R7-3); `false` never sets it, `true` also replaces an existing mapping. Ignored by `POST /api/market/bootstrap`.',
+        '`POST /api/market/curves` only: make the bootstrapped curve the discount curve of its currency (`discountCurveId[currency]`). Default (omitted): the mapping is set when the currency has no discount curve yet – the first curve of a new currency becomes its discount curve, as in the workstation\'s "+ Kurve" (Markt R7-3); `false` never sets it, `true` also replaces an existing mapping. A valuation-date rebuild applies the same rule to the re-bootstrapped curve (N9-03). Ignored by `POST /api/market/bootstrap`.',
     },
-    spec: {
-      type: "object",
-      required: ["id", "currency", "index", "quotes"],
-      properties: {
-        id: { type: "string", minLength: 1, maxLength: 64 },
-        currency,
-        index: {
-          ...rateIndex,
-          description:
-            'Floating-rate index the curve projects, e.g. "EURIBOR-6M", "ESTR", "SOFR", "NOWA" – any registered index (`GET /api/market` lists `currencies` and `indices`; further indices and currencies are registered with `POST /api/market/indices` / `POST /api/market/conventions`). An unregistered name answers 422 `UNKNOWN_INDEX`.',
-        },
-        interpolation: { type: "string", enum: [...INTERPOLATIONS] },
-        dayCount,
-        discountCurveId: {
-          type: "string",
-          maxLength: 64,
-          description: "Curve id used for discounting during the bootstrap (dual-curve); not the snapshot mapping – see `isDiscountCurve`",
-        },
-        referenceCurveIds: { type: "array", items: { type: "string", maxLength: 64 }, maxItems: 50 },
-        spotLag: { type: "integer", minimum: 0, maximum: 5 },
-        turnOfYear: {
-          type: "array",
-          maxItems: 50,
-          description: "Turn-of-year forward jumps: instantaneous forward over [date, date + days) raised by `bp`; pillars re-solved so every quote reprices",
-          items: {
-            type: "object",
-            required: ["date", "bp"],
-            properties: { date: isoDate, bp: { type: "number", minimum: -1000, maximum: 1000 }, days: { type: "integer", minimum: 1, maximum: 366 } },
-            additionalProperties: false,
-          },
-        },
-        globalSweeps: {
-          type: "integer",
-          minimum: 0,
-          maximum: 50,
-          description: "Global re-solve sweeps after the sequential pass (default 6 for cubicSplineZero/monotoneConvex, 0 otherwise)",
-        },
-        pillarMergeToleranceDays: {
-          type: "integer",
-          minimum: 0,
-          maximum: 60,
-          description: "Merge quotes whose pillars fall within this many days (default 0 = off); dropped quotes are reported in `mergedQuotes`",
-        },
-        quotes: {
-          type: "array",
-          minItems: 1,
-          maxItems: 200,
-          items: {
-            type: "object",
-            required: ["type"],
-            properties: {
-              type: { type: "string", enum: [...CURVE_QUOTE_TYPES] },
-              tenor: { type: "string", maxLength: 8 },
-              start: { type: "string", maxLength: 12 },
-              end: { type: "string", maxLength: 12 },
-              rate: { type: "number", minimum: -0.1, maximum: 1 },
-              price: { type: "number", minimum: 50, maximum: 110 },
-              convexityBp: { type: "number" },
-              spread: { type: "number", minimum: -0.1, maximum: 0.1 },
-              otherIndex: rateIndex,
-              otherCurveId: { type: "string", maxLength: 64 },
-              foreignCurrency: currency,
-              foreignDiscountCurveId: { type: "string", maxLength: 64 },
-              foreignProjectionCurveId: { type: "string", maxLength: 64 },
-              domesticProjectionCurveId: { type: "string", maxLength: 64 },
-              fxSpot: { ...positiveNumber, description: "XccyBasis / FxSwapPoints: spot of the pair (1 domestic = fxSpot foreign)" },
-              domesticIndex: rateIndex,
-              foreignIndex: rateIndex,
-              points: { type: "number", description: "FxSwapPoints: forward points in pips (outright = spot + points / pipFactor)" },
-              pair: { ...currencyPair, description: "FxSwapPoints: pair whose base or quote currency is the curve currency" },
-              pipFactor: { type: "number", exclusiveMinimum: 0, description: "FxSwapPoints: pip denominator (default 10 000; 100 for JPY quotes)" },
-              otherDiscountCurveId: { type: "string", maxLength: 64, description: "FxSwapPoints: discount curve id of the other currency of the pair" },
-            },
-            additionalProperties: false,
-          },
-        },
-      },
-      additionalProperties: false,
-    },
+    spec: curveBuildSpecRef,
   },
   additionalProperties: false,
 } as const;
@@ -1366,7 +1377,22 @@ export const marketSnapshotSchema = {
       maxItems: 100,
       items: customCalendarRef,
       description:
-        "API envelope extension (ADR-027, Markt R8-2): custom holiday calendars registered at runtime via `POST /api/market/calendars` – exported when present, re-registered on import before `indices` (which may reference them). The whole envelope is validated before anything is registered (N8-04): an invalid entry answers 400 `INVALID_CURVE_SPEC` with `details.problems[]` and registers nothing.",
+        "API envelope extension (ADR-027, Markt R8-2): custom holiday calendars registered at runtime via `POST /api/market/calendars` – exported when present, re-registered on import before `indices` (which may reference them). The whole envelope is validated before anything is registered (N8-04): an invalid entry answers 400 `INVALID_CURVE_SPEC` with `details.problems[]` and registers nothing. Indices and conventions may reference an envelope calendar in a composite id (`CZ+TARGET`, N9-01).",
+    },
+    quotes: {
+      type: "array",
+      maxItems: 200,
+      description:
+        'API envelope extension (ADR-027 R9, Markt R9-1): bootstrap specs of the curves the exporting instance knows quotes for – every curve loaded through `POST /api/market/curves` outside the sample set (the workstation exports the same block for its "+ Kurve" curves). The curve itself travels in `curves` as before and is imported unchanged; the spec is stored next to it so that `POST /api/risk/par[/portfolio]` bumps the curve\'s quotes after the import (no `PAR_RISK_INCOMPLETE:` for it) and a later `PUT /api/market { discardImport: true }` re-bootstraps it. Not part of the snapshot id (`X-Market-Snapshot-Id` is unchanged by the block) but part of the export ETag. Validated with the market (422 `SNAPSHOT_INVALID`): `curveId` must be a curve of the snapshot, `spec.id`/`spec.currency` must match it, `spec.index` must be registered or listed in `indices`. Omitted when the store knows no quotes.',
+      items: {
+        type: "object",
+        required: ["curveId", "spec"],
+        properties: {
+          curveId: { type: "string", minLength: 1, maxLength: 64, description: "Id of the curve in `curves` the spec belongs to (= `spec.id`)" },
+          spec: curveBuildSpecRef,
+        },
+        additionalProperties: false,
+      },
     },
   },
   additionalProperties: false,
@@ -1475,7 +1501,7 @@ export const errorResponseSchema = {
         "INVALID_REQUEST (semantically invalid request outside the schema, e.g. no trades for a portfolio par-risk run), ID_MISMATCH (body `id` differs from the path id), INVALID_QUERY_MAP (`uti`/`transactionPrice` map malformed or above 4 kB – use the POST body), CSV_INVALID (CSV import: unparsable file / header / missing `?type=`), SNAPSHOT_MALFORMED, VOL_SURFACE_INVALID (a swaption / caplet / FX vol surface in `PUT /api/market`, a snapshot or a `designationSnapshot` is structurally inconsistent – grid rows ≠ expiries, row length ≠ tenors / strikes, FX vectors ≠ expiries, axes not strictly increasing, key ≠ currency / pair; `problems[]` names each path); " +
         "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request), STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods) and PAYLOAD_TOO_LARGE (body above the 5 MB limit); 415 UNSUPPORTED_MEDIA_TYPE (request body with a content-type other than `application/json` – `text/plain`, `application/xml`, … – or `text/csv` on any route but the import route); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED (also on unknown routes); 500 INTERNAL_ERROR. " +
         "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID (a CSV row that could not be mapped – parser / builder error – or whose built trade violates the `Trade` schema; the row is reported, the upload proceeds) and INTERNAL_ERROR (pricing failed for reasons that are not the trade's). " +
-        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset – or of an expired FX option's exercise date – approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `EXPIRED:` (FX option past its expiry with the delivery still pending – settled payoff, Greeks 0), `EXPIRES_TODAY:` (FX option expiring on the valuation date – intrinsic value on today's fixing / spot), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0), `BARRIER_STATE_UNKNOWN:` (barrier option without `barrier.hit` whose knock state was derived from today's spot or the expiry fixing – touch events in between are not observed), `VOL_IMPLAUSIBLE:` (a vol surface the valuation read – or a surface sent to `PUT /api/market` / the snapshot import, then in the 200 response's `warnings[]` – has numbers that do not fit its `volType`, e.g. a Lognormal cube with a median below 1 %, or is degenerate: all zeros / identical), `MARKET_STATE_DROPPED:` (`PUT /api/market`: state of the previous market a valuation-date change or `discardImport` could not carry over – a runtime curve that no longer bootstraps, a discount / collateral mapping whose curve is gone, a discarded imported snapshot; everything else – runtime curves, mappings, vol overrides, fixings, spots – survives the change, N8-01), `PAR_RISK_INCOMPLETE:` (`POST /api/risk/par` and `/par/portfolio`: a curve the trade depends on has no bootstrap quotes in the store – imported snapshot curves outside the sample set – and was not bumped; the curve is listed in `curvesWithoutQuotes[]`; load it through `POST /api/market/curves` to track its quotes, Markt R8-3).",
+        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset – or of an expired FX option's exercise date – approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `EXPIRED:` (FX option past its expiry with the delivery still pending – settled payoff, Greeks 0), `EXPIRES_TODAY:` (FX option expiring on the valuation date – intrinsic value on today's fixing / spot), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0), `BARRIER_STATE_UNKNOWN:` (barrier option without `barrier.hit` whose knock state was derived from today's spot or the expiry fixing – touch events in between are not observed), `VOL_IMPLAUSIBLE:` (a vol surface the valuation read – or a surface sent to `PUT /api/market` / the snapshot import, then in the 200 response's `warnings[]` – has numbers that do not fit its `volType`, e.g. a Lognormal cube with a median below 1 %, or is degenerate: all zeros / identical), `MARKET_STATE_DROPPED:` (`PUT /api/market`: state of the previous market a valuation-date change or `discardImport` could not carry over – a runtime curve that no longer bootstraps, a discount / collateral mapping whose curve is gone, a discarded imported snapshot; everything else – runtime curves, mappings, vol overrides, fixings, spots – survives the change, N8-01), `PAR_RISK_INCOMPLETE:` (`POST /api/risk/par` and `/par/portfolio`: a curve the trade depends on has no bootstrap quotes in the store – an imported snapshot curve outside the sample set whose snapshot carried no `quotes` entry for it (R9-1) – and was not bumped; the curve is listed in `curvesWithoutQuotes[]`; load it through `POST /api/market/curves` or import a snapshot with its `quotes` entry to track its quotes, Markt R8-3).",
     },
     details: {
       type: "object",
@@ -1562,7 +1588,7 @@ export const pricingResultSchema = {
       'LegResult[] (legType, pv, pvReporting, annuity, cashflows[] with kind Interest | Notional | Premium | OptionPayoff | Settlement, paymentDate, discountFactor, presentValue). A trade with an `upfront` premium / fee carries it as the last leg (`legType: "Upfront premium"`) with one cashflow of `kind: "Premium"` (amount −upfront.amount, discounted from `upfront.date`), so the premium appears in the cashflow table, in theta as a cashflow and in the CVA grid; before round 6 it was subtracted from the PV without a cashflow.',
     ),
     analytics: anyObject(
-      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). Swaps: `parRate` / `fairSpread` are computed from the economic legs only (R8, N8-1 – an `upfront` premium no longer distorts them); with an `upfront` the all-in figures `parRateAllIn` / `fairSpreadAllIn` (the rate / spread that sets the PV including the premium to zero) are reported next to them. FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1) and `deltaPremiumAdjusted` (premium-adjusted spot delta, R8); barrier options report `rebateAt` (hit | expiry | default – the rebate convention applied). " +
+      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). Swaps: `parRate` / `fairSpread` are computed from the economic legs only (R8, N8-1 – an `upfront` premium no longer distorts them); with an `upfront` the all-in figures `parRateAllIn` / `fairSpreadAllIn` (the rate / spread that sets the PV including the premium to zero) are reported next to them. FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1) and `deltaPremiumAdjusted` (premium-adjusted spot delta, R8); barrier options with a rebate report `rebateAt` (hit | expiry – the effective knock-out rebate convention; `hit` unless the trade says `expiry`, R9 – the earlier `default` value no longer occurs). " +
         "Caps/floors and swaptions: `model` (Bachelier | Black | ShiftedBlack), `volatility` in the model's own quotation, `volConverted` (\"yes\" when the surface vols were converted into that quotation because the requested model differs from the surface's vol type – then `warnings[]` carries `VOL_TYPE_CONVERTED:` and swaptions additionally report the unconverted `surfaceVolatility`). " +
         'FX options additionally: `lifecycle` (state on the valuation date: live | expires-today | expired-pending-delivery | delivered – expired / delivered options are a settled payoff with Greeks 0 and `warnings[]` `EXPIRED:` / `EXPIRES_TODAY:`) and `greeksMethod` ("analytic" for vanillas, "finite-difference" for barrier / digital, "settled-payoff" after expiry); barrier options report `barrierState` (alive | knocked-in | knocked-out – from `barrier.hit` when given, otherwise derived with a `BARRIER_STATE_UNKNOWN:` warning when the derivation decides the value). Dates live in `details`.',
     ),
@@ -1804,7 +1830,7 @@ export const csvRequestBody = {
   schema: {
     type: "string",
     description:
-      "CSV document: header row plus one trade per row; `?type=` selects one of the eleven column templates (see the operation description; `BasisSwap`/`AmortisingSwap`/`ImmSwap` build `InterestRateSwap`s), `?mode=upsert` replaces existing ids. Separator `;`/`,`/tab, German or plain numbers, dates ISO or DD.MM.YYYY; `collateralCurrency` accepts `none` for an uncollateralised trade. Rows that cannot be mapped or violate the `Trade` schema are reported per row (`CSV_ROW_INVALID`).",
+      "CSV document: header row plus one trade per row; `?type=` selects one of the eleven column templates (see the operation description; `BasisSwap`/`AmortisingSwap`/`ImmSwap` build `InterestRateSwap`s), `?mode=upsert` replaces existing ids. Separator `;`/`,`/tab, German or plain numbers, dates ISO or DD.MM.YYYY; `collateralCurrency` accepts `none` for an uncollateralised trade. An optional leading `type` column (the workstation's token `IRS`/`FXF`/…, R9-4) must match `?type=` – a mismatching row is rejected. Rows that cannot be mapped or violate the `Trade` schema are reported per row (`CSV_ROW_INVALID`).",
   },
 } as const;
 

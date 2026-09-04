@@ -27,6 +27,14 @@ export type BootstrapBody = {
 };
 
 /**
+ * One entry of the snapshot envelope's `quotes` (Markt R9-1, ADR-027 R9): the bootstrap spec of a runtime curve in
+ * the shape `POST /api/market/curves` accepts (`spec`), keyed by the curve it belongs to. The workstation exports
+ * the same shape for its "+ Kurve" curves. The curve itself travels in `curves` as before – the spec only serves
+ * par risk (`parRiskSpecs`) and a later rebuild.
+ */
+export type RuntimeCurveQuotes = { curveId: string; spec: BootstrapBodySpec };
+
+/**
  * Resolve an API bootstrap body against the market: curve ids → curve objects (all market
  * curves are offered as references unless `referenceCurveIds` narrows them, so
  * BasisSwap/XccyBasis/FxSwapPoints quotes find their curves) and ISO turn-of-year dates →

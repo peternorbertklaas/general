@@ -22,7 +22,7 @@ export const PAR_RISK_INCOMPLETE_PREFIX = "PAR_RISK_INCOMPLETE";
 const parRiskReportSchema = {
   type: "object",
   description:
-    "Par risk per curve and quote; `total` is the sum over all buckets in reporting currency. Bumped are the curves the trade depends on that have bootstrap quotes in the store – the sample curves and every curve loaded through `POST /api/market/curves` (Markt R8-3); curves without quotes (typically imported snapshot curves outside the sample set) are listed in `curvesWithoutQuotes` with a `PAR_RISK_INCOMPLETE:` warning instead of contributing a silent zero.",
+    "Par risk per curve and quote; `total` is the sum over all buckets in reporting currency. Bumped are the curves the trade depends on that have bootstrap quotes in the store – the sample curves, every curve loaded through `POST /api/market/curves` (Markt R8-3) and every imported curve whose snapshot carried a `quotes` entry (R9-1); curves without quotes (imported snapshot curves outside the sample set without a `quotes` entry) are listed in `curvesWithoutQuotes` with a `PAR_RISK_INCOMPLETE:` warning instead of contributing a silent zero.",
   properties: {
     tradeId: { type: "string" },
     currency: { type: "string" },
@@ -52,7 +52,7 @@ function curvesWithoutQuotes(m: MarketContext, trade: Trade, specs: ParRiskSpecs
 const incompleteWarnings = (missing: string[]): string[] =>
   missing.map(
     (id) =>
-      `${PAR_RISK_INCOMPLETE_PREFIX}: curve ${id} has no bootstrap quotes in the store and was not bumped – load it through POST /api/market/curves to track its quotes`,
+      `${PAR_RISK_INCOMPLETE_PREFIX}: curve ${id} has no bootstrap quotes in the store and was not bumped – load it through POST /api/market/curves (or import a snapshot with its quotes entry) to track its quotes`,
   );
 
 const dimension = {
