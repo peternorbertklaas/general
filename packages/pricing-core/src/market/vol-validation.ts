@@ -252,6 +252,8 @@ export const VOL_PLAUSIBILITY = {
   fxMin: 0.0005,
   /** FX surfaces (N7-6): median below this → import scaled by 1/100 (pegged pairs stay above it). */
   fxMedianMin: 0.002,
+  /** FX smiles (N8-6): |risk reversal| / |butterfly| above this (50 vol points) → quotes look scaled / are not vol differences. */
+  fxSmileMax: 0.5,
 } as const;
 
 function median(values: number[]): number {
@@ -314,6 +316,50 @@ function implausibleVols(values: number[], volType: unknown, path: string, fx = 
   return out;
 }
 
+/** Expiry label for smile messages ("1W", "6M", "1Y", "18M", "2.5Y"). */
+function expiryLabel(t: number): string {
+  const months = t * 12;
+  if (t < 1 / 12 - 1e-9) return `${Math.max(1, Math.round(t * 52))}W`;
+  if (t < 1 || (months < 24 && Math.abs(months - Math.round(months)) < 1e-9 && Math.round(months) % 12 !== 0)) return `${Math.round(months)}M`;
+  return `${Number(t.toFixed(2))}Y`;
+}
+
+/**
+ * Pillar-vol plausibility of an FX smile (N8-6): per expiry the 25Δ (and 10Δ)
+ * put / call pillar vols ATM + BF ∓ RR/2 must be positive – equivalently
+ * |RR| ≤ 2·(ATM + BF) – and |RR|, |BF| must stay below `fxSmileMax`. A surface
+ * with `rr25 = 0.30` (30 vol points on a 7.55 % ATM) implied a 25Δ put vol of
+ * −7.23 % and priced a 1.20 put at 10.81 % instead of 7.85 % without a signal;
+ * the pricer now repeats this warning and refuses non-positive pillars
+ * (`INVALID_VOL_SURFACE`, `fxVolAtStrike`).
+ */
+function fxSmilePlausibility(s: FxVolSurface, path: string): string[] {
+  const out: string[] = [];
+  const pct = (v: number) => `${(v * 100).toFixed(2)} %`;
+  const check = (i: number, delta: string, rr: number, bf: number) => {
+    const atm = s.atm[i]!;
+    const t = expiryLabel(s.expiries[i]!);
+    const put = atm + bf - rr / 2;
+    const call = atm + bf + rr / 2;
+    if (!(put > 0) || !(call > 0)) {
+      const side = put <= 0 ? "put" : "call";
+      out.push(
+        `${VOL_IMPLAUSIBLE_PREFIX} ${path}: ${delta} ${side} pillar vol at ${t} is ${pct(side === "put" ? put : call)} (ATM ${pct(atm)} + BF ${pct(bf)} ${side === "put" ? "−" : "+"} RR ${pct(rr)}/2) – pillar vols must be positive, |RR| ≤ 2·(ATM + BF); smile quotes are vol differences in decimals (0.003 = 0.3 %), check the sign / scaling of the import`,
+      );
+    } else if (Math.abs(rr) > VOL_PLAUSIBILITY.fxSmileMax || Math.abs(bf) > VOL_PLAUSIBILITY.fxSmileMax) {
+      const what = Math.abs(rr) > VOL_PLAUSIBILITY.fxSmileMax ? `risk reversal ${pct(rr)}` : `butterfly ${pct(bf)}`;
+      out.push(
+        `${VOL_IMPLAUSIBLE_PREFIX} ${path}: ${delta} ${what} at ${t} exceeds ${pct(VOL_PLAUSIBILITY.fxSmileMax)} – smile quotes are vol differences in decimals (0.003 = 0.3 %), check the scaling of the import`,
+      );
+    }
+  };
+  s.expiries.forEach((_, i) => {
+    check(i, "25Δ", s.rr25[i]!, s.bf25[i]!);
+    if (s.rr10 && s.bf10) check(i, "10Δ", s.rr10[i]!, s.bf10[i]!);
+  });
+  return out;
+}
+
 function surfaceVolValues(s: object): { values: number[]; volType: unknown; fx: boolean } {
   const x = s as { atm?: unknown; vols?: unknown; volType?: unknown; tenors?: unknown; strikes?: unknown; pair?: unknown };
   if ("pair" in x) return { values: Array.isArray(x.atm) ? (x.atm as number[]) : [], volType: undefined, fx: true };
@@ -337,6 +383,7 @@ export function volSurfaceWarnings(input: VolSurfacesInput): string[] {
       if (!s || typeof s !== "object" || problems(s, key).length) continue;
       const { values, volType, fx } = surfaceVolValues(s);
       out.push(...implausibleVols(values, volType, `${name}.${key}`, fx));
+      if (fx) out.push(...fxSmilePlausibility(s as FxVolSurface, `${name}.${key}`));
     }
   };
   each(input.swaptionVols, "swaptionVols", swaptionSurfaceProblems);
@@ -359,6 +406,7 @@ export function surfaceVolWarnings(s: SwaptionVolSurface | CapletVolSurface | Fx
     const kind = "pair" in s ? "FX vol surface" : "strikes" in s ? "caplet surface" : "swaption surface";
     const { values, volType, fx } = surfaceVolValues(s);
     w = implausibleVols(values, volType, `${kind} ${s.id}`, fx);
+    if (fx && fxSurfaceProblems(s, "", `${kind} ${s.id}`).length === 0) w.push(...fxSmilePlausibility(s as FxVolSurface, `${kind} ${s.id}`));
     plausibility.set(s, w);
   }
   return w;

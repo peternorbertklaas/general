@@ -49,20 +49,26 @@ export {
 export {
   CustomCalendar,
   JointCalendar,
+  QUANTLIB_CROSS_CHECKED_CALENDARS,
   addBusinessDays,
   adjust,
   advance,
   businessDaysBetween,
   clearCalendarHolidays,
+  customCalendarFromJson,
   easterSunday,
   getCalendar,
   hasCalendarHolidayFeed,
+  isBuiltInCalendar,
   isBusinessDay,
+  listCustomCalendars,
   registerCalendar,
   registerCalendarHolidays,
+  validateCustomCalendar,
   type BusinessDayConvention,
   type Calendar,
   type CalendarId,
+  type CustomCalendarJson,
 } from "./dates/calendar.js";
 export { dayCount, normalizeDayCount, yearFraction, type DayCountConvention, type YearFractionContext } from "./dates/daycount.js";
 export {
@@ -96,13 +102,17 @@ export {
   SWAP_CONVENTIONS,
   getIndex,
   getSwapConventions,
+  indexScheduleCalendar,
   isBuiltInIndex,
   knownCurrencies,
   knownIndices,
   registerRateIndex,
   registerSwapConventions,
+  validateRateIndex,
+  validateSwapConventions,
   type RateIndex,
   type SwapConventions,
+  type ValidateConventionsOptions,
 } from "./curves/index-definitions.js";
 export {
   bootstrapCurve,
@@ -284,7 +294,7 @@ export {
   type BarrierState,
   type FxOptionLifecycle,
 } from "./pricing/fx-pricer.js";
-export { assertValidTrade, pricePortfolio, priceTrade, tradeCurrencies, validateTrade } from "./pricing/price.js";
+export { assertValidTrade, discountedCurrencies, pricePortfolio, priceTrade, tradeCurrencies, validateTrade } from "./pricing/price.js";
 // Risk & XVA
 export {
   computeRisk,

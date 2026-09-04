@@ -121,6 +121,12 @@ export interface FloatingRateProjection {
  * Observation days before the valuation date of a period that has not yet
  * started (RFR lookback on a spot-starting swap) are projected with the
  * curve's first forward without a warning.
+ *
+ * RFR conventions: lookback (`lookbackDays`, optionally with observation
+ * shift) and lockout (`lockoutDays`, N8-7 – the fixing of business day
+ * `end − k` on the fixing calendar applies to the last k business days of the
+ * period, in the realised part from the fixing history, in the projection as
+ * the curve forward of that day's overnight period compounded day by day).
  */
 export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: SchedulePeriod, projCurve: Curve): FloatingRateProjection {
   const idx = getIndex(leg.index);
@@ -147,7 +153,8 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
     const fwd = projCurve.forwardRate(period.accrualStart, period.accrualEnd, idx.dayCount);
     return { rate: gearing * fwd + spread, isFixed: false };
   }
-  // Overnight compounding in arrears.
+  // Overnight compounding in arrears on the index's fixing calendar (N8-4: SOFR on `US-SIFMA` – a Good Friday is
+  // no publication day, Thursday's fixing accrues over four days).
   const cal = getCalendar(idx.fixingCalendar);
   const start = period.accrualStart;
   const end = period.accrualEnd;
@@ -160,17 +167,26 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
   let missingFixing: SerialDate | undefined;
   const lookback = leg.lookbackDays ?? 0;
   const obsShift = leg.observationShift ?? false;
+  const lockout = leg.lockoutDays ?? 0;
+  // N8-7 lockout: the fixing of the business day `end − lockoutDays` (floored at the accrual start) applies from that
+  // day to the end of the period.
+  const lockoutDate = lockout > 0 ? Math.max(start, addBusinessDays(end, -lockout, cal)) : undefined;
   const periodStarted = start <= val;
+  // Fixing-calendar business day whose rate is in effect on `x` (an accrual day on a fixing holiday, e.g. a SOFR
+  // period starting on Good Friday, uses the last published fixing).
+  const inEffect = (x: SerialDate) => (cal.isHoliday(x) ? addBusinessDays(x, -1, cal) : x);
   // Observation date for an accrual day d: d shifted back by `lookback` business days.
   const obs = (d: SerialDate) => (lookback > 0 ? addBusinessDays(d, -lookback, cal) : d);
+  // Fixing date whose rate applies to accrual day d (lockout freezes it at the lockout date).
+  const fixingDayOf = (d: SerialDate) => (lockoutDate !== undefined && d >= lockoutDate ? lockoutDate : inEffect(obs(d)));
   let d = start;
   let realisedTo = start;
   // Realised part: daily fixings whose observation date is before the valuation date.
-  while (d < end && obs(d) < val) {
+  while (d < end && fixingDayOf(d) < val) {
     const next = addBusinessDays(d, 1, cal);
     const stop = Math.min(next, end);
-    const od = obs(d);
-    const oStop = obs(stop);
+    const od = fixingDayOf(d);
+    const oStop = lockoutDate !== undefined && d >= lockoutDate ? addBusinessDays(od, 1, cal) : obs(stop);
     // Weight: accrual-day count of the accrual period (lookback) or of the observation period (observation shift).
     const tau = obsShift ? yearFraction(od, oStop, idx.dayCount) : yearFraction(d, stop, idx.dayCount);
     const fixing = getFixing(ctx, idx.name, od);
@@ -196,8 +212,26 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
     if (policy === "throw") throw new PricingError("MISSING_FIXING", message, { index: idx.name, fixingDate: missingFixing });
   }
   const isFixed = realisedTo >= end;
-  if (realisedTo < end) {
-    const oFrom = obs(realisedTo);
+  if (realisedTo < end && lockoutDate !== undefined && lockoutDate < end) {
+    // Projection with lockout: telescoping forward up to the lockout date, then the lockout date's overnight
+    // forward compounded day by day over the frozen tail (the realised loop already covered a lockout date < today).
+    if (realisedTo < lockoutDate) {
+      const tauFwd = yearFraction(realisedTo, lockoutDate, idx.dayCount);
+      const fwd = projCurve.forwardRate(inEffect(realisedTo), lockoutDate, idx.dayCount);
+      compounded *= 1 + fwd * tauFwd;
+      sumAvg += fwd * tauFwd;
+    }
+    const rLock = projCurve.forwardRate(lockoutDate, addBusinessDays(lockoutDate, 1, cal), idx.dayCount);
+    let x = Math.max(realisedTo, lockoutDate);
+    while (x < end) {
+      const nx = Math.min(addBusinessDays(x, 1, cal), end);
+      const tau = yearFraction(x, nx, idx.dayCount);
+      compounded *= 1 + rLock * tau;
+      sumAvg += rLock * tau;
+      x = nx;
+    }
+  } else if (realisedTo < end) {
+    const oFrom = inEffect(obs(realisedTo));
     const oTo = obs(end);
     const tauFwd = obsShift ? yearFraction(oFrom, oTo, idx.dayCount) : yearFraction(realisedTo, end, idx.dayCount);
     const fwd = projCurve.forwardRate(oFrom, oTo, idx.dayCount);

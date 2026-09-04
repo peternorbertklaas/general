@@ -15,6 +15,7 @@ import { swaptionAtmVol, swaptionVol } from "../models/vol-surfaces.js";
 import { fxForwardRate } from "../pricing/fx-pricer.js";
 import { fxToReporting, scheduleDates } from "../pricing/leg-pricer.js";
 import { priceInterestRateSwap } from "../pricing/swap-pricer.js";
+import { upfrontPremiumLeg } from "../pricing/upfront.js";
 
 export interface ExposurePoint {
   date: number;
@@ -263,6 +264,9 @@ function hazardLabel(credit: CreditInputs): string {
  * remaining swap (Sorensen–Bollier), valued with the smile vol at the swap's
  * fixed rate (or 70bp normal vol fallback). The profile ends at maturity with
  * zero exposure so the last coupon period carries its default probability.
+ * An upfront fee only nets the t = 0 exposure (current PV); the remaining
+ * swaps are priced without it (N8-1 – the fee used to enter `parRate` and
+ * shift every replication forward).
  */
 export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
@@ -282,8 +286,10 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
   for (let i = 0; i < dates.length - 1; i++) {
     const t = dates[i]!;
     const T = yearFraction(ctx.valuationDate, t, "ACT/365F");
+    // N8-1: the remaining swap carries no fee – the premium is paid on its date and does not shift the forward.
     const remaining: InterestRateSwap = {
       ...swap,
+      upfront: undefined,
       legs: swap.legs.map((l) => ({ ...l, effectiveDate: t })),
     };
     let fwd: number;
@@ -363,7 +369,7 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
   for (let i = 0; i < dates.length - 1; i++) {
     const t = dates[i]!;
     const T = yearFraction(ctx.valuationDate, t, "ACT/365F");
-    const remaining: InterestRateSwap = { ...swap, legs: swap.legs.map((l) => ({ ...l, effectiveDate: t })) };
+    const remaining: InterestRateSwap = { ...swap, upfront: undefined, legs: swap.legs.map((l) => ({ ...l, effectiveDate: t })) };
     let fairSpread: number;
     let annuity: number;
     try {
@@ -394,7 +400,15 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
   return aggregate(swap.id, reporting, profile, credit, `Basis-swaption replication (Bachelier on the tenor-basis spread), ${hazardLabel(credit)}`, warnings);
 }
 
-/** CVA for an FX forward using Garman–Kohlhagen on the forward at each grid date. */
+/**
+ * CVA for an FX forward using Garman–Kohlhagen on the forward at each grid
+ * date. The t = 0 point is the trade's PV (`priceTrade`, premium included). An
+ * unpaid upfront premium (N8-2) is netted while it is outstanding: the value
+ * at t is V = N·DF_q·(F_T − K) + c with the premium PV c (quote currency), so
+ * EPE = N·DF_q·E[(F_T − K′)⁺] with the shifted strike K′ = K − c/(N·DF_q) –
+ * the same μ-shift `cvaGeneric` applies; after the premium date the plain
+ * forward exposure remains.
+ */
 export function cvaFxForward(ctx: MarketContext, fwdTrade: FxForward, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
   const base = fwdTrade.buyCurrency;
@@ -409,30 +423,32 @@ export function cvaFxForward(ctx: MarketContext, fwdTrade: FxForward, credit: Cr
   let prevT = 0;
   const F = fxForwardRate(ctx, base, quote, fwdTrade.deliveryDate, fwdTrade.collateralCurrency);
   const dfQ = getDiscountCurve(ctx, quote, fwdTrade.collateralCurrency).df(fwdTrade.deliveryDate);
-  profile.push({
-    date: ctx.valuationDate,
-    years: 0,
-    epe: Math.max((F - K) * dfQ * fwdTrade.buyAmount * fxQ, 0),
-    ene: Math.max(-(F - K) * dfQ * fwdTrade.buyAmount * fxQ, 0),
-    pdCpty: 0,
-    pdOwn: 0,
-  });
+  const scale = dfQ * fwdTrade.buyAmount * fxQ;
+  // N8-2: open premium (PV today, quote currency) shifts the strike while it is outstanding.
+  const up = fwdTrade.upfront;
+  const premium = up && up.date > ctx.valuationDate ? upfrontPremiumLeg(ctx, fwdTrade, reporting, 2) : undefined;
+  const premiumQuote = premium ? premium.pvReporting / fxQ : 0;
+  const pv0 = priceTrade(ctx, fwdTrade, reporting).pv;
+  profile.push({ date: ctx.valuationDate, years: 0, epe: Math.max(pv0, 0), ene: Math.max(-pv0, 0), pdCpty: 0, pdOwn: 0 });
   for (let i = 1; i <= steps; i++) {
     const t = (T * i) / steps;
+    const date = ctx.valuationDate + Math.round(t * 365.25);
     const vol = surface ? fxAtmVol(surface, t) : 0.08;
-    const epe = black76("Call", F, K, vol, t) * dfQ * fwdTrade.buyAmount * fxQ;
-    const ene = black76("Put", F, K, vol, t) * dfQ * fwdTrade.buyAmount * fxQ;
-    profile.push({
-      date: ctx.valuationDate + Math.round(t * 365.25),
-      years: t,
-      epe,
-      ene,
-      pdCpty: cptyPd(credit, prevT, t),
-      pdOwn: ownPd(credit, prevT, t),
-    });
+    const kEff = premium && up!.date > date ? K - premiumQuote / (dfQ * fwdTrade.buyAmount) : K;
+    let epe: number;
+    let ene: number;
+    if (kEff <= 0) {
+      // The premium we receive exceeds any possible loss: the value is positive for every spot.
+      epe = (F - kEff) * scale;
+      ene = 0;
+    } else {
+      epe = black76("Call", F, kEff, vol, t) * scale;
+      ene = black76("Put", F, kEff, vol, t) * scale;
+    }
+    profile.push({ date, years: t, epe, ene, pdCpty: cptyPd(credit, prevT, t), pdOwn: ownPd(credit, prevT, t) });
     prevT = t;
   }
-  return aggregate(fwdTrade.id, reporting, profile, credit, `GK forward-exposure, ${hazardLabel(credit)}`, warnings);
+  return aggregate(fwdTrade.id, reporting, profile, credit, `GK forward-exposure${premium ? " (open premium netted)" : ""}, ${hazardLabel(credit)}`, warnings);
 }
 
 function aggregate(tradeId: string, currency: string, profile: ExposurePoint[], credit: CreditInputs, method: string, warnings: string[]): XvaResult {

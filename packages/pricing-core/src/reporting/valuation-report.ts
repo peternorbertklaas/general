@@ -1,5 +1,6 @@
 import { type InterpolatedCurve, curveSource } from "../curves/curve.js";
 import { getIndex } from "../curves/index-definitions.js";
+import { QUANTLIB_CROSS_CHECKED_CALENDARS } from "../dates/calendar.js";
 import { parseISO, toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
 import { frequencyPerYear } from "../dates/schedule.js";
@@ -580,20 +581,28 @@ function curveLines(ctx: MarketContext, trade: Trade): string[] {
   return lines;
 }
 
+/**
+ * Calendar clause of the convention sentence (N8-5): names exactly the
+ * calendars whose holidays are cross-checked against QuantLib in the golden
+ * test (`QUANTLIB_CROSS_CHECKED_CALENDARS`) – "TARGET2/US/UK/CH/JP/NO/SE/DK/PL"
+ * plus the SOFR fixing calendar; `DE` is not listed because it is not checked.
+ */
+function checkedCalendarClause(): string {
+  const label = (id: string) => (id === "TARGET" ? "TARGET2" : id);
+  const main = QUANTLIB_CROSS_CHECKED_CALENDARS.filter((id) => id !== "US-SIFMA").map(label);
+  const sofr = QUANTLIB_CROSS_CHECKED_CALENDARS.includes("US-SIFMA") ? " sowie SOFR-Fixingkalender US-SIFMA" : "";
+  return `regelbasierte Kalender ${main.join("/")}${sofr}, gegen QuantLib abgeglichen (Werktagsfeiertage 2024–2032, Golden-Test), in Produktion durch Feiertagsfeeds überschreibbar`;
+}
+
 function conventionLines(trade: Trade): string[] {
   const legs = legsOf(trade);
-  if (legs.length === 0)
-    return [
-      "Tageszählung, Geschäftstagekonvention und Kalender gemäß ISDA-Definitionen (TARGET2, US, UK, CH, JP, NO, SE, DK, PL – regelbasiert, gegen QuantLib abgeglichen, in Produktion durch Feiertagsfeeds überschreibbar).",
-    ];
+  if (legs.length === 0) return [`Tageszählung, Geschäftstagekonvention und Kalender gemäß ISDA-Definitionen (${checkedCalendarClause()}).`];
   const parts = legs.map((l, i) => {
     const kind =
       l.type === "Fixed" ? `Fix ${pct(l.rate)}` : `Float ${l.index}${l.spread ? ` ${l.spread >= 0 ? "+" : ""}${formatDe(l.spread * 1e4, 1)} bp` : ""}`;
     return `Leg ${i + 1} (${l.payReceive === "Receive" ? "Empfang" : "Zahlung"}, ${kind}): ${l.frequency}, ${l.dayCount}, ${bdcLabelDe(l.businessDayConvention)}, Kalender ${l.calendar}, ${stubLabelDe(l.stub)}${l.endOfMonth ? ", EOM-Roll" : ""}${l.roll === "IMM" ? ", IMM-Roll" : ""}${l.paymentLag ? `, Zahlungsverzug ${l.paymentLag} GT` : ""}`;
   });
-  return [
-    `Konventionen gemäß ISDA-Definitionen (regelbasierte Kalender TARGET2/US/UK/CH/JP/NO/SE/DK/PL, gegen QuantLib abgeglichen, in Produktion durch Feiertagsfeeds überschreibbar): ${parts.join("; ")}.`,
-  ];
+  return [`Konventionen gemäß ISDA-Definitionen (${checkedCalendarClause()}): ${parts.join("; ")}.`];
 }
 
 function fixingLines(ctx: MarketContext, trade: Trade, pricing: PricingResult): string[] {
@@ -620,7 +629,7 @@ function fixingLines(ctx: MarketContext, trade: Trade, pricing: PricingResult): 
     }
     if (idxType === "OIS") {
       lines.push(
-        `RFR-Leg ${l.index}: ${(l.compounding ?? "Compound") === "Compound" ? "Compounding" : "arithmetisches Averaging"} in arrears der täglichen Fixings, Lookback ${l.lookbackDays ?? 0} Geschäftstage${l.lookbackDays ? (l.observationShift ? " mit Observation Shift (Gewichte aus der Beobachtungsperiode)" : " ohne Observation Shift (Gewichte aus der Zinsperiode)") : ""}, realisierter Teil bis zum Bewertungstag aus Fixings, Rest aus der Kurve; Accrued = realisiertes Compounding.`,
+        `RFR-Leg ${l.index}: ${(l.compounding ?? "Compound") === "Compound" ? "Compounding" : "arithmetisches Averaging"} in arrears der täglichen Fixings${l.lockoutDays ? ` (Fixingkalender ${getIndex(l.index).fixingCalendar}), Lockout ${l.lockoutDays} Geschäftstage (Fixing des Tages Periodenende − ${l.lockoutDays} eingefroren, ISDA 2021)` : `, Lookback ${l.lookbackDays ?? 0} Geschäftstage${l.lookbackDays ? (l.observationShift ? " mit Observation Shift (Gewichte aus der Beobachtungsperiode)" : " ohne Observation Shift (Gewichte aus der Zinsperiode)") : ""}`}, realisierter Teil bis zum Bewertungstag aus Fixings, Rest aus der Kurve; Accrued = realisiertes Compounding.`,
       );
     }
     if (l.capRate !== undefined || l.floorRate !== undefined) {
@@ -719,8 +728,15 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
             ? `Smile aus ATM/RR/BF-Quotes der Fläche ${s.id} (ATM ${fxAtmConventionLabelDe(s.atmConvention)}, Delta-Konvention ${fxDeltaConventionLabelDe(s.deltaConvention)}, Butterfly als ${(s.strangleType ?? "Smile") === "Broker" ? "Broker-Strangle (Reiswich-Wystup-Iteration)" : "Smile-Strangle"}, Interpolation ${(s.smileInterpolation ?? "linear") === "cubic" ? "monoton-kubisch" : "linear"} im Delta-Raum, flache Extrapolation jenseits der äußeren Pillars, Fixpunkt Strike↔Delta)`
             : "Rückfall-Volatilität 8 % (keine Fläche)";
       const vol = typeof a.volatility === "number" ? `, verwendete Vol ${pct(a.volatility, 3)}` : "";
+      const rebateNote = trade.barrier?.rebate
+        ? trade.barrier.rebateAt === "expiry"
+          ? "; Knock-out-Rebate am Verfall (Konvention „expiry“: lebend Rebate·DF·P(Berührung), entschieden Rebate·DF(Lieferung) – eine Konvention, stetig an der Barrier)"
+          : trade.barrier.rebateAt === "hit"
+            ? "; Knock-out-Rebate bei Berührung (Konvention „hit“: lebend Reiner-Rubinstein-Term F, Spot jenseits der Barrier = Berührung heute value-today, bestätigte Berührung = bereits gezahlt)"
+            : "; Knock-out-Rebate ohne festgelegte Konvention: lebend bei Berührung (Term F), entschieden Rebate·DF(Lieferung) – Sprung Rebate·(1 − DF) an der Barrier; Konvention „hit“ oder „expiry“ am Geschäft setzen"
+        : "";
       const barrierNote = trade.barrier
-        ? ` / Reiner-Rubinstein (Single-Barrier: Auszahlung auf das Lieferdatum diskontiert und gegen den Lieferdatums-Forward gestellt, Diffusion und Barrier-Drift auf dem Horizont bis zur Ausübung${a.deliveryConvention === "non-standard" ? "; Lieferdatum weicht vom Spot-Datum der Ausübung ab – Drift und Rebate-Diskontierung aus den Kurven bis zum Standard-Lieferdatum, nur Auszahlungsdiskont und Forward auf das tatsächliche Lieferdatum" : ""})`
+        ? ` / Reiner-Rubinstein (Single-Barrier: Auszahlung auf das Lieferdatum diskontiert und gegen den Lieferdatums-Forward gestellt, Diffusion und Barrier-Drift auf dem Horizont bis zur Ausübung${a.deliveryConvention === "non-standard" ? "; Lieferdatum weicht vom Spot-Datum der Ausübung ab – Drift und Rebate-Diskontierung aus den Kurven bis zum Standard-Lieferdatum, nur Auszahlungsdiskont und Forward auf das tatsächliche Lieferdatum" : ""}${rebateNote})`
         : trade.digital
           ? " (Digital analytisch, Cash- bzw. Asset-or-Nothing)"
           : "";

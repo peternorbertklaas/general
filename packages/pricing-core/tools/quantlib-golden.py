@@ -797,14 +797,28 @@ def ql_cds_check():  # pragma: no cover
 #    there is no closed form; the file is only meaningful with QuantLib.
 # --------------------------------------------------------------------------
 CALENDAR_YEARS = list(range(2024, 2033))
-# engine calendar id → QuantLib constructor
+# engine calendar id → QuantLib constructor ("Class" or "Class(Market)"); R8 (N8-4 / N8-5) adds US, US-SIFMA, UK, CH, JP
 CALENDARS_QL = {
     "TARGET": "TARGET",
+    "US": "UnitedStates(Settlement)",
+    "US-SIFMA": "UnitedStates(SOFR)",
+    "UK": "UnitedKingdom(Settlement)",
+    "CH": "Switzerland",
+    "JP": "Japan",
     "NO": "Norway",
     "SE": "Sweden",
     "DK": "Denmark",
     "PL": "Poland",
 }
+
+
+def ql_calendar(spec: str):  # pragma: no cover
+    """Instantiate a QuantLib calendar from "Class" or "Class(Market)"."""
+    if "(" in spec:
+        cls, market = spec[:-1].split("(")
+        klass = getattr(ql, cls)
+        return klass(getattr(klass, market))
+    return getattr(ql, spec)()
 # Documented, intentional differences (engine right, vendor lagging): the engine keeps these holidays.
 KNOWN_ENGINE_ONLY = {
     "PL": {
@@ -819,11 +833,13 @@ def golden_calendars() -> None:
     (`Calendar.holidayList(from, to, includeWeekends=False)`), ISO dates. The engine
     test (`src/testing/golden.test.ts`) lists every weekday holiday of its rule-based
     calendar over the same years and requires set equality except for the
-    `knownEngineOnly` dates (engine ahead of the vendor: PL 24.12. from 2025)."""
+    `knownEngineOnly` dates (engine ahead of the vendor: PL 24.12. from 2025).
+    US-SIFMA = QuantLib `UnitedStates(SOFR)`: Settlement plus Good Friday, without
+    the Friday observance of a Saturday New Year's Day / Veterans Day."""
     holidays = {}
     if HAVE_QL:
         for cal_id, ctor in CALENDARS_QL.items():
-            cal = getattr(ql, ctor)()
+            cal = ql_calendar(ctor)
             per_year = {}
             for y in CALENDAR_YEARS:
                 lst = ql.Calendar.holidayList(cal, ql.Date(1, 1, y), ql.Date(31, 12, y), False)
@@ -831,7 +847,7 @@ def golden_calendars() -> None:
             holidays[cal_id] = per_year
     payload = {
         "case": "calendars-quantlib",
-        "description": "Weekday holidays 2024–2032 of the rule-based engine calendars TARGET / NO (Oslo) / SE (Stockholm) / DK (Copenhagen) / PL (Warsaw) cross-checked against QuantLib's TARGET / Norway / Sweden / Denmark / Poland calendars (Quant R7, N7-4: DK Friday after Ascension, NO Christmas Eve).",
+        "description": "Weekday holidays 2024–2032 of the rule-based engine calendars TARGET / US (New York settlement) / US-SIFMA (SOFR fixing calendar) / UK / CH / JP / NO (Oslo) / SE (Stockholm) / DK (Copenhagen) / PL (Warsaw) cross-checked against QuantLib's TARGET / UnitedStates(Settlement) / UnitedStates(SOFR) / UnitedKingdom / Switzerland / Japan / Norway / Sweden / Denmark / Poland calendars (Quant R7, N7-4: DK Friday after Ascension, NO Christmas Eve; R8, N8-4: SOFR Good Friday, N8-5: JP substitute / citizens' holidays and equinox formula).",
         "derivation": golden_calendars.__doc__.strip(),
         "inputs": {"years": CALENDAR_YEARS, "calendars": CALENDARS_QL},
         "knownEngineOnly": KNOWN_ENGINE_ONLY,

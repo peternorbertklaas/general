@@ -11,13 +11,27 @@ export interface RateIndex {
   /** Tenor for IBOR indices, e.g. "6M". Overnight indices use "1D". */
   tenor: string;
   dayCount: DayCountConvention;
+  /** Calendar of the fixings / publication days (drives the daily RFR compounding grid and IBOR fixing dates). */
   fixingCalendar: CalendarId;
+  /**
+   * Calendar of the index's accrual / payment schedule when it differs from
+   * the fixing calendar (N8-4): SOFR is published on SIFMA business days
+   * (`US-SIFMA`, Good Friday closed) while USD payments follow the US
+   * settlement calendar (`US`). Default: `fixingCalendar` – read it through
+   * `indexScheduleCalendar`.
+   */
+  paymentCalendar?: CalendarId;
   /** Fixing lag in business days (2 for EURIBOR, 0 for €STR/SOFR). */
   fixingLag: number;
   businessDayConvention: BusinessDayConvention;
   endOfMonth: boolean;
   /** Curve id used to project this index (in a MarketContext). */
   curveId: string;
+}
+
+/** Calendar the bootstrap / builders use for an index's accrual and payment schedule (`paymentCalendar`, else `fixingCalendar`). */
+export function indexScheduleCalendar(idx: RateIndex): CalendarId {
+  return idx.paymentCalendar ?? idx.fixingCalendar;
 }
 
 /**
@@ -27,7 +41,14 @@ export interface RateIndex {
 function ibor(name: string, currency: string, tenor: string, dayCount: DayCountConvention, fixingCalendar: CalendarId, curveId: string): RateIndex {
   return { name, currency, type: "IBOR", tenor, dayCount, fixingCalendar, fixingLag: 2, businessDayConvention: "ModifiedFollowing", endOfMonth: true, curveId };
 }
-function ois(name: string, currency: string, dayCount: DayCountConvention, fixingCalendar: CalendarId, curveId: string): RateIndex {
+function ois(
+  name: string,
+  currency: string,
+  dayCount: DayCountConvention,
+  fixingCalendar: CalendarId,
+  curveId: string,
+  paymentCalendar?: CalendarId,
+): RateIndex {
   return {
     name,
     currency,
@@ -35,6 +56,7 @@ function ois(name: string, currency: string, dayCount: DayCountConvention, fixin
     tenor: "1D",
     dayCount,
     fixingCalendar,
+    ...(paymentCalendar ? { paymentCalendar } : {}),
     fixingLag: 0,
     businessDayConvention: "ModifiedFollowing",
     endOfMonth: true,
@@ -50,7 +72,7 @@ function ois(name: string, currency: string, dayCount: DayCountConvention, fixin
  * |----------------|-----|------|-------|-----------|-------------|-----------------|
  * | EURIBOR-1M…12M | EUR | IBOR | 1M…12M| ACT/360   | TARGET (T-2)| EUR-EURIBOR-<t> |
  * | ESTR           | EUR | OIS  | 1D    | ACT/360   | TARGET      | EUR-ESTR        |
- * | SOFR           | USD | OIS  | 1D    | ACT/360   | US          | USD-SOFR        |
+ * | SOFR           | USD | OIS  | 1D    | ACT/360   | US-SIFMA ¹  | USD-SOFR        |
  * | SONIA          | GBP | OIS  | 1D    | ACT/365F  | UK          | GBP-SONIA       |
  * | SARON          | CHF | OIS  | 1D    | ACT/360   | CH          | CHF-SARON       |
  * | TONA           | JPY | OIS  | 1D    | ACT/365F  | JP          | JPY-TONA        |
@@ -68,6 +90,11 @@ function ois(name: string, currency: string, dayCount: DayCountConvention, fixin
  * Financial Benchmark Facility / Nationalbanken, GPW Benchmark / NBP; QuantLib
  * `Nowa`/`Swestr`/`Destr`/`Wibor` use the same day counts); the national
  * calendars are rule-based approximations (see `dates/calendar.ts`).
+ *
+ * ¹ SOFR (N8-4): fixings on the SIFMA / Treasury-market calendar `US-SIFMA`
+ * (Good Friday is not a publication day, QuantLib `UnitedStates(SOFR)`), the
+ * accrual / payment schedule on the US settlement calendar
+ * (`paymentCalendar: "US"`, `indexScheduleCalendar`).
  */
 export const RATE_INDICES: Record<string, RateIndex> = {
   "EURIBOR-1M": ibor("EURIBOR-1M", "EUR", "1M", "ACT/360", "TARGET", "EUR-EURIBOR-1M"),
@@ -75,7 +102,7 @@ export const RATE_INDICES: Record<string, RateIndex> = {
   "EURIBOR-6M": ibor("EURIBOR-6M", "EUR", "6M", "ACT/360", "TARGET", "EUR-EURIBOR-6M"),
   "EURIBOR-12M": ibor("EURIBOR-12M", "EUR", "12M", "ACT/360", "TARGET", "EUR-EURIBOR-12M"),
   ESTR: ois("ESTR", "EUR", "ACT/360", "TARGET", "EUR-ESTR"),
-  SOFR: ois("SOFR", "USD", "ACT/360", "US", "USD-SOFR"),
+  SOFR: ois("SOFR", "USD", "ACT/360", "US-SIFMA", "USD-SOFR", "US"),
   SONIA: ois("SONIA", "GBP", "ACT/365F", "UK", "GBP-SONIA"),
   SARON: ois("SARON", "CHF", "ACT/360", "CH", "CHF-SARON"),
   TONA: ois("TONA", "JPY", "ACT/365F", "JP", "JPY-TONA"),
@@ -280,20 +307,22 @@ function invalid(what: string, detail: string, def: unknown): never {
   throw new PricingError("INVALID_CURVE_SPEC", `${what}: ${detail}`, { definition: def });
 }
 
-function checkDayCount(dc: unknown, what: string, def: unknown): void {
+function dayCountProblem(dc: unknown): string | undefined {
   try {
     normalizeDayCount(dc as DayCountConvention);
+    return undefined;
   } catch {
-    invalid(what, `unknown day count ${JSON.stringify(dc)}`, def);
+    return `unknown day count ${JSON.stringify(dc)}`;
   }
 }
 
-function checkCalendar(id: unknown, what: string, def: unknown): void {
-  if (!isStr(id)) invalid(what, "calendar id missing", def);
+function calendarProblem(id: unknown, what = "calendar"): string | undefined {
+  if (!isStr(id)) return `${what} id missing`;
   try {
     getCalendar(id);
+    return undefined;
   } catch {
-    invalid(what, `unknown calendar ${JSON.stringify(id)} (register it with registerCalendar first)`, def);
+    return `unknown ${what} ${JSON.stringify(id)} (register it with registerCalendar first)`;
   }
 }
 
@@ -305,14 +334,54 @@ export function isBuiltInIndex(name: string): boolean {
   return BUILT_IN_INDEX_NAMES.has(String(name).toUpperCase());
 }
 
+const BDCS = ["Following", "ModifiedFollowing", "Preceding", "ModifiedPreceding", "Unadjusted"];
+
+/**
+ * Problems of an index definition (empty = valid) – the checks of
+ * `registerRateIndex` without registering anything (R8, Architektur N8-04: an
+ * envelope importer validates every entry before it registers the first one).
+ * Includes the built-in-name rule (N7-7) and, when given, the
+ * `paymentCalendar`.
+ */
+export function validateRateIndex(def: unknown): string[] {
+  const out: string[] = [];
+  const d = def as Partial<RateIndex> | null;
+  if (!d || typeof d !== "object" || Array.isArray(d)) return ["definition must be an object"];
+  if (!isStr(d.name) || /\s/.test(d.name)) out.push("name must be a non-empty string without whitespace");
+  else if (isBuiltInIndex(d.name)) {
+    out.push(
+      `${d.name.toUpperCase()} is a built-in index and cannot be replaced (valuations would change without a trace in the snapshot id); register the variant under a new name`,
+    );
+  }
+  if (!isStr(d.currency) || !/^[A-Za-z]{3}$/.test(d.currency)) out.push("currency must be a 3-letter code");
+  if (d.type !== "IBOR" && d.type !== "OIS") out.push('type must be "IBOR" or "OIS"');
+  else if (d.type === "OIS" ? d.tenor !== "1D" : !/^[1-9]\d{0,2}[MWY]$/i.test(String(d.tenor))) {
+    out.push(d.type === "OIS" ? 'overnight indices use tenor "1D"' : `IBOR tenor must be like "3M" (got ${JSON.stringify(d.tenor)})`);
+  }
+  const dc = dayCountProblem(d.dayCount);
+  if (dc) out.push(dc);
+  const cal = calendarProblem(d.fixingCalendar);
+  if (cal) out.push(cal);
+  if (d.paymentCalendar !== undefined) {
+    const pc = calendarProblem(d.paymentCalendar, "paymentCalendar");
+    if (pc) out.push(pc);
+  }
+  if (!isNonNegInt(d.fixingLag)) out.push("fixingLag must be a non-negative integer");
+  if (!BDCS.includes(String(d.businessDayConvention))) out.push(`unknown businessDayConvention ${JSON.stringify(d.businessDayConvention)}`);
+  if (typeof d.endOfMonth !== "boolean") out.push("endOfMonth must be a boolean");
+  if (!isStr(d.curveId)) out.push("curveId missing");
+  return out;
+}
+
 /**
  * Register a floating-rate index at runtime (or replace one registered at
  * runtime). Validates the definition (3-letter currency, type, tenor "<n>M|W|Y"
- * for IBOR / "1D" for OIS, known day count, registered calendar, non-negative
- * integer fixing lag, curve id) and raises `PricingError("INVALID_CURVE_SPEC")`
- * otherwise. The name is stored upper-cased, exactly as `getIndex` looks it up;
- * after the call the index can be used in curve specs (`bootstrapCurves`), swap
- * legs and builders. Returns the stored definition.
+ * for IBOR / "1D" for OIS, known day count, registered calendar(s), non-negative
+ * integer fixing lag, curve id – `validateRateIndex`) and raises
+ * `PricingError("INVALID_CURVE_SPEC")` listing the problems otherwise. The
+ * name is stored upper-cased, exactly as `getIndex` looks it up; after the call
+ * the index can be used in curve specs (`bootstrapCurves`), swap legs and
+ * builders. Returns the stored definition.
  *
  * Built-in indices cannot be replaced (N7-7, `INVALID_CURVE_SPEC`): an index
  * definition (day count, fixing calendar / lag, projection curve) enters the
@@ -327,67 +396,93 @@ export function isBuiltInIndex(name: string): boolean {
  */
 export function registerRateIndex(def: RateIndex): RateIndex {
   const what = `registerRateIndex(${isStr(def?.name) ? def.name : "?"})`;
-  if (!def || typeof def !== "object") invalid(what, "definition must be an object", def);
-  if (!isStr(def.name) || /\s/.test(def.name)) invalid(what, "name must be a non-empty string without whitespace", def);
-  if (isBuiltInIndex(def.name)) {
-    invalid(
-      what,
-      `${def.name.toUpperCase()} is a built-in index and cannot be replaced (valuations would change without a trace in the snapshot id); register the variant under a new name`,
-      def,
-    );
-  }
-  if (!isStr(def.currency) || !/^[A-Za-z]{3}$/.test(def.currency)) invalid(what, "currency must be a 3-letter code", def);
-  if (def.type !== "IBOR" && def.type !== "OIS") invalid(what, 'type must be "IBOR" or "OIS"', def);
-  if (def.type === "OIS" ? def.tenor !== "1D" : !/^[1-9]\d{0,2}[MWY]$/i.test(String(def.tenor))) {
-    invalid(what, def.type === "OIS" ? 'overnight indices use tenor "1D"' : `IBOR tenor must be like "3M" (got ${JSON.stringify(def.tenor)})`, def);
-  }
-  checkDayCount(def.dayCount, what, def);
-  checkCalendar(def.fixingCalendar, what, def);
-  if (!isNonNegInt(def.fixingLag)) invalid(what, "fixingLag must be a non-negative integer", def);
-  if (!["Following", "ModifiedFollowing", "Preceding", "ModifiedPreceding", "Unadjusted"].includes(String(def.businessDayConvention))) {
-    invalid(what, `unknown businessDayConvention ${JSON.stringify(def.businessDayConvention)}`, def);
-  }
-  if (typeof def.endOfMonth !== "boolean") invalid(what, "endOfMonth must be a boolean", def);
-  if (!isStr(def.curveId)) invalid(what, "curveId missing", def);
+  const problems = validateRateIndex(def);
+  if (problems.length) invalid(what, problems.join("; "), def);
   const stored: RateIndex = { ...def, name: def.name.toUpperCase(), currency: def.currency.toUpperCase(), tenor: def.tenor.toUpperCase() };
   RATE_INDICES[stored.name] = stored;
   return stored;
+}
+
+/** Options of `validateSwapConventions`. */
+export interface ValidateConventionsOptions {
+  /**
+   * Index definitions that are about to be registered together with the
+   * conventions (envelope import): they count as registered for the
+   * `floatIndex` / `oisIndex` checks.
+   */
+  pendingIndices?: RateIndex[];
+}
+
+/**
+ * Problems of a swap-conventions definition (empty = valid) – the checks of
+ * `registerSwapConventions` without registering anything (R8, Architektur
+ * N8-04). Either `validateSwapConventions(conv)` or
+ * `validateSwapConventions(ccy, conv)` (the currency the caller expects – a
+ * mismatch with `conv.currency` is a problem). `opts.pendingIndices` lets an
+ * atomic envelope import validate conventions whose indices are part of the
+ * same envelope.
+ */
+export function validateSwapConventions(conv: unknown, opts?: ValidateConventionsOptions): string[];
+export function validateSwapConventions(ccy: string, conv: unknown, opts?: ValidateConventionsOptions): string[];
+export function validateSwapConventions(a: unknown, b?: unknown, c?: ValidateConventionsOptions): string[] {
+  const expectedCcy = typeof a === "string" ? a : undefined;
+  const conv = (typeof a === "string" ? b : a) as Partial<SwapConventions> | null;
+  const opts = (typeof a === "string" ? c : (b as ValidateConventionsOptions | undefined)) ?? {};
+  const out: string[] = [];
+  if (!conv || typeof conv !== "object" || Array.isArray(conv)) return ["conventions must be an object"];
+  if (!isStr(conv.currency) || !/^[A-Za-z]{3}$/.test(conv.currency)) out.push("currency must be a 3-letter code");
+  else if (expectedCcy !== undefined && conv.currency.toUpperCase() !== expectedCcy.toUpperCase()) {
+    out.push(`currency ${conv.currency} does not match ${expectedCcy}`);
+  }
+  const ccy = isStr(conv.currency) ? conv.currency.toUpperCase() : "?";
+  for (const [key, f] of [
+    ["fixedFrequency", conv.fixedFrequency],
+    ["floatFrequency", conv.floatFrequency],
+    ["oisFixedFrequency", conv.oisFixedFrequency],
+  ] as const) {
+    if (!isStr(f) || !FREQUENCY.test(f)) out.push(`${key} must match ${String(FREQUENCY)} (got ${JSON.stringify(f)})`);
+  }
+  for (const [key, dc] of [
+    ["fixedDayCount", conv.fixedDayCount],
+    ["oisFixedDayCount", conv.oisFixedDayCount],
+  ] as const) {
+    const p = dayCountProblem(dc);
+    if (p) out.push(`${key}: ${p}`);
+  }
+  const cal = calendarProblem(conv.calendar);
+  if (cal) out.push(cal);
+  if (!isNonNegInt(conv.spotLag) || !isNonNegInt(conv.oisPaymentLag)) out.push("spotLag and oisPaymentLag must be non-negative integers");
+  const pending = new Map((opts.pendingIndices ?? []).filter((i) => isStr(i?.name)).map((i) => [i.name.toUpperCase(), i] as const));
+  for (const [key, name, type] of [
+    ["floatIndex", conv.floatIndex, undefined],
+    ["oisIndex", conv.oisIndex, "OIS"],
+  ] as const) {
+    const idx = isStr(name) ? (RATE_INDICES[name.toUpperCase()] ?? pending.get(name.toUpperCase())) : undefined;
+    if (!idx) {
+      out.push(`${key} ${JSON.stringify(name)} is not a registered index (registerRateIndex first)`);
+      continue;
+    }
+    if (String(idx.currency).toUpperCase() !== ccy) out.push(`${key} ${idx.name} belongs to ${idx.currency}, not ${ccy}`);
+    if (type && idx.type !== type) out.push(`${key} ${idx.name} must be an ${type} index`);
+  }
+  return out;
 }
 
 /**
  * Register (or replace) the vanilla-swap / OIS conventions of a currency at
  * runtime. Both referenced indices must already be registered and belong to
  * the currency; frequencies follow the leg pattern (`1Y`, `6M`, `ZC`), day
- * counts and calendar must be known, lags non-negative integers – otherwise
- * `PricingError("INVALID_CURVE_SPEC")`. Afterwards `getSwapConventions`,
- * the builders (`makeVanillaSwap`, `makeFxForward`, …) and the bootstrap
- * accept the currency. Returns the stored conventions.
+ * counts and calendar must be known, lags non-negative integers
+ * (`validateSwapConventions`) – otherwise `PricingError("INVALID_CURVE_SPEC")`.
+ * Afterwards `getSwapConventions`, the builders (`makeVanillaSwap`,
+ * `makeFxForward`, …) and the bootstrap accept the currency. Returns the
+ * stored conventions.
  */
 export function registerSwapConventions(conv: SwapConventions): SwapConventions {
   const what = `registerSwapConventions(${isStr(conv?.currency) ? conv.currency : "?"})`;
-  if (!conv || typeof conv !== "object") invalid(what, "conventions must be an object", conv);
-  if (!isStr(conv.currency) || !/^[A-Za-z]{3}$/.test(conv.currency)) invalid(what, "currency must be a 3-letter code", conv);
+  const problems = validateSwapConventions(conv);
+  if (problems.length) invalid(what, problems.join("; "), conv);
   const ccy = conv.currency.toUpperCase();
-  for (const [key, f] of [
-    ["fixedFrequency", conv.fixedFrequency],
-    ["floatFrequency", conv.floatFrequency],
-    ["oisFixedFrequency", conv.oisFixedFrequency],
-  ] as const) {
-    if (!isStr(f) || !FREQUENCY.test(f)) invalid(what, `${key} must match ${FREQUENCY} (got ${JSON.stringify(f)})`, conv);
-  }
-  checkDayCount(conv.fixedDayCount, what, conv);
-  checkDayCount(conv.oisFixedDayCount, what, conv);
-  checkCalendar(conv.calendar, what, conv);
-  if (!isNonNegInt(conv.spotLag) || !isNonNegInt(conv.oisPaymentLag)) invalid(what, "spotLag and oisPaymentLag must be non-negative integers", conv);
-  for (const [key, name, type] of [
-    ["floatIndex", conv.floatIndex, undefined],
-    ["oisIndex", conv.oisIndex, "OIS"],
-  ] as const) {
-    const idx = isStr(name) ? RATE_INDICES[name.toUpperCase()] : undefined;
-    if (!idx) invalid(what, `${key} ${JSON.stringify(name)} is not a registered index (registerRateIndex first)`, conv);
-    if (idx.currency !== ccy) invalid(what, `${key} ${idx.name} belongs to ${idx.currency}, not ${ccy}`, conv);
-    if (type && idx.type !== type) invalid(what, `${key} ${idx.name} must be an ${type} index`, conv);
-  }
   const stored: SwapConventions = { ...conv, currency: ccy, floatIndex: conv.floatIndex.toUpperCase(), oisIndex: conv.oisIndex.toUpperCase() };
   SWAP_CONVENTIONS[ccy] = stored;
   return stored;

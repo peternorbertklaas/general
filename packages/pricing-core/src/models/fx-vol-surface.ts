@@ -225,18 +225,35 @@ function rawRowQuotes(s: FxVolSurface, t: number): RowQuotes {
   return row;
 }
 
+/**
+ * A smile pillar vol must be positive (N8-6): ATM + BF ∓ RR/2 ≤ 0 (e.g.
+ * `rr25 = 0.30` on a 7.55 % ATM) has no strike and would run a negative vol
+ * through the delta ↔ strike fixed point – `PricingError("INVALID_VOL_SURFACE")`
+ * instead of a numerically plausible but wrong smile vol.
+ */
+function assertPillarVol(s: FxVolSurface, vol: number, what: string, t: number): number {
+  if (!(vol > 0)) {
+    throw new PricingError(
+      "INVALID_VOL_SURFACE",
+      `FX vol surface ${s.id}: ${what} pillar vol at expiry ${t} is ${(vol * 100).toFixed(2)} % – ATM + BF ± RR/2 must be positive (|RR| ≤ 2·(ATM + BF)); check the sign / scaling of the smile quotes`,
+      { surfaceId: s.id, expiry: t, pillar: what, vol },
+    );
+  }
+  return vol;
+}
+
 /** Smile pillars (internal coordinate, vol) from row quotes, sorted by coordinate. */
 function pillarsFromRow(s: FxVolSurface, row: RowQuotes, t: number, dff: number): Pillar[] {
   const conv = s.deltaConvention ?? "Forward";
   const coord = (delta: number, vol: number) => coordinateOfMoneyness(fxMoneynessFromDelta(delta, vol, t, conv, dff), vol, t);
   const pts: Pillar[] = [];
-  const p25 = row.atm + row.ss25 - row.rr25 / 2;
-  const c25 = row.atm + row.ss25 + row.rr25 / 2;
+  const p25 = assertPillarVol(s, row.atm + row.ss25 - row.rr25 / 2, "25Δ put", t);
+  const c25 = assertPillarVol(s, row.atm + row.ss25 + row.rr25 / 2, "25Δ call", t);
   pts.push({ x: coord(-0.25, p25), v: p25 });
   pts.push({ x: coord(0.25, c25), v: c25 });
   if (row.rr10 !== undefined && row.bf10 !== undefined) {
-    const p10 = row.atm + row.bf10 - row.rr10 / 2;
-    const c10 = row.atm + row.bf10 + row.rr10 / 2;
+    const p10 = assertPillarVol(s, row.atm + row.bf10 - row.rr10 / 2, "10Δ put", t);
+    const c10 = assertPillarVol(s, row.atm + row.bf10 + row.rr10 / 2, "10Δ call", t);
     pts.push({ x: coord(-0.1, p10), v: p10 });
     pts.push({ x: coord(0.1, c10), v: c10 });
   }

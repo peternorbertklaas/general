@@ -1,4 +1,4 @@
-import { type SerialDate, addDays, addTenor, dayOfWeek, endOfMonth, fromYMD, isEndOfMonth, isWeekend, parseTenor, toYMD } from "./date.js";
+import { type SerialDate, addDays, addTenor, dayOfWeek, endOfMonth, fromYMD, isEndOfMonth, isWeekend, parseISO, parseTenor, toISO, toYMD } from "./date.js";
 
 import { PricingError } from "../errors.js";
 
@@ -9,7 +9,7 @@ export interface Calendar {
   isHoliday(d: SerialDate): boolean;
 }
 
-export type CalendarId = "TARGET" | "NONE" | "WEEKEND" | "US" | "USNY" | "UK" | "GB" | "CH" | "DE" | "JP" | string;
+export type CalendarId = "TARGET" | "NONE" | "WEEKEND" | "US" | "USNY" | "US-SIFMA" | "UK" | "GB" | "CH" | "DE" | "JP" | string;
 
 /** Anonymous Gregorian algorithm (Meeus/Jones/Butcher) for Easter Sunday. */
 export function easterSunday(year: number): SerialDate {
@@ -119,10 +119,12 @@ class GermanyCalendar extends RuleCalendar {
 }
 
 /**
- * United States (SIFMA / Federal Reserve style, New York) – rule-based
- * approximation; override with the SIFMA holiday schedule via
- * `registerCalendarHolidays("US", dates)` in production (early closes and
- * ad-hoc closures such as national days of mourning are not rule-based).
+ * United States settlement calendar (New York; QuantLib `UnitedStates(Settlement)`,
+ * set-equal 2024–2032) – rule-based approximation; override with the SIFMA
+ * holiday schedule via `registerCalendarHolidays("US", dates)` in production
+ * (early closes and ad-hoc closures such as national days of mourning are not
+ * rule-based). Payment calendar of USD legs and of the SOFR index; SOFR
+ * *fixings* follow `US-SIFMA` (N8-4).
  */
 class UnitedStatesCalendar extends RuleCalendar {
   readonly name = "US";
@@ -143,6 +145,39 @@ class UnitedStatesCalendar extends RuleCalendar {
     // New Year's Day observed on Dec 31 of previous year when Jan 1 is Saturday.
     if (dayOfWeek(fromYMD(y + 1, 1, 1)) === 6) list.push(fromYMD(y, 12, 31));
     return list;
+  }
+}
+
+/**
+ * United States – SIFMA government-bond market / SOFR fixing calendar (N8-4;
+ * QuantLib `UnitedStates(SOFR)`, set-equal 2024–2032). SOFR is published by
+ * the New York Fed only on SIFMA business days of the Treasury market: Good
+ * Friday is a holiday (so far SOFR never fixed on a Good Friday), while SIFMA
+ * does not recommend a full close for New Year's Day and Veterans Day when
+ * they fall on a Saturday (no Friday observance: 31.12.2027, 10.11.2028,
+ * 31.12.2032 are fixing days). Independence Day, Juneteenth and Christmas keep
+ * the Friday observance. Used as `fixingCalendar` of SOFR; the payment
+ * calendar of USD legs stays `US`.
+ */
+class UnitedStatesSifmaCalendar extends RuleCalendar {
+  readonly name = "US-SIFMA";
+  protected holidaysInYear(y: number): SerialDate[] {
+    const easter = easterSunday(y);
+    const sundayToMonday = (d: SerialDate): SerialDate[] => (dayOfWeek(d) === 0 ? [d + 1] : dayOfWeek(d) === 6 ? [] : [d]);
+    return [
+      ...sundayToMonday(fromYMD(y, 1, 1)),
+      nthWeekdayOfMonth(y, 1, 1, 3), // MLK
+      nthWeekdayOfMonth(y, 2, 1, 3), // Presidents' Day
+      easter - 2, // Good Friday (SOFR is not published)
+      lastWeekdayOfMonth(y, 5, 1), // Memorial Day
+      ...(y >= 2022 ? [observedUS(fromYMD(y, 6, 19))] : []), // Juneteenth
+      observedUS(fromYMD(y, 7, 4)),
+      nthWeekdayOfMonth(y, 9, 1, 1), // Labor Day
+      nthWeekdayOfMonth(y, 10, 1, 2), // Columbus Day
+      ...sundayToMonday(fromYMD(y, 11, 11)), // Veterans Day (no Friday observance)
+      nthWeekdayOfMonth(y, 11, 4, 4), // Thanksgiving
+      observedUS(fromYMD(y, 12, 25)),
+    ];
   }
 }
 
@@ -196,37 +231,68 @@ class SwitzerlandCalendar extends RuleCalendar {
 }
 
 /**
- * Japan (Tokyo) – simplified rule set for the major national holidays
- * (equinoxes approximated by fixed dates, no substitute-holiday chains).
- * Override with the JPX / BoJ published schedule via
- * `registerCalendarHolidays("JP", dates)` in production.
+ * Day of month of the vernal / autumnal equinox in Japan (JST), standard
+ * approximation valid 1980–2099 (National Astronomical Observatory of Japan
+ * formula, as used by QuantLib `Japan`): ⌊20.8431 + 0.242194·(y − 1980) −
+ * ⌊(y − 1980)/4⌋⌋ for March, 23.2488 analogously for September (N8-5).
+ */
+function equinoxDay(y: number, base: number): number {
+  return Math.floor(base + 0.242194 * (y - 1980) - Math.floor((y - 1980) / 4));
+}
+
+/**
+ * Japan (Tokyo) – national holidays under the Act on National Holidays with
+ * its two general rules (N8-5): a national holiday falling on a Sunday is
+ * substituted by the next day that is not a national holiday (振替休日 – Golden
+ * Week 03.05. Sunday → 06.05.), and a weekday between two national holidays is a
+ * citizens' holiday (国民の休日 – e.g. 22.09.2026 between Respect-for-the-Aged
+ * Day and the Autumnal Equinox). Equinoxes from the standard formula
+ * (`equinoxDay`), plus the BoJ / JPX bank holidays 2–3 January and 31
+ * December. Rule set for 2020 onwards (Emperor's Birthday 23.02., Olympic
+ * shifts 2020/2021); set-equal to QuantLib `Japan` 2024–2032
+ * (`test-data/golden/calendars-quantlib.json`). Override with the JPX / BoJ
+ * published schedule via `registerCalendarHolidays("JP", dates)` for ad-hoc
+ * holidays.
  */
 class JapanCalendar extends RuleCalendar {
   readonly name = "JP";
   protected holidaysInYear(y: number): SerialDate[] {
-    const obs = (d: SerialDate) => (dayOfWeek(d) === 0 ? d + 1 : d);
-    const list = [
-      fromYMD(y, 1, 1),
-      fromYMD(y, 1, 2),
-      fromYMD(y, 1, 3),
-      nthWeekdayOfMonth(y, 1, 1, 2), // Coming of Age
-      obs(fromYMD(y, 2, 11)), // National Foundation
-      obs(fromYMD(y, 2, 23)), // Emperor's Birthday (from 2020)
-      obs(fromYMD(y, 3, 20)), // Vernal Equinox (approx)
-      obs(fromYMD(y, 4, 29)), // Showa Day
-      fromYMD(y, 5, 3),
-      fromYMD(y, 5, 4),
-      fromYMD(y, 5, 5),
-      nthWeekdayOfMonth(y, 7, 1, 3), // Marine Day
-      obs(fromYMD(y, 8, 11)), // Mountain Day
-      nthWeekdayOfMonth(y, 9, 1, 3), // Respect for the Aged
-      obs(fromYMD(y, 9, 23)), // Autumnal Equinox (approx)
-      nthWeekdayOfMonth(y, 10, 1, 2), // Sports Day
-      obs(fromYMD(y, 11, 3)), // Culture Day
-      obs(fromYMD(y, 11, 23)), // Labour Thanksgiving
-      fromYMD(y, 12, 31),
-    ];
-    return list;
+    const national = new Set<SerialDate>([
+      fromYMD(y, 1, 1), // New Year's Day
+      nthWeekdayOfMonth(y, 1, 1, 2), // Coming of Age Day
+      fromYMD(y, 2, 11), // National Foundation Day
+      ...(y >= 2020 ? [fromYMD(y, 2, 23)] : []), // Emperor's Birthday
+      fromYMD(y, 3, equinoxDay(y, 20.8431)), // Vernal Equinox Day
+      fromYMD(y, 4, 29), // Showa Day
+      fromYMD(y, 5, 3), // Constitution Memorial Day
+      fromYMD(y, 5, 4), // Greenery Day
+      fromYMD(y, 5, 5), // Children's Day
+      y === 2020 ? fromYMD(2020, 7, 23) : y === 2021 ? fromYMD(2021, 7, 22) : nthWeekdayOfMonth(y, 7, 1, 3), // Marine Day
+      ...(y >= 2016 ? [y === 2020 ? fromYMD(2020, 8, 10) : y === 2021 ? fromYMD(2021, 8, 8) : fromYMD(y, 8, 11)] : []), // Mountain Day
+      nthWeekdayOfMonth(y, 9, 1, 3), // Respect for the Aged Day
+      fromYMD(y, 9, equinoxDay(y, 23.2488)), // Autumnal Equinox Day
+      y === 2020 ? fromYMD(2020, 7, 24) : y === 2021 ? fromYMD(2021, 7, 23) : nthWeekdayOfMonth(y, 10, 1, 2), // Sports Day
+      fromYMD(y, 11, 3), // Culture Day
+      fromYMD(y, 11, 23), // Labour Thanksgiving Day
+    ]);
+    const out = new Set<SerialDate>(national);
+    // Substitute holiday: Sunday → the next day that is not a national holiday.
+    for (const d of national) {
+      if (dayOfWeek(d) !== 0) continue;
+      let s = d + 1;
+      while (national.has(s)) s++;
+      out.add(s);
+    }
+    // Citizens' holiday: a single day between two national holidays (not a Sunday).
+    for (const d of national) {
+      const mid = d + 1;
+      if (national.has(mid + 1) && !out.has(mid) && dayOfWeek(mid) !== 0) out.add(mid);
+    }
+    // Bank holidays (BoJ / JPX)
+    out.add(fromYMD(y, 1, 2));
+    out.add(fromYMD(y, 1, 3));
+    out.add(fromYMD(y, 12, 31));
+    return [...out];
   }
 }
 
@@ -352,6 +418,20 @@ export class JointCalendar implements Calendar {
   }
 }
 
+/**
+ * Serialisable form of a `CustomCalendar` (R8, Markt R8-2): the registry id,
+ * an optional display name, the holidays as ISO dates and whether weekends are
+ * holidays (default true). `registerCalendar` accepts it directly, so an API
+ * (`POST /api/market/calendars`) or a snapshot envelope `calendars[]` can
+ * register calendars without code; `listCustomCalendars()` exports them.
+ */
+export interface CustomCalendarJson {
+  id: string;
+  name?: string;
+  holidays: string[];
+  weekendsAreHolidays?: boolean;
+}
+
 /** Calendar defined by an explicit holiday list (e.g. loaded from a data provider). */
 export class CustomCalendar implements Calendar {
   private readonly set: Set<number>;
@@ -359,12 +439,71 @@ export class CustomCalendar implements Calendar {
     readonly name: string,
     holidays: SerialDate[],
     private readonly weekendsAreHolidays = true,
+    /** Optional display name (`CustomCalendarJson.name`); defaults to the id. */
+    readonly label?: string,
   ) {
     this.set = new Set(holidays);
   }
   isHoliday(d: SerialDate): boolean {
     return (this.weekendsAreHolidays && isWeekend(d)) || this.set.has(d);
   }
+  /** JSON form (`CustomCalendarJson`): holidays sorted ascending as ISO dates. */
+  toJSON(): CustomCalendarJson {
+    return {
+      id: this.name,
+      name: this.label ?? this.name,
+      holidays: [...this.set].sort((a, b) => a - b).map(toISO),
+      weekendsAreHolidays: this.weekendsAreHolidays,
+    };
+  }
+}
+
+const isIsoDate = (s: unknown): s is string => typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+
+/**
+ * Problems of a custom-calendar definition (empty = valid): `id` a non-empty
+ * string without whitespace that is not a built-in calendar id or alias,
+ * `holidays` an array of valid ISO dates, `weekendsAreHolidays` a boolean when
+ * given. Does not register anything – an importer validates every entry of an
+ * envelope before registering the first (atomic import, Architektur N8-04).
+ */
+export function validateCustomCalendar(json: unknown, path = "calendar"): string[] {
+  const out: string[] = [];
+  const c = json as Partial<CustomCalendarJson> | null;
+  if (!c || typeof c !== "object" || Array.isArray(c)) return [`${path} must be an object { id, holidays[] }`];
+  if (typeof c.id !== "string" || !c.id.trim() || /\s/.test(c.id)) out.push(`${path}.id must be a non-empty string without whitespace`);
+  else if (isBuiltInCalendar(c.id))
+    out.push(`${path}.id "${c.id}" is a built-in calendar and cannot be replaced (use registerCalendarHolidays for a holiday feed)`);
+  if (c.name !== undefined && typeof c.name !== "string") out.push(`${path}.name must be a string`);
+  if (!Array.isArray(c.holidays)) out.push(`${path}.holidays must be an array of ISO dates`);
+  else {
+    c.holidays.forEach((h: unknown, i) => {
+      if (!isIsoDate(h)) {
+        out.push(`${path}.holidays[${i}] must be an ISO date (YYYY-MM-DD), got ${JSON.stringify(h)}`);
+        return;
+      }
+      try {
+        parseISO(h);
+      } catch {
+        out.push(`${path}.holidays[${i}] "${h}" is not a valid calendar date`);
+      }
+    });
+  }
+  if (c.weekendsAreHolidays !== undefined && typeof c.weekendsAreHolidays !== "boolean") out.push(`${path}.weekendsAreHolidays must be a boolean`);
+  return out;
+}
+
+/** Build a `CustomCalendar` from its JSON form (validated: `PricingError("INVALID_CALENDAR")` listing the problems). */
+export function customCalendarFromJson(json: CustomCalendarJson): CustomCalendar {
+  const problems = validateCustomCalendar(json);
+  if (problems.length) {
+    throw new PricingError("INVALID_CALENDAR", `Invalid calendar ${String((json as { id?: unknown })?.id ?? "")}: ${problems.join("; ")}`, { problems });
+  }
+  return new CustomCalendar(json.id.trim(), json.holidays.map(parseISO), json.weekendsAreHolidays ?? true, json.name);
+}
+
+function isCalendarJson(x: Calendar | CustomCalendarJson): x is CustomCalendarJson {
+  return "holidays" in x && !("isHoliday" in x);
 }
 
 /**
@@ -411,10 +550,56 @@ class FeedOverlayCalendar implements Calendar {
 }
 
 const registry = new Map<string, Calendar>();
+/** Ids and aliases registered at module load (frozen after the built-in block below, R8). */
+const BUILT_IN_CALENDAR_IDS = new Set<string>();
 
-export function registerCalendar(cal: Calendar, ...aliases: string[]): void {
-  registry.set(cal.name.toUpperCase(), cal);
-  for (const a of aliases) registry.set(a.toUpperCase(), cal);
+/** True when `id` (any case) is a built-in calendar id or alias (`TARGET`, `EUR`, `US`, `USNY`, `US-SIFMA`, `JP`, …). */
+export function isBuiltInCalendar(id: string): boolean {
+  return BUILT_IN_CALENDAR_IDS.has(String(id).trim().toUpperCase());
+}
+
+/**
+ * Register a calendar under its name (and optional aliases), replacing a
+ * calendar registered at runtime under the same id. Accepts a `Calendar`
+ * instance or the JSON form `CustomCalendarJson` (validated,
+ * `PricingError("INVALID_CALENDAR")`). Built-in ids and aliases cannot be
+ * replaced (R8, like `isBuiltInIndex` for indices): a redefined `US` would
+ * change every USD schedule without a trace in the snapshot id – overlay a
+ * holiday feed with `registerCalendarHolidays` instead. Returns the registered
+ * calendar.
+ */
+export function registerCalendar(cal: Calendar | CustomCalendarJson, ...aliases: string[]): Calendar {
+  const calendar = isCalendarJson(cal) ? customCalendarFromJson(cal) : cal;
+  const ids = [calendar.name, ...aliases].map((k) => k.trim().toUpperCase());
+  for (const id of ids) {
+    if (BUILT_IN_CALENDAR_IDS.has(id)) {
+      throw new PricingError(
+        "INVALID_CALENDAR",
+        `Calendar id "${id}" is a built-in calendar and cannot be replaced (use registerCalendarHolidays for a holiday feed)`,
+        {
+          calendar: id,
+          builtIn: true,
+        },
+      );
+    }
+  }
+  for (const id of ids) registry.set(id, calendar);
+  return calendar;
+}
+
+/**
+ * Custom calendars registered at runtime (JSON form, sorted by id) – the
+ * `calendars[]` envelope an API / the web app exports and re-imports via
+ * `registerCalendar`. Built-in calendars and holiday-feed overlays
+ * (`registerCalendarHolidays`) are not part of the list.
+ */
+export function listCustomCalendars(): CustomCalendarJson[] {
+  const seen = new Set<CustomCalendar>();
+  for (const cal of registry.values()) {
+    const base = cal instanceof FeedOverlayCalendar ? cal.underlying : cal;
+    if (base instanceof CustomCalendar) seen.add(base);
+  }
+  return [...seen].map((c) => c.toJSON()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function replaceInRegistry(from: Calendar, to: Calendar): void {
@@ -457,6 +642,7 @@ registerCalendar(new WeekendCalendar(), "NONE", "NULL");
 registerCalendar(new TargetCalendar(), "EUR", "TARGET2", "EUTA");
 registerCalendar(new GermanyCalendar(), "DEFR", "FRANKFURT");
 registerCalendar(new UnitedStatesCalendar(), "USNY", "USD", "NYC", "USGS");
+registerCalendar(new UnitedStatesSifmaCalendar(), "SOFR", "USSIFMA", "SIFMA");
 registerCalendar(new UnitedKingdomCalendar(), "GB", "GBP", "GBLO", "LONDON");
 registerCalendar(new SwitzerlandCalendar(), "CHF", "CHZU", "ZURICH");
 registerCalendar(new JapanCalendar(), "JPY", "JPTO", "TOKYO");
@@ -465,6 +651,17 @@ registerCalendar(new NorwayCalendar(), "NOK", "NOOS", "OSLO");
 registerCalendar(new SwedenCalendar(), "SEK", "SEST", "STOCKHOLM");
 registerCalendar(new DenmarkCalendar(), "DKK", "DKCO", "COPENHAGEN");
 registerCalendar(new PolandCalendar(), "PLN", "PLWA", "WARSAW");
+for (const id of registry.keys()) BUILT_IN_CALENDAR_IDS.add(id);
+
+/**
+ * Built-in calendars whose weekday holidays 2024–2032 are set-equal to
+ * QuantLib 1.43 (`test-data/golden/calendars-quantlib.json`, N7-4 / N8-5):
+ * TARGET, US (`UnitedStates(Settlement)`), US-SIFMA (`UnitedStates(SOFR)`), UK,
+ * CH, JP, NO, SE, DK, PL (PL up to the documented 24.12. from 2025). The
+ * valuation report's convention sentence names exactly these; `DE` is not
+ * cross-checked.
+ */
+export const QUANTLIB_CROSS_CHECKED_CALENDARS: readonly string[] = ["TARGET", "US", "UK", "CH", "JP", "NO", "SE", "DK", "PL", "US-SIFMA"];
 
 /**
  * Resolve a calendar id. Composite ids like "TARGET+US" produce a joint calendar.

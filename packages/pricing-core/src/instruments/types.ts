@@ -101,6 +101,16 @@ export interface FloatLeg extends LegBase {
   lookbackDays?: number;
   /** Observation shift: weights taken from the shifted observation period (true) vs. lookback without shift (false). */
   observationShift?: boolean;
+  /**
+   * RFR lockout (ISDA 2021 "Compounded with Lockout", N8-7): the fixing of the
+   * business day `end − lockoutDays` (fixing calendar of the index) applies to
+   * that day and to every later day of the accrual period – the last
+   * `lockoutDays` business days are frozen at the lockout-date rate (2–5 days
+   * for SOFR FRNs / loans), also in the projection (curve forward of the
+   * lockout date's overnight period). Not combinable with `lookbackDays` /
+   * `observationShift` (`INVALID_TRADE`).
+   */
+  lockoutDays?: number;
 }
 
 export type SwapLeg = FixedLeg | FloatLeg;
@@ -210,13 +220,24 @@ export interface FxOption extends TradeBase {
    * `undefined` = unknown – the pricer then derives the state from today's
    * spot (alive option) or the expiry fixing (expired option) and raises a
    * `BARRIER_STATE_UNKNOWN:` warning whenever that derivation decides the value.
-   * `rebate` (quote currency per unit base notional): once the knock state is
-   * decided (flag, spot beyond the barrier, expiry fixing) a knock-out rebate
-   * and the rebate of a never-touched knock-in are paid on the delivery date
-   * (rebate·DF, N7-2 / N7-5); a live option below the barrier carries the
-   * Reiner–Rubinstein at-hit rebate.
+   * `rebate` (quote currency per unit base notional): the rebate of a
+   * never-touched knock-in is always paid at expiry (settled on the delivery
+   * date, rebate·DF). Knock-out rebates follow `rebateAt` (N7-5, R8):
+   * - `"expiry"`: paid at expiry / settled on the delivery date on every path –
+   *   the live model uses the Reiner–Rubinstein expiry-rebate term
+   *   (K·DF·P(hit)), a decided knock (flag, spot beyond the barrier, expiry
+   *   fixing) is worth rebate·DF(delivery) – continuous across the barrier;
+   * - `"hit"`: paid when the barrier is touched (Haug Tab. 4-13 term F, the
+   *   QuantLib `AnalyticBarrierEngine` convention) – a spot at or beyond the
+   *   barrier today is a touch today (rebate settles value-today, DF 1), a
+   *   recorded `hit: true` or an expiry fixing beyond the barrier means the
+   *   rebate has already been paid (PV 0);
+   * - `undefined` (default, kept for backward compatibility): the round-7
+   *   mixture – live model at the hit, decided paths rebate·DF(delivery), i.e.
+   *   the value jumps by rebate·(1 − DF) at the barrier. Set `rebateAt`
+   *   explicitly for a single convention.
    */
-  barrier?: { type: BarrierType; level: number; rebate?: number; hit?: boolean };
+  barrier?: { type: BarrierType; level: number; rebate?: number; hit?: boolean; rebateAt?: "hit" | "expiry" };
   digital?: { payoutCurrency: string; payout: number };
   volOverride?: number;
 }

@@ -8,7 +8,7 @@ import { brent } from "../math/rootfind.js";
 import { type InterpolationMethod, isNonLocalInterpolation } from "../math/interpolation.js";
 import { priceCrossCurrencySwap, priceInterestRateSwap } from "../pricing/swap-pricer.js";
 import { type Curve, type CurveNode, type ForwardJump, InterpolatedCurve } from "./curve.js";
-import { getIndex, getSwapConventions, type RateIndex } from "./index-definitions.js";
+import { getIndex, getSwapConventions, indexScheduleCalendar, type RateIndex } from "./index-definitions.js";
 import { PricingError } from "../errors.js";
 
 /**
@@ -291,8 +291,11 @@ function resolveXccyIndices(q: XccyBasisQuote, spec: Pick<BootstrapSpec, "index"
   return { domIdx, forIdx };
 }
 
+/** Joint schedule calendar of two indices (payment calendars, N8-4 – SOFR pays on `US`, fixes on `US-SIFMA`). */
 function jointCalendarId(a: RateIndex, b: RateIndex): string {
-  return a.fixingCalendar === b.fixingCalendar ? a.fixingCalendar : `${a.fixingCalendar}+${b.fixingCalendar}`;
+  const ca = indexScheduleCalendar(a);
+  const cb = indexScheduleCalendar(b);
+  return ca === cb ? ca : `${ca}+${cb}`;
 }
 
 function legPaymentLag(index: RateIndex): number {
@@ -319,7 +322,7 @@ export function quoteDates(
 ): { spot: SerialDate; start: SerialDate; end: SerialDate; endUnadjusted: SerialDate } {
   const idx = getIndex(spec.index);
   const conv = getSwapConventions(spec.currency);
-  const cal = getCalendar(idx.fixingCalendar);
+  const cal = getCalendar(indexScheduleCalendar(idx));
   const spotLag = spec.spotLag ?? conv.spotLag;
   const spot = spotLag === 0 ? valuationDate : addBusinessDays(valuationDate, spotLag, cal);
   return { spot, ...quoteMaturity(q, spot, idx, cal, "ModifiedFollowing", makeLagInfo(spec, idx, {}), valuationDate) };
@@ -392,7 +395,7 @@ export function bumpQuote(q: CurveQuote, bp: number): CurveQuote {
 export function bootstrapCurve(valuationDate: SerialDate, spec: BootstrapSpec): BootstrapResult {
   const idx = getIndex(spec.index);
   const conv = getSwapConventions(spec.currency);
-  const cal = getCalendar(idx.fixingCalendar);
+  const cal = getCalendar(indexScheduleCalendar(idx));
   const bdc: BusinessDayConvention = "ModifiedFollowing";
   const spotLag = spec.spotLag ?? conv.spotLag;
   const spot = spotLag === 0 ? valuationDate : addBusinessDays(valuationDate, spotLag, cal);
@@ -609,7 +612,7 @@ function makeParSwap(
         terminationDate: end,
         frequency: fixedFreq,
         dayCount: fixedDc,
-        calendar: idx.fixingCalendar,
+        calendar: indexScheduleCalendar(idx),
         businessDayConvention: bdc,
         rate,
         paymentLag: payLag,
@@ -624,7 +627,7 @@ function makeParSwap(
         terminationDate: end,
         frequency: floatFreq,
         dayCount: idx.dayCount,
-        calendar: idx.fixingCalendar,
+        calendar: indexScheduleCalendar(idx),
         businessDayConvention: bdc,
         index: idx.name,
         paymentLag: payLag,

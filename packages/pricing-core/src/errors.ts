@@ -20,6 +20,12 @@ export type PricingErrorCode =
   | "NO_FX_SPOT"
   | "UNKNOWN_INDEX"
   | "UNKNOWN_CALENDAR"
+  /**
+   * A custom calendar definition is unusable (missing id, built-in id, holiday
+   * that is not an ISO date) – raised by `registerCalendar` for JSON
+   * definitions (`validateCustomCalendar` lists the problems, R8).
+   */
+  | "INVALID_CALENDAR"
   | "UNSUPPORTED_TRADE_TYPE"
   /** Frequency string that is not a positive tenor ("7Q", "0M"); raised by the schedule builder (R3-4). */
   | "INVALID_FREQUENCY"

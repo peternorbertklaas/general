@@ -1,3 +1,4 @@
+import { getIndex } from "../curves/index-definitions.js";
 import { normalizeDayCount } from "../dates/daycount.js";
 import { frequencyPerYear } from "../dates/schedule.js";
 import { PricingError } from "../errors.js";
@@ -154,8 +155,14 @@ function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
   if (l.type === "Float") {
     const fl = l as FloatLeg;
     if (!isStr(fl.index)) out.push(`${path}.index (floating index) missing`);
+    checkIndexCurrency(fl.index, l.currency, path, out);
     checkBusinessDayCount(fl.fixingLag, `${path}.fixingLag`, out);
     checkBusinessDayCount(fl.lookbackDays, `${path}.lookbackDays`, out);
+    checkBusinessDayCount(fl.lockoutDays, `${path}.lockoutDays`, out);
+    // N8-7: a lockout freezes the fixing, a lookback shifts it – the ISDA 2021 variants are alternatives.
+    if (isNum(fl.lockoutDays) && fl.lockoutDays > 0 && ((isNum(fl.lookbackDays) && fl.lookbackDays > 0) || fl.observationShift === true)) {
+      out.push(`${path}: lockoutDays cannot be combined with lookbackDays / observationShift`);
+    }
     checkOptionalNumber(fl.spread, `${path}.spread`, out);
     checkOptionalNumber(fl.gearing, `${path}.gearing`, out);
     checkStepSchedule(fl.spreadSchedule, "spread", `${path}.spreadSchedule`, out);
@@ -168,6 +175,30 @@ function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
     if (isNum(fl.capRate) && isNum(fl.floorRate) && fl.capRate < fl.floorRate) {
       out.push(`${path}: embedded capRate (${fl.capRate}) must not be below floorRate (${fl.floorRate})`);
     }
+  }
+}
+
+/**
+ * Leg / trade currency must be the currency of its floating index (Markt R8-1
+ * core part): a CZK leg projecting EURIBOR-6M priced silently. An unknown index
+ * is not reported here – the pricer raises `UNKNOWN_INDEX` with its hint on
+ * `registerRateIndex` / `POST /api/market/indices`.
+ */
+function checkIndexCurrency(index: unknown, currency: unknown, path: string, out: string[]): void {
+  if (!isStr(index) || !isStr(currency)) return;
+  let idxCcy: string;
+  let idxName: string;
+  try {
+    const idx = getIndex(index);
+    idxCcy = idx.currency;
+    idxName = idx.name;
+  } catch {
+    return;
+  }
+  if (idxCcy !== currency.toUpperCase()) {
+    out.push(
+      `${path}: currency ${currency} does not match the currency ${idxCcy} of index ${idxName} – a ${currency.toUpperCase()} floating leg needs a ${currency.toUpperCase()} index (register one with registerRateIndex / POST /api/market/indices)`,
+    );
   }
 }
 
@@ -208,7 +239,9 @@ function checkFxLeg(l: Omit<FxForward, "type" | "id"> | undefined, path: string,
  * in [0, legs.length); N5-4: positive digital payout, barrier type from the
  * enum, numeric `spread` / `gearing` / step schedules, boolean
  * `observationShift`, FX swap far leg after near leg; N6-5: boolean
- * `barrier.hit`). Returns a
+ * `barrier.hit`; R8: leg / trade currency = index currency (Markt R8-1),
+ * `lockoutDays` a non-negative integer not combined with a lookback (N8-7),
+ * `barrier.rebateAt` from the enum (N7-5)). Returns a
  * list of problems (empty = valid); `priceTrade` throws a
  * `PricingError("INVALID_TRADE")` with this list instead of producing a null
  * or NaN PV.
@@ -236,6 +269,7 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
       checkPositive(trade.notional, `${path}.notional`, out);
       if (!isStr(trade.currency)) out.push(`${path}.currency missing`);
       if (!isStr(trade.index)) out.push(`${path}.index missing`);
+      checkIndexCurrency(trade.index, trade.currency, path, out);
       if (!isNum(trade.startDate) || !isNum(trade.endDate)) out.push(`${path}: startDate / endDate must be serial dates`);
       else if (trade.endDate <= trade.startDate) out.push(`${path}: endDate must be after startDate`);
       if (!isNum(trade.fixedRate)) out.push(`${path}.fixedRate must be a finite number`);
@@ -246,6 +280,7 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
       checkPositive(trade.notional, `${path}.notional`, out);
       if (!isStr(trade.currency)) out.push(`${path}.currency missing`);
       if (!isStr(trade.index)) out.push(`${path}.index missing`);
+      checkIndexCurrency(trade.index, trade.currency, path, out);
       if (!isNum(trade.effectiveDate) || !isNum(trade.terminationDate)) out.push(`${path}: effectiveDate / terminationDate must be serial dates`);
       else if (trade.terminationDate <= trade.effectiveDate) out.push(`${path}: terminationDate must be after effectiveDate`);
       checkFrequency(trade.frequency, `${path}.frequency`, out);
@@ -324,6 +359,10 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
           }
           // N6-5: the observed knock state is a boolean flag ("yes" would be read as touched).
           checkOptionalBoolean(trade.barrier.hit, `${path}.barrier.hit`, out);
+          // N7-5 (R8): rebate timing convention.
+          if (trade.barrier.rebateAt !== undefined && trade.barrier.rebateAt !== "hit" && trade.barrier.rebateAt !== "expiry") {
+            out.push(`${path}.barrier.rebateAt must be "hit" or "expiry" (got ${JSON.stringify(trade.barrier.rebateAt) ?? String(trade.barrier.rebateAt)})`);
+          }
         }
       }
       // N5-4a: digital payout must be a positive finite amount in a 3-letter currency (−100 gave a bought digital a negative PV).
@@ -413,9 +452,25 @@ export function priceTrade(ctx: MarketContext, trade: Trade, reportingCurrency?:
     );
   }
   // Markt R4-1: a CSA without a collateral-specific discount curve is discounted on the standard curve – say so.
-  const csaWarnings = collateralCurveWarnings(ctx, tradeCurrencies(trade), trade.collateralCurrency);
+  // N8-3: only currencies that are actually discounted – the economic legs plus an *unsettled* premium; a premium
+  // paid before the valuation date reads no curve and must not raise COLLATERAL_CURVE_MISSING.
+  const csaWarnings = collateralCurveWarnings(ctx, discountedCurrencies(ctx, trade), trade.collateralCurrency);
   const warnings = csaWarnings.length ? Array.from(new Set([...res.warnings, ...csaWarnings])) : res.warnings;
   return { ...res, warnings, timingMs: performance.now() - t0 };
+}
+
+/**
+ * Currencies whose discount curve a valuation reads (N8-3): the economic legs
+ * and, only while it is still unpaid (`upfront.date > valuationDate`), the
+ * premium currency. Used for the `COLLATERAL_CURVE_MISSING:` check.
+ */
+export function discountedCurrencies(ctx: MarketContext, trade: Trade): string[] {
+  const out = tradeCurrencies(trade, { upfront: false });
+  if (trade.upfront && trade.upfront.date > ctx.valuationDate) {
+    const ccy = trade.upfront.currency.toUpperCase();
+    if (!out.includes(ccy)) out.push(ccy);
+  }
+  return out;
 }
 
 export function pricePortfolio(ctx: MarketContext, trades: Trade[], reportingCurrency: string) {

@@ -18,20 +18,28 @@ import { upfrontPremiumLeg } from "./upfront.js";
 /**
  * Swap analytics. Par solver with coupon schedules (step-up swaps):
  * - `parRate` / `parRateBase`: the coupon of the *first outstanding period*
- *   that zeroes the PV while every step difference of `rateSchedule` is kept
- *   constant (r_i − r_0 unchanged). Without a schedule this is the ordinary
- *   par rate. Formula: r_0 − PV / (s · A · fx), exact because PV is linear in
- *   the base coupon; notional exchanges of the fixed leg are included.
+ *   that zeroes the PV of the **economic legs** while every step difference of
+ *   `rateSchedule` is kept constant (r_i − r_0 unchanged). Without a schedule
+ *   this is the ordinary (forward) par rate. Formula: r_0 − PV / (s · A · fx),
+ *   exact because PV is linear in the base coupon; notional exchanges of the
+ *   fixed leg are included.
  * - `parRateFlat`: the single constant coupon replacing the whole schedule
  *   that zeroes the PV (equals `parRate` without a schedule).
  * - `fairSpread`: analogous for the (first) floating leg – the spread of its
  *   first outstanding period keeping the `spreadSchedule` steps constant.
+ * - `parRateAllIn` / `fairSpreadAllIn` (only with an `upfront`, N8-1): the
+ *   coupon / spread that zeroes the *total* PV including the premium leg – the
+ *   "all-in" rate of a swap with an arrangement fee. Until round 8 `parRate`
+ *   itself included the fee, which shifted the forward used by the CVA
+ *   swaption replication (10Y payer with 100 k fee: CVA −20 %).
  */
 export interface SwapAnalytics {
   parRate?: number;
   parRateBase?: number;
   parRateFlat?: number;
   fairSpread?: number;
+  parRateAllIn?: number;
+  fairSpreadAllIn?: number;
   fixedRate?: number;
   annuity?: number;
   pvFixed?: number;
@@ -75,7 +83,9 @@ export function priceInterestRateSwap(ctx: MarketContext, trade: InterestRateSwa
   const fxOf = (ccy: string) => fxToReporting(ctx, ccy, reporting, trade.collateralCurrency);
   // Upfront fee (N6-1): a `Premium` cashflow in its own (last) leg, not a silent PV deduction.
   const upfront = upfrontPremiumLeg(ctx, trade, reporting, trade.legs.length);
-  const pv = legResults.reduce((s, l) => s + l.pvReporting, 0) + (upfront?.pvReporting ?? 0);
+  // N8-1: par rate / fair spread are analytics of the economic legs – the fee is reported separately as `…AllIn`.
+  const pvEconomic = legResults.reduce((s, l) => s + l.pvReporting, 0);
+  const pv = pvEconomic + (upfront?.pvReporting ?? 0);
   const analytics: Record<string, number | string | undefined> = {};
   const fixed = fixedLegs(trade.legs);
   const floats = floatLegs(trade.legs);
@@ -95,11 +105,12 @@ export function priceInterestRateSwap(ctx: MarketContext, trade: InterestRateSwa
       const start0 = firstAccrualStart(fixedRes);
       const r0 = start0 !== undefined ? fixedRateAt(fixedLeg, start0) : fixedLeg.rate;
       // Base coupon keeping the step differences constant (see `SwapAnalytics`).
-      const parBase = r0 - pv / (sFixed * annuity * fxFixed);
+      const parBase = r0 - pvEconomic / (sFixed * annuity * fxFixed);
       analytics.parRate = parBase;
       analytics.parRateBase = parBase;
       // Constant coupon replacing the whole schedule.
-      analytics.parRateFlat = fixedLeg.rateSchedule?.length ? -(pv - couponPv(fixedRes) * fxFixed) / (sFixed * annuity * fxFixed) : parBase;
+      analytics.parRateFlat = fixedLeg.rateSchedule?.length ? -(pvEconomic - couponPv(fixedRes) * fxFixed) / (sFixed * annuity * fxFixed) : parBase;
+      if (upfront) analytics.parRateAllIn = r0 - pv / (sFixed * annuity * fxFixed);
     }
     analytics.fixedRate = fixedLeg.rate;
     analytics.annuity = annuity;
@@ -114,7 +125,9 @@ export function priceInterestRateSwap(ctx: MarketContext, trade: InterestRateSwa
     const fxFl = fxOf(fl.currency);
     if (flAnnuity > 0) {
       const s0 = firstAccrualStart(flRes);
-      analytics.fairSpread = (s0 !== undefined ? floatSpreadAt(fl, s0) : (fl.spread ?? 0)) - pv / (sFloat * flAnnuity * fxFl);
+      const spread0 = s0 !== undefined ? floatSpreadAt(fl, s0) : (fl.spread ?? 0);
+      analytics.fairSpread = spread0 - pvEconomic / (sFloat * flAnnuity * fxFl);
+      if (upfront) analytics.fairSpreadAllIn = spread0 - pv / (sFloat * flAnnuity * fxFl);
     }
   } else if (floats.length === 2 && fixed.length === 0) {
     // Basis swap: fair spread on leg 0
@@ -124,7 +137,9 @@ export function priceInterestRateSwap(ctx: MarketContext, trade: InterestRateSwa
     const fxFl = fxOf(fl.currency);
     if ((flRes.annuity ?? 0) > 0) {
       const s0 = firstAccrualStart(flRes);
-      analytics.fairSpread = (s0 !== undefined ? floatSpreadAt(fl, s0) : (fl.spread ?? 0)) - pv / (sFloat * flRes.annuity! * fxFl);
+      const spread0 = s0 !== undefined ? floatSpreadAt(fl, s0) : (fl.spread ?? 0);
+      analytics.fairSpread = spread0 - pvEconomic / (sFloat * flRes.annuity! * fxFl);
+      if (upfront) analytics.fairSpreadAllIn = spread0 - pv / (sFloat * flRes.annuity! * fxFl);
     }
   }
 

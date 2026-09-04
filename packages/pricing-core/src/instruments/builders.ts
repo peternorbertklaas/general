@@ -1,4 +1,4 @@
-import { RATE_INDICES, getIndex, getSwapConventions } from "../curves/index-definitions.js";
+import { RATE_INDICES, getIndex, getSwapConventions, indexScheduleCalendar } from "../curves/index-definitions.js";
 import { type CalendarId, addBusinessDays, advance, getCalendar } from "../dates/calendar.js";
 import { type SerialDate, addTenor, immDate, nextImmDate, today, toYMD } from "../dates/date.js";
 import { buildSchedule, frequencyPerYear } from "../dates/schedule.js";
@@ -494,7 +494,9 @@ export function makeCrossCurrencySwap(p: CrossCurrencySwapParams): CrossCurrency
   const frnConv = getSwapConventions(frn);
   const domIdx = getIndex(p.domesticIndex ?? domConv.oisIndex);
   const frnIdx = getIndex(p.foreignIndex ?? frnConv.oisIndex);
-  const calendar: CalendarId = domIdx.fixingCalendar === frnIdx.fixingCalendar ? domIdx.fixingCalendar : `${domIdx.fixingCalendar}+${frnIdx.fixingCalendar}`;
+  const domCal = indexScheduleCalendar(domIdx);
+  const frnCal = indexScheduleCalendar(frnIdx);
+  const calendar: CalendarId = domCal === frnCal ? domCal : `${domCal}+${frnCal}`;
   const maturity = typeof p.tenor === "string" ? addTenor(p.effectiveDate, p.tenor) : p.tenor;
   const domPR: PayReceive = p.domesticPayReceive ?? "Receive";
   const frnPR: PayReceive = domPR === "Receive" ? "Pay" : "Receive";
@@ -641,7 +643,7 @@ export function makeFra(p: {
   if (period) periodMonths = Number(period[2]) - Number(period[1]);
   else if (typeof p.start === "number" && p.end !== undefined) periodMonths = Math.round((p.end - p.start) / 30.4375);
   const idx = getIndex(p.index ?? (periodMonths !== undefined && periodMonths > 0 ? fraIndexForPeriod(p.currency, periodMonths) : conv.floatIndex));
-  const cal = getCalendar(idx.fixingCalendar);
+  const cal = getCalendar(indexScheduleCalendar(idx));
   let startDate: SerialDate;
   let endDate: SerialDate;
   let label: string;

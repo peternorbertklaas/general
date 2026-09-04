@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { type CurveQuote, bootstrapCurve } from "../curves/bootstrap.js";
 import { flatCurve } from "../curves/curve.js";
-import { getCalendar } from "../dates/calendar.js";
+import { QUANTLIB_CROSS_CHECKED_CALENDARS, getCalendar } from "../dates/calendar.js";
 import { fromYMD, isWeekend, parseISO, toISO } from "../dates/date.js";
 import { makeFxForward } from "../instruments/builders.js";
 import { type CapFloor, type InterestRateSwap, type Swaption } from "../instruments/types.js";
@@ -530,7 +530,7 @@ describe("golden master – sample-market €STR OIS bootstrap (calendar, paymen
   });
 });
 
-describe("golden master – calendars vs QuantLib (N7-4: TARGET / NO / SE / DK / PL weekday holidays 2024–2032)", () => {
+describe("golden master – calendars vs QuantLib (N7-4 / N8-4 / N8-5: TARGET / US / US-SIFMA / UK / CH / JP / NO / SE / DK / PL weekday holidays 2024–2032)", () => {
   interface G {
     inputs: { years: number[]; calendars: Record<string, string> };
     knownEngineOnly: Record<string, { reason: string; dates: string[] }>;
@@ -546,11 +546,15 @@ describe("golden master – calendars vs QuantLib (N7-4: TARGET / NO / SE / DK /
     return out;
   }
 
-  it("the block was generated with QuantLib 1.43 and covers 2024–2032", () => {
+  it("the block was generated with QuantLib 1.43 and covers 2024–2032 for exactly the calendars the report calls cross-checked", () => {
     expect(g.quantlib.status).toBe("done");
     expect(g.quantlib.version ?? "1.43").toMatch(/^1\.\d+/);
     expect(g.inputs.years).toEqual([2024, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2032]);
-    expect(Object.keys(g.quantlib.holidays).sort()).toEqual(["DK", "NO", "PL", "SE", "TARGET"]);
+    expect(Object.keys(g.quantlib.holidays).sort()).toEqual([...QUANTLIB_CROSS_CHECKED_CALENDARS].sort());
+    expect(Object.keys(g.quantlib.holidays).sort()).toEqual(["CH", "DK", "JP", "NO", "PL", "SE", "TARGET", "UK", "US", "US-SIFMA"]);
+    expect(g.inputs.calendars["US-SIFMA"]).toBe("UnitedStates(SOFR)");
+    expect(g.inputs.calendars.US).toBe("UnitedStates(Settlement)");
+    expect(g.inputs.calendars.JP).toBe("Japan");
   });
 
   it("every engine calendar reproduces QuantLib's weekday holidays year by year; the only differences are the documented engine-only dates", () => {
@@ -583,5 +587,53 @@ describe("golden master – calendars vs QuantLib (N7-4: TARGET / NO / SE / DK /
     expect(engineHolidays("PL", 2025)).toContain("2025-12-24");
     expect(engineHolidays("PL", 2024)).not.toContain("2024-12-24");
     expect(g.quantlib.holidays.PL!["2025"]).not.toContain("2025-12-24");
+  });
+
+  it("N8-4: US-SIFMA = US settlement + Good Friday without the Friday observance of a Saturday New Year's Day / Veterans Day", () => {
+    const goodFridays = ["2024-03-29", "2025-04-18", "2026-04-03", "2027-03-26", "2028-04-14", "2029-03-30", "2030-04-19", "2031-04-11", "2032-03-26"];
+    for (const gf of goodFridays) {
+      const y = Number(gf.slice(0, 4));
+      expect(engineHolidays("US-SIFMA", y), gf).toContain(gf);
+      expect(engineHolidays("US", y), gf).not.toContain(gf);
+      expect(g.quantlib.holidays["US-SIFMA"]![String(y)]).toContain(gf);
+    }
+    for (const [iso, y] of [
+      ["2027-12-31", 2027],
+      ["2028-11-10", 2028],
+      ["2032-12-31", 2032],
+    ] as const) {
+      expect(engineHolidays("US", y)).toContain(iso);
+      expect(engineHolidays("US-SIFMA", y)).not.toContain(iso);
+      expect(g.quantlib.holidays["US-SIFMA"]![String(y)]).not.toContain(iso);
+    }
+    // apart from those, the two US calendars coincide
+    for (const y of g.inputs.years) {
+      const settlement = engineHolidays("US", y).filter((d) => !["2027-12-31", "2028-11-10", "2032-12-31"].includes(d));
+      const sifma = engineHolidays("US-SIFMA", y).filter((d) => !goodFridays.includes(d));
+      expect(sifma, String(y)).toEqual(settlement);
+    }
+  });
+
+  it("N8-5: JP substitute holidays, citizens' holidays and equinoxes follow QuantLib / JPX", () => {
+    // Golden Week substitute (03.05. Sunday → 06.05.), citizens' holiday 22.09.2026 and 21./22.09.2032, equinoxes 22.03.2027, 22.09.2028, 21.03.2031
+    for (const iso of [
+      "2024-05-06",
+      "2025-05-06",
+      "2026-05-06",
+      "2026-09-22",
+      "2027-03-22",
+      "2028-09-22",
+      "2030-05-06",
+      "2031-03-21",
+      "2031-05-06",
+      "2032-09-21",
+      "2032-09-22",
+    ]) {
+      expect(engineHolidays("JP", Number(iso.slice(0, 4))), iso).toContain(iso);
+    }
+    // the former fixed-date equinox approximations are business days
+    expect(engineHolidays("JP", 2031)).not.toContain("2031-03-20");
+    expect(engineHolidays("JP", 2032)).not.toContain("2032-09-23");
+    expect(engineHolidays("JP", 2026).length).toBe(19);
   });
 });
