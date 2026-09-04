@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
 import {
-  type CurveQuote,
+  type Curve,
+  type CustomCalendarJson,
   type Fixing,
   type MarketContext,
+  type ParRiskSpecs,
   type RateIndex,
   type SampleMarketQuotes,
   type SwapConventions,
@@ -10,8 +12,12 @@ import {
   SAMPLE_CURVE_IDS,
   SAMPLE_QUOTES,
   advance,
+  bootstrapCurve,
   buildSampleMarket,
+  customCalendarFromJson,
   getCalendar,
+  hashString,
+  isBuiltInCalendar,
   knownCurrencies,
   knownIndices,
   makeCapFloor,
@@ -21,11 +27,38 @@ import {
   makeVanillaSwap,
   marketSnapshotId,
   parseISO,
+  registerCalendar,
   registerRateIndex,
   registerSwapConventions,
+  rollMarket,
+  sampleBootstrapSpecs,
   sampleFixings,
   stableStringify,
+  toISO,
 } from "@deriva/pricing-core";
+
+export type { CustomCalendarJson };
+import { type BootstrapBody, resolveBootstrap, toCurveBuildSpec } from "./curve-specs.js";
+
+/** Vol surfaces set through `PUT /api/market` (per key) – re-applied after a sample-market rebuild (N8-01). */
+export type VolOverrides = Pick<MarketContext, "swaptionVols" | "capletVols" | "fxVols">;
+
+/** Where the active market comes from: the built-in sample market or an imported snapshot (`PUT /api/market/snapshot`). */
+export type MarketSource = "sample" | "import";
+
+export interface RebuildOptions {
+  /** Import mode only: drop the imported snapshot and rebuild the sample market for the new date instead of rolling the import. */
+  discardImport?: boolean;
+}
+
+export interface RebuildResult {
+  market: MarketContext;
+  /** `MARKET_STATE_DROPPED:` entries – everything of the previous market state the rebuild could not carry over. */
+  warnings: string[];
+}
+
+/** Prefix of the `warnings[]` entries naming state a valuation-date change had to drop (Architektur N8-01). */
+export const MARKET_STATE_DROPPED_PREFIX = "MARKET_STATE_DROPPED";
 
 /**
  * In-memory repositories behind small interfaces. The API is stateless by
@@ -35,12 +68,29 @@ import {
 export interface MarketRepository {
   get(): MarketContext;
   set(ctx: MarketContext): void;
-  /** Rebuild the sample market for a new valuation date, preserving manual overrides (spots, fixings, quotes). */
-  rebuild(valuationDate: number): MarketContext;
+  /** Replace the market with an imported snapshot (import mode: a valuation-date change rolls it instead of rebuilding the sample market). */
+  setImported(ctx: MarketContext): void;
+  /** Origin of the active market. */
+  source(): MarketSource;
+  /**
+   * Move the market to a new valuation date (N8-01). Sample mode: rebuild the sample market and carry over user
+   * state – runtime curves are re-bootstrapped from their remembered quotes, discount / collateral mappings and vol
+   * overrides re-applied, user fixings, FX fixings, spots, spot dates, credit and the fixing policy kept. Import mode:
+   * roll the imported market (`rollMarket`, constant zero curves) unless `discardImport` asks for the sample market.
+   * Whatever cannot be carried over is named in `warnings` (`MARKET_STATE_DROPPED:`).
+   */
+  rebuild(valuationDate: number, opts?: RebuildOptions): RebuildResult;
   /** Current market quotes per sample curve (basis for par-risk re-bootstrapping and rebuilds). */
   getQuotes(): SampleMarketQuotes;
-  /** Replace the quotes of one sample curve; returns false when the curve id is not a sample curve. */
-  setCurveQuotes(curveId: string, quotes: CurveQuote[]): boolean;
+  /**
+   * Remember the bootstrap body of a curve stored via `POST /api/market/curves`: a sample curve id updates its quote
+   * set, any other id is kept as a runtime curve (re-bootstrapped on rebuild, bumped by par risk). Always tracked.
+   */
+  rememberCurve(body: BootstrapBody): void;
+  /** Remember vol surfaces set per key through `PUT /api/market` so a sample-market rebuild re-applies them. */
+  rememberVols(vols: VolOverrides): void;
+  /** Bootstrap specs of every curve with known quotes (sample curves + runtime curves) for `parRisk`. */
+  parRiskSpecs(): ParRiskSpecs;
   /** Deterministic id of the active market (same hash as `ValuationReport.audit.snapshotId`). */
   snapshotId(): string;
 }
@@ -60,11 +110,21 @@ export { marketSnapshotId };
 /** Curve id → key in `SampleMarketQuotes`. */
 const QUOTE_KEY_BY_CURVE: Record<string, keyof Omit<SampleMarketQuotes, "fxSpots">> = Object.fromEntries(
   (Object.entries(SAMPLE_CURVE_IDS) as [keyof typeof SAMPLE_CURVE_IDS, string][]).map(([k, id]) => [id, k]),
-) as Record<string, keyof Omit<SampleMarketQuotes, "fxSpots">>;
+);
+
+const dropped = (what: string): string => `${MARKET_STATE_DROPPED_PREFIX}: ${what}`;
 
 export class MarketStore implements MarketRepository {
   private ctx: MarketContext;
   private quotes: SampleMarketQuotes;
+  private origin: MarketSource = "sample";
+  /**
+   * Curves stored via `POST /api/market/curves` that are not sample curves, in insertion order (a later curve may
+   * reference an earlier one). The body – not the curve – is remembered: a rebuild re-bootstraps from the quotes.
+   */
+  private runtimeCurves = new Map<string, BootstrapBody>();
+  /** Vol surfaces set per key through `PUT /api/market` (sample mode: re-applied after a rebuild). */
+  private volOverrides: VolOverrides = {};
   /** Snapshot ids per (immutable) market context object. */
   private ids = new WeakMap<MarketContext, string>();
   constructor(valuationDate = parseISO("2026-09-03"), quotes: SampleMarketQuotes = SAMPLE_QUOTES) {
@@ -77,6 +137,16 @@ export class MarketStore implements MarketRepository {
   set(ctx: MarketContext): void {
     this.ctx = ctx;
   }
+  setImported(ctx: MarketContext): void {
+    // The snapshot replaces every curve and surface; what was remembered for the previous market is gone with it.
+    this.ctx = ctx;
+    this.origin = "import";
+    this.runtimeCurves.clear();
+    this.volOverrides = {};
+  }
+  source(): MarketSource {
+    return this.origin;
+  }
   snapshotId(): string {
     let id = this.ids.get(this.ctx);
     if (!id) {
@@ -88,16 +158,49 @@ export class MarketStore implements MarketRepository {
   getQuotes(): SampleMarketQuotes {
     return this.quotes;
   }
-  setCurveQuotes(curveId: string, quotes: CurveQuote[]): boolean {
-    const key = QUOTE_KEY_BY_CURVE[curveId];
-    if (!key) return false;
-    this.quotes = { ...this.quotes, [key]: quotes };
-    return true;
+  rememberCurve(body: BootstrapBody): void {
+    const key = QUOTE_KEY_BY_CURVE[body.spec.id];
+    if (key) {
+      this.quotes = { ...this.quotes, [key]: body.spec.quotes };
+      return;
+    }
+    // Re-insert so the order stays "latest definition last" (dependencies were stored before their dependants).
+    this.runtimeCurves.delete(body.spec.id);
+    this.runtimeCurves.set(body.spec.id, { spec: body.spec, ...(body.isDiscountCurve !== undefined ? { isDiscountCurve: body.isDiscountCurve } : {}) });
   }
-  rebuild(valuationDate: number): MarketContext {
+  rememberVols(vols: VolOverrides): void {
+    this.volOverrides = {
+      ...(vols.swaptionVols || this.volOverrides.swaptionVols
+        ? { swaptionVols: { ...(this.volOverrides.swaptionVols ?? {}), ...(vols.swaptionVols ?? {}) } }
+        : {}),
+      ...(vols.capletVols || this.volOverrides.capletVols ? { capletVols: { ...(this.volOverrides.capletVols ?? {}), ...(vols.capletVols ?? {}) } } : {}),
+      ...(vols.fxVols || this.volOverrides.fxVols ? { fxVols: { ...(this.volOverrides.fxVols ?? {}), ...(vols.fxVols ?? {}) } } : {}),
+    };
+  }
+  parRiskSpecs(): ParRiskSpecs {
+    const specs: ParRiskSpecs = { ...sampleBootstrapSpecs(this.ctx.valuationDate, this.quotes) };
+    for (const [id, body] of this.runtimeCurves) specs[id] = toCurveBuildSpec(body.spec);
+    return specs;
+  }
+  rebuild(valuationDate: number, opts: RebuildOptions = {}): RebuildResult {
     const prev = this.ctx;
+    const warnings: string[] = [];
+    if (this.origin === "import" && !opts.discardImport) {
+      // Import mode: the snapshot is the market – roll its curves to the new date (constant zero curves, the core's
+      // theta roll); spots, fixings, vols, mappings and credit stay as imported. Nothing is dropped.
+      this.ctx = rollMarket(prev, valuationDate - prev.valuationDate);
+      return { market: this.ctx, warnings };
+    }
+    if (this.origin === "import") {
+      warnings.push(
+        dropped(
+          `imported snapshot ${prev.meta?.label ? `"${prev.meta.label}" ` : ""}(${this.snapshotId()}) discarded – sample market rebuilt for ${toISO(valuationDate)}`,
+        ),
+      );
+      this.origin = "sample";
+    }
     const fresh = buildSampleMarket(valuationDate, { ...this.quotes, fxSpots: { ...this.quotes.fxSpots, ...prev.fxSpots } });
-    this.ctx = {
+    let m: MarketContext = {
       ...fresh,
       fixings: rebuiltFixings(prev, fresh),
       // FX fixings of past MtM-reset dates are history, not sample-market data – they survive a valuation-date change.
@@ -106,7 +209,37 @@ export class MarketStore implements MarketRepository {
       ...(prev.fxSpotDates ? { fxSpotDates: prev.fxSpotDates } : {}),
       ...(prev.missingFixingPolicy ? { missingFixingPolicy: prev.missingFixingPolicy } : {}),
     };
-    return this.ctx;
+    // Runtime curves (`POST /api/market/curves`, N8-01): re-bootstrap from the remembered quotes, in insertion order.
+    for (const [id, body] of [...this.runtimeCurves]) {
+      try {
+        const { spec } = resolveBootstrap(m, body);
+        const curve: Curve = bootstrapCurve(valuationDate, spec).curve;
+        m = { ...m, curves: { ...m.curves, [curve.id]: curve } };
+      } catch (e) {
+        this.runtimeCurves.delete(id);
+        warnings.push(dropped(`curve ${id} could not be re-bootstrapped for ${toISO(valuationDate)} (${(e as Error).message})`));
+      }
+    }
+    // Discount / collateral mappings of the previous market survive where their curve still exists.
+    const discountCurveId = { ...m.discountCurveId };
+    for (const [ccy, curveId] of Object.entries(prev.discountCurveId)) {
+      if (m.curves[curveId]) discountCurveId[ccy] = curveId;
+      else if (!fresh.discountCurveId[ccy]) warnings.push(dropped(`discountCurveId.${ccy} = ${curveId} (curve not in the rebuilt market)`));
+    }
+    const collateralDiscountCurveId = { ...(m.collateralDiscountCurveId ?? {}) };
+    for (const [key, curveId] of Object.entries(prev.collateralDiscountCurveId ?? {})) {
+      if (m.curves[curveId]) collateralDiscountCurveId[key] = curveId;
+      else if (!fresh.collateralDiscountCurveId?.[key])
+        warnings.push(dropped(`collateralDiscountCurveId.${key} = ${curveId} (curve not in the rebuilt market)`));
+    }
+    m = { ...m, discountCurveId, ...(Object.keys(collateralDiscountCurveId).length ? { collateralDiscountCurveId } : {}) };
+    // Vol overrides (`PUT /api/market { swaptionVols | capletVols | fxVols }`) are plain data – re-apply per key.
+    const o = this.volOverrides;
+    if (o.swaptionVols) m = { ...m, swaptionVols: { ...(m.swaptionVols ?? {}), ...o.swaptionVols } };
+    if (o.capletVols) m = { ...m, capletVols: { ...(m.capletVols ?? {}), ...o.capletVols } };
+    if (o.fxVols) m = { ...m, fxVols: { ...(m.fxVols ?? {}), ...o.fxVols } };
+    this.ctx = m;
+    return { market: m, warnings };
   }
 }
 
@@ -136,9 +269,28 @@ export function rebuiltFixings(prev: MarketContext, fresh: MarketContext): Fixin
  * Built-in indices cannot be replaced (the core throws `INVALID_CURVE_SPEC`, N7-7); conventions of a
  * built-in currency may be overridden and are exported like any other registration.
  */
+/**
+ * Canonical ids of the calendars shipped with the engine (rule-based; `getCalendar` also knows their aliases such as
+ * `EUR`, `USNY`, `GBLO` – `isBuiltInCalendar` of the core covers ids and aliases). The list is probed against the core,
+ * so a calendar the core adds later is listed as soon as it resolves.
+ */
+const BUILT_IN_CALENDAR_CANDIDATES = ["TARGET", "DE", "US", "US-SIFMA", "UK", "CH", "JP", "NO", "SE", "DK", "PL", "WEEKEND"] as const;
+
+/** Built-in calendar ids the core ships (canonical names, aliases excluded) – `GET /api/market` `calendars`. */
+export function builtInCalendarIds(): string[] {
+  return BUILT_IN_CALENDAR_CANDIDATES.filter((id) => {
+    try {
+      return isBuiltInCalendar(id) && getCalendar(id) !== undefined;
+    } catch {
+      return false;
+    }
+  });
+}
+
 export class RegisterStore {
   private indices = new Map<string, RateIndex>();
   private conventions = new Map<string, SwapConventions>();
+  private calendars = new Map<string, CustomCalendarJson>();
   /** Register (validated by the core – throws `PricingError("INVALID_CURVE_SPEC")`); `replaced` = the name was already registered at runtime. */
   registerIndex(def: RateIndex): { index: RateIndex; replaced: boolean } {
     const replaced = knownIndices().some((ix) => ix.name === def.name.toUpperCase());
@@ -153,6 +305,25 @@ export class RegisterStore {
     this.conventions.set(conventions.currency, conventions);
     return { conventions, replaced };
   }
+  /**
+   * Register a custom calendar (Markt R8-2) through the core's JSON form (`customCalendarFromJson` validates –
+   * `PricingError("INVALID_CALENDAR")` for a built-in id or a malformed list, `INVALID_DATE` for a non-existent date
+   * such as `2027-02-30` – and `registerCalendar` stores it under the upper-cased id). `replaced` = a runtime calendar
+   * of the same id was registered through this instance before. The stored JSON is the core's `toJSON()` form
+   * (holidays sorted, `name` defaulting to the id, `weekendsAreHolidays` explicit).
+   */
+  registerCalendar(def: CustomCalendarJson): { calendar: CustomCalendarJson; replaced: boolean } {
+    const cal = customCalendarFromJson({ ...def, id: def.id.trim().toUpperCase() });
+    registerCalendar(cal);
+    const calendar = cal.toJSON();
+    const replaced = this.calendars.has(calendar.id);
+    this.calendars.set(calendar.id, calendar);
+    return { calendar, replaced };
+  }
+  /** True when `id` is a calendar shipped with the engine or one of its aliases (core `isBuiltInCalendar`) – never replaceable. */
+  isBuiltInCalendar(id: string): boolean {
+    return isBuiltInCalendar(id);
+  }
   /** Indices registered through this API instance (sorted by name). */
   listIndices(): RateIndex[] {
     return [...this.indices.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -160,6 +331,22 @@ export class RegisterStore {
   /** Conventions registered through this API instance (sorted by currency). */
   listConventions(): SwapConventions[] {
     return [...this.conventions.values()].sort((a, b) => a.currency.localeCompare(b.currency));
+  }
+  /** Calendars registered through this API instance (sorted by id). */
+  listCalendars(): CustomCalendarJson[] {
+    return [...this.calendars.values()].sort((a, b) => a.id.localeCompare(b.id));
+  }
+  /**
+   * Hash of the register as exported in the snapshot envelope (N8-03). The register is not part of the market's
+   * snapshot id, but it is part of the `GET /api/market/snapshot` representation – so the export ETag carries it.
+   * Empty string when nothing is registered (an untouched export keeps `ETag = "<snapshotId>"`).
+   */
+  hash(): string {
+    const indices = this.listIndices();
+    const conventions = this.listConventions();
+    const calendars = this.listCalendars();
+    if (!indices.length && !conventions.length && !calendars.length) return "";
+    return hashString(stableStringify({ indices, conventions, calendars })).slice(0, 16);
   }
 }
 

@@ -17,6 +17,8 @@ import {
 import { type AppContext } from "../app.js";
 import { apiErrorCode, sendError } from "../lib/errors.js";
 import { ifNoneMatchSatisfied } from "../lib/etag.js";
+import { collateralMappingProblems, envelopeProblems, withCalendarHint } from "../lib/register-validation.js";
+import { type CustomCalendarJson } from "../lib/store.js";
 import { volSurfacePlausibilityWarnings, volSurfaceProblems } from "../lib/vol-surfaces.js";
 import {
   type EMIR_BOOLEAN,
@@ -54,11 +56,22 @@ type EmirBody = EmirOptions & { uti?: Record<string, string>; transactionPrice?:
 
 /**
  * API snapshot envelope (ADR-027): the core's `deriva.market/1` document plus the runtime register –
- * indices and swap conventions registered through `POST /api/market/indices|conventions`. The core
- * neither serialises nor hashes the register (`serializeMarket`, `marketSnapshotId`), so the two arrays
- * live in the API layer only: exported when non-empty, re-registered on import before the market is replaced.
+ * calendars, indices and swap conventions registered through `POST /api/market/calendars|indices|conventions`.
+ * The core neither serialises nor hashes the register (`serializeMarket`, `marketSnapshotId`), so the three
+ * arrays live in the API layer only: exported when non-empty, validated as a whole and re-registered on import
+ * (calendars → indices → conventions) before the market is replaced. The export ETag covers them (N8-03).
  */
-export type ApiMarketSnapshot = MarketSnapshotJson & { indices?: RateIndex[]; conventions?: SwapConventions[] };
+export type ApiMarketSnapshot = MarketSnapshotJson & { calendars?: CustomCalendarJson[]; indices?: RateIndex[]; conventions?: SwapConventions[] };
+
+/**
+ * ETag of `GET /api/market/snapshot` (N8-03): the market's snapshot id alone while nothing is registered
+ * (byte-identical with `X-Market-Snapshot-Id` and `audit.snapshotId`), otherwise the id plus a hash of the
+ * envelope – the register changes the representation, so a cached body must not be revalidated as fresh
+ * (RFC 9110 § 8.8.3). `X-Market-Snapshot-Id` stays the pure market id in both cases.
+ */
+export function snapshotExportEtag(snapshotId: string, registerHash: string): string {
+  return registerHash ? `"${snapshotId}-${registerHash}"` : `"${snapshotId}"`;
+}
 
 /**
  * Upper bound of one query map (N4-06). Node rejects request lines above 16 kB with 431 before any
@@ -109,31 +122,35 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
       schema: {
         operationId: "getMarketSnapshot",
         tags: ["market"],
-        summary: "Vollständigen Markt-Snapshot exportieren (JSON, ISO-Daten, versioniert; starker ETag = Snapshot-ID, If-None-Match → 304)",
+        summary:
+          'Vollständigen Markt-Snapshot exportieren (JSON, ISO-Daten, versioniert; starker ETag = Snapshot-ID, mit Register-Envelope `"<snapshotId>-<registerHash>"`; If-None-Match → 304)',
         description:
-          "The core's `deriva.market/1` document (`serializeMarket`). When indices or swap conventions were registered at runtime (`POST /api/market/indices|conventions`), the API adds the envelope arrays `indices` / `conventions` (ADR-027) so a re-import restores them; they are not part of the snapshot id / ETag, which covers the market data only.",
+          'The core\'s `deriva.market/1` document (`serializeMarket`). When calendars, indices or swap conventions were registered at runtime (`POST /api/market/calendars|indices|conventions`), the API adds the envelope arrays `calendars` / `indices` / `conventions` (ADR-027) so a re-import restores them. They are not part of the snapshot id (`X-Market-Snapshot-Id`, `audit.snapshotId` – market data only) but they are part of this representation, so the `ETag` is `"<snapshotId>"` while nothing is registered and `"<snapshotId>-<registerHash>"` afterwards (N8-03): a registration changes the ETag, not the header, and a client revalidating with the old ETag gets the fresh body instead of 304.',
         headers: {
           type: "object",
           properties: {
             "if-none-match": {
               type: "string",
-              description: 'Snapshot ETag(s) the client holds (`"snapshotId"`), or "*"; weak comparison (`W/` ignored). Match → 304.',
+              description:
+                'Snapshot ETag(s) the client holds (`"snapshotId"` or `"snapshotId-registerHash"`), or "*"; weak comparison (`W/` ignored). Match → 304.',
             },
           },
         },
         response: responsesWithoutBody({
           200: marketSnapshotRef,
-          304: { type: "null", description: "Not modified (snapshot id matches If-None-Match, weak comparison)" },
+          304: { type: "null", description: "Not modified (snapshot id and register hash match If-None-Match, weak comparison)" },
         }),
       },
     },
     async (req, reply) => {
-      const etag = `"${ctx.market.snapshotId()}"`;
+      const etag = snapshotExportEtag(ctx.market.snapshotId(), ctx.registry.hash());
       reply.header("etag", etag);
       if (ifNoneMatchSatisfied(req.headers["if-none-match"], etag)) return reply.status(304).send();
+      const calendars = ctx.registry.listCalendars();
       const indices = ctx.registry.listIndices();
       const conventions = ctx.registry.listConventions();
       const out: ApiMarketSnapshot = serializeMarket(ctx.market.get());
+      if (calendars.length) out.calendars = calendars;
       if (indices.length) out.indices = indices;
       if (conventions.length) out.conventions = conventions;
       return out;
@@ -148,9 +165,9 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
         operationId: "importMarketSnapshot",
         tags: ["market"],
         summary:
-          "Markt-Snapshot importieren (ersetzt den aktiven Snapshot nach Schema-, Vol-Flächen- und Konsistenzprüfung; registriert `indices`/`conventions` des API-Envelopes)",
+          "Markt-Snapshot importieren (ersetzt den aktiven Snapshot nach Schema-, Vol-Flächen- und Konsistenzprüfung; registriert `calendars`/`indices`/`conventions` des API-Envelopes atomar)",
         description:
-          "Order of checks: JSON schema (400 `VALIDATION_ERROR`) → structural vol-surface check (400 `VOL_SURFACE_INVALID` with `problems[]`: grid dimensions, axis ordering, key ↔ currency/pair) → structural deserialisation (400 `SNAPSHOT_MALFORMED` / `INVALID_TIMESTAMP` / `INVALID_DATE`) → market consistency (`validateMarket`, 422 `SNAPSHOT_INVALID` with `problems[]`) → register (`indices`, then `conventions` of the API envelope, ADR-027: each entry is validated by the core – an invalid definition or a built-in index name answers 400 `INVALID_CURVE_SPEC` with `details.entry`). The active snapshot is replaced only when every step passes; a register failure leaves the market unchanged (entries registered before the failing one stay registered – the register is process-wide and additive). Implausible but structurally sound vol surfaces (numbers not fitting the `volType`, degenerate grids – Markt R6-4) are imported and reported in `warnings[]` (`VOL_IMPLAUSIBLE:`).",
+          "Order of checks: JSON schema (400 `VALIDATION_ERROR`) → structural vol-surface check (400 `VOL_SURFACE_INVALID` with `problems[]`: grid dimensions, axis ordering, key ↔ currency/pair) → structural deserialisation (400 `SNAPSHOT_MALFORMED` / `INVALID_TIMESTAMP` / `INVALID_DATE`) → market consistency (`validateMarket` plus the API's collateral-mapping currency check, N8-02: 422 `SNAPSHOT_INVALID` with `problems[]`) → envelope validation as a whole (N8-04: built-in calendar / index names, calendars referenced by indices and conventions – the envelope's own count –, tenor per index type, convention indices registered or in the envelope with matching currency and OIS type; any problem answers 400 `INVALID_CURVE_SPEC` with `details.problems[]` and `details.entry` of the first one, and **nothing** is registered) → register (`calendars`, then `indices`, then `conventions`, ADR-027; the core validates each entry again – a rule the pre-check does not know answers 400 with `details.registered` naming what was applied before it). The active snapshot is replaced only when every step passes. After a successful import the market is in import mode (`GET /api/market` `source: \"import\"`): a valuation-date change rolls it, `PUT /api/market { discardImport: true }` returns to the sample market (N8-01). Implausible but structurally sound vol surfaces (numbers not fitting the `volType`, degenerate grids – Markt R6-4) are imported and reported in `warnings[]` (`VOL_IMPLAUSIBLE:`).",
         body: marketSnapshotRef,
         response: responses(
           {
@@ -162,6 +179,7 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
                 valuationDate: { type: "string" },
                 curves: { type: "array", items: { type: "string" } },
                 snapshotId: { type: "string" },
+                calendars: { type: "array", items: { type: "string" }, description: "Ids of the calendars registered from the envelope's `calendars`" },
                 indices: { type: "array", items: { type: "string" }, description: "Names of the indices registered from the envelope's `indices`" },
                 conventions: {
                   type: "array",
@@ -184,7 +202,7 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
     },
     async (req, reply) => {
       // The envelope arrays are an API extension (ADR-027) – the core sees the `deriva.market/1` document only.
-      const { indices = [], conventions = [], ...core } = req.body;
+      const { calendars = [], indices = [], conventions = [], ...core } = req.body;
       const surfaceProblems = volSurfaceProblems(core);
       if (surfaceProblems.length) {
         return sendError(reply, req, 400, "VOL_SURFACE_INVALID", `Vol surface(s) of the snapshot structurally invalid (${surfaceProblems.length} problem(s))`, {
@@ -199,34 +217,49 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
         const code = apiErrorCode(isPricingError(e) ? e.code : undefined, "SNAPSHOT_MALFORMED");
         return sendError(reply, req, 400, code, (e as Error).message);
       }
-      const problems = validateMarket(m);
+      // Core consistency plus the collateral-mapping currency check the core lacks (N8-02); duplicates of a future core check are dropped.
+      const coreProblems = validateMarket(m);
+      const apiProblems = collateralMappingProblems(m).filter((p) => {
+        const key = /[A-Z]{3}\|[A-Z]{3}/.exec(p)?.[0];
+        return !key || !coreProblems.some((c) => c.includes(key));
+      });
+      const problems = [...coreProblems, ...apiProblems];
       if (problems.length) return sendError(reply, req, 422, "SNAPSHOT_INVALID", "Snapshot validation failed", { problems });
-      // Register the envelope's indices and conventions (Markt R6-5 rest) – validated by the core, built-ins never replaced.
-      const registered = { indices: [] as string[], conventions: [] as string[] };
+      // Envelope (Markt R6-5 rest / R8-2): validated as a whole first (N8-04) so an invalid second entry registers nothing.
+      const envelope = envelopeProblems({ calendars, indices, conventions });
+      if (envelope.length) {
+        const first = envelope[0]!;
+        return sendError(
+          reply,
+          req,
+          400,
+          "INVALID_CURVE_SPEC",
+          `${first.section}: ${first.entry}: ${first.problem}${envelope.length > 1 ? ` (+${envelope.length - 1} more problem(s), see details.problems)` : ""} – nothing registered, market unchanged`,
+          { details: { entry: first.entry, section: first.section, ...(first.builtIn ? { builtIn: true } : {}), problems: envelope } },
+        );
+      }
+      const registered = { calendars: [] as string[], indices: [] as string[], conventions: [] as string[] };
       try {
+        for (const cal of calendars) registered.calendars.push(ctx.registry.registerCalendar(cal).calendar.id);
         for (const ix of indices) {
+          // Belt and braces: the pre-check rejected built-ins already; the core would throw `INVALID_CURVE_SPEC` too.
           if (isBuiltInIndex(ix.name)) {
-            return sendError(
-              reply,
-              req,
-              400,
-              "INVALID_CURVE_SPEC",
-              `indices: ${ix.name.toUpperCase()} is a built-in index and cannot be replaced – drop it from the snapshot or rename the variant`,
-              {
-                details: { entry: ix.name.toUpperCase(), builtIn: true },
-              },
-            );
+            return sendError(reply, req, 400, "INVALID_CURVE_SPEC", `indices: ${ix.name.toUpperCase()} is a built-in index and cannot be replaced`, {
+              details: { entry: ix.name.toUpperCase(), builtIn: true, registered },
+            });
           }
           registered.indices.push(ctx.registry.registerIndex(ix).index.name);
         }
         for (const conv of conventions) registered.conventions.push(ctx.registry.registerConventions(conv).conventions.currency);
       } catch (e) {
         if (!isPricingError(e)) throw e;
-        return sendError(reply, req, 400, apiErrorCode(e.code, "INVALID_CURVE_SPEC"), e.message, { details: { ...(e.details ?? {}), registered } });
+        return sendError(reply, req, 400, apiErrorCode(e.code, "INVALID_CURVE_SPEC"), withCalendarHint(e.message), {
+          details: { ...(e.details ?? {}), registered },
+        });
       }
       // Implausible (but structurally sound) surfaces are imported with a warning (Markt R6-4).
       const warnings = volSurfacePlausibilityWarnings(core);
-      ctx.market.set(m);
+      ctx.market.setImported(m);
       const snapshotId = ctx.market.snapshotId();
       ctx.audit.append({
         actor: "api",

@@ -1,5 +1,14 @@
 import { type FastifyInstance } from "fastify";
-import { type Trade, type VegaBucketOptions, parRisk, parRiskPortfolio, sampleBootstrapSpecs, vegaBuckets } from "@deriva/pricing-core";
+import {
+  type MarketContext,
+  type ParRiskSpecs,
+  type Trade,
+  type VegaBucketOptions,
+  parRisk,
+  parRiskPortfolio,
+  tradeCurveIds,
+  vegaBuckets,
+} from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import { sendError } from "../lib/errors.js";
@@ -7,18 +16,44 @@ import { arrayResponse, parRiskPortfolioBodySchema, responses, tradeRef } from "
 
 const currency = { type: "string", pattern: "^[A-Z]{3}$" } as const;
 
+/** Prefix of the `warnings[]` entries naming curves par risk could not bump for lack of quotes (Markt R8-3). */
+export const PAR_RISK_INCOMPLETE_PREFIX = "PAR_RISK_INCOMPLETE";
+
 const parRiskReportSchema = {
   type: "object",
-  description: "Par risk per curve and quote; `total` is the sum over all buckets in reporting currency.",
+  description:
+    "Par risk per curve and quote; `total` is the sum over all buckets in reporting currency. Bumped are the curves the trade depends on that have bootstrap quotes in the store – the sample curves and every curve loaded through `POST /api/market/curves` (Markt R8-3); curves without quotes (typically imported snapshot curves outside the sample set) are listed in `curvesWithoutQuotes` with a `PAR_RISK_INCOMPLETE:` warning instead of contributing a silent zero.",
   properties: {
     tradeId: { type: "string" },
     currency: { type: "string" },
     bumpBp: { description: "Bump size (bp)" },
     curves: arrayResponse("{ curveId, buckets: { quote, tenor, delta }[] }[]"),
-    total: { description: "Sum of bucket deltas" },
+    total: { description: "Sum of bucket deltas (bumped curves only)" },
+    curvesWithoutQuotes: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Curve ids the trade depends on (discount / projection curves in the market) that have no bootstrap quotes in the store and were therefore not bumped",
+    },
+    warnings: {
+      type: "array",
+      items: { type: "string" },
+      description: "`PAR_RISK_INCOMPLETE:` per curve in `curvesWithoutQuotes` (empty when every curve was bumped)",
+    },
   },
   additionalProperties: true,
 } as const;
+
+/** Curves of the trade (discount and projection curves present in the market) that no spec covers – restricted to `curveIds` when given. */
+function curvesWithoutQuotes(m: MarketContext, trade: Trade, specs: ParRiskSpecs, curveIds?: string[]): string[] {
+  const ids = tradeCurveIds(m, trade).filter((id) => m.curves[id] && !specs[id]);
+  return curveIds ? ids.filter((id) => curveIds.includes(id)) : ids;
+}
+const incompleteWarnings = (missing: string[]): string[] =>
+  missing.map(
+    (id) =>
+      `${PAR_RISK_INCOMPLETE_PREFIX}: curve ${id} has no bootstrap quotes in the store and was not bumped – load it through POST /api/market/curves to track its quotes`,
+  );
 
 const dimension = {
   type: "string",
@@ -66,9 +101,11 @@ const vegaResponse = { type: "array", items: vegaBucketReportSchema, description
  * Market-quote (par) sensitivities and vega buckets. Par risk re-bootstraps
  * every curve per bumped quote, so it is an on-demand endpoint (≈ 1 s per
  * trade on the sample market) rather than a per-keystroke one; the portfolio
- * variant shares the re-bootstrapping across all trades. The quotes are the
- * store's current ones, so curves replaced via `POST /api/market/curves` are
- * bumped at their actual market inputs. Vega buckets cover swaption cubes,
+ * variant shares the re-bootstrapping across all trades. The specs are the
+ * store's (`parRiskSpecs`): sample curves at their current quotes plus every
+ * runtime curve loaded through `POST /api/market/curves`, so a NOK or CZK swap
+ * gets par buckets on its own curve (Markt R8-3); curves without quotes are
+ * reported, not silently skipped. Vega buckets cover swaption cubes,
  * caplet surfaces and – for FX options – the pair's FX vol surface (`kind:
  * "fx"`, ATM per expiry, optionally the RR25 / BF25 smile buckets).
  */
@@ -98,9 +135,10 @@ export async function registerExtendedRiskRoutes(app: FastifyInstance, ctx: AppC
     async (req) => {
       const m = ctx.market.get();
       const trade = datesToSerial(req.body.trade);
-      const specs = sampleBootstrapSpecs(m.valuationDate, ctx.market.getQuotes());
+      const specs = ctx.market.parRiskSpecs();
       const res = parRisk(m, trade, req.body.reportingCurrency ?? "EUR", specs, { curveIds: req.body.curveIds, bumpBp: req.body.bumpBp });
-      return datesToIso(res);
+      const missing = curvesWithoutQuotes(m, trade, specs, req.body.curveIds);
+      return { ...datesToIso(res), curvesWithoutQuotes: missing, warnings: incompleteWarnings(missing) };
     },
   );
 
@@ -121,9 +159,12 @@ export async function registerExtendedRiskRoutes(app: FastifyInstance, ctx: AppC
       const trades = req.body.useStore || !req.body.trades ? ctx.trades.list().map((t) => t.trade) : datesToSerial(req.body.trades);
       if (trades.length === 0) return sendError(reply, req, 400, "INVALID_REQUEST", "No trades given (body.trades or useStore=true with a non-empty store)");
       if (trades.length > 200) return sendError(reply, req, 400, "INVALID_REQUEST", "At most 200 trades per par-risk portfolio request");
-      const specs = sampleBootstrapSpecs(m.valuationDate, ctx.market.getQuotes());
+      const specs = ctx.market.parRiskSpecs();
       const res = parRiskPortfolio(m, trades, req.body.reportingCurrency ?? "EUR", specs, { curveIds: req.body.curveIds, bumpBp: req.body.bumpBp });
-      return datesToIso(res);
+      return datesToIso(res).map((report, i) => {
+        const missing = curvesWithoutQuotes(m, trades[i]!, specs, req.body.curveIds);
+        return { ...report, curvesWithoutQuotes: missing, warnings: incompleteWarnings(missing) };
+      });
     },
   );
 

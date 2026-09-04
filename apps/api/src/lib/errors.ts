@@ -162,7 +162,7 @@ export function classifyError(err: unknown): ClassifiedError {
   if (isDateInputError(err)) {
     const code = isPricingError(err) ? err.code : DATE_ERROR.test(err.message) ? "INVALID_DATE" : "INVALID_TENOR";
     // `details.input` of the core's PricingError names the offending string – kept on the 400 path too (N5-01).
-    const details = isPricingError(err) && err.details && typeof err.details === "object" ? { details: err.details as Record<string, unknown> } : {};
+    const details = isPricingError(err) && err.details && typeof err.details === "object" ? { details: err.details } : {};
     return { status: 400, message: err.message, code, ...details, level: "none" };
   }
   if (isPricingError(err)) return { status: 422, message: err.message, code: err.code, ...(err.details ? { details: err.details } : {}), level: "none" };

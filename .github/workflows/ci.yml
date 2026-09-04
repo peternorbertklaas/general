@@ -18,6 +18,38 @@ permissions:
   contents: read
 
 jobs:
+  commitlint:
+    # Conventional Commits with `header-max-length` 72 and the CONTRIBUTING scopes (`commitlint.config.mjs`, review R8
+    # N6-03a). Only the commits of this push / PR are checked – the round-4…7 subjects in the history predate the rule.
+    # No git hook is installed; this job is the gate.
+    name: Commit messages (commitlint)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'claude/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+      - name: Lint PR commits (base…head)
+        if: github.event_name == 'pull_request'
+        run: npx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+      - name: Lint pushed commits (before…sha)
+        # A branch creation or force-push reports `before` as all zeros – then only the head commit is checked.
+        if: github.event_name == 'push'
+        run: |
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            npx commitlint --from HEAD~1 --to HEAD --verbose
+          else
+            npx commitlint --from ${{ github.event.before }} --to ${{ github.sha }} --verbose
+          fi
+
   build-test:
     name: Build & test (Node ${{ matrix.node }})
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'claude/')

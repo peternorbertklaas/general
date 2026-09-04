@@ -471,6 +471,7 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "MarketSnapshotJson",
     "FxFixing",
     "MasterAgreementRef",
+    "ParRiskSpecs",
     "PortfolioReport",
     "RateIndex",
     "ReportPerspective",
@@ -516,6 +517,17 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "isBuiltInIndex",
     "getSwapConventions",
     "sampleFixings",
+    // Round 8 (Markt R8-2 calendars, R8-3 par risk for runtime curves, Architektur N8-01 valuation-date rebuild / import roll,
+    // N8-04 atomic envelope import with the core's validators)
+    "CustomCalendarJson",
+    "customCalendarFromJson",
+    "registerCalendar",
+    "isBuiltInCalendar",
+    "validateCustomCalendar",
+    "validateRateIndex",
+    "validateSwapConventions",
+    "rollMarket",
+    "tradeCurveIds",
     // Builders
     "makeVanillaSwap",
     "makeCapFloor",
@@ -735,7 +747,7 @@ describe("R4-5 vol surfaces via PUT /api/market and the CSV request body in the 
     await app2.close();
   });
 
-  it("OpenAPI: POST /api/trades/import declares application/json and text/csv request bodies; 43 operations", () => {
+  it("OpenAPI: POST /api/trades/import declares application/json and text/csv request bodies; 44 operations", () => {
     const doc = app.swagger() as unknown as {
       paths: Record<
         string,
@@ -747,8 +759,9 @@ describe("R4-5 vol surfaces via PUT /api/market and the CSV request body in the 
     expect(content["text/csv"]!.schema.type).toBe("string");
     expect(content["text/csv"]!.schema.description).toMatch(/\?type=/);
     const ops = Object.values(doc.paths).flatMap((methods) => Object.values(methods).map((op) => op.operationId));
-    expect(ops).toHaveLength(43);
+    expect(ops).toHaveLength(44);
     expect(ops).toContain("emirValuationsPost");
+    expect(ops).toContain("registerCalendar");
     // `PUT /api/market` documents the three vol-surface fields.
     const put = doc.paths["/api/market"]!.put!.requestBody!.content["application/json"]!.schema as { properties: Record<string, unknown> };
     expect(Object.keys(put.properties)).toEqual(expect.arrayContaining(["swaptionVols", "capletVols", "fxVols"]));

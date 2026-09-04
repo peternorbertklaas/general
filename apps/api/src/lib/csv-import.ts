@@ -66,6 +66,12 @@ export interface CsvTemplate {
   tradeType: Trade["type"];
   required: readonly string[];
   optional: readonly string[];
+  /**
+   * Alternative vocabulary (Markt R8-4): when the header carries all of `columns`, the `replaces` required columns
+   * need not be present – the workstation's FX-forward template writes `buyCurrency`/`buyAmount`/`sellCurrency`/
+   * `sellAmount` instead of `pair`/`baseAmount`/`rate`.
+   */
+  alternative?: { readonly columns: readonly string[]; readonly replaces: readonly string[] };
   /** One example row in `[...required, ...optional]` order (German number format). */
   example: readonly string[];
   notes: string;
@@ -74,6 +80,9 @@ export interface CsvTemplate {
 const COLLATERAL_NOTE =
   "`collateralCurrency`: ISO code of the CSA currency, empty = builder default, `none` (also `unbesichert`, `ohne`) = explicitly uncollateralised.";
 const STEP_UP_NOTE = "`stepUp` = coupon steps `<date>:<rate>|<date>:<rate>` on the fixed leg (`2027-09-07:3,50 %|2028-09-07:4,00 %`).";
+/** Unit rule of every `spread` column (Markt R8-4 – the same heuristic the workstation applies). */
+export const SPREAD_UNIT_NOTE =
+  "`spread` unit: `%` or `bp` suffix as written (`-20 bp`, `0,12 %`); a plain number with |x| ≥ 1 is read as basis points (`-20` = −20 bp), |x| < 1 as a decimal (`-0,002`) – the workstation reads and writes the same rule.";
 
 export const CSV_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
   InterestRateSwap: {
@@ -100,15 +109,17 @@ export const CSV_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
       "",
       "",
     ],
-    notes: `\`payReceive\` = direction of the fixed leg (Pay = payer swap); \`maturity\` tenor or date; \`index\` defaults to the currency's IBOR/RFR. ${STEP_UP_NOTE} ${COLLATERAL_NOTE}`,
+    notes: `\`payReceive\` = direction of the fixed leg (Pay = payer swap); \`maturity\` tenor or date (alias \`tenor\`); \`index\` defaults to the currency's IBOR/RFR. ${STEP_UP_NOTE} ${SPREAD_UNIT_NOTE} ${COLLATERAL_NOTE}`,
   },
   FxForward: {
     type: "FxForward",
     tradeType: "FxForward",
     required: ["pair", "baseAmount", "rate", "deliveryDate"],
-    optional: [...COMMON_COLUMNS],
-    example: ["EURUSD", "-2.000.000", "1,1725", "2027-03-15", "FXF-CSV-1", "", "CPTY-B", "", ""],
-    notes: "`baseAmount` signed: positive = buy base / sell quote currency.",
+    optional: [...COMMON_COLUMNS, "buyCurrency", "buyAmount", "sellCurrency", "sellAmount"],
+    alternative: { columns: ["buyCurrency", "buyAmount", "sellCurrency", "sellAmount"], replaces: ["pair", "baseAmount", "rate"] },
+    example: ["EURUSD", "-2.000.000", "1,1725", "2027-03-15", "FXF-CSV-1", "", "CPTY-B", "", "", "", "", "", ""],
+    notes:
+      "`baseAmount` signed: positive = buy base / sell quote currency. Alternative vocabulary of the workstation's template (Markt R8-4): `buyCurrency`, `buyAmount`, `sellCurrency`, `sellAmount` instead of `pair`/`baseAmount`/`rate` (the trade buys `buyAmount` of `buyCurrency` against `sellAmount` of `sellCurrency`; `pair` = buy + sell currency, `rate` = `sellAmount` / `buyAmount`); when both vocabularies are filled, `pair`/`baseAmount`/`rate` win.",
   },
   CapFloor: {
     type: "CapFloor",
@@ -124,7 +135,7 @@ export const CSV_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     required: ["currency", "notional", "payerReceiver", "strike", "expiry", "tenor"],
     optional: [...COMMON_COLUMNS, "settlement", "longShort"],
     example: ["EUR", "10.000.000", "Payer", "3,00 %", "1Y", "5Y", "SWPT-CSV-1", "", "CPTY-A", "", "", "Physical", "Long"],
-    notes: "`expiry` tenor from the market valuation date or a date; `tenor` of the underlying swap; `settlement` Physical | Cash.",
+    notes: "`expiry` (alias `expiryDate`) tenor from the market valuation date or a date; `tenor` of the underlying swap; `settlement` Physical | Cash.",
   },
   FxOption: {
     type: "FxOption",
@@ -133,7 +144,7 @@ export const CSV_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     optional: [...COMMON_COLUMNS, "deliveryDate", "longShort", "barrierType", "barrierLevel", "barrierRebate", "barrierHit"],
     example: ["EURUSD", "Put", "3.000.000", "1,15", "2027-06-15", "FXO-CSV-1", "", "CPTY-A", "", "", "", "Long", "", "", "", ""],
     notes:
-      "`notional` in the base currency; `deliveryDate` defaults to the spot date of the expiry. Barrier options: `barrierType` UpIn | UpOut | DownIn | DownOut with `barrierLevel` (and optional `barrierRebate`); `barrierHit` true | false records an observed knock (N6-5) – without it the knock state is derived from spot / fixing with a `BARRIER_STATE_UNKNOWN:` warning.",
+      "`notional` in the base currency; `expiryDate` (alias `expiry` – the workstation's column) a date; `deliveryDate` defaults to the spot date of the expiry. Barrier options: `barrierType` UpIn | UpOut | DownIn | DownOut with `barrierLevel` (and optional `barrierRebate`); `barrierHit` true | false records an observed knock (N6-5) – without it the knock state is derived from spot / fixing with a `BARRIER_STATE_UNKNOWN:` warning.",
   },
   CrossCurrencySwap: {
     type: "CrossCurrencySwap",
@@ -142,17 +153,18 @@ export const CSV_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     optional: [...COMMON_COLUMNS, "fxSpot", "foreignNotional", "spread", "fixedRate", "domesticPayReceive", "frequency", "collateralCurrency"],
     example: ["EURUSD", "10.000.000", "2026-09-07", "5Y", "CCS-CSV-1", "", "CPTY-A", "", "", "1,17", "", "-20 bp", "", "Receive", "3M", ""],
     notes:
-      "exactly one of `fxSpot` / `foreignNotional` is required and fixes the foreign leg; `spread` decimal, `%` or `bp` (default 0); `fixedRate` makes the domestic leg fixed. " +
+      `exactly one of \`fxSpot\` / \`foreignNotional\` is required and fixes the foreign leg; \`spread\` on the domestic float leg (default 0) – ${SPREAD_UNIT_NOTE} \`fixedRate\` makes the domestic leg fixed. ` +
       "`collateralCurrency`: ISO code of the CSA currency, empty = market default (USD when one leg is USD, else the quote currency of the pair), `none` (also `unbesichert`, `ohne`) = explicitly uncollateralised – both legs on their own OIS curves, the built trade carries no `collateralCurrency` (same semantics as the web template's `collateral` column). " +
-      "Column aliases (Markt R7-5 – the workstation's older CCS template): `notional` → `domesticNotional`, `start` → `effectiveDate`, `maturity` → `tenor`, `rate` / `fixed rate` → `fixedRate`, `direction` / `payReceive` → `domesticPayReceive`, `collateral` / `csa` → `collateralCurrency`; a file exported by the workstation imports unchanged, and the workstation's template now carries these API names.",
+      "Column aliases (Markt R7-5 / R8-4 – the workstation's CCS template): `notional` → `domesticNotional`, `start` → `effectiveDate`, `maturity` → `tenor`, `rate` / `fixed rate` → `fixedRate`, `direction` / `payReceive` → `domesticPayReceive`, `collateral` / `csa` → `collateralCurrency`; a file exported by the workstation imports unchanged, and the workstation's template carries the API names.",
   },
   FRA: {
     type: "FRA",
     tradeType: "FRA",
     required: ["currency", "notional", "payReceive", "start", "rate"],
-    optional: [...COMMON_COLUMNS, "index", "end", "collateralCurrency"],
-    example: ["EUR", "5.000.000", "Pay", "3x9", "2,20 %", "FRA-CSV-1", "", "CPTY-B", "", "", "EURIBOR-6M", "", ""],
-    notes: `\`start\` as period \`3x9\` (months from spot) or accrual start date (then \`end\` defaults to start + index tenor); \`payReceive\` Pay = pay fixed. ${COLLATERAL_NOTE}`,
+    optional: [...COMMON_COLUMNS, "index", "end", "period", "collateralCurrency"],
+    alternative: { columns: ["period"], replaces: ["start"] },
+    example: ["EUR", "5.000.000", "Pay", "3x9", "2,20 %", "FRA-CSV-1", "", "CPTY-B", "", "", "EURIBOR-6M", "", "", ""],
+    notes: `\`start\` as period \`3x9\` (months from spot) or accrual start date (then \`end\` defaults to start + index tenor; alias \`maturity\`); the workstation's template writes the period in its own column \`period\` (Markt R8-4) – a filled \`period\` wins over \`start\`, an empty one leaves \`start\` in charge; \`payReceive\` Pay = pay fixed. ${COLLATERAL_NOTE}`,
   },
   FxSwap: {
     type: "FxSwap",
@@ -169,8 +181,7 @@ export const CSV_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     required: ["currency", "notional", "receiveIndex", "payIndex", "spread", "effectiveDate", "maturity"],
     optional: [...COMMON_COLUMNS],
     example: ["EUR", "10.000.000", "EURIBOR-6M", "EURIBOR-3M", "12 bp", "2026-09-07", "5Y", "BASIS-CSV-1", "", "CPTY-A", "", ""],
-    notes:
-      "tenor basis swap in one currency: receive `receiveIndex` + `spread` (decimal, `%` or `bp`) vs pay `payIndex`, both floating; the built trade is an `InterestRateSwap` with two float legs (leg 0 carries the spread).",
+    notes: `tenor basis swap in one currency: receive \`receiveIndex\` + \`spread\` vs pay \`payIndex\`, both floating; the built trade is an \`InterestRateSwap\` with two float legs (leg 0 carries the spread). ${SPREAD_UNIT_NOTE}`,
   },
   AmortisingSwap: {
     type: "AmortisingSwap",
@@ -234,6 +245,22 @@ const ALIASES: Record<string, string> = {
   payreceive: "payReceive",
   rate: "rate",
   maturity: "maturity",
+  // Markt R8-4: the workstation's vocabulary for the swaption / FX-option / FRA / FX-forward templates.
+  tenor: "tenor",
+  expiry: "expiry",
+  expirydate: "expiryDate",
+  period: "period",
+  periode: "period",
+  buycurrency: "buyCurrency",
+  kaufwährung: "buyCurrency",
+  kaufwaehrung: "buyCurrency",
+  buyamount: "buyAmount",
+  kaufbetrag: "buyAmount",
+  sellcurrency: "sellCurrency",
+  verkaufswährung: "sellCurrency",
+  verkaufswaehrung: "sellCurrency",
+  sellamount: "sellAmount",
+  verkaufsbetrag: "sellAmount",
   richtung: "payReceive",
   direction: "payReceive",
   payrec: "payReceive",
@@ -302,14 +329,17 @@ function canonicalColumn(header: string, template: CsvTemplate): string | undefi
   if (direct) return direct;
   const alias = ALIASES[key];
   if (alias && known.includes(alias)) return alias;
-  // "start"/"maturity" aliases for the swaption/CCS/FRA vocabularies.
+  // "start"/"maturity"/"tenor"/"expiry" aliases for the swaption/CCS/FRA/FX-option vocabularies (Markt R7-5, R8-4).
   if (alias === "effectiveDate" && known.includes("start")) return "start";
   if (alias === "start" && known.includes("effectiveDate")) return "effectiveDate";
   if (alias === "maturity" && known.includes("tenor")) return "tenor";
+  if (alias === "maturity" && known.includes("end")) return "end";
+  if (alias === "tenor" && known.includes("maturity")) return "maturity";
   if (alias === "fixedRate" && known.includes("rate")) return "rate";
   if (alias === "rate" && known.includes("fixedRate")) return "fixedRate";
   if (alias === "fixedRate" && known.includes("strike")) return "strike";
   if (alias === "expiry" && known.includes("expiryDate")) return "expiryDate";
+  if (alias === "expiryDate" && known.includes("expiry")) return "expiry";
   if (alias === "notional" && known.includes("domesticNotional")) return "domesticNotional";
   if (alias === "notional" && known.includes("baseAmount")) return "baseAmount";
   if (alias === "payReceive" && known.includes("payerReceiver")) return "payerReceiver";
@@ -392,12 +422,25 @@ export function parseCsvNumber(raw: string): number {
   return n;
 }
 
+/**
+ * Spread cell → decimal (Markt R8-4, the workstation's rule): a `%` / `bp` suffix is authoritative
+ * (`-20 bp` → −0,002, `0,12 %` → 0,0012); a plain number with |x| ≥ 1 is basis points (`-20` → −0,002,
+ * `5` → 0,0005), |x| < 1 a decimal (`-0,002`). A spread of a whole percentage point or more must
+ * therefore carry its unit – which is what both templates write.
+ */
+export function parseCsvSpread(raw: string): number {
+  const s = raw.trim();
+  if (/(%|bp)$/i.test(s)) return parseCsvNumber(s);
+  const v = parseCsvNumber(s);
+  return Math.abs(v) >= 1 ? v / 10_000 : v;
+}
+
 /** Serial date from ISO (`2026-09-07`) or German (`07.09.2026`) input. */
 export function parseCsvDate(raw: string): number {
   const s = raw.trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return parseISO(s);
   const de = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(s);
-  if (de) return parseISO(`${de[3]}-${de[2]!.padStart(2, "0")}-${de[1]!.padStart(2, "0")}`);
+  if (de) return parseISO(`${de[3]!}-${de[2]!.padStart(2, "0")}-${de[1]!.padStart(2, "0")}`);
   throw new Error(`not a date (YYYY-MM-DD or DD.MM.YYYY): "${raw}"`);
 }
 
@@ -476,6 +519,13 @@ class Row {
   optNum(col: string): number | undefined {
     return this.has(col) ? parseCsvNumber(this.cells[col]!) : undefined;
   }
+  /** Spread column with the unit heuristic (`parseCsvSpread`). */
+  spread(col = "spread"): number {
+    return parseCsvSpread(this.str(col));
+  }
+  optSpread(col = "spread"): number | undefined {
+    return this.has(col) ? parseCsvSpread(this.cells[col]!) : undefined;
+  }
   date(col: string): number {
     return parseCsvDate(this.str(col));
   }
@@ -518,7 +568,7 @@ function swapParams(row: Row) {
     payReceiveFixed: direction(row.str("payReceive"), "payReceive"),
     fixedRate: row.num("fixedRate"),
     index: row.opt("index"),
-    spread: row.optNum("spread"),
+    spread: row.optSpread(),
     fixedFrequency: row.opt("fixedFrequency")?.toUpperCase(),
     floatFrequency: row.opt("floatFrequency")?.toUpperCase(),
     // Fixed/float swaps are uncollateralised by default, so `none` and empty coincide here.
@@ -551,7 +601,7 @@ function buildTrade(row: Row, valuationDate: number): Trade {
         maturity: dateOrTenor(row.str("maturity")),
         receiveIndex: row.str("receiveIndex").toUpperCase(),
         payIndex: row.str("payIndex").toUpperCase(),
-        spread: row.num("spread"),
+        spread: row.spread(),
       });
     case "FxSwap":
       return makeFxSwap({
@@ -563,14 +613,33 @@ function buildTrade(row: Row, valuationDate: number): Trade {
         nearDate: row.date("nearDate"),
         farDate: row.date("farDate"),
       });
-    case "FxForward":
-      return makeFxForward({
+    case "FxForward": {
+      if (row.has("pair") || !row.has("buyCurrency")) {
+        return makeFxForward({
+          ...common,
+          pair: row.pair("pair"),
+          baseAmount: row.num("baseAmount"),
+          rate: row.num("rate"),
+          deliveryDate: row.date("deliveryDate"),
+        });
+      }
+      // Workstation vocabulary (Markt R8-4): buy `buyAmount` of `buyCurrency`, sell `sellAmount` of `sellCurrency`.
+      const buyCurrency = row.currency("buyCurrency");
+      const sellCurrency = row.currency("sellCurrency");
+      const buyAmount = row.num("buyAmount");
+      const sellAmount = row.num("sellAmount");
+      if (buyCurrency === sellCurrency) throw new Error(`buyCurrency and sellCurrency must differ (got ${buyCurrency})`);
+      if (!(buyAmount > 0) || !(sellAmount > 0)) throw new Error("buyAmount and sellAmount must be positive");
+      const built = makeFxForward({
         ...common,
-        pair: row.pair("pair"),
-        baseAmount: row.num("baseAmount"),
-        rate: row.num("rate"),
+        pair: `${buyCurrency}${sellCurrency}`,
+        baseAmount: buyAmount,
+        rate: sellAmount / buyAmount,
         deliveryDate: row.date("deliveryDate"),
       });
+      // Keep the amounts exactly as written (the builder's `sellAmount = buyAmount × rate` may differ in the last bit).
+      return { ...built, buyCurrency, buyAmount, sellCurrency, sellAmount };
+    }
     case "CapFloor":
       return makeCapFloor({
         ...common,
@@ -626,7 +695,7 @@ function buildTrade(row: Row, valuationDate: number): Trade {
         domesticNotional: row.num("domesticNotional"),
         fxSpot: row.optNum("fxSpot"),
         foreignNotional: row.optNum("foreignNotional"),
-        spread: row.optNum("spread") ?? 0,
+        spread: row.optSpread() ?? 0,
         fixedRate: row.optNum("fixedRate"),
         domesticPayReceive: row.has("domesticPayReceive") ? direction(row.str("domesticPayReceive"), "domesticPayReceive") : undefined,
         effectiveDate: row.date("effectiveDate"),
@@ -638,7 +707,8 @@ function buildTrade(row: Row, valuationDate: number): Trade {
       return makeCrossCurrencySwap(params);
     }
     case "FRA": {
-      const start = row.str("start").trim();
+      // The workstation writes the period (`3x6`) in its own column; a filled `period` wins, an empty one leaves `start` in charge.
+      const start = (row.opt("period") ?? row.str("start")).trim();
       return makeFra({
         ...common,
         name: row.opt("name"),
@@ -677,9 +747,14 @@ export function csvToTrades(text: string, type: CsvTradeType, valuationDate: num
   const template = CSV_TEMPLATES[type];
   const { header, rows } = parseCsvText(text);
   const columns = header.map((h) => canonicalColumn(h, template));
-  const missing = template.required.filter((c) => !columns.includes(c));
+  // An alternative vocabulary (FX forward buy/sell quartet, FRA `period`) stands in for the required columns it replaces.
+  const alt = template.alternative;
+  const altPresent = alt !== undefined && alt.columns.every((c) => columns.includes(c));
+  const missing = template.required.filter((c) => !columns.includes(c) && !(altPresent && alt.replaces.includes(c)));
   if (missing.length) {
-    throw new Error(`CSV header lacks required column(s) for ${type}: ${missing.join(", ")} (header: ${header.join(", ")})`);
+    const hint =
+      alt && !altPresent ? ` (or ${alt.columns.map((c) => `\`${c}\``).join(", ")} instead of ${alt.replaces.map((c) => `\`${c}\``).join(", ")})` : "";
+    throw new Error(`CSV header lacks required column(s) for ${type}: ${missing.join(", ")}${hint} (header: ${header.join(", ")})`);
   }
   const out: CsvImportResult = { trades: [], rows: [], rejected: [] };
   rows.forEach((cells, i) => {
@@ -689,7 +764,7 @@ export function csvToTrades(text: string, type: CsvTradeType, valuationDate: num
       if (col && cells[j] !== undefined && cells[j] !== "") record[col] = cells[j]!;
     });
     try {
-      const built = compact(buildTrade(new Row(record, template), valuationDate)) as Trade;
+      const built = compact(buildTrade(new Row(record, template), valuationDate));
       const extras: Partial<Trade> = {};
       if (record.name && !("name" in built)) extras.name = record.name;
       if (record.book) extras.book = record.book;
@@ -707,7 +782,8 @@ export function csvToTrades(text: string, type: CsvTradeType, valuationDate: num
 /** Markdown documentation of the templates (OpenAPI description and docs). */
 export function csvTemplatesMarkdown(): string {
   const lines = [
-    "CSV import (`content-type: text/csv`, `?type=<Template>`): header row, `;`/`,`/tab separated, German or plain numbers (`10.000.000,50`, `3,15 %`, `-20 bp`; a single dot is the decimal point, dots are thousands separators with a decimal comma or from two groups on), dates ISO or `DD.MM.YYYY`, tenors `5Y`. Common optional columns: `id`, `name`, `counterparty`, `book`, `uti`. Rows are mapped through the core builders and each built trade is checked against the `Trade` schema; a row that cannot be mapped or whose trade violates the schema is listed as `rejected` (`code: CSV_ROW_INVALID`) with its row number – it never fails the other rows. `?type=` names the template; `BasisSwap`, `AmortisingSwap` and `ImmSwap` build `InterestRateSwap` trades.",
+    "CSV import (`content-type: text/csv`, `?type=<Template>`): header row, `;`/`,`/tab separated, German or plain numbers (`10.000.000,50`, `3,15 %`, `-20 bp`; a single dot is the decimal point, dots are thousands separators with a decimal comma or from two groups on), dates ISO or `DD.MM.YYYY`, tenors `5Y`. Common optional columns: `id`, `name`, `counterparty`, `book`, `uti`; unknown columns (the workstation's `type`, `status`, `frequency`, `amortisation`) are ignored. Rows are mapped through the core builders and each built trade is checked against the `Trade` schema; a row that cannot be mapped or whose trade violates the schema is listed as `rejected` (`code: CSV_ROW_INVALID`) with its row number – it never fails the other rows. `?type=` names the template; `BasisSwap`, `AmortisingSwap` and `ImmSwap` build `InterestRateSwap` trades. " +
+      `The eleven workstation templates (\`apps/web/src/lib/portfolio-io.ts\`, header and example row) import through the matching \`?type=\` unchanged (Markt R8-4): aliases \`tenor\` ↔ \`maturity\`, \`expiry\` ↔ \`expiryDate\`, \`period\` (FRA), \`buyCurrency\`/\`buyAmount\`/\`sellCurrency\`/\`sellAmount\` (FX forward), \`direction\`/\`rate\`/\`start\`/\`collateral\` (swaps, CCS). ${SPREAD_UNIT_NOTE}`,
     "",
   ];
   for (const t of Object.values(CSV_TEMPLATES)) {

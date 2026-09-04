@@ -202,6 +202,13 @@ const floatLegSchemaBase = {
     compounding: { type: "string", enum: ["Compound", "Average"] },
     lookbackDays: { type: "integer", minimum: 0, maximum: 10 },
     observationShift: { type: "boolean" },
+    lockoutDays: {
+      type: "integer",
+      minimum: 0,
+      maximum: 10,
+      description:
+        "RFR compounding lockout (R8, N8-7): the fixing of the business day `end − lockoutDays` (fixing calendar of the index) applies to the remaining `lockoutDays` business days of the period (2–5 days in SOFR/€STR loan documentation); default 0",
+    },
   },
   additionalProperties: false,
 } as const;
@@ -401,6 +408,12 @@ export const fxOptionSchema = {
           type: "boolean",
           description:
             "Observed knock state (N6-5): `true` = the barrier has been touched (knock-out → rebate only, knock-in → vanilla), `false` = not touched so far. Without the flag the state is derived from today's spot (live option) or the expiry fixing (expired option) and, when that derivation decides the value, the valuation warns `BARRIER_STATE_UNKNOWN:`; `analytics.barrierState` reports alive | knocked-in | knocked-out",
+        },
+        rebateAt: {
+          type: "string",
+          enum: ["hit", "expiry"],
+          description:
+            'Knock-out rebate convention (R8, N7-5): `hit` = the rebate is paid when the barrier is touched (a decided knock-out is then worth 0, the rebate having been paid), `expiry` = paid at the delivery date (rebate·DF). Default: the model\'s convention (rebate at expiry for the live option, rebate·DF for decided knocks) with `analytics.rebateAt: "default"`',
         },
       },
       additionalProperties: false,
@@ -889,10 +902,15 @@ export const marketPutSchema = {
     collateralDiscountCurveId: {
       type: "object",
       description:
-        'Collateral (CSA) discount-curve mapping keyed `${ccy}|${collateralCcy}` (`{ "EUR|USD": "EUR-ESTR-USDCSA" }`) – merged into the snapshot\'s `collateralDiscountCurveId`; the curve must exist (422 `CURVE_NOT_FOUND`)',
+        'Collateral (CSA) discount-curve mapping keyed `${ccy}|${collateralCcy}` (`{ "EUR|USD": "EUR-ESTR-USDCSA" }`) – merged into the snapshot\'s `collateralDiscountCurveId`; the curve must exist (422 `CURVE_NOT_FOUND`) and be denominated in `ccy`, the first currency of the key (400 `INVALID_REQUEST`, N8-02 – EUR cash flows discounted on a CZK curve are a mis-valuation, not a CSA)',
       propertyNames: { type: "string", pattern: "^[A-Z]{3}\\|[A-Z]{3}$" },
       additionalProperties: { type: "string", minLength: 1, maxLength: 64 },
       maxProperties: 100,
+    },
+    discardImport: {
+      type: "boolean",
+      description:
+        "Import mode only (the active market came from `PUT /api/market/snapshot`): `true` drops the imported snapshot and rebuilds the sample market (for `valuationDate` when given, else for the current date); the response names it in `warnings[]` (`MARKET_STATE_DROPPED:`). Default `false`: a `valuationDate` change rolls the imported market instead (`rollMarket`, constant zero curves). Ignored in sample mode.",
     },
   },
   additionalProperties: false,
@@ -1123,7 +1141,16 @@ export const rateIndexSchema = {
     type: { type: "string", enum: ["IBOR", "OIS"], description: "IBOR = forward-looking term rate, OIS = compounded overnight rate" },
     tenor: { type: "string", pattern: "^([1-9]\\d{0,2}[DWMY])$", description: 'Index tenor: "1M" … "12M" (IBOR), "1D" for overnight indices' },
     dayCount,
-    fixingCalendar: { ...calendar, description: 'Fixing calendar id (registered calendar, e.g. "TARGET", "US", "UK", "NO", "TARGET+US")' },
+    fixingCalendar: {
+      ...calendar,
+      description:
+        'Fixing calendar id (registered calendar, e.g. "TARGET", "US", "US-SIFMA", "UK", "NO", "TARGET+US", or one registered with `POST /api/market/calendars`)',
+    },
+    paymentCalendar: {
+      ...calendar,
+      description:
+        "Optional accrual / payment calendar of the index schedule when it differs from the fixing calendar (R8: SOFR fixes on `US-SIFMA`, pays on `US`); default = `fixingCalendar`",
+    },
     fixingLag: { type: "integer", minimum: 0, maximum: 10, description: "Fixing lag in business days (2 for EURIBOR, 0 for €STR/SOFR)" },
     businessDayConvention: { type: "string", enum: [...BUSINESS_DAY_CONVENTIONS] },
     endOfMonth: { type: "boolean" },
@@ -1175,8 +1202,31 @@ export const swapConventionsSchema = {
 } as const;
 export const swapConventionsRef = { $ref: "SwapConventions#" } as const;
 
-/** Response of `POST /api/market/indices` / `/conventions`. */
-export const registerResponseSchema = (kind: "index" | "conventions") =>
+/** Serialisable custom calendar (Markt R8-2) – the body of `POST /api/market/calendars` and the items of a snapshot's `calendars`. */
+export const customCalendarSchema = {
+  $id: "CustomCalendar",
+  title: "CustomCalendar",
+  type: "object",
+  description:
+    "Holiday calendar defined by an explicit date list (core `CustomCalendar`), registered under `id` with `POST /api/market/calendars` so indices (`fixingCalendar`) and conventions (`calendar`) of a new currency can reference it – e.g. `CZ` with the Prague holidays instead of falling back to `TARGET`. Built-in calendars (`TARGET`, `DE`, `US`, `UK`, `CH`, `JP`, `NO`, `SE`, `DK`, `PL` and their aliases such as `EUR`, `USNY`, `GBLO`) cannot be replaced (400 `INVALID_CURVE_SPEC`). Weekends are holidays unless `weekendsAreHolidays: false`. Exported in the snapshot envelope (`calendars`, ADR-027) and re-registered on import before `indices` and `conventions`.",
+  required: ["id", "holidays"],
+  properties: {
+    id: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9._-]{0,31}$", description: 'Calendar id (stored upper-cased), e.g. "CZ", "PRAGUE", "CZ-PSE"' },
+    name: { type: "string", maxLength: 120, description: 'Display name, e.g. "Prague Stock Exchange" (documentation only)' },
+    holidays: {
+      type: "array",
+      maxItems: 5000,
+      items: isoDate,
+      description: "Holidays as ISO dates (`YYYY-MM-DD`); duplicates are dropped, weekends need not be listed. May be empty for a weekend-only calendar.",
+    },
+    weekendsAreHolidays: { type: "boolean", description: "Saturdays and Sundays are holidays (default `true`)" },
+  },
+  additionalProperties: false,
+} as const;
+export const customCalendarRef = { $ref: "CustomCalendar#" } as const;
+
+/** Response of `POST /api/market/indices` / `/conventions` / `/calendars`. */
+export const registerResponseSchema = (kind: "index" | "conventions" | "calendar") =>
   ({
     type: "object",
     required: ["registered", "replaced", kind],
@@ -1184,9 +1234,9 @@ export const registerResponseSchema = (kind: "index" | "conventions") =>
       registered: { type: "boolean", description: "Always `true` on 200/201" },
       replaced: {
         type: "boolean",
-        description: "`true` (200) when a runtime-registered entry of the same name / currency was replaced, `false` (201) for a new entry",
+        description: "`true` (200) when a runtime-registered entry of the same name / currency / id was replaced, `false` (201) for a new entry",
       },
-      [kind]: kind === "index" ? rateIndexRef : swapConventionsRef,
+      [kind]: kind === "index" ? rateIndexRef : kind === "conventions" ? swapConventionsRef : customCalendarRef,
       currencies: { type: "array", items: { type: "string" }, description: "`knownCurrencies()` after the call" },
       snapshotId: {
         type: "string",
@@ -1311,6 +1361,13 @@ export const marketSnapshotSchema = {
       description:
         "API envelope extension (ADR-027): swap conventions registered at runtime via `POST /api/market/conventions` (new currencies such as CZK/HUF, or overrides of built-in currencies) – exported when present, re-registered on import after `indices`.",
     },
+    calendars: {
+      type: "array",
+      maxItems: 100,
+      items: customCalendarRef,
+      description:
+        "API envelope extension (ADR-027, Markt R8-2): custom holiday calendars registered at runtime via `POST /api/market/calendars` – exported when present, re-registered on import before `indices` (which may reference them). The whole envelope is validated before anything is registered (N8-04): an invalid entry answers 400 `INVALID_CURVE_SPEC` with `details.problems[]` and registers nothing.",
+    },
   },
   additionalProperties: false,
 } as const;
@@ -1340,6 +1397,7 @@ export const API_ERROR_CODES = {
     "NO_FX_SPOT",
     "UNKNOWN_INDEX",
     "UNKNOWN_CALENDAR",
+    "INVALID_CALENDAR",
     "UNSUPPORTED_TRADE_TYPE",
     "INVALID_FREQUENCY",
     "UNKNOWN_DAYCOUNT",
@@ -1390,6 +1448,8 @@ export const WARNING_PREFIXES = [
   "EXPIRES_TODAY",
   "BARRIER_STATE_UNKNOWN",
   "VOL_IMPLAUSIBLE",
+  "MARKET_STATE_DROPPED",
+  "PAR_RISK_INCOMPLETE",
 ] as const;
 
 export const errorResponseSchema = {
@@ -1406,7 +1466,7 @@ export const errorResponseSchema = {
       // `examples` (the full code list) is added to the OpenAPI document by `openApiTransform` – @fastify/swagger would collapse it to a single `example`.
       description:
         "Machine-readable code (stable; the complete list is in `examples`). " +
-        "422 domain errors of the pricing core: INVALID_TRADE (semantically invalid trade), NON_FINITE_PV, MISSING_RATE, MISSING_FIXING (policy `throw`), NO_DISCOUNT_CURVE (currency without a discount-curve mapping – set it with `POST /api/market/curves` (first curve of a currency) or `PUT /api/market { discountCurveId }`), CURVE_NOT_FOUND (also 422 when `PUT /api/market { discountCurveId }` names a curve that is not in the market), NO_FX_SPOT, UNKNOWN_INDEX (a floating-rate index that is not registered – `GET /api/market` lists the registered `currencies` and `indices`; further indices are registered with `POST /api/market/indices`, further currencies with `POST /api/market/conventions`), UNKNOWN_CALENDAR, UNSUPPORTED_TRADE_TYPE, " +
+        "422 domain errors of the pricing core: INVALID_TRADE (semantically invalid trade), NON_FINITE_PV, MISSING_RATE, MISSING_FIXING (policy `throw`), NO_DISCOUNT_CURVE (currency without a discount-curve mapping – set it with `POST /api/market/curves` (first curve of a currency) or `PUT /api/market { discountCurveId }`), CURVE_NOT_FOUND (also 422 when `PUT /api/market { discountCurveId }` names a curve that is not in the market), NO_FX_SPOT, UNKNOWN_INDEX (a floating-rate index that is not registered – `GET /api/market` lists the registered `currencies` and `indices`; further indices are registered with `POST /api/market/indices`, further currencies with `POST /api/market/conventions`), UNKNOWN_CALENDAR (a calendar id nothing registered – built-in ids and aliases are listed in `GET /api/market` `calendars`, further calendars are registered with `POST /api/market/calendars`), INVALID_CALENDAR (400 on `POST /api/market/calendars`: a custom-calendar definition the core rejects – a holiday that is not a valid ISO date such as `2027-02-30`, `details.problems[]`; a built-in id answers INVALID_CURVE_SPEC with `details.builtIn`, the snapshot envelope reports the same problems under INVALID_CURVE_SPEC), UNSUPPORTED_TRADE_TYPE, " +
         'INVALID_FREQUENCY (frequency that is not a positive tenor, e.g. "7Q"), UNKNOWN_DAYCOUNT (day count outside the supported conventions), ' +
         "VOL_MODEL_INCOMPATIBLE (requested option model cannot be fed from the vol surface – e.g. Black on a non-positive forward or strike without shift), " +
         "INVALID_CREDIT_CURVE (CDS quotes imply a negative hazard rate; `details.pillar`; avoid with `floorHazard`), INVALID_TIMESTAMP (non-ISO-8601 timestamp: 400 on snapshot import, 422 from the EMIR export), " +
@@ -1415,7 +1475,7 @@ export const errorResponseSchema = {
         "INVALID_REQUEST (semantically invalid request outside the schema, e.g. no trades for a portfolio par-risk run), ID_MISMATCH (body `id` differs from the path id), INVALID_QUERY_MAP (`uti`/`transactionPrice` map malformed or above 4 kB – use the POST body), CSV_INVALID (CSV import: unparsable file / header / missing `?type=`), SNAPSHOT_MALFORMED, VOL_SURFACE_INVALID (a swaption / caplet / FX vol surface in `PUT /api/market`, a snapshot or a `designationSnapshot` is structurally inconsistent – grid rows ≠ expiries, row length ≠ tenors / strikes, FX vectors ≠ expiries, axes not strictly increasing, key ≠ currency / pair; `problems[]` names each path); " +
         "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request), STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods) and PAYLOAD_TOO_LARGE (body above the 5 MB limit); 415 UNSUPPORTED_MEDIA_TYPE (request body with a content-type other than `application/json` – `text/plain`, `application/xml`, … – or `text/csv` on any route but the import route); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED (also on unknown routes); 500 INTERNAL_ERROR. " +
         "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID (a CSV row that could not be mapped – parser / builder error – or whose built trade violates the `Trade` schema; the row is reported, the upload proceeds) and INTERNAL_ERROR (pricing failed for reasons that are not the trade's). " +
-        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset – or of an expired FX option's exercise date – approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `EXPIRED:` (FX option past its expiry with the delivery still pending – settled payoff, Greeks 0), `EXPIRES_TODAY:` (FX option expiring on the valuation date – intrinsic value on today's fixing / spot), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0), `BARRIER_STATE_UNKNOWN:` (barrier option without `barrier.hit` whose knock state was derived from today's spot or the expiry fixing – touch events in between are not observed), `VOL_IMPLAUSIBLE:` (a vol surface the valuation read – or a surface sent to `PUT /api/market` / the snapshot import, then in the 200 response's `warnings[]` – has numbers that do not fit its `volType`, e.g. a Lognormal cube with a median below 1 %, or is degenerate: all zeros / identical).",
+        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset – or of an expired FX option's exercise date – approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `EXPIRED:` (FX option past its expiry with the delivery still pending – settled payoff, Greeks 0), `EXPIRES_TODAY:` (FX option expiring on the valuation date – intrinsic value on today's fixing / spot), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0), `BARRIER_STATE_UNKNOWN:` (barrier option without `barrier.hit` whose knock state was derived from today's spot or the expiry fixing – touch events in between are not observed), `VOL_IMPLAUSIBLE:` (a vol surface the valuation read – or a surface sent to `PUT /api/market` / the snapshot import, then in the 200 response's `warnings[]` – has numbers that do not fit its `volType`, e.g. a Lognormal cube with a median below 1 %, or is degenerate: all zeros / identical), `MARKET_STATE_DROPPED:` (`PUT /api/market`: state of the previous market a valuation-date change or `discardImport` could not carry over – a runtime curve that no longer bootstraps, a discount / collateral mapping whose curve is gone, a discarded imported snapshot; everything else – runtime curves, mappings, vol overrides, fixings, spots – survives the change, N8-01), `PAR_RISK_INCOMPLETE:` (`POST /api/risk/par` and `/par/portfolio`: a curve the trade depends on has no bootstrap quotes in the store – imported snapshot curves outside the sample set – and was not bumped; the curve is listed in `curvesWithoutQuotes[]`; load it through `POST /api/market/curves` to track its quotes, Markt R8-3).",
     },
     details: {
       type: "object",
@@ -1502,7 +1562,7 @@ export const pricingResultSchema = {
       'LegResult[] (legType, pv, pvReporting, annuity, cashflows[] with kind Interest | Notional | Premium | OptionPayoff | Settlement, paymentDate, discountFactor, presentValue). A trade with an `upfront` premium / fee carries it as the last leg (`legType: "Upfront premium"`) with one cashflow of `kind: "Premium"` (amount −upfront.amount, discounted from `upfront.date`), so the premium appears in the cashflow table, in theta as a cashflow and in the CVA grid; before round 6 it was subtracted from the PV without a cashflow.',
     ),
     analytics: anyObject(
-      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1). " +
+      "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). Swaps: `parRate` / `fairSpread` are computed from the economic legs only (R8, N8-1 – an `upfront` premium no longer distorts them); with an `upfront` the all-in figures `parRateAllIn` / `fairSpreadAllIn` (the rate / spread that sets the PV including the premium to zero) are reported next to them. FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1) and `deltaPremiumAdjusted` (premium-adjusted spot delta, R8); barrier options report `rebateAt` (hit | expiry | default – the rebate convention applied). " +
         "Caps/floors and swaptions: `model` (Bachelier | Black | ShiftedBlack), `volatility` in the model's own quotation, `volConverted` (\"yes\" when the surface vols were converted into that quotation because the requested model differs from the surface's vol type – then `warnings[]` carries `VOL_TYPE_CONVERTED:` and swaptions additionally report the unconverted `surfaceVolatility`). " +
         'FX options additionally: `lifecycle` (state on the valuation date: live | expires-today | expired-pending-delivery | delivered – expired / delivered options are a settled payoff with Greeks 0 and `warnings[]` `EXPIRED:` / `EXPIRES_TODAY:`) and `greeksMethod` ("analytic" for vanillas, "finite-difference" for barrier / digital, "settled-payoff" after expiry); barrier options report `barrierState` (alive | knocked-in | knocked-out – from `barrier.hit` when given, otherwise derived with a `BARRIER_STATE_UNKNOWN:` warning when the derivation decides the value). Dates live in `details`.',
     ),
