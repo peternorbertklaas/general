@@ -105,9 +105,20 @@ describe("N8-1 – upfront fee: parRate / fairSpread are analytics of the econom
       [5e5, VAL + 365],
     ] as const) {
       const fee = computeXva(ctx, withUpfront(payer, amount, "EUR", date), credit, "EUR");
-      expect(Math.abs(fee.cva / base.cva - 1), `fee ${amount} in ${date - VAL} d`).toBeLessThan(0.001); // R8: −19.6 % / −19.2 % / −65.6 %
-      // R9 (N9-2): the premium date is an extra grid point; every coupon point from the premium date on is unchanged
-      expect(fee.profile.length).toBe(base.profile.length + 1);
+      if (date === VAL + 2) {
+        expect(Math.abs(fee.cva / base.cva - 1), `fee ${amount} in ${date - VAL} d`).toBeLessThan(0.001); // R8: −19.6 %
+      } else {
+        // R10 (N10-2): on the monthly grid the paid fee is netted at every point before its payment date – the CVA falls by at
+        // most fee·DF·LGD·PD(payment date) (R8: −19.2 % / −65.6 % through a shifted replication forward; R9 annual grid: ≈ 0)
+        const pd = 1 - Math.exp(-credit.cptyHazard * yearFraction(VAL, date, "ACT/365F"));
+        expect(fee.cva, `fee ${amount} in ${date - VAL} d`).toBeLessThan(base.cva);
+        expect(base.cva - fee.cva, `fee ${amount} in ${date - VAL} d`).toBeLessThan(
+          amount * getDiscountCurve(ctx, "EUR").df(date) * (1 - credit.cptyRecovery) * pd,
+        );
+      }
+      // R9 (N9-2): the premium date is a grid point (R10: an extra one unless it is a monthly / coupon point already);
+      // every point from the premium date on is unchanged
+      expect(fee.profile.length).toBe(base.profile.length + (base.profile.some((x) => x.date === date) ? 0 : 1));
       for (const p of fee.profile.slice(1)) {
         const b = base.profile.find((x) => x.date === p.date);
         if (!b) {

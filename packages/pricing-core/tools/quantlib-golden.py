@@ -962,6 +962,232 @@ def golden_lockout() -> None:
     write("rfr-lockout-quantlib.json", payload)
 
 
+# --------------------------------------------------------------------------
+# L. RFR lookback with observation shift and lookback on holiday-start periods
+#    (Quant R10 N10-1 / N10-3): with `observationShift` the daily weights AND the
+#    divisor come from the observation period (ISDA 2021 "Compounded with
+#    Observation Period Shift"), a period starting on a fixing holiday looks
+#    back from the business day whose rate is in effect on the start
+#    (`obs(inEffect(start))`, QuantLib `advance(adjust(start, Preceding), -n)`).
+#    Reference: closed-form manual compounding over the SIFMA business days and,
+#    with QuantLib, `OvernightIndexedCoupon(lookbackDays, 0, applyObservationShift)`.
+# --------------------------------------------------------------------------
+# SIFMA (SOFR publication) weekday holidays that the periods below or their lookback windows touch:
+# Presidents' Day, Good Friday, Memorial Day 2026 for the realised periods; the 2Y swap window (Aug 2026 – Sep 2028)
+# per QuantLib `UnitedStates(SOFR)` (asserted against the vendor calendar below; no Friday observance of the
+# Saturday New Year 01.01.2028, so 31.12.2027 is a publication day).
+OBS_SIFMA_HOLIDAYS = {d(2026, 2, 16), d(2026, 4, 3), d(2026, 5, 25)} | {
+    dt.date.fromisoformat(s)
+    for s in (
+        "2026-09-07", "2026-10-12", "2026-11-11", "2026-11-26", "2026-12-25", "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26",
+        "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06", "2027-10-11", "2027-11-11", "2027-11-25", "2027-12-24", "2028-01-17",
+        "2028-02-21", "2028-04-14", "2028-05-29", "2028-06-19", "2028-07-04", "2028-09-04",
+    )
+}
+OBS_PERIODS = [
+    (d(2026, 5, 1), d(2026, 6, 1), "monthly period, 31 accrual vs 28 observation days at lookback 5 (N10-1 reviewer case)"),
+    (d(2026, 4, 3), d(2026, 5, 4), "starts on Good Friday 03.04.2026 – a SIFMA holiday (N10-3 reviewer case)"),
+    (d(2026, 3, 3), d(2026, 4, 3), "ends on Good Friday 03.04.2026"),
+    (d(2026, 3, 19), d(2026, 4, 20), "regular period (business-day start and end)"),
+    (d(2026, 3, 2), d(2026, 6, 2), "quarterly period with equally long accrual and observation periods (92/92 days)"),
+]
+OBS_LOOKBACKS = (1, 2, 5)
+# Projected 2Y SOFR swap (quarterly, 100 Mio.) on a flat 4 % curve: evaluation date before the first observation day.
+OBS_SWAP_EVAL = d(2026, 8, 28)
+OBS_SWAP_START = d(2026, 9, 8)
+OBS_SWAP_END = d(2028, 9, 8)
+OBS_SWAP_FLAT_RATE = 0.04
+OBS_SWAP_NOTIONAL = 100e6
+
+
+def obs_sifma_bd(x: dt.date) -> bool:
+    return x.weekday() < 5 and x not in OBS_SIFMA_HOLIDAYS
+
+
+def obs_prev_bd(x: dt.date, n: int) -> dt.date:
+    while n > 0:
+        x -= dt.timedelta(1)
+        if obs_sifma_bd(x):
+            n -= 1
+    return x
+
+
+def obs_in_effect(x: dt.date) -> dt.date:
+    """Business day whose SOFR fixing is in effect on x (x itself, or the last business day before a holiday)."""
+    return x if obs_sifma_bd(x) else obs_prev_bd(x, 1)
+
+
+def obs_accrual_days(start: dt.date, end: dt.date) -> list:
+    """Accrual day starts: the period start (even on a holiday) and every SIFMA business day strictly inside."""
+    return [start] + [start + dt.timedelta(n) for n in range(1, days(start, end)) if obs_sifma_bd(start + dt.timedelta(n))]
+
+
+def obs_shift_rate(start: dt.date, end: dt.date, lookback: int, shift: bool, fixing) -> float:
+    """Compounded rate with lookback n (fixing of day d = obs(inEffect(d)) = n-th SIFMA business day before the
+    business day in effect on d) and optionally observation shift (weights and divisor from the observation
+    period [obs(inEffect(start)), obs(end)) instead of the accrual period [start, end))."""
+    def obs(x):
+        return obs_prev_bd(x, lookback) if lookback else x
+    starts = obs_accrual_days(start, end)
+    stops = starts[1:] + [end]
+    acc = 1.0
+    for x, stop in zip(starts, stops):
+        od = obs(obs_in_effect(x))
+        tau = days(od, obs(stop)) / 360.0 if shift else days(x, stop) / 360.0
+        acc *= 1.0 + fixing(od) * tau
+    divisor = days(obs(obs_in_effect(start)), obs(end)) / 360.0 if shift else days(start, end) / 360.0
+    return (acc - 1.0) / divisor
+
+
+def obs_swap_periods() -> list:
+    """Quarterly accrual periods of the 2Y swap, ModifiedFollowing on the US settlement calendar (QuantLib when available,
+    otherwise the checked-in dates)."""
+    if HAVE_QL:
+        cal = ql.UnitedStates(ql.UnitedStates.Settlement)
+        sch = ql.Schedule(ql.Date(OBS_SWAP_START.day, OBS_SWAP_START.month, OBS_SWAP_START.year),
+                          ql.Date(OBS_SWAP_END.day, OBS_SWAP_END.month, OBS_SWAP_END.year),
+                          ql.Period(3, ql.Months), cal, ql.ModifiedFollowing, ql.ModifiedFollowing, ql.DateGeneration.Forward, False)
+        ds = [dt.date(x.year(), x.month(), x.dayOfMonth()) for x in sch.dates()]
+        return list(zip(ds[:-1], ds[1:]))
+    ds = [d(2026, 9, 8), d(2026, 12, 8), d(2027, 3, 8), d(2027, 6, 8), d(2027, 9, 8), d(2027, 12, 8), d(2028, 3, 8), d(2028, 6, 8), d(2028, 9, 8)]
+    return list(zip(ds[:-1], ds[1:]))
+
+
+def golden_obs_shift() -> None:
+    """Realised SOFR periods (ACT/360, SIFMA fixing calendar, fixings 4.00 % + 0.02 %·((d − start) mod 7) relative to
+    each period's start) with lookback n = 1, 2, 5 – without and with observation shift. Fixing of accrual day d =
+    the n-th SIFMA business day before the business day whose rate is in effect on d (`obs(inEffect(d))`, N10-3: a
+    period starting on Good Friday looks back from the Thursday). Without shift the weights are the accrual days
+    and the divisor is the accrual period; with shift the weights are the observation days
+    [obs(inEffect(d)), obs(stop)) and the divisor is the observation period [obs(inEffect(start)), obs(end)) –
+    ISDA 2021 "Compounded with Observation Period Shift" (N10-1: 01.05.–01.06.2026 has 31 accrual but 28
+    observation days at lookback 5). Projected block: 2Y SOFR swap (quarterly, 100 Mio., ModifiedFollowing on the
+    US settlement calendar) on a flat 4 % continuously compounded ACT/365F curve as of 2026-08-28 – coupon rate =
+    (DF(obs(inEffect(start)))/DF(obs(end)) − 1)/τ_obs with shift, (DF(start)/DF(end) − 1)/τ_acc without lookback;
+    coupon = N·rate·τ_acc. QuantLib: `OvernightIndexedCoupon(…, Sofr, Actual360, lookbackDays, 0,
+    applyObservationShift)` with `CompoundingOvernightIndexedCouponPricer`; the flat curve as `FlatForward`."""
+    cases = []
+    for start, end, note in OBS_PERIODS:
+        def fixing(x, start=start):
+            return 0.04 + 0.0002 * (((x - start).days % 7 + 7) % 7)
+        for n in OBS_LOOKBACKS:
+            for shift in (False, True):
+                cases.append({
+                    "accrualStart": start.isoformat(),
+                    "accrualEnd": end.isoformat(),
+                    "note": note,
+                    "lookbackDays": n,
+                    "observationShift": shift,
+                    "observationStart": obs_prev_bd(obs_in_effect(start), n).isoformat(),
+                    "observationEnd": obs_prev_bd(end, n).isoformat(),
+                    "rate": obs_shift_rate(start, end, n, shift, fixing),
+                })
+    # projected swap coupons on the flat curve
+    def df(x):
+        return math.exp(-OBS_SWAP_FLAT_RATE * days(OBS_SWAP_EVAL, x) / 365.0)
+    swap_cases = []
+    for start, end in obs_swap_periods():
+        tau_acc = days(start, end) / 360.0
+        plain = (df(start) / df(end) - 1.0) / tau_acc
+        o_start = obs_prev_bd(obs_in_effect(start), 5)
+        o_end = obs_prev_bd(end, 5)
+        tau_obs = days(o_start, o_end) / 360.0
+        shifted = (df(o_start) / df(o_end) - 1.0) / tau_obs
+        swap_cases.append({
+            "accrualStart": start.isoformat(),
+            "accrualEnd": end.isoformat(),
+            "accrualDays": days(start, end),
+            "observationStart": o_start.isoformat(),
+            "observationEnd": o_end.isoformat(),
+            "observationDays": days(o_start, o_end),
+            "rateLookback0": plain,
+            "couponLookback0": OBS_SWAP_NOTIONAL * plain * tau_acc,
+            "rateLookback5Shift": shifted,
+            "couponLookback5Shift": OBS_SWAP_NOTIONAL * shifted * tau_acc,
+        })
+    ql_block = {"status": "pending", "note": "QuantLib not installed when the file was generated; run tools/quantlib-golden.py with the QuantLib Python bindings."}
+    if HAVE_QL:
+        cal = ql.UnitedStates(ql.UnitedStates.SOFR)
+        saved = ql.Settings.instance().evaluationDate
+        ql.Settings.instance().evaluationDate = ql.Date(VAL.day, VAL.month, VAL.year)
+        # the file's holiday assumptions must match the vendor calendar over every period and lookback window
+        for x in (d(2026, 2, 9) + dt.timedelta(n) for n in range(days(d(2026, 2, 9), d(2026, 6, 3)))):
+            assert cal.isBusinessDay(ql.Date(x.day, x.month, x.year)) == obs_sifma_bd(x), x
+        for x in (d(2026, 8, 1) + dt.timedelta(n) for n in range(days(d(2026, 8, 1), d(2028, 10, 1)))):
+            assert cal.isBusinessDay(ql.Date(x.day, x.month, x.year)) == obs_sifma_bd(x), x
+        ql_cases = []
+        for c in cases:
+            start = dt.date.fromisoformat(c["accrualStart"])
+            end = dt.date.fromisoformat(c["accrualEnd"])
+            idx = ql.Sofr()
+            idx.clearFixings()
+            x = start - dt.timedelta(15)
+            while x <= end:
+                if obs_sifma_bd(x):
+                    idx.addFixing(ql.Date(x.day, x.month, x.year), 0.04 + 0.0002 * (((x - start).days % 7 + 7) % 7))
+                x += dt.timedelta(1)
+            cpn = ql.OvernightIndexedCoupon(ql.Date(end.day, end.month, end.year), 1.0, ql.Date(start.day, start.month, start.year),
+                                            ql.Date(end.day, end.month, end.year), idx, 1.0, 0.0, ql.Date(), ql.Date(), ql.Actual360(), False,
+                                            ql.RateAveraging.Compound, c["lookbackDays"], 0, c["observationShift"])
+            cpn.setPricer(ql.CompoundingOvernightIndexedCouponPricer())
+            vd = cpn.valueDates()
+            ql_cases.append({
+                "accrualStart": c["accrualStart"], "accrualEnd": c["accrualEnd"], "lookbackDays": c["lookbackDays"],
+                "observationShift": c["observationShift"], "rate": cpn.rate(),
+                "firstValueDate": vd[0].ISO(), "lastValueDate": vd[-1].ISO(),
+                "firstFixingDates": [y.ISO() for y in cpn.fixingDates()][:3],
+                "sumDt": sum(cpn.dt()),
+            })
+        # projected swap on the flat curve
+        ql.Settings.instance().evaluationDate = ql.Date(OBS_SWAP_EVAL.day, OBS_SWAP_EVAL.month, OBS_SWAP_EVAL.year)
+        flat = ql.FlatForward(ql.Date(OBS_SWAP_EVAL.day, OBS_SWAP_EVAL.month, OBS_SWAP_EVAL.year), OBS_SWAP_FLAT_RATE, ql.Actual365Fixed(), ql.Continuous)
+        sofr = ql.Sofr(ql.YieldTermStructureHandle(flat))
+        ql_swap = []
+        for start, end in obs_swap_periods():
+            row = {"accrualStart": start.isoformat(), "accrualEnd": end.isoformat()}
+            for key, (n, shift) in {"rateLookback0": (0, False), "rateLookback5Shift": (5, True), "rateLookback5NoShift": (5, False)}.items():
+                cpn = ql.OvernightIndexedCoupon(ql.Date(end.day, end.month, end.year), OBS_SWAP_NOTIONAL, ql.Date(start.day, start.month, start.year),
+                                                ql.Date(end.day, end.month, end.year), sofr, 1.0, 0.0, ql.Date(), ql.Date(), ql.Actual360(), False,
+                                                ql.RateAveraging.Compound, n, 0, shift)
+                cpn.setPricer(ql.CompoundingOvernightIndexedCouponPricer())
+                row[key] = cpn.rate()
+                row[key.replace("rate", "coupon")] = cpn.amount()
+            ql_swap.append(row)
+        ql.Settings.instance().evaluationDate = saved
+        ql_block = {
+            "status": "done", "version": ql.__version__,
+            "engine": "OvernightIndexedCoupon + CompoundingOvernightIndexedCouponPricer, Sofr() with the synthetic fixings; swap: Sofr on FlatForward(4 %, Actual365Fixed, Continuous)",
+            "cases": ql_cases,
+            "swap": ql_swap,
+        }
+    payload = {
+        "case": "rfr-observation-shift-quantlib",
+        "description": "Compounded SOFR rates with lookback 1/2/5 without and with observation shift on five periods (monthly 01.05.–01.06.2026 with 31 vs 28 days, start on Good Friday, end on Good Friday, regular, quarterly 92/92) plus the projected coupons of a 2Y SOFR swap (lookback 5 + observation shift) on a flat curve (Quant R10 N10-1: divisor = observation period; N10-3: lookback from the business day in effect on a holiday start).",
+        "derivation": golden_obs_shift.__doc__.strip(),
+        "inputs": {
+            "valuationDate": VAL.isoformat(),
+            "index": "SOFR",
+            "fixingCalendar": "US-SIFMA",
+            "dayCount": "ACT/360",
+            "fixingRule": "0.04 + 0.0002 * (((d - accrualStart) mod 7) + 7 mod 7) on every SIFMA business day from accrualStart − 15 to accrualEnd, per period",
+            "fixingHolidays": sorted(x.isoformat() for x in OBS_SIFMA_HOLIDAYS),
+            "swap": {
+                "evaluationDate": OBS_SWAP_EVAL.isoformat(),
+                "flatRate": OBS_SWAP_FLAT_RATE,
+                "flatCurveDayCount": "ACT/365F",
+                "compounding": "continuous",
+                "notional": OBS_SWAP_NOTIONAL,
+                "lookbackDays": 5,
+                "scheduleCalendar": "US",
+                "frequency": "3M",
+            },
+        },
+        "expected": {"cases": cases, "swap": swap_cases},
+        "quantlib": ql_block,
+    }
+    write("rfr-observation-shift-quantlib.json", payload)
+
+
 if __name__ == "__main__":
     print("QuantLib available:", HAVE_QL)
     golden_swap()
@@ -975,4 +1201,5 @@ if __name__ == "__main__":
     golden_cds()
     golden_calendars()
     golden_lockout()
+    golden_obs_shift()
     sys.exit(0)

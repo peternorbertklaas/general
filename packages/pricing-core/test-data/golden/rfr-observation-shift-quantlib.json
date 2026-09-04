@@ -1,0 +1,872 @@
+{
+  "case": "rfr-observation-shift-quantlib",
+  "description": "Compounded SOFR rates with lookback 1/2/5 without and with observation shift on five periods (monthly 01.05.–01.06.2026 with 31 vs 28 days, start on Good Friday, end on Good Friday, regular, quarterly 92/92) plus the projected coupons of a 2Y SOFR swap (lookback 5 + observation shift) on a flat curve (Quant R10 N10-1: divisor = observation period; N10-3: lookback from the business day in effect on a holiday start).",
+  "derivation": "Realised SOFR periods (ACT/360, SIFMA fixing calendar, fixings 4.00 % + 0.02 %·((d − start) mod 7) relative to\n    each period's start) with lookback n = 1, 2, 5 – without and with observation shift. Fixing of accrual day d =\n    the n-th SIFMA business day before the business day whose rate is in effect on d (`obs(inEffect(d))`, N10-3: a\n    period starting on Good Friday looks back from the Thursday). Without shift the weights are the accrual days\n    and the divisor is the accrual period; with shift the weights are the observation days\n    [obs(inEffect(d)), obs(stop)) and the divisor is the observation period [obs(inEffect(start)), obs(end)) –\n    ISDA 2021 \"Compounded with Observation Period Shift\" (N10-1: 01.05.–01.06.2026 has 31 accrual but 28\n    observation days at lookback 5). Projected block: 2Y SOFR swap (quarterly, 100 Mio., ModifiedFollowing on the\n    US settlement calendar) on a flat 4 % continuously compounded ACT/365F curve as of 2026-08-28 – coupon rate =\n    (DF(obs(inEffect(start)))/DF(obs(end)) − 1)/τ_obs with shift, (DF(start)/DF(end) − 1)/τ_acc without lookback;\n    coupon = N·rate·τ_acc. QuantLib: `OvernightIndexedCoupon(…, Sofr, Actual360, lookbackDays, 0,\n    applyObservationShift)` with `CompoundingOvernightIndexedCouponPricer`; the flat curve as `FlatForward`.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "index": "SOFR",
+    "fixingCalendar": "US-SIFMA",
+    "dayCount": "ACT/360",
+    "fixingRule": "0.04 + 0.0002 * (((d - accrualStart) mod 7) + 7 mod 7) on every SIFMA business day from accrualStart − 15 to accrualEnd, per period",
+    "fixingHolidays": [
+      "2026-02-16",
+      "2026-04-03",
+      "2026-05-25",
+      "2026-09-07",
+      "2026-10-12",
+      "2026-11-11",
+      "2026-11-26",
+      "2026-12-25",
+      "2027-01-01",
+      "2027-01-18",
+      "2027-02-15",
+      "2027-03-26",
+      "2027-05-31",
+      "2027-06-18",
+      "2027-07-05",
+      "2027-09-06",
+      "2027-10-11",
+      "2027-11-11",
+      "2027-11-25",
+      "2027-12-24",
+      "2028-01-17",
+      "2028-02-21",
+      "2028-04-14",
+      "2028-05-29",
+      "2028-06-19",
+      "2028-07-04",
+      "2028-09-04"
+    ],
+    "swap": {
+      "evaluationDate": "2026-08-28",
+      "flatRate": 0.04,
+      "flatCurveDayCount": "ACT/365F",
+      "compounding": "continuous",
+      "notional": 100000000.0,
+      "lookbackDays": 5,
+      "scheduleCalendar": "US",
+      "frequency": "3M"
+    }
+  },
+  "expected": {
+    "cases": [
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "note": "monthly period, 31 accrual vs 28 observation days at lookback 5 (N10-1 reviewer case)",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "observationStart": "2026-04-30",
+        "observationEnd": "2026-05-29",
+        "rate": 0.040976740701801996
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "note": "monthly period, 31 accrual vs 28 observation days at lookback 5 (N10-1 reviewer case)",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "observationStart": "2026-04-30",
+        "observationEnd": "2026-05-29",
+        "rate": 0.040578841961835733
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "note": "monthly period, 31 accrual vs 28 observation days at lookback 5 (N10-1 reviewer case)",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "observationStart": "2026-04-29",
+        "observationEnd": "2026-05-28",
+        "rate": 0.04089908389285479
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "note": "monthly period, 31 accrual vs 28 observation days at lookback 5 (N10-1 reviewer case)",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "observationStart": "2026-04-29",
+        "observationEnd": "2026-05-28",
+        "rate": 0.04057192365807138
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "note": "monthly period, 31 accrual vs 28 observation days at lookback 5 (N10-1 reviewer case)",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "observationStart": "2026-04-24",
+        "observationEnd": "2026-05-22",
+        "rate": 0.04060788000273587
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "note": "monthly period, 31 accrual vs 28 observation days at lookback 5 (N10-1 reviewer case)",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "observationStart": "2026-04-24",
+        "observationEnd": "2026-05-22",
+        "rate": 0.040573988044056986
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "note": "starts on Good Friday 03.04.2026 – a SIFMA holiday (N10-3 reviewer case)",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "observationStart": "2026-04-01",
+        "observationEnd": "2026-05-01",
+        "rate": 0.04097720287950971
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "note": "starts on Good Friday 03.04.2026 – a SIFMA holiday (N10-3 reviewer case)",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "observationStart": "2026-04-01",
+        "observationEnd": "2026-05-01",
+        "rate": 0.04073775233770682
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "note": "starts on Good Friday 03.04.2026 – a SIFMA holiday (N10-3 reviewer case)",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "observationStart": "2026-03-31",
+        "observationEnd": "2026-04-30",
+        "rate": 0.0408995416032534
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "note": "starts on Good Friday 03.04.2026 – a SIFMA holiday (N10-3 reviewer case)",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "observationStart": "2026-03-31",
+        "observationEnd": "2026-04-30",
+        "rate": 0.04072437527113504
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "note": "starts on Good Friday 03.04.2026 – a SIFMA holiday (N10-3 reviewer case)",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "observationStart": "2026-03-26",
+        "observationEnd": "2026-04-27",
+        "rate": 0.04072480770579645
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "note": "starts on Good Friday 03.04.2026 – a SIFMA holiday (N10-3 reviewer case)",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "observationStart": "2026-03-26",
+        "observationEnd": "2026-04-27",
+        "rate": 0.04066849167487785
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "note": "ends on Good Friday 03.04.2026",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "observationStart": "2026-03-02",
+        "observationEnd": "2026-04-02",
+        "rate": 0.04052458015909108
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "note": "ends on Good Friday 03.04.2026",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "observationStart": "2026-03-02",
+        "observationEnd": "2026-04-02",
+        "rate": 0.040576349988216596
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "note": "ends on Good Friday 03.04.2026",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "observationStart": "2026-02-27",
+        "observationEnd": "2026-04-01",
+        "rate": 0.04048575719481029
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "note": "ends on Good Friday 03.04.2026",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "observationStart": "2026-02-27",
+        "observationEnd": "2026-04-01",
+        "rate": 0.04059826737283536
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "note": "ends on Good Friday 03.04.2026",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "observationStart": "2026-02-24",
+        "observationEnd": "2026-03-27",
+        "rate": 0.04055045633032262
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "note": "ends on Good Friday 03.04.2026",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "observationStart": "2026-02-24",
+        "observationEnd": "2026-03-27",
+        "rate": 0.04055045633032262
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "note": "regular period (business-day start and end)",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "observationStart": "2026-03-18",
+        "observationEnd": "2026-04-17",
+        "rate": 0.04061204480290376
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "note": "regular period (business-day start and end)",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "observationStart": "2026-03-18",
+        "observationEnd": "2026-04-17",
+        "rate": 0.0405638923255518
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "note": "regular period (business-day start and end)",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "observationStart": "2026-03-17",
+        "observationEnd": "2026-04-16",
+        "rate": 0.04092554870426035
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "note": "regular period (business-day start and end)",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "observationStart": "2026-03-17",
+        "observationEnd": "2026-04-16",
+        "rate": 0.040597334620551706
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "note": "regular period (business-day start and end)",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "observationStart": "2026-03-12",
+        "observationEnd": "2026-04-13",
+        "rate": 0.040505462166891826
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "note": "regular period (business-day start and end)",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "observationStart": "2026-03-12",
+        "observationEnd": "2026-04-13",
+        "rate": 0.04051800159244723
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "note": "quarterly period with equally long accrual and observation periods (92/92 days)",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "observationStart": "2026-02-27",
+        "observationEnd": "2026-06-01",
+        "rate": 0.04066402237574099
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "note": "quarterly period with equally long accrual and observation periods (92/92 days)",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "observationStart": "2026-02-27",
+        "observationEnd": "2026-06-01",
+        "rate": 0.04073601620557243
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "note": "quarterly period with equally long accrual and observation periods (92/92 days)",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "observationStart": "2026-02-26",
+        "observationEnd": "2026-05-29",
+        "rate": 0.04060035364470928
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "note": "quarterly period with equally long accrual and observation periods (92/92 days)",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "observationStart": "2026-02-26",
+        "observationEnd": "2026-05-29",
+        "rate": 0.040723299408180084
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "note": "quarterly period with equally long accrual and observation periods (92/92 days)",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "observationStart": "2026-02-23",
+        "observationEnd": "2026-05-26",
+        "rate": 0.04070792838778445
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "note": "quarterly period with equally long accrual and observation periods (92/92 days)",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "observationStart": "2026-02-23",
+        "observationEnd": "2026-05-26",
+        "rate": 0.04071671053995689
+      }
+    ],
+    "swap": [
+      {
+        "accrualStart": "2026-09-08",
+        "accrualEnd": "2026-12-08",
+        "accrualDays": 91,
+        "observationStart": "2026-08-31",
+        "observationEnd": "2026-12-01",
+        "observationDays": 92,
+        "rateLookback0": 0.03964943019926063,
+        "couponLookback0": 1002249.4855924214,
+        "rateLookback5Shift": 0.039651606461367374,
+        "couponLookback5Shift": 1002304.4966623419
+      },
+      {
+        "accrualStart": "2026-12-08",
+        "accrualEnd": "2027-03-08",
+        "accrualDays": 90,
+        "observationStart": "2026-12-01",
+        "observationEnd": "2027-03-01",
+        "observationDays": 90,
+        "rateLookback0": 0.03964725409627512,
+        "couponLookback0": 991181.352406878,
+        "rateLookback5Shift": 0.03964725409627512,
+        "couponLookback5Shift": 991181.352406878
+      },
+      {
+        "accrualStart": "2027-03-08",
+        "accrualEnd": "2027-06-08",
+        "accrualDays": 92,
+        "observationStart": "2027-03-01",
+        "observationEnd": "2027-06-01",
+        "observationDays": 92,
+        "rateLookback0": 0.039651606461367374,
+        "couponLookback0": 1013318.8317904995,
+        "rateLookback5Shift": 0.039651606461367374,
+        "couponLookback5Shift": 1013318.8317904995
+      },
+      {
+        "accrualStart": "2027-06-08",
+        "accrualEnd": "2027-09-08",
+        "accrualDays": 92,
+        "observationStart": "2027-06-01",
+        "observationEnd": "2027-08-31",
+        "observationDays": 91,
+        "rateLookback0": 0.039651606461367374,
+        "couponLookback0": 1013318.8317904995,
+        "rateLookback5Shift": 0.03964943019925975,
+        "couponLookback5Shift": 1013263.2162033046
+      },
+      {
+        "accrualStart": "2027-09-08",
+        "accrualEnd": "2027-12-08",
+        "accrualDays": 91,
+        "observationStart": "2027-08-31",
+        "observationEnd": "2027-12-01",
+        "observationDays": 92,
+        "rateLookback0": 0.03964943019925975,
+        "couponLookback0": 1002249.4855923991,
+        "rateLookback5Shift": 0.039651606461367374,
+        "couponLookback5Shift": 1002304.4966623419
+      },
+      {
+        "accrualStart": "2027-12-08",
+        "accrualEnd": "2028-03-08",
+        "accrualDays": 91,
+        "observationStart": "2027-12-01",
+        "observationEnd": "2028-03-01",
+        "observationDays": 91,
+        "rateLookback0": 0.03964943019926063,
+        "couponLookback0": 1002249.4855924214,
+        "rateLookback5Shift": 0.03964943019925975,
+        "couponLookback5Shift": 1002249.4855923991
+      },
+      {
+        "accrualStart": "2028-03-08",
+        "accrualEnd": "2028-06-08",
+        "accrualDays": 92,
+        "observationStart": "2028-03-01",
+        "observationEnd": "2028-06-01",
+        "observationDays": 92,
+        "rateLookback0": 0.039651606461367374,
+        "couponLookback0": 1013318.8317904995,
+        "rateLookback5Shift": 0.039651606461367374,
+        "couponLookback5Shift": 1013318.8317904995
+      },
+      {
+        "accrualStart": "2028-06-08",
+        "accrualEnd": "2028-09-08",
+        "accrualDays": 92,
+        "observationStart": "2028-06-01",
+        "observationEnd": "2028-08-31",
+        "observationDays": 91,
+        "rateLookback0": 0.039651606461366506,
+        "couponLookback0": 1013318.8317904774,
+        "rateLookback5Shift": 0.03964943019925975,
+        "couponLookback5Shift": 1013263.2162033046
+      }
+    ]
+  },
+  "quantlib": {
+    "status": "done",
+    "version": "1.43",
+    "engine": "OvernightIndexedCoupon + CompoundingOvernightIndexedCouponPricer, Sofr() with the synthetic fixings; swap: Sofr on FlatForward(4 %, Actual365Fixed, Continuous)",
+    "cases": [
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "rate": 0.040976740701801996,
+        "firstValueDate": "2026-04-30",
+        "lastValueDate": "2026-05-29",
+        "firstFixingDates": ["2026-04-30", "2026-05-01", "2026-05-04"],
+        "sumDt": 0.0861111111111111
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "rate": 0.040578841961835733,
+        "firstValueDate": "2026-04-30",
+        "lastValueDate": "2026-05-29",
+        "firstFixingDates": ["2026-04-30", "2026-05-01", "2026-05-04"],
+        "sumDt": 0.08055555555555555
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "rate": 0.04089908389285479,
+        "firstValueDate": "2026-04-29",
+        "lastValueDate": "2026-05-28",
+        "firstFixingDates": ["2026-04-29", "2026-04-30", "2026-05-01"],
+        "sumDt": 0.0861111111111111
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "rate": 0.04057192365807138,
+        "firstValueDate": "2026-04-29",
+        "lastValueDate": "2026-05-28",
+        "firstFixingDates": ["2026-04-29", "2026-04-30", "2026-05-01"],
+        "sumDt": 0.08055555555555555
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "rate": 0.04060788000273587,
+        "firstValueDate": "2026-04-24",
+        "lastValueDate": "2026-05-22",
+        "firstFixingDates": ["2026-04-24", "2026-04-27", "2026-04-28"],
+        "sumDt": 0.0861111111111111
+      },
+      {
+        "accrualStart": "2026-05-01",
+        "accrualEnd": "2026-06-01",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "rate": 0.040573988044056986,
+        "firstValueDate": "2026-04-24",
+        "lastValueDate": "2026-05-22",
+        "firstFixingDates": ["2026-04-24", "2026-04-27", "2026-04-28"],
+        "sumDt": 0.07777777777777778
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "rate": 0.04097720287950971,
+        "firstValueDate": "2026-04-01",
+        "lastValueDate": "2026-05-01",
+        "firstFixingDates": ["2026-04-01", "2026-04-02", "2026-04-06"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "rate": 0.04073775233770682,
+        "firstValueDate": "2026-04-01",
+        "lastValueDate": "2026-05-01",
+        "firstFixingDates": ["2026-04-01", "2026-04-02", "2026-04-06"],
+        "sumDt": 0.08333333333333333
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "rate": 0.0408995416032534,
+        "firstValueDate": "2026-03-31",
+        "lastValueDate": "2026-04-30",
+        "firstFixingDates": ["2026-03-31", "2026-04-01", "2026-04-02"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "rate": 0.04072437527113504,
+        "firstValueDate": "2026-03-31",
+        "lastValueDate": "2026-04-30",
+        "firstFixingDates": ["2026-03-31", "2026-04-01", "2026-04-02"],
+        "sumDt": 0.08333333333333333
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "rate": 0.04072480770579645,
+        "firstValueDate": "2026-03-26",
+        "lastValueDate": "2026-04-27",
+        "firstFixingDates": ["2026-03-26", "2026-03-27", "2026-03-30"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-04-03",
+        "accrualEnd": "2026-05-04",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "rate": 0.04066849167487785,
+        "firstValueDate": "2026-03-26",
+        "lastValueDate": "2026-04-27",
+        "firstFixingDates": ["2026-03-26", "2026-03-27", "2026-03-30"],
+        "sumDt": 0.08888888888888888
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "rate": 0.04052458015909108,
+        "firstValueDate": "2026-03-02",
+        "lastValueDate": "2026-04-02",
+        "firstFixingDates": ["2026-03-02", "2026-03-03", "2026-03-04"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "rate": 0.040576349988216596,
+        "firstValueDate": "2026-03-02",
+        "lastValueDate": "2026-04-02",
+        "firstFixingDates": ["2026-03-02", "2026-03-03", "2026-03-04"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "rate": 0.04048575719481029,
+        "firstValueDate": "2026-02-27",
+        "lastValueDate": "2026-04-01",
+        "firstFixingDates": ["2026-02-27", "2026-03-02", "2026-03-03"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "rate": 0.04059826737283536,
+        "firstValueDate": "2026-02-27",
+        "lastValueDate": "2026-04-01",
+        "firstFixingDates": ["2026-02-27", "2026-03-02", "2026-03-03"],
+        "sumDt": 0.09166666666666667
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "rate": 0.04055045633032262,
+        "firstValueDate": "2026-02-24",
+        "lastValueDate": "2026-03-27",
+        "firstFixingDates": ["2026-02-24", "2026-02-25", "2026-02-26"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-03-03",
+        "accrualEnd": "2026-04-03",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "rate": 0.04055045633032262,
+        "firstValueDate": "2026-02-24",
+        "lastValueDate": "2026-03-27",
+        "firstFixingDates": ["2026-02-24", "2026-02-25", "2026-02-26"],
+        "sumDt": 0.08611111111111111
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "rate": 0.04061204480290376,
+        "firstValueDate": "2026-03-18",
+        "lastValueDate": "2026-04-17",
+        "firstFixingDates": ["2026-03-18", "2026-03-19", "2026-03-20"],
+        "sumDt": 0.08888888888888889
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "rate": 0.0405638923255518,
+        "firstValueDate": "2026-03-18",
+        "lastValueDate": "2026-04-17",
+        "firstFixingDates": ["2026-03-18", "2026-03-19", "2026-03-20"],
+        "sumDt": 0.08333333333333333
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "rate": 0.04092554870426035,
+        "firstValueDate": "2026-03-17",
+        "lastValueDate": "2026-04-16",
+        "firstFixingDates": ["2026-03-17", "2026-03-18", "2026-03-19"],
+        "sumDt": 0.08888888888888889
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "rate": 0.040597334620551706,
+        "firstValueDate": "2026-03-17",
+        "lastValueDate": "2026-04-16",
+        "firstFixingDates": ["2026-03-17", "2026-03-18", "2026-03-19"],
+        "sumDt": 0.08333333333333334
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "rate": 0.040505462166891826,
+        "firstValueDate": "2026-03-12",
+        "lastValueDate": "2026-04-13",
+        "firstFixingDates": ["2026-03-12", "2026-03-13", "2026-03-16"],
+        "sumDt": 0.08888888888888889
+      },
+      {
+        "accrualStart": "2026-03-19",
+        "accrualEnd": "2026-04-20",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "rate": 0.04051800159244723,
+        "firstValueDate": "2026-03-12",
+        "lastValueDate": "2026-04-13",
+        "firstFixingDates": ["2026-03-12", "2026-03-13", "2026-03-16"],
+        "sumDt": 0.08888888888888888
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "lookbackDays": 1,
+        "observationShift": false,
+        "rate": 0.04066402237574099,
+        "firstValueDate": "2026-02-27",
+        "lastValueDate": "2026-06-01",
+        "firstFixingDates": ["2026-02-27", "2026-03-02", "2026-03-03"],
+        "sumDt": 0.2555555555555553
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "lookbackDays": 1,
+        "observationShift": true,
+        "rate": 0.04073601620557243,
+        "firstValueDate": "2026-02-27",
+        "lastValueDate": "2026-06-01",
+        "firstFixingDates": ["2026-02-27", "2026-03-02", "2026-03-03"],
+        "sumDt": 0.2611111111111109
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "lookbackDays": 2,
+        "observationShift": false,
+        "rate": 0.04060035364470928,
+        "firstValueDate": "2026-02-26",
+        "lastValueDate": "2026-05-29",
+        "firstFixingDates": ["2026-02-26", "2026-02-27", "2026-03-02"],
+        "sumDt": 0.2555555555555553
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "lookbackDays": 2,
+        "observationShift": true,
+        "rate": 0.040723299408180084,
+        "firstValueDate": "2026-02-26",
+        "lastValueDate": "2026-05-29",
+        "firstFixingDates": ["2026-02-26", "2026-02-27", "2026-03-02"],
+        "sumDt": 0.2555555555555553
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "lookbackDays": 5,
+        "observationShift": false,
+        "rate": 0.04070792838778445,
+        "firstValueDate": "2026-02-23",
+        "lastValueDate": "2026-05-26",
+        "firstFixingDates": ["2026-02-23", "2026-02-24", "2026-02-25"],
+        "sumDt": 0.2555555555555553
+      },
+      {
+        "accrualStart": "2026-03-02",
+        "accrualEnd": "2026-06-02",
+        "lookbackDays": 5,
+        "observationShift": true,
+        "rate": 0.04071671053995689,
+        "firstValueDate": "2026-02-23",
+        "lastValueDate": "2026-05-26",
+        "firstFixingDates": ["2026-02-23", "2026-02-24", "2026-02-25"],
+        "sumDt": 0.2555555555555553
+      }
+    ],
+    "swap": [
+      {
+        "accrualStart": "2026-09-08",
+        "accrualEnd": "2026-12-08",
+        "rateLookback0": 0.03964943019925975,
+        "couponLookback0": 1002249.4855923991,
+        "rateLookback5Shift": 0.039651606461367374,
+        "couponLookback5Shift": 1002304.4966623419,
+        "rateLookback5NoShift": 0.039648950473410376,
+        "couponLookback5NoShift": 1002237.3591889844
+      },
+      {
+        "accrualStart": "2026-12-08",
+        "accrualEnd": "2027-03-08",
+        "rateLookback0": 0.03964725409627512,
+        "couponLookback0": 991181.352406878,
+        "rateLookback5Shift": 0.03964725409627512,
+        "couponLookback5Shift": 991181.352406878,
+        "rateLookback5NoShift": 0.03964652661838475,
+        "couponLookback5NoShift": 991163.1654596187
+      },
+      {
+        "accrualStart": "2027-03-08",
+        "accrualEnd": "2027-06-08",
+        "rateLookback0": 0.039651606461367374,
+        "couponLookback0": 1013318.8317904995,
+        "rateLookback5Shift": 0.039651606461366506,
+        "couponLookback5Shift": 1013318.8317904773,
+        "rateLookback5NoShift": 0.039651274282890475,
+        "couponLookback5NoShift": 1013310.3427849788
+      },
+      {
+        "accrualStart": "2027-06-08",
+        "accrualEnd": "2027-09-08",
+        "rateLookback0": 0.039651606461367374,
+        "couponLookback0": 1013318.8317904995,
+        "rateLookback5Shift": 0.03964943019926063,
+        "couponLookback5Shift": 1013263.2162033272,
+        "rateLookback5NoShift": 0.03965117935841437,
+        "couponLookback5NoShift": 1013307.9169372561
+      },
+      {
+        "accrualStart": "2027-09-08",
+        "accrualEnd": "2027-12-08",
+        "rateLookback0": 0.03964943019925975,
+        "couponLookback0": 1002249.4855923991,
+        "rateLookback5Shift": 0.039651606461367374,
+        "couponLookback5Shift": 1002304.4966623419,
+        "rateLookback5NoShift": 0.03964895047340861,
+        "couponLookback5NoShift": 1002237.35918894
+      },
+      {
+        "accrualStart": "2027-12-08",
+        "accrualEnd": "2028-03-08",
+        "rateLookback0": 0.03964943019926063,
+        "couponLookback0": 1002249.4855924214,
+        "rateLookback5Shift": 0.03964943019925975,
+        "couponLookback5Shift": 1002249.4855923991,
+        "rateLookback5NoShift": 0.039648926500782534,
+        "couponLookback5NoShift": 1002236.7532142252
+      },
+      {
+        "accrualStart": "2028-03-08",
+        "accrualEnd": "2028-06-08",
+        "rateLookback0": 0.039651606461366506,
+        "couponLookback0": 1013318.8317904773,
+        "rateLookback5Shift": 0.039651606461367374,
+        "couponLookback5Shift": 1013318.8317904995,
+        "rateLookback5NoShift": 0.039651274282890475,
+        "couponLookback5NoShift": 1013310.3427849788
+      },
+      {
+        "accrualStart": "2028-06-08",
+        "accrualEnd": "2028-09-08",
+        "rateLookback0": 0.039651606461367374,
+        "couponLookback0": 1013318.8317904995,
+        "rateLookback5Shift": 0.03964943019925975,
+        "couponLookback5Shift": 1013263.2162033046,
+        "rateLookback5NoShift": 0.03965122679291765,
+        "couponLookback5NoShift": 1013309.12915234
+      }
+    ]
+  }
+}

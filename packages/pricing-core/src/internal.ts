@@ -93,7 +93,7 @@ export { linearFxDeltaAmount } from "./pricing/fx-pricer.js";
 export { upfrontPremiumLeg } from "./pricing/upfront.js";
 // Risk & XVA internals
 export { capletSurfaceKeysFor, cashflowsPaidWithin, fxSurfaceKeysFor, tenorLabel } from "./risk/sensitivities.js";
-export { BASIS_SPREAD_VOL_FRACTION, cvaBasisSwap, cvaFxForward, cvaGeneric, cvaSwap } from "./xva/cva.js";
+export { BASIS_SPREAD_VOL_FRACTION, CVA_SWAP_GRID_MAX_STEPS, cvaBasisSwap, cvaFxForward, cvaGeneric, cvaSwap, swapExposureGrid } from "./xva/cva.js";
 // Reporting & hedge internals
 export { csvCell } from "./reporting/valuation-report.js";
 export {

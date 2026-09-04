@@ -129,6 +129,24 @@ export interface FloatingRateProjection {
  * Lockout", QuantLib `OvernightIndexedCoupon(lockoutDays = k)`; in the
  * realised part from the fixing history, in the projection as the curve
  * forward of that day's overnight period compounded day by day).
+ *
+ * Lookback (N10-3): accrual day d takes the fixing of the n-th fixing-calendar
+ * business day before the business day whose rate is in effect on d –
+ * `obs(inEffect(d))`, so a period starting on a fixing holiday (SOFR from Good
+ * Friday) looks back from the Thursday, like QuantLib
+ * (`fixingCalendar.advance(adjust(d, Preceding), −n)`); the period end is
+ * observed as `obs(end)` without the adjustment (QuantLib value dates).
+ *
+ * Observation shift (N10-1, ISDA 2021 "Compounded with Observation Period
+ * Shift", QuantLib `applyObservationShift = true`): the daily weights **and
+ * the divisor** come from the observation period [obs(inEffect(start)),
+ * obs(end)): rate = (Π(1 + r_i·τ_i^obs) − 1) / τ_obs, applied to the accrual
+ * period's year fraction by the caller. Until round 10 the engine divided the
+ * observation-period factor by the accrual period's τ, which is exact only
+ * when both periods are equally long (SOFR 01.05.–01.06.2026 with lookback 5:
+ * 31 accrual vs 28 observation days → −39 bp). The accrued interest of a
+ * running period is the compounded observation factor to date scaled to the
+ * accrual days elapsed.
  */
 export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: SchedulePeriod, projCurve: Curve): FloatingRateProjection {
   const idx = getIndex(leg.index);
@@ -181,10 +199,19 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
   const frozenFixing = lockoutDate !== undefined ? (lockoutDate > start ? addBusinessDays(lockoutDate, -1, cal) : inEffect(start)) : undefined;
   // Observation date for an accrual day d: d shifted back by `lookback` business days.
   const obs = (d: SerialDate) => (lookback > 0 ? addBusinessDays(d, -lookback, cal) : d);
-  // Fixing date whose rate applies to accrual day d (lockout freezes it at the fixing before the window).
-  const fixingDayOf = (d: SerialDate) => (lockoutDate !== undefined && frozenFixing !== undefined && d >= lockoutDate ? frozenFixing : inEffect(obs(d)));
+  // Fixing date whose rate applies to accrual day d: `obs(inEffect(d))` (N10-3 – first the business day whose rate is
+  // in effect on d, then the lookback); lockout freezes it at the fixing before the window.
+  const fixingDayOf = (d: SerialDate) => (lockoutDate !== undefined && frozenFixing !== undefined && d >= lockoutDate ? frozenFixing : obs(inEffect(d)));
+  // N10-1: observation period of the coupon – the divisor under observation shift (QuantLib value dates
+  // `advance(adjust(start, Preceding), −n)` … `advance(end, −n)`); equals the accrual period for lookback 0.
+  const obsStart = obs(inEffect(start));
+  const obsEnd = obs(end);
+  const tauObs = obsShift ? yearFraction(obsStart, obsEnd, idx.dayCount) : tauTotal;
+  const tauDivisor = tauObs > 0 ? tauObs : tauTotal;
   let d = start;
   let realisedTo = start;
+  let realisedToDate = start;
+  let tauObsToDate = 0;
   // Realised part: daily fixings whose observation date is before the valuation date.
   while (d < end && fixingDayOf(d) < val) {
     const next = addBusinessDays(d, 1, cal);
@@ -207,6 +234,8 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
     if (stop <= val) {
       compoundedToDate *= 1 + r * tau;
       sumAvgToDate += r * tau;
+      tauObsToDate += tau;
+      realisedToDate = stop;
     }
     realisedTo = stop;
     d = stop;
@@ -236,18 +265,43 @@ export function projectFloatingRate(ctx: MarketContext, leg: FloatLeg, period: S
       x = nx;
     }
   } else if (realisedTo < end) {
-    const oFrom = inEffect(obs(realisedTo));
-    const oTo = obs(end);
-    const tauFwd = obsShift ? yearFraction(oFrom, oTo, idx.dayCount) : yearFraction(realisedTo, end, idx.dayCount);
-    const fwd = projCurve.forwardRate(oFrom, oTo, idx.dayCount);
-    compounded *= 1 + fwd * tauFwd;
-    sumAvg += fwd * tauFwd;
+    let x = realisedTo;
+    if (!obsShift) {
+      // QuantLib daily product (R10): the overnight forward of the observation day weighted with the accrual day.
+      // Needed day by day while observation and accrual days differ – for a lookback (the forward of `obs(d)`'s
+      // overnight period accrues over d's accrual days) and for a holiday start (the in-effect day's forward spans
+      // the holiday: SOFR from Good Friday accrues Thursday's forward over three days); for lookback 0 the product
+      // telescopes to a single forward from the first business day on.
+      while (x < end && (lookback > 0 || cal.isHoliday(x))) {
+        const nx = Math.min(addBusinessDays(x, 1, cal), end);
+        const od = fixingDayOf(x);
+        const r = projCurve.forwardRate(od, addBusinessDays(od, 1, cal), idx.dayCount);
+        const tau = yearFraction(x, nx, idx.dayCount);
+        compounded *= 1 + r * tau;
+        sumAvg += r * tau;
+        x = nx;
+      }
+    }
+    if (x < end) {
+      // Telescoping forward over the remaining observation period [obs(inEffect(x)), obs(end)) – exact under
+      // observation shift (weights = observation days) and for lookback 0 from a business day on.
+      const oFrom = obs(inEffect(x));
+      const oTo = obsEnd;
+      const tauFwd = obsShift ? yearFraction(oFrom, oTo, idx.dayCount) : yearFraction(x, end, idx.dayCount);
+      const fwd = projCurve.forwardRate(oFrom, oTo, idx.dayCount);
+      compounded *= 1 + fwd * tauFwd;
+      sumAvg += fwd * tauFwd;
+    }
   }
   const isCompound = (leg.compounding ?? "Compound") === "Compound";
-  const rate = isCompound ? (compounded - 1) / tauTotal : sumAvg / tauTotal;
+  // N10-1: under observation shift the compounded factor of the observation period is annualised over the
+  // observation days (τ_obs), otherwise over the accrual days (τ_acc = τ_obs for lookback 0).
+  const rate = isCompound ? (compounded - 1) / tauDivisor : sumAvg / tauDivisor;
   let accruedRateTau: number | undefined;
   if (periodStarted && end > val) {
-    const realisedPart = isCompound ? compoundedToDate - 1 : sumAvgToDate;
+    let realisedPart = isCompound ? compoundedToDate - 1 : sumAvgToDate;
+    // Observation shift: realised observation factor to date, scaled to the accrual days elapsed.
+    if (obsShift && tauObsToDate > 0) realisedPart *= yearFraction(start, realisedToDate, idx.dayCount) / tauObsToDate;
     accruedRateTau = gearing * realisedPart + spread * yearFraction(start, val, leg.dayCount);
   }
   return {

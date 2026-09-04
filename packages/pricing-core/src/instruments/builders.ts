@@ -1,6 +1,6 @@
-import { RATE_INDICES, getIndex, getSwapConventions, indexScheduleCalendar } from "../curves/index-definitions.js";
+import { RATE_INDICES, type RateIndex, getIndex, getSwapConventions, indexScheduleCalendar } from "../curves/index-definitions.js";
 import { type CalendarId, addBusinessDays, advance, getCalendar } from "../dates/calendar.js";
-import { type SerialDate, addTenor, immDate, nextImmDate, today, toYMD } from "../dates/date.js";
+import { type SerialDate, addTenor, immDate, isSerialDate, nextImmDate, today, toYMD } from "../dates/date.js";
 import { buildSchedule, frequencyPerYear } from "../dates/schedule.js";
 import { formatDe, formatPctDe } from "../format.js";
 import { fxSpotDateFrom, pipFactor } from "../market/fx-spot.js";
@@ -274,7 +274,13 @@ export function makeFxOption(p: {
   };
 }
 
-/** Tenor basis swap: receive index A + spread vs pay index B (same currency). */
+/**
+ * Tenor basis swap: receive index A + spread vs pay index B (same currency).
+ * Leg frequency = index tenor for IBOR legs; the OIS leg of an IBOR/OIS basis
+ * swap pays with the frequency of the IBOR leg (market convention, Markt R10:
+ * NIBOR-6M vs NOWA → both legs 6M; until round 10 the OIS leg was always 3M),
+ * an OIS/OIS basis swap keeps quarterly OIS legs.
+ */
 export function makeBasisSwap(p: {
   id?: string;
   currency: string;
@@ -290,8 +296,11 @@ export function makeBasisSwap(p: {
 }): InterestRateSwap {
   const conv = getSwapConventions(p.currency);
   const maturity = typeof p.maturity === "string" ? addTenor(p.effectiveDate, p.maturity) : p.maturity;
-  const mk = (index: string, payReceive: "Pay" | "Receive", spread: number) => {
-    const idx = getIndex(index);
+  const receiveIdx = getIndex(p.receiveIndex);
+  const payIdx = getIndex(p.payIndex);
+  // IBOR/OIS basis: the OIS leg follows the IBOR leg's frequency (R10); OIS/OIS: quarterly.
+  const iborTenor = receiveIdx.type !== "OIS" ? receiveIdx.tenor : payIdx.type !== "OIS" ? payIdx.tenor : undefined;
+  const mk = (idx: RateIndex, payReceive: "Pay" | "Receive", spread: number) => {
     const isOis = idx.type === "OIS";
     return {
       type: "Float" as const,
@@ -300,7 +309,7 @@ export function makeBasisSwap(p: {
       currency: p.currency,
       effectiveDate: p.effectiveDate,
       terminationDate: maturity,
-      frequency: isOis ? "3M" : idx.tenor,
+      frequency: isOis ? (iborTenor ?? "3M") : idx.tenor,
       dayCount: idx.dayCount,
       calendar: conv.calendar,
       businessDayConvention: "ModifiedFollowing" as const,
@@ -317,7 +326,7 @@ export function makeBasisSwap(p: {
       `Basis-Swap ${p.receiveIndex} ${p.spread >= 0 ? "+" : ""}${formatDe(p.spread * 1e4, 1)} bp vs ${p.payIndex} ${typeof p.maturity === "string" ? p.maturity : ""}`.trim(),
     type: "InterestRateSwap",
     counterparty: p.counterparty,
-    legs: [mk(p.receiveIndex, "Receive", p.spread), mk(p.payIndex, "Pay", 0)],
+    legs: [mk(receiveIdx, "Receive", p.spread), mk(payIdx, "Pay", 0)],
   } as InterestRateSwap;
 }
 
@@ -643,6 +652,15 @@ export function makeFra(p: {
   // Period form "3x6": months from spot; the index tenor follows the period length unless given explicitly (R3-2).
   const period = typeof p.start === "string" ? /^\s*(\d+)\s*[xX×]\s*(\d+)\s*$/.exec(p.start) : null;
   if (typeof p.start === "string" && !period) throw new PricingError("INVALID_TRADE", `Invalid FRA period "${p.start}" – expected e.g. "3x6"`);
+  // N10-4: a missing / NaN start used to run `advance` into an endless business-day search.
+  if (typeof p.start !== "string" && !isSerialDate(p.start)) {
+    throw new PricingError("INVALID_TRADE", `makeFra: start must be a period like "3x6" or a serial date, got ${String(p.start)}`, { start: p.start });
+  }
+  if (p.end !== undefined && !isSerialDate(p.end))
+    throw new PricingError("INVALID_TRADE", `makeFra: end must be a serial date, got ${String(p.end)}`, { end: p.end });
+  if (p.valuationDate !== undefined && !isSerialDate(p.valuationDate)) {
+    throw new PricingError("INVALID_TRADE", `makeFra: valuationDate must be a serial date, got ${String(p.valuationDate)}`, { valuationDate: p.valuationDate });
+  }
   let periodMonths: number | undefined;
   if (period) periodMonths = Number(period[2]) - Number(period[1]);
   else if (typeof p.start === "number" && p.end !== undefined) periodMonths = Math.round((p.end - p.start) / 30.4375);

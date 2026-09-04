@@ -25,6 +25,7 @@ export {
   addMonths,
   addTenor,
   addYears,
+  assertSerialDate,
   compareDates,
   dayOfWeek,
   daysInMonth,
@@ -33,6 +34,7 @@ export {
   immDate,
   isEndOfMonth,
   isLeapYear,
+  isSerialDate,
   isWeekend,
   nextImmDate,
   parseISO,
@@ -299,6 +301,8 @@ export {
 export { assertValidTrade, discountedCurrencies, pricePortfolio, priceTrade, tradeCurrencies, validateTrade } from "./pricing/price.js";
 // Risk & XVA
 export {
+  PAR_RISK_SPEC_TOLERANCE,
+  checkParRiskSpecs,
   computeRisk,
   computeTheta,
   parRisk,
@@ -316,6 +320,8 @@ export {
   type ParRiskCurve,
   type ParRiskOptions,
   type ParRiskReport,
+  type ParRiskSpecCheck,
+  type ParRiskSpecInconsistency,
   type ParRiskSpecs,
   type RiskReport,
   type ThetaDetail,

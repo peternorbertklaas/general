@@ -109,8 +109,12 @@ export function volTypeLabelDe(volType: string | undefined): string {
  */
 export function xvaMethodLabelDe(method: string): string {
   const hazard = /hazard term structure/i.test(method) ? "Hazard-Termstruktur aus CDS-Bootstrap" : "flache Hazard-Rate";
-  if (/^Swaption-replication/i.test(method)) return `Swaption-Replikation (Sorensen–Bollier) mit der Smile-Vol am Strike, ${hazard}`;
-  if (/^Basis-swaption replication/i.test(method)) return `Basis-Swaption-Replikation (Bachelier auf den Tenor-Basis-Spread), ${hazard}`;
+  // N10-2: the swap grids name their resolution ("monthly exposure grid plus coupon dates" / "3-monthly …").
+  const gridMatch = /(\d+)-monthly exposure grid|monthly exposure grid/i.exec(method);
+  const grid = gridMatch ? `, Exposure-Gitter ${gridMatch[1] ? `${gridMatch[1]}-monatlich` : "monatlich"} plus Kupontermine` : "";
+  const premium = /open premium netted/i.test(method) ? ", offene Prämie bis zum Zahltermin genettet" : "";
+  if (/^Swaption-replication/i.test(method)) return `Swaption-Replikation (Sorensen–Bollier) mit der Smile-Vol am Strike${grid}${premium}, ${hazard}`;
+  if (/^Basis-swaption replication/i.test(method)) return `Basis-Swaption-Replikation (Bachelier auf den Tenor-Basis-Spread)${grid}${premium}, ${hazard}`;
   if (/^GK forward-exposure/i.test(method)) return `Garman-Kohlhagen-Exposure auf dem Forward, ${hazard}`;
   if (/^Delta-normal exposure/i.test(method)) return `Delta-Normal-Exposure (gerollte Sensitivitäten × ATM-Vols je Restlaufzeit), ${hazard}`;
   if (/^Delta-normal \(expired\)/i.test(method)) return "Delta-Normal-Exposure (Geschäft abgelaufen, kein Exposure)";

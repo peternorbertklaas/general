@@ -18,11 +18,32 @@ export interface Tenor {
 
 const MS_PER_DAY = 86_400_000;
 
+/** True for a usable serial date: a finite integer number of days (N10-4). */
+export function isSerialDate(d: unknown): d is SerialDate {
+  return typeof d === "number" && Number.isInteger(d);
+}
+
+/**
+ * Guard of every exported date / calendar function (Quant R10 N10-4): a
+ * `NaN`, `undefined`, `Infinity` or fractional "date" throws
+ * `PricingError("INVALID_DATE")` naming the argument instead of looping
+ * forever in a business-day search (`addBusinessDays(NaN, …)`,
+ * `adjust(NaN, …)`, `advance(NaN, "6M")`, `makeFra({ start: undefined })`
+ * hung the process until round 10) or returning `NaN` arithmetic silently.
+ * `what` names the argument in the message (`details.input` carries the value).
+ */
+export function assertSerialDate(d: unknown, what = "date"): asserts d is SerialDate {
+  if (!isSerialDate(d)) {
+    throw new PricingError("INVALID_DATE", `${what} must be a serial date (integer days since 1970-01-01), got ${String(d)}`, { what, input: d });
+  }
+}
+
 export function fromYMD(year: number, month: number, day: number): SerialDate {
   return Math.round(Date.UTC(year, month - 1, day) / MS_PER_DAY);
 }
 
 export function toYMD(d: SerialDate): { year: number; month: number; day: number } {
+  assertSerialDate(d);
   const dt = new Date(d * MS_PER_DAY);
   return { year: dt.getUTCFullYear(), month: dt.getUTCMonth() + 1, day: dt.getUTCDate() };
 }
@@ -43,6 +64,7 @@ export function parseISO(iso: string): SerialDate {
 }
 
 export function toISO(d: SerialDate): string {
+  assertSerialDate(d);
   const { year, month, day } = toYMD(d);
   return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
@@ -57,6 +79,7 @@ export function daysInMonth(y: number, m: number): number {
 
 /** 0 = Sunday ... 6 = Saturday */
 export function dayOfWeek(d: SerialDate): number {
+  assertSerialDate(d);
   return ((d % 7) + 11) % 7; // 1970-01-01 was a Thursday (4)
 }
 
@@ -66,10 +89,14 @@ export function isWeekend(d: SerialDate): boolean {
 }
 
 export function addDays(d: SerialDate, n: number): SerialDate {
+  assertSerialDate(d);
+  if (!Number.isInteger(n)) throw new PricingError("INVALID_DATE", `addDays: n must be an integer number of days, got ${String(n)}`, { input: n });
   return d + n;
 }
 
 export function addMonths(d: SerialDate, n: number, endOfMonth = false): SerialDate {
+  assertSerialDate(d);
+  if (!Number.isInteger(n)) throw new PricingError("INVALID_DATE", `addMonths: n must be an integer number of months, got ${String(n)}`, { input: n });
   const { year, month, day } = toYMD(d);
   const total = year * 12 + (month - 1) + n;
   const ny = Math.floor(total / 12);
@@ -129,6 +156,7 @@ export function tenorInMonths(t: Tenor): number {
 }
 
 export function addTenor(d: SerialDate, tenor: string | Tenor, endOfMonth = false): SerialDate {
+  assertSerialDate(d);
   const t = parseTenor(tenor);
   switch (t.unit) {
     case "D":
@@ -161,6 +189,7 @@ export function immDate(year: number, month: number): SerialDate {
 
 /** Next IMM date strictly after `d` on the Mar/Jun/Sep/Dec cycle. */
 export function nextImmDate(d: SerialDate): SerialDate {
+  assertSerialDate(d);
   let { year, month } = toYMD(d);
   for (let i = 0; i < 15; i++) {
     if (month % 3 === 0) {

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { type CurveQuote, bootstrapCurve } from "../curves/bootstrap.js";
-import { flatCurve } from "../curves/curve.js";
+import { InterpolatedCurve, flatCurve } from "../curves/curve.js";
 import { QUANTLIB_CROSS_CHECKED_CALENDARS, getCalendar, isBusinessDay } from "../dates/calendar.js";
 import { fromYMD, isWeekend, parseISO, toISO } from "../dates/date.js";
 import { buildSchedule } from "../dates/schedule.js";
@@ -710,5 +710,156 @@ describe("golden master – RFR lockout / lookback compounding vs QuantLib Overn
     expect(r(3)).toBeCloseTo(0.04059598697698849, 14);
     expect(g.quantlib.cases[1]!.lastFixingDates.slice(-2)).toEqual(["2026-07-30", "2026-07-30"]);
     expect(g.quantlib.cases[2]!.lastFixingDates.slice(-3)).toEqual(["2026-07-29", "2026-07-29", "2026-07-29"]);
+  });
+});
+
+describe("golden master – RFR lookback with observation shift / holiday-start lookback vs QuantLib OvernightIndexedCoupon (N10-1 / N10-3)", () => {
+  interface Case {
+    accrualStart: string;
+    accrualEnd: string;
+    note: string;
+    lookbackDays: number;
+    observationShift: boolean;
+    observationStart: string;
+    observationEnd: string;
+    rate: number;
+  }
+  interface SwapCase {
+    accrualStart: string;
+    accrualEnd: string;
+    accrualDays: number;
+    observationStart: string;
+    observationEnd: string;
+    observationDays: number;
+    rateLookback0: number;
+    couponLookback0: number;
+    rateLookback5Shift: number;
+    couponLookback5Shift: number;
+  }
+  interface G {
+    inputs: {
+      valuationDate: string;
+      fixingHolidays: string[];
+      swap: { evaluationDate: string; flatRate: number; notional: number; lookbackDays: number };
+    };
+    expected: { cases: Case[]; swap: SwapCase[] };
+    quantlib: {
+      status: string;
+      version?: string;
+      cases: {
+        accrualStart: string;
+        lookbackDays: number;
+        observationShift: boolean;
+        rate: number;
+        firstValueDate: string;
+        lastValueDate: string;
+        sumDt: number;
+      }[];
+      swap: {
+        accrualStart: string;
+        rateLookback0: number;
+        rateLookback5Shift: number;
+        rateLookback5NoShift: number;
+        couponLookback5Shift: number;
+        couponLookback5NoShift: number;
+      }[];
+    };
+  }
+  const g = golden<G>("rfr-observation-shift-quantlib");
+  const val = parseISO(g.inputs.valuationDate);
+  const sifma = getCalendar("US-SIFMA");
+  const usdCurve = getCurve(buildSampleMarket(val), SAMPLE_CURVE_IDS.usdSofr);
+  const legFor = (start: number, end: number, lookbackDays: number, observationShift: boolean): FloatLeg => ({
+    type: "Float",
+    payReceive: "Receive",
+    notional: 1,
+    currency: "USD",
+    effectiveDate: start,
+    terminationDate: end,
+    frequency: "3M",
+    dayCount: "ACT/360",
+    calendar: "US",
+    index: "SOFR",
+    lookbackDays,
+    observationShift,
+  });
+  const periodOf = (l: FloatLeg) => buildSchedule({ ...l, businessDayConvention: "Unadjusted", stub: "ShortFront", paymentLag: 0 }).periods[0]!;
+
+  it("the file's holiday assumptions match the engine's US-SIFMA calendar; QuantLib block present; realised divisor = observation period", () => {
+    for (const iso of g.inputs.fixingHolidays) expect(isBusinessDay(parseISO(iso), sifma), iso).toBe(false);
+    expect(g.inputs.fixingHolidays).toContain("2026-04-03"); // Good Friday
+    expect(g.inputs.fixingHolidays).toContain("2026-09-07"); // Labor Day (2Y swap window)
+    expect(g.quantlib.status).toBe("done");
+    expect(g.quantlib.version ?? "1.43").toMatch(/^1\.\d+/);
+    expect(g.expected.cases.length).toBe(30);
+    // manual = QuantLib bit for bit, and the observation period of the file is QuantLib's value-date span
+    g.expected.cases.forEach((c, i) => {
+      const q = g.quantlib.cases[i]!;
+      expect([q.accrualStart, q.lookbackDays, q.observationShift]).toEqual([c.accrualStart, c.lookbackDays, c.observationShift]);
+      expectRel(c.rate, q.rate, `${c.accrualStart} lookback ${c.lookbackDays} shift ${c.observationShift} (manual vs QuantLib)`, 1e-13);
+      expect(q.firstValueDate).toBe(c.observationStart);
+      expect(q.lastValueDate).toBe(c.observationEnd);
+      const obsDays = parseISO(c.observationEnd) - parseISO(c.observationStart);
+      const accDays = parseISO(c.accrualEnd) - parseISO(c.accrualStart);
+      expect(Math.round(q.sumDt * 360)).toBe(c.observationShift ? obsDays : accDays);
+    });
+  });
+
+  it("realised periods: engine = manual = QuantLib (1e-12) for lookback 1/2/5 with and without observation shift, incl. Good-Friday start and end", () => {
+    for (const c of g.expected.cases) {
+      const start = parseISO(c.accrualStart);
+      const end = parseISO(c.accrualEnd);
+      const fixings: Fixing[] = [];
+      for (let d = start - 15; d <= end; d++)
+        if (isBusinessDay(d, sifma)) fixings.push({ index: "SOFR", date: d, value: 0.04 + 0.0002 * ((((d - start) % 7) + 7) % 7) });
+      const ctx: MarketContext = { ...buildSampleMarket(val), fixings };
+      const l = legFor(start, end, c.lookbackDays, c.observationShift);
+      const p = periodOf(l);
+      expect([p.accrualStart, p.accrualEnd]).toEqual([start, end]);
+      const proj = projectFloatingRate(ctx, l, p, usdCurve);
+      expect(proj.isFixed, c.accrualStart).toBe(true);
+      expectRel(proj.rate, c.rate, `${c.accrualStart}→${c.accrualEnd} lookback ${c.lookbackDays} shift ${c.observationShift}`, 1e-12);
+    }
+    // reviewer's numbers (Quant R10): N10-1 monthly period 4.057399 % (engine gave 3.664747 %), N10-3 Good-Friday start 4.09772029 % / 4.08995416 %
+    const find = (start: string, lb: number, shift: boolean) =>
+      g.expected.cases.find((c) => c.accrualStart === start && c.lookbackDays === lb && c.observationShift === shift)!.rate;
+    expect(find("2026-05-01", 5, true)).toBeCloseTo(0.040573988, 10);
+    expect(find("2026-05-01", 5, false)).toBeCloseTo(0.04060788, 9);
+    expect(find("2026-04-03", 1, false)).toBeCloseTo(0.0409772029, 10);
+    expect(find("2026-04-03", 2, false)).toBeCloseTo(0.0408995416, 10);
+    expect(find("2026-04-03", 1, true)).toBeCloseTo(0.0407377523, 10);
+    expect(find("2026-03-03", 2, true)).toBeCloseTo(0.0405982674, 10);
+    expect(find("2026-03-19", 1, true)).toBeCloseTo(0.0405638923, 10);
+  });
+
+  it("projected 2Y SOFR swap on a flat 4 % curve: coupon rates lookback 0 / lookback 5 + shift = manual = QuantLib (1e-12); lookback 5 without shift = QuantLib's daily product", () => {
+    const evalDate = parseISO(g.inputs.swap.evaluationDate);
+    const r = g.inputs.swap.flatRate;
+    const nodes = [1, 2, 3, 4, 5].map((y) => ({ date: evalDate + 365 * y, df: Math.exp((-r * 365 * y) / 365) }));
+    const flat = new InterpolatedCurve({ id: "FLAT-USD", currency: "USD", referenceDate: evalDate, nodes, interpolation: "logLinear", dayCount: "ACT/365F" });
+    const ctx: MarketContext = { ...buildSampleMarket(val), valuationDate: evalDate, fixings: [] };
+    expect(g.expected.swap.length).toBe(8);
+    expect(g.expected.swap.filter((s) => s.accrualDays !== s.observationDays).length).toBe(4); // 91/92 and 92/91 periods
+    g.expected.swap.forEach((s, i) => {
+      const q = g.quantlib.swap[i]!;
+      expect(q.accrualStart).toBe(s.accrualStart);
+      const start = parseISO(s.accrualStart);
+      const end = parseISO(s.accrualEnd);
+      const tauAcc = (end - start) / 360;
+      const plain = projectFloatingRate(ctx, legFor(start, end, 0, false), periodOf(legFor(start, end, 0, false)), flat);
+      const shifted = projectFloatingRate(ctx, legFor(start, end, 5, true), periodOf(legFor(start, end, 5, true)), flat);
+      const noShift = projectFloatingRate(ctx, legFor(start, end, 5, false), periodOf(legFor(start, end, 5, false)), flat);
+      expect(plain.isFixed).toBe(false);
+      expectRel(plain.rate, s.rateLookback0, `${s.accrualStart} lookback 0 (manual)`, 1e-12);
+      expectRel(plain.rate, q.rateLookback0, `${s.accrualStart} lookback 0 (QuantLib)`, 1e-12);
+      expectRel(shifted.rate, s.rateLookback5Shift, `${s.accrualStart} lookback 5 shift (manual)`, 1e-12);
+      expectRel(shifted.rate, q.rateLookback5Shift, `${s.accrualStart} lookback 5 shift (QuantLib)`, 1e-12);
+      expectRel(shifted.rate * tauAcc * g.inputs.swap.notional, q.couponLookback5Shift, `${s.accrualStart} coupon lookback 5 shift (QuantLib)`, 1e-12);
+      // R10: the projection without shift is QuantLib's daily product of observation-day forwards × accrual weights
+      expectRel(noShift.rate, q.rateLookback5NoShift, `${s.accrualStart} lookback 5 no shift (QuantLib)`, 1e-12);
+      // N10-1: with shift the rate is the flat curve's simple rate for the observation period's length, not the accrual period's
+      if (s.accrualDays !== s.observationDays) expect(Math.abs(shifted.rate / plain.rate - 1)).toBeGreaterThan(1e-6);
+      else expectRel(shifted.rate, plain.rate, `${s.accrualStart} equal lengths`, 1e-12);
+    });
   });
 });

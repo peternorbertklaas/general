@@ -228,27 +228,43 @@ describe("N9-2 – cvaSwap / cvaBasisSwap: grid point at the premium date, expos
     }
   });
 
-  it("fee 100 k on the first coupon date (1Y): CVA difference = ½·ΔEPE(0)·PD(1Y)·LGD ≈ ½·fee·DF·PD(1Y)·LGD (reviewer's formula); a settled fee changes nothing", () => {
+  it("fee 100 k on the first coupon date (1Y): netted at every grid point before it – CVA difference = Σ trapezoids of ΔEPE up to 1Y ≈ −fee·DF·PD(1Y)·LGD (R9 annual grid: ½ of it); a settled fee changes nothing", () => {
     const receiver = flip(
       makeVanillaSwap({ id: "V", currency: "EUR", notional: 1e7, payReceiveFixed: "Pay", fixedRate: 0.03, effectiveDate: VAL + 2, maturity: "10Y" }),
       "R",
     );
     const base = computeXva(ctx, receiver, credit, "EUR");
-    const t1 = base.profile[1]!.date; // first coupon date ≈ 1Y
-    expect(t1 - VAL).toBeGreaterThan(360);
+    // R10 (N10-2): the grid is monthly, the first coupon date ≈ 1Y is the 13th point
+    const t1 = base.profile.find((p) => p.date - VAL > 360)!.date;
     expect(t1 - VAL).toBeLessThan(372);
+    const i1 = base.profile.findIndex((p) => p.date === t1);
+    expect(i1).toBeGreaterThan(10);
     const fee = computeXva(ctx, withUpfront(receiver, 1e5, "EUR", t1), credit, "EUR");
     expect(fee.profile.length).toBe(base.profile.length); // the premium date is a coupon date already
-    fee.profile.slice(1).forEach((p, i) => {
-      expect(p.epe).toBeCloseTo(base.profile[i + 1]!.epe, 6);
-      expect(p.ene).toBeCloseTo(base.profile[i + 1]!.ene, 6);
+    fee.profile.forEach((p, i) => {
+      const b = base.profile[i]!;
+      expect(p.date).toBe(b.date);
+      if (p.date >= t1) {
+        expect(p.epe).toBeCloseTo(b.epe, 6);
+        expect(p.ene).toBeCloseTo(b.ene, 6);
+      } else expect(p.epe).toBeLessThan(b.epe); // netted: we pay the fee
     });
     const dEpe0 = fee.profile[0]!.epe - base.profile[0]!.epe;
     const dfFee = getDiscountCurve(ctx, "EUR").df(t1);
     expect(dEpe0).toBeCloseTo(-1e5 * dfFee, 6); // receiver PV ≈ +104 k stays positive after the fee
-    const pd1 = fee.profile[1]!.pdCpty;
-    expect(fee.cva - base.cva).toBeCloseTo(0.5 * dEpe0 * pd1 * LGD, 6);
-    expect(Math.abs((fee.cva - base.cva) / (-0.5 * 1e5 * pd1 * LGD) - 1)).toBeLessThan(0.04); // ≈ fee·PD(1Y)·LGD·½ up to the fee's discounting
+    // the whole difference is the trapezoid sum of ΔEPE over the intervals up to the premium date
+    let sum = 0;
+    for (let i = 1; i <= i1; i++) {
+      const d0 = fee.profile[i - 1]!.epe - base.profile[i - 1]!.epe;
+      const d1 = fee.profile[i]!.epe - base.profile[i]!.epe;
+      sum += LGD * fee.profile[i]!.pdCpty * 0.5 * (d0 + d1);
+    }
+    expect(fee.cva - base.cva).toBeCloseTo(sum, 6);
+    // ≈ −fee·DF·PD(1Y)·LGD (the payable is outstanding all year; the option-value netting shaves a part of it)
+    const pd1Y = 1 - Math.exp(-credit.cptyHazard * fee.profile[i1]!.years);
+    const ratio = (fee.cva - base.cva) / (-1e5 * dfFee * pd1Y * LGD);
+    expect(ratio).toBeGreaterThan(0.4);
+    expect(ratio).toBeLessThan(1.0);
     expect(fee.cva).toBeLessThan(base.cva);
     // a fee between two coupon dates: extra grid point, plain exposure from that date on
     const mid = computeXva(ctx, withUpfront(receiver, 1e5, "EUR", VAL + 200), credit, "EUR");

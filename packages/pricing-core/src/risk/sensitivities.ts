@@ -439,6 +439,13 @@ export interface ParRiskReport {
   total: number;
   /** Bump size used (bp). */
   bumpBp: number;
+  /**
+   * Specs that do not reproduce the market curve they describe
+   * (`checkParRiskSpecs`, Markt R10-1) – their curves were **not** bumped.
+   * Only present when `ParRiskOptions.checkSpecs` was set (empty array when
+   * every spec passed).
+   */
+  inconsistent?: ParRiskSpecInconsistency[];
 }
 
 export interface ParRiskOptions {
@@ -446,6 +453,84 @@ export interface ParRiskOptions {
   curveIds?: string[];
   /** Bump size in bp (default 1). */
   bumpBp?: number;
+  /**
+   * Markt R10-1: verify with `checkParRiskSpecs` that every spec re-bootstraps
+   * to the curve of the same id in `ctx` before bumping; inconsistent specs
+   * are skipped (their curves report no buckets) and listed in
+   * `ParRiskReport.inconsistent`. Default false – a par-risk bump subtracts
+   * the PV on the **market** curves from the PV on the re-bootstrapped bumped
+   * curves, so a spec that does not reproduce the market curve yields the
+   * level difference instead of the sensitivity (−97 521 EUR for a
+   * 6 828 EUR DV01 in the reviewer's imported snapshot).
+   */
+  checkSpecs?: boolean;
+  /** Tolerance on |Δdf| for `checkSpecs` (default `PAR_RISK_SPEC_TOLERANCE`). */
+  specTolerance?: number;
+}
+
+/** A par-risk spec whose re-bootstrap does not reproduce the market curve (see `checkParRiskSpecs`). */
+export interface ParRiskSpecInconsistency {
+  curveId: string;
+  /** Largest absolute discount-factor difference over the pillars of both curves; `Infinity` when the spec did not bootstrap. */
+  maxAbsDfDiff: number;
+  /** Bootstrap error message when the spec could not be built at all. */
+  reason?: string;
+}
+
+export interface ParRiskSpecCheck {
+  /** Curve ids whose spec reproduces the market curve within the tolerance. */
+  consistent: string[];
+  inconsistent: ParRiskSpecInconsistency[];
+  /** Spec ids without a curve in `ctx.curves`. */
+  missing: string[];
+}
+
+/**
+ * Default tolerance of `checkParRiskSpecs` on the discount factors: a curve
+ * re-bootstrapped from its own quotes reproduces itself to ≈ 1e-15; imported
+ * snapshot nodes carry full double precision. 1e-9 in DF corresponds to well
+ * below 0.01 bp in zero rate on every tenor of a par-risk curve, while a stale
+ * quote set differs by ≥ 1e-6 already at 1 bp on the first pillar.
+ */
+export const PAR_RISK_SPEC_TOLERANCE = 1e-9;
+
+/**
+ * Consistency check of par-risk specs against a market context (Markt R10-1):
+ * every spec is re-bootstrapped **against the market's curves** (its
+ * `discountCurveId` / reference curves are taken from `ctx.curves`, not from
+ * the other specs) and compared with the market curve of the same id on the
+ * union of both curves' pillars. `inconsistent` names the curves whose
+ * quotes do not describe the market curve (a snapshot imported with the
+ * importer's default sample quotes, a discount curve replaced without
+ * rebuilding its dependants, a spec that does not bootstrap at all), `missing`
+ * the specs without a market curve. Cost: one bootstrap per spec.
+ */
+export function checkParRiskSpecs(ctx: MarketContext, specs: ParRiskSpecs, opts: { tolerance?: number } = {}): ParRiskSpecCheck {
+  const tolerance = opts.tolerance ?? PAR_RISK_SPEC_TOLERANCE;
+  const out: ParRiskSpecCheck = { consistent: [], inconsistent: [], missing: [] };
+  for (const [key, s] of Object.entries(specs)) {
+    const id = s.id ?? key;
+    const market = ctx.curves[id];
+    if (!market) {
+      out.missing.push(id);
+      continue;
+    }
+    let rebuilt: Curve;
+    try {
+      rebuilt = bootstrapCurves(ctx.valuationDate, [{ ...s, id }], ctx.curves).curves[id]!;
+    } catch (e) {
+      out.inconsistent.push({ curveId: id, maxAbsDfDiff: Infinity, reason: e instanceof Error ? e.message : String(e) });
+      continue;
+    }
+    let maxAbsDfDiff = 0;
+    for (const d of new Set([...market.nodeDates, ...rebuilt.nodeDates])) {
+      const diff = Math.abs(rebuilt.df(d) - market.df(d));
+      if (!(diff <= maxAbsDfDiff)) maxAbsDfDiff = Number.isNaN(diff) ? Infinity : diff;
+    }
+    if (maxAbsDfDiff <= tolerance) out.consistent.push(id);
+    else out.inconsistent.push({ curveId: id, maxAbsDfDiff });
+  }
+  return out;
 }
 
 /**
@@ -480,11 +565,14 @@ export function parRiskPortfolio(
   const all: CurveBuildSpec[] = Object.entries(specs).map(([key, s]) => ({ ...s, id: s.id ?? key }));
   const ordered = orderCurveSpecs(all);
   const bases = trades.map((t) => priceTrade(ctx, t, reportingCurrency).pv);
+  // Markt R10-1: specs that do not reproduce their market curve are not bumped (level difference ≠ sensitivity).
+  const inconsistent = opts.checkSpecs ? checkParRiskSpecs(ctx, specs, { tolerance: opts.specTolerance }).inconsistent : undefined;
+  const excluded = new Set((inconsistent ?? []).map((x) => x.curveId));
   // Curves targeted per trade (default: specs of the trade's currencies that exist in ctx).
   const targetsPerTrade = trades.map((t) => {
-    if (opts.curveIds) return opts.curveIds;
+    if (opts.curveIds) return opts.curveIds.filter((id) => !excluded.has(id));
     const ccys = tradeCurrencies(t);
-    return ordered.filter((s) => ccys.includes(s.currency) && ctx.curves[s.id] !== undefined).map((s) => s.id);
+    return ordered.filter((s) => ccys.includes(s.currency) && ctx.curves[s.id] !== undefined && !excluded.has(s.id)).map((s) => s.id);
   });
   const union: string[] = [];
   for (const ts of targetsPerTrade) for (const id of ts) if (!union.includes(id)) union.push(id);
@@ -534,6 +622,7 @@ export function parRiskPortfolio(
       curves,
       total: curves.reduce((s, c) => s + c.total, 0),
       bumpBp,
+      ...(inconsistent ? { inconsistent } : {}),
     };
   });
 }

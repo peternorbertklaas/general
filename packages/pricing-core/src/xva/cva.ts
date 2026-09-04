@@ -1,5 +1,5 @@
 import { type Curve } from "../curves/curve.js";
-import { type SerialDate, addTenor } from "../dates/date.js";
+import { type SerialDate, addMonths, addTenor } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
 import { PricingError } from "../errors.js";
 import { brent } from "../math/rootfind.js";
@@ -272,7 +272,8 @@ function hazardLabel(credit: CreditInputs): string {
  * (s = +1 receiving fixed) – the same μ-shift `cvaGeneric` and `cvaFxForward`
  * apply –, from the premium date on the plain swap exposure. Until round 9
  * only the t = 0 point was netted and the trapezoid spread the fee over the
- * whole first coupon interval (−8.9 % for a fee paid in two days).
+ * whole first coupon interval (−8.9 % for a fee paid in two days). The grid
+ * is the fixed leg's coupon dates refined to `swapExposureGrid` (N10-2).
  */
 export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
@@ -280,7 +281,7 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
   if (!fixed) throw new PricingError("UNSUPPORTED_TRADE_TYPE", "CVA (swaption approach) needs a fixed/float swap");
   const ccy = fixed.currency;
   const fx = fxToReporting(ctx, ccy, reporting, swap.collateralCurrency);
-  const dates = scheduleDates(fixed).filter((d) => d > ctx.valuationDate);
+  const dates = scheduleDates(fixed);
   const surface = ctx.swaptionVols?.[ccy];
   if (!surface) warnings.push("No swaption vol surface – 70bp normal vol assumed for exposure");
   const profile: ExposurePoint[] = [];
@@ -292,7 +293,8 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
   profile.push({ date: ctx.valuationDate, years: 0, epe: Math.max(pv0, 0) * fx, ene: Math.max(-pv0, 0) * fx, pdCpty: 0, pdOwn: 0 });
   // N9-2: open premium (PV today, swap currency) nets the exposure until its payment date – a grid point.
   const premium = openPremium(ctx, swap, reporting, fx);
-  for (const t of exposureGridWithPremium(dates.slice(0, -1), premium?.date, fixed.terminationDate)) {
+  const grid = swapExposureGrid(ctx.valuationDate, dates, fixed.terminationDate, premium?.date);
+  for (const t of grid.dates) {
     const T = yearFraction(ctx.valuationDate, t, "ACT/365F");
     // N8-1: the remaining swap carries no fee – the premium is paid on its date and does not shift the forward.
     const remaining: InterestRateSwap = {
@@ -338,9 +340,56 @@ export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: Cred
     reporting,
     profile,
     credit,
-    `Swaption-replication (Sorensen–Bollier), smile vol at strike${premium ? ", open premium netted until its payment date" : ""}, ${hazardLabel(credit)}`,
+    `Swaption-replication (Sorensen–Bollier), smile vol at strike${premium ? ", open premium netted until its payment date" : ""}, ${grid.label}, ${hazardLabel(credit)}`,
     warnings,
   );
+}
+
+/**
+ * Upper bound for the number of intermediate exposure points of the swap /
+ * basis-swap CVA grid: monthly points up to 10Y, then the step widens
+ * (2M up to 20Y, 3M up to 30Y, …) so the Sorensen–Bollier replication stays
+ * at ≈ 120 remaining-swap valuations per trade.
+ */
+export const CVA_SWAP_GRID_MAX_STEPS = 120;
+
+/**
+ * Exposure grid of `cvaSwap` / `cvaBasisSwap` (N10-2): the coupon dates of the
+ * driving leg **plus** regular intermediate points – monthly from the
+ * valuation date (`addMonths(valuationDate, k·step)`, step = 1M for maturities
+ * up to 10Y, else widened so that at most `CVA_SWAP_GRID_MAX_STEPS` steps are
+ * needed) – and the premium date of an open upfront fee (N9-2). Until round 10
+ * the grid consisted of the coupon dates only (annual for an EUR fixed leg):
+ * the EPE profile of a swap is concave (∝ √t) and the trapezoid rule
+ * interpolates linearly, so the CVA of a 10Y receiver came out 2 % below a
+ * 7-day reference (ATM −3.7 %) and a premium date – the only refinement –
+ * moved the CVA by its grid effect rather than by the netting. On the monthly
+ * grid the CVA is within 0.1 % of the 7-day reference and a paid fee always
+ * lowers the CVA. Returns the sorted dates strictly inside (valuation date,
+ * maturity) and a label for `XvaResult.method`.
+ */
+export function swapExposureGrid(
+  valuationDate: SerialDate,
+  couponDates: readonly SerialDate[],
+  maturity: SerialDate,
+  premiumDate?: SerialDate,
+): { dates: SerialDate[]; stepMonths: number; label: string } {
+  const set = new Set<SerialDate>();
+  for (const d of couponDates) if (d > valuationDate && d < maturity) set.add(d);
+  if (premiumDate !== undefined && premiumDate > valuationDate && premiumDate < maturity) set.add(premiumDate);
+  // Whole months to maturity (floor, so a spot-starting 10Y swap – 120 months and a few days – keeps the monthly grid).
+  const monthsToMaturity = Math.max(1, Math.floor((maturity - valuationDate) / 30.4375));
+  const stepMonths = Math.max(1, Math.ceil(monthsToMaturity / CVA_SWAP_GRID_MAX_STEPS));
+  for (let k = 1; ; k++) {
+    const d = addMonths(valuationDate, k * stepMonths);
+    if (d >= maturity) break;
+    set.add(d);
+  }
+  return {
+    dates: [...set].sort((a, b) => a - b),
+    stepMonths,
+    label: `${stepMonths === 1 ? "monthly" : `${stepMonths}-monthly`} exposure grid plus coupon dates`,
+  };
 }
 
 /** Open upfront premium of a trade (payment date after the valuation date): PV today in the reporting currency and in the trade currency (via `fx`). */
@@ -350,13 +399,6 @@ function openPremium(ctx: MarketContext, trade: Trade, reporting: string, fx: nu
   const leg = upfrontPremiumLeg(ctx, trade, reporting, 99);
   if (!leg) return undefined;
   return { date: up.date, pvReporting: leg.pvReporting, pvCcy: leg.pvReporting / fx };
-}
-
-/** Coupon grid plus the premium date (N9-2) when it lies strictly before the maturity – sorted, unique. */
-function exposureGridWithPremium(coupons: SerialDate[], premiumDate: SerialDate | undefined, maturity: SerialDate): SerialDate[] {
-  const set = new Set(coupons);
-  if (premiumDate !== undefined && premiumDate < maturity) set.add(premiumDate);
-  return [...set].sort((a, b) => a - b);
 }
 
 /**
@@ -397,7 +439,7 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
   const leg0 = swap.legs[0] as FloatLeg;
   const ccy = leg0.currency;
   const fx = fxToReporting(ctx, ccy, reporting, swap.collateralCurrency);
-  const dates = scheduleDates(leg0).filter((d) => d > ctx.valuationDate);
+  const dates = scheduleDates(leg0);
   const maturity = Math.max(...swap.legs.map((l) => l.terminationDate));
   const surface = ctx.swaptionVols?.[ccy];
   if (credit.basisSpreadVol === undefined) {
@@ -413,7 +455,8 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
   let prevT = 0;
   // N9-2: open premium nets the exposure until its payment date (grid point, shifted strike K′ = K + s·c/A as in `cvaSwap`).
   const premium = openPremium(ctx, swap, reporting, fx);
-  for (const t of exposureGridWithPremium(dates.slice(0, -1), premium?.date, maturity)) {
+  const grid = swapExposureGrid(ctx.valuationDate, dates, maturity, premium?.date);
+  for (const t of grid.dates) {
     const T = yearFraction(ctx.valuationDate, t, "ACT/365F");
     const remaining: InterestRateSwap = { ...swap, upfront: undefined, legs: swap.legs.map((l) => ({ ...l, effectiveDate: t })) };
     let fairSpread: number;
@@ -449,7 +492,7 @@ export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit:
     reporting,
     profile,
     credit,
-    `Basis-swaption replication (Bachelier on the tenor-basis spread)${premium ? ", open premium netted until its payment date" : ""}, ${hazardLabel(credit)}`,
+    `Basis-swaption replication (Bachelier on the tenor-basis spread)${premium ? ", open premium netted until its payment date" : ""}, ${grid.label}, ${hazardLabel(credit)}`,
     warnings,
   );
 }
@@ -529,16 +572,30 @@ function aggregate(tradeId: string, currency: string, profile: ExposurePoint[], 
   return { tradeId, currency, cva, dva, bcva: -cva + dva, profile, method, warnings };
 }
 
-/** Exposure grid: the trade's payment dates plus maturity (quarterly points when there are few cashflows), at most 60 points. */
+/** Longest gap (calendar days) the generic exposure grid leaves between two points before monthly points are inserted (N10-2). */
+const GENERIC_GRID_MAX_GAP_DAYS = 35;
+
+/**
+ * Exposure grid of `cvaGeneric`: the trade's payment dates plus maturity, every
+ * gap longer than a month filled with (roughly) monthly points (N10-2 – until
+ * round 10 only grids with fewer than four points were filled quarterly, so a
+ * premium date refined a sparse FX-swap grid and moved its CVA by +6 %), at
+ * most 60 points (long-dated trades are thinned as before).
+ */
 function exposureGrid(ctx: MarketContext, base: ReturnType<typeof priceTrade>, maturity: number): number[] {
   const val = ctx.valuationDate;
   const set = new Set<number>();
   for (const leg of base.legs) for (const c of leg.cashflows) if (c.paymentDate > val && c.paymentDate <= maturity) set.add(c.paymentDate);
   set.add(maturity);
-  if (set.size < 4) {
-    const T = maturity - val;
-    const steps = Math.max(2, Math.min(40, Math.ceil((T / 365.25) * 4)));
-    for (let i = 1; i <= steps; i++) set.add(val + Math.round((T * i) / steps));
+  const sorted = [...set].sort((a, b) => a - b);
+  let prev = val;
+  for (const d of sorted) {
+    const gap = d - prev;
+    if (gap > GENERIC_GRID_MAX_GAP_DAYS) {
+      const steps = Math.ceil(gap / 30.4375);
+      for (let i = 1; i < steps; i++) set.add(prev + Math.round((gap * i) / steps));
+    }
+    prev = d;
   }
   let grid = [...set].sort((a, b) => a - b);
   if (grid.length > 60) {

@@ -1,4 +1,18 @@
-import { type SerialDate, addDays, addTenor, dayOfWeek, endOfMonth, fromYMD, isEndOfMonth, isWeekend, parseISO, parseTenor, toISO, toYMD } from "./date.js";
+import {
+  type SerialDate,
+  addDays,
+  addTenor,
+  assertSerialDate,
+  dayOfWeek,
+  endOfMonth,
+  fromYMD,
+  isEndOfMonth,
+  isWeekend,
+  parseISO,
+  parseTenor,
+  toISO,
+  toYMD,
+} from "./date.js";
 
 import { PricingError } from "../errors.js";
 
@@ -679,10 +693,19 @@ export function getCalendar(id: CalendarId | Calendar): Calendar {
 }
 
 export function isBusinessDay(d: SerialDate, cal: Calendar): boolean {
+  assertSerialDate(d);
   return !cal.isHoliday(d);
 }
 
+/**
+ * Business-day adjustment of `d`. Every exported calendar function
+ * (`adjust`, `addBusinessDays`, `advance`, `businessDaysBetween`,
+ * `isBusinessDay`) validates its date arguments with `assertSerialDate`
+ * (N10-4): `isBusinessDay(NaN)` is never true, so the searches below looped
+ * forever for `NaN` / `undefined` input; they now throw `INVALID_DATE`.
+ */
 export function adjust(d: SerialDate, bdc: BusinessDayConvention, cal: Calendar): SerialDate {
+  assertSerialDate(d);
   if (bdc === "Unadjusted" || isBusinessDay(d, cal)) return d;
   const { month } = toYMD(d);
   let x = d;
@@ -705,6 +728,9 @@ export function adjust(d: SerialDate, bdc: BusinessDayConvention, cal: Calendar)
 }
 
 export function addBusinessDays(d: SerialDate, n: number, cal: Calendar): SerialDate {
+  assertSerialDate(d);
+  if (!Number.isInteger(n))
+    throw new PricingError("INVALID_DATE", `addBusinessDays: n must be an integer number of business days, got ${String(n)}`, { input: n });
   let x = d;
   let remaining = Math.abs(n);
   const step = n >= 0 ? 1 : -1;
@@ -728,6 +754,7 @@ export function advance(
   endOfMonthRule = false,
   businessDaysForShortTenors = true,
 ): SerialDate {
+  assertSerialDate(d);
   const t = parseTenor(tenor);
   if (t.unit === "D" && businessDaysForShortTenors) return addBusinessDays(d, t.n, cal);
   const eom = endOfMonthRule && isEndOfMonth(d) && (t.unit === "M" || t.unit === "Y");
@@ -736,6 +763,8 @@ export function advance(
 }
 
 export function businessDaysBetween(from: SerialDate, to: SerialDate, cal: Calendar): number {
+  assertSerialDate(from, "from");
+  assertSerialDate(to, "to");
   let n = 0;
   for (let x = from; x < to; x++) if (isBusinessDay(x, cal)) n++;
   return n;
