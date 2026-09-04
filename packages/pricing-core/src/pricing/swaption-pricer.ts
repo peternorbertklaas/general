@@ -100,8 +100,9 @@ export function priceSwaption(ctx: MarketContext, trade: Swaption, reportingCurr
     const fxu = fxToReporting(ctx, trade.upfront.currency, reporting, trade.collateralCurrency);
     pv -= trade.upfront.amount * d2.df(trade.upfront.date) * fxu;
   }
-  const expired = trade.expiryDate <= ctx.valuationDate;
-  if (expired) warnings.push("Swaption expired – intrinsic value shown");
+  // N5-4g: on the exercise date itself the option is not expired – say so.
+  if (trade.expiryDate < ctx.valuationDate) warnings.push("Swaption expired – intrinsic value shown");
+  else if (trade.expiryDate === ctx.valuationDate) warnings.push("Swaption expires today – intrinsic value shown");
   const deltaAbs = longShort * notional * annuity * g.delta * fx;
   const gammaAbs = longShort * notional * annuity * g.gamma * fx;
   return {

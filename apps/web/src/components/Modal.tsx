@@ -35,11 +35,15 @@ export function restoreFocus(el: Element | null): void {
  */
 export function useFocusTrap(ref: React.RefObject<HTMLElement | null>, opts: { autoFocus?: boolean; initial?: React.RefObject<HTMLElement | null> } = {}) {
   const prev = useRef<Element | null>(null);
+  // The trap is installed once per mount; the options are read at that moment (a fresh object per render must not re-run it).
+  const optsRef = useRef(opts);
+  optsRef.current = opts;
   useEffect(() => {
+    const o = optsRef.current;
     prev.current = document.activeElement;
     const root = ref.current;
-    if (root && opts.autoFocus !== false) {
-      const target = opts.initial?.current ?? focusables(root)[0] ?? root;
+    if (root && o.autoFocus !== false) {
+      const target = o.initial?.current ?? focusables(root)[0] ?? root;
       window.setTimeout(() => target.focus(), 0);
     }
     const onKey = (e: KeyboardEvent) => {
@@ -66,7 +70,7 @@ export function useFocusTrap(ref: React.RefObject<HTMLElement | null>, opts: { a
       document.removeEventListener("keydown", onKey, true);
       restoreFocus(prev.current);
     };
-  }, []);
+  }, [ref]);
 }
 
 /** Registers an open modal in the store so background hotkeys are suspended. */

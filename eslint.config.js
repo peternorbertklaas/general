@@ -2,6 +2,7 @@
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 import globals from "globals";
+import reactHooks from "eslint-plugin-react-hooks";
 
 export default tseslint.config(
   { ignores: ["**/dist/**", "**/coverage/**", "**/node_modules/**", "**/*.d.ts", "apps/web/e2e-screenshots/**"] },
@@ -25,7 +26,17 @@ export default tseslint.config(
     },
   },
   {
-    files: ["**/*.test.ts", "**/*.test.tsx", "**/e2e/**"],
+    // React hooks discipline for the web app only (arch N4-03): the rules of hooks are errors, stale
+    // dependency lists are warnings – and the lint gate runs with `--max-warnings 0`, so both block.
+    files: ["apps/web/src/**/*.ts", "apps/web/src/**/*.tsx"],
+    plugins: { "react-hooks": reactHooks },
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
+    },
+  },
+  {
+    files: ["**/*.test.ts", "**/*.test.tsx", "**/e2e/**", "apps/web/scripts/**"],
     rules: { "no-console": "off" },
   },
 );

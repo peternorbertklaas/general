@@ -1,11 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App.js";
 import { parseQuickEntry } from "./lib/quick-parser.js";
 import { newTradeTemplate } from "./lib/templates.js";
 import { useStore } from "./state/store.js";
+import { preloadViews } from "./views/lazy-views.js";
 
 describe("App", () => {
+  // Views are lazy chunks (ADR-026); preloading once keeps the assertions below synchronous.
+  beforeAll(() => preloadViews());
   beforeEach(() => {
     localStorage.clear();
     useStore.setState({

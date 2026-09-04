@@ -73,9 +73,10 @@ describe("i18n core message mapping (F-25)", () => {
     expect(translatePricingError(new Error("FRA already settled"))).toBe("FRA bereits abgerechnet");
     expect(translatePricingError("plain")).toBe("plain");
     // core round 4: typed date / tenor parse errors
-    expect(translatePricingError(new PricingError("INVALID_DATE", "Invalid ISO date: 2026-13-45"))).toBe("Ungültiges Datum: Ungültiges Datum: 2026-13-45");
-    expect(translatePricingError(new PricingError("INVALID_DATE", "Invalid date: foo"))).toBe("Ungültiges Datum: Ungültiges Datum: foo");
-    expect(translatePricingError(new PricingError("INVALID_TENOR", "Invalid tenor: 7X"))).toBe("Ungültiger Tenor: Ungültiger Tenor: 7X");
+    // the headline is not repeated when the translated detail already starts with it (R5-06)
+    expect(translatePricingError(new PricingError("INVALID_DATE", "Invalid ISO date: 2026-13-45"))).toBe("Ungültiges Datum: 2026-13-45");
+    expect(translatePricingError(new PricingError("INVALID_DATE", "Invalid date: foo"))).toBe("Ungültiges Datum: foo");
+    expect(translatePricingError(new PricingError("INVALID_TENOR", "Invalid tenor: 7X"))).toBe("Ungültiger Tenor: 7X");
     expect(PRICING_ERROR_CODES_DE.INVALID_DATE).toBe("Ungültiges Datum");
     expect(PRICING_ERROR_CODES_DE.INVALID_TENOR).toBe("Ungültiger Tenor");
   });
@@ -159,9 +160,7 @@ describe("i18n core message mapping (F-25)", () => {
     expect(translatePricingError(new PricingError("INVALID_FREQUENCY", 'Invalid frequency: 7X (expected a tenor like "3M", "6M", "1Y" or "ZC")'))).toBe(
       "Ungültige Kuponfrequenz: Ungültige Frequenz: 7X (erwartet ein Tenor wie 3M, 6M, 1Y oder ZC)",
     );
-    expect(translatePricingError(new PricingError("UNKNOWN_DAYCOUNT", "Unknown day count convention: ACT/999"))).toBe(
-      "Unbekannte Tageszählung: Unbekannte Tageszählung: ACT/999",
-    );
+    expect(translatePricingError(new PricingError("UNKNOWN_DAYCOUNT", "Unknown day count convention: ACT/999"))).toBe("Unbekannte Tageszählung: ACT/999");
     expect(
       translatePricingError(
         new PricingError(

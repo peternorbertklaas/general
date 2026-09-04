@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toISO } from "@deriva/pricing-core";
 import { formatDateInput, parseDateInput } from "../lib/date-parse.js";
-import { useStore } from "../state/store.js";
+import { changeValuationDate, useStore } from "../state/store.js";
 import { useFocusTrap } from "./Modal.js";
 
 function pad(n: number): string {
@@ -51,10 +51,11 @@ export function ValuationDatePopover() {
   }, []);
   const apply = (iso: string) => {
     const st = useStore.getState();
-    if (st.setValuationDate(iso)) {
+    // With an imported snapshot the helper asks before the market is rebuilt from the quotes (R5-F2).
+    if (changeValuationDate(iso)) {
       st.showToast(`Bewertungstag ${iso.split("-").reverse().join(".")}`);
       close();
-    } else st.showToast("Ungültiges Datum");
+    }
   };
   const applyText = () => {
     const d = parseDateInput(text, { base: valuationDate, current: valuationDate });
@@ -111,7 +112,7 @@ export function ValuationDatePopover() {
       </div>
       <div className="muted xs" style={{ marginTop: 8 }}>
         Palette: <code className="mono">stichtag 2026-12-31</code> · Hotkey <kbd>⇧</kbd>
-        <kbd>T</kbd> · Quotes und Interpolation bleiben erhalten
+        <kbd>T</kbd> · Quotes und Interpolation bleiben erhalten; ein importierter Snapshot wird nur nach Rückfrage verworfen
       </div>
     </div>
   );

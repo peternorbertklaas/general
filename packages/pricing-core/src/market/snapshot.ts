@@ -4,6 +4,7 @@ import { type DayCountConvention } from "../dates/daycount.js";
 import { PricingError } from "../errors.js";
 import { type InterpolationMethod } from "../math/interpolation.js";
 import { type FxFixing, type MarketContext, normalizeFxPair } from "./market-context.js";
+import { validateVolSurfaces } from "./vol-validation.js";
 
 /** ISO-8601 date-time with mandatory time part and zone designator (`2026-09-03T16:30:00Z`, `…+02:00`, optional fraction). */
 const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
@@ -89,13 +90,24 @@ export function serializeCurve(c: Curve): MarketSnapshotJson["curves"][number] {
  * Rebuild a market context from its JSON form. Curves without a `meta.source`
  * are tagged `"import"` (pillars taken from the snapshot, R3-7); a
  * `meta.snapshotTime` that is not an ISO-8601 date-time raises
- * `PricingError("INVALID_TIMESTAMP")` (N3-03).
+ * `PricingError("INVALID_TIMESTAMP")` (N3-03); a structurally malformed vol
+ * surface raises `PricingError("INVALID_VOL_SURFACE", …, { key, problems })`
+ * (Markt R5-1, see `validateVolSurfaces`).
  */
 export function deserializeMarket(json: MarketSnapshotJson): MarketContext {
-  if (json.schema !== "deriva.market/1") throw new Error(`Unsupported market snapshot schema: ${String(json.schema)}`);
+  if (json.schema !== "deriva.market/1") throw new PricingError("INVALID_SNAPSHOT", `Unsupported market snapshot schema: ${String(json.schema)}`);
   if (json.meta?.snapshotTime !== undefined && !isIsoDateTime(json.meta.snapshotTime)) {
     throw new PricingError("INVALID_TIMESTAMP", `meta.snapshotTime must be an ISO-8601 date-time (got ${JSON.stringify(json.meta.snapshotTime)})`, {
       snapshotTime: json.meta.snapshotTime,
+    });
+  }
+  const volProblems = validateVolSurfaces({ swaptionVols: json.swaptionVols, capletVols: json.capletVols, fxVols: json.fxVols });
+  if (volProblems.length) {
+    // The key is the first path segment after the collection name ("swaptionVols.USD.atm[0] …" → "USD").
+    const key = /^(?:swaptionVols|capletVols|fxVols)\.([^.[\s]+)/.exec(volProblems[0]!)?.[1];
+    throw new PricingError("INVALID_VOL_SURFACE", `Market snapshot: malformed vol surface${key ? ` ${key}` : ""}: ${volProblems.join("; ")}`, {
+      key,
+      problems: volProblems,
     });
   }
   const valuationDate: SerialDate = parseISO(json.valuationDate);
@@ -136,21 +148,28 @@ export function deserializeMarket(json: MarketSnapshotJson): MarketContext {
  * with the offending index, like a malformed curve node would.
  */
 function deserializeFxFixings(raw: NonNullable<MarketSnapshotJson["fxFixings"]>): FxFixing[] {
-  if (!Array.isArray(raw)) throw new Error("Market snapshot: fxFixings must be an array of { pair, date, rate }");
+  if (!Array.isArray(raw)) throw new PricingError("INVALID_SNAPSHOT", "Market snapshot: fxFixings must be an array of { pair, date, rate }");
   return raw.map((f, i) => {
     const pair = typeof f?.pair === "string" ? normalizeFxPair(f.pair) : "";
-    if (!/^[A-Z]{6}$/.test(pair)) throw new Error(`Market snapshot: fxFixings[${i}].pair must be a 6-letter currency pair (got ${JSON.stringify(f?.pair)})`);
+    if (!/^[A-Z]{6}$/.test(pair))
+      throw new PricingError("INVALID_SNAPSHOT", `Market snapshot: fxFixings[${i}].pair must be a 6-letter currency pair (got ${JSON.stringify(f?.pair)})`);
     if (typeof f.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(f.date))
-      throw new Error(`Market snapshot: fxFixings[${i}].date must be an ISO date (got ${JSON.stringify(f.date)})`);
+      throw new PricingError("INVALID_SNAPSHOT", `Market snapshot: fxFixings[${i}].date must be an ISO date (got ${JSON.stringify(f.date)})`);
     if (typeof f.rate !== "number" || !Number.isFinite(f.rate) || f.rate <= 0)
-      throw new Error(`Market snapshot: fxFixings[${i}].rate must be a positive finite number (got ${String(f.rate)})`);
+      throw new PricingError("INVALID_SNAPSHOT", `Market snapshot: fxFixings[${i}].rate must be a positive finite number (got ${String(f.rate)})`);
     return { pair, date: parseISO(f.date), rate: f.rate };
   });
 }
 
-/** Validate a snapshot for internal consistency; returns a list of problems (empty = OK). */
+/**
+ * Validate a snapshot for internal consistency (discount-curve mapping, DF
+ * range and monotonicity, FX spots, FX fixings, `meta.snapshotTime` and –
+ * Markt R5-1 – the structure of every vol surface via `validateVolSurfaces`);
+ * returns a list of problems (empty = OK).
+ */
 export function validateMarket(ctx: MarketContext): string[] {
   const problems: string[] = [];
+  problems.push(...validateVolSurfaces({ swaptionVols: ctx.swaptionVols, capletVols: ctx.capletVols, fxVols: ctx.fxVols }));
   for (const [ccy, id] of Object.entries(ctx.discountCurveId)) {
     if (!ctx.curves[id]) problems.push(`Discount curve ${id} for ${ccy} missing`);
   }

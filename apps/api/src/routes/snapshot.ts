@@ -13,6 +13,8 @@ import {
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { sendError } from "../lib/errors.js";
+import { ifNoneMatchSatisfied } from "../lib/etag.js";
+import { volSurfaceProblems } from "../lib/vol-surfaces.js";
 import {
   type EMIR_BOOLEAN,
   type EMIR_CLEARED,
@@ -95,16 +97,26 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
       schema: {
         operationId: "getMarketSnapshot",
         tags: ["market"],
-        summary: "Vollständigen Markt-Snapshot exportieren (JSON, ISO-Daten, versioniert; ETag = Snapshot-ID, If-None-Match → 304)",
-        headers: { type: "object", properties: { "if-none-match": { type: "string" } } },
-        response: responses({ 200: marketSnapshotRef, 304: { type: "null", description: "Not modified (snapshot id matches If-None-Match)" } }),
+        summary: "Vollständigen Markt-Snapshot exportieren (JSON, ISO-Daten, versioniert; starker ETag = Snapshot-ID, If-None-Match → 304)",
+        headers: {
+          type: "object",
+          properties: {
+            "if-none-match": {
+              type: "string",
+              description: 'Snapshot ETag(s) the client holds (`"snapshotId"`), or "*"; weak comparison (`W/` ignored). Match → 304.',
+            },
+          },
+        },
+        response: responses({
+          200: marketSnapshotRef,
+          304: { type: "null", description: "Not modified (snapshot id matches If-None-Match, weak comparison)" },
+        }),
       },
     },
     async (req, reply) => {
       const etag = `"${ctx.market.snapshotId()}"`;
       reply.header("etag", etag);
-      const inm = req.headers["if-none-match"];
-      if (inm && inm.split(",").some((v) => v.trim() === etag || v.trim() === "*")) return reply.status(304).send();
+      if (ifNoneMatchSatisfied(req.headers["if-none-match"], etag)) return reply.status(304).send();
       return serializeMarket(ctx.market.get());
     },
   );
@@ -116,7 +128,9 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
       schema: {
         operationId: "importMarketSnapshot",
         tags: ["market"],
-        summary: "Markt-Snapshot importieren (ersetzt den aktiven Snapshot nach Schema- und Konsistenzprüfung)",
+        summary: "Markt-Snapshot importieren (ersetzt den aktiven Snapshot nach Schema-, Vol-Flächen- und Konsistenzprüfung)",
+        description:
+          "Order of checks: JSON schema (400 `VALIDATION_ERROR`) → structural vol-surface check (400 `VOL_SURFACE_INVALID` with `problems[]`: grid dimensions, axis ordering, key ↔ currency/pair) → structural deserialisation (400 `SNAPSHOT_MALFORMED` / `INVALID_TIMESTAMP` / `INVALID_DATE`) → market consistency (`validateMarket`, 422 `SNAPSHOT_INVALID` with `problems[]`). The active snapshot is replaced only when every step passes.",
         body: marketSnapshotRef,
         response: responses(
           {
@@ -138,6 +152,12 @@ export async function registerSnapshotRoutes(app: FastifyInstance, ctx: AppConte
       },
     },
     async (req, reply) => {
+      const surfaceProblems = volSurfaceProblems(req.body);
+      if (surfaceProblems.length) {
+        return sendError(reply, req, 400, "VOL_SURFACE_INVALID", `Vol surface(s) of the snapshot structurally invalid (${surfaceProblems.length} problem(s))`, {
+          problems: surfaceProblems,
+        });
+      }
       let m;
       try {
         m = deserializeMarket(req.body);

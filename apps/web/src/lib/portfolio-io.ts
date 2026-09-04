@@ -147,6 +147,7 @@ export type CsvColumn =
   | "spread"
   | "fxSpot"
   | "period"
+  | "collateral"
   | "status";
 
 export type CsvTradeType = "IRS" | "FXF" | "CAP" | "SWPT" | "FXO" | "CCS" | "FRA";
@@ -240,7 +241,24 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
   CCS: {
     type: "CCS",
     label: "Cross-Currency-Swap",
-    columns: ["type", "id", "name", "counterparty", "book", "pair", "notional", "spread", "rate", "fxSpot", "direction", "start", "maturity", "status"],
+    // `collateral`: CSA currency (empty = market default – quote currency; `none` = unsecured), Markt R5-3.
+    columns: [
+      "type",
+      "id",
+      "name",
+      "counterparty",
+      "book",
+      "pair",
+      "notional",
+      "spread",
+      "rate",
+      "fxSpot",
+      "direction",
+      "start",
+      "maturity",
+      "collateral",
+      "status",
+    ],
     example: [
       "CCS",
       "CCS-1001",
@@ -255,6 +273,7 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
       "Receive",
       "2026-09-07",
       "5Y",
+      "USD",
       "Live",
     ],
   },
@@ -350,6 +369,11 @@ const HEADER_ALIASES: Record<string, CsvColumn> = {
   kassakurs: "fxSpot",
   period: "period",
   periode: "period",
+  collateral: "collateral",
+  csa: "collateral",
+  collateralcurrency: "collateral",
+  "collateral-währung": "collateral",
+  besicherung: "collateral",
   status: "status",
 };
 
@@ -404,9 +428,46 @@ function rateOf(s: string | undefined): number | undefined {
   return Math.abs(p.value) >= 0.5 ? p.value / 100 : p.value;
 }
 
-function dateOf(s: string | undefined, base: number): number | undefined {
-  if (!s) return undefined;
-  return parseDateInput(s, { base });
+/** German column labels for row errors ("Spalte „start“ (Start)"). */
+const COLUMN_DE: Partial<Record<CsvColumn, string>> = {
+  start: "Start",
+  maturity: "Laufzeit/Enddatum",
+  deliveryDate: "Lieferdatum",
+  expiry: "Verfall",
+};
+
+/**
+ * Date cell of a CSV row. An empty cell yields `undefined` (the caller applies
+ * its default); text that is not a date, an impossible date (`31.02.2026`,
+ * `2026-02-30`) or an unknown tenor raises a German row error instead of being
+ * replaced silently by the default (R5-F1).
+ */
+function dateOf(s: string | undefined, base: number, column: CsvColumn): number | undefined {
+  if (s === undefined || s.trim() === "") return undefined;
+  const d = parseDateInput(s, { base });
+  if (d === undefined) throw new Error(invalidDateMessage(s, column));
+  return d;
+}
+
+/** Row error for an unreadable / impossible date cell (exported for tests and the API-style error list). */
+export function invalidDateMessage(value: string, column: CsvColumn): string {
+  const label = COLUMN_DE[column] ?? column;
+  return `Ungültiges Datum „${value.trim()}“ in Spalte „${column}“ (${label}) – erwartet TT.MM.JJJJ, JJJJ-MM-TT oder Tenor (z. B. 5Y); unmögliche Daten wie 31.02. werden nicht übernommen`;
+}
+
+/**
+ * CSA column of a cross-currency swap (Markt R5-3): empty → the market default
+ * (`ccsCollateralCurrency`), `none` / `unbesichert` / `keine` / `-` → unsecured
+ * (`null`), otherwise a 3-letter currency.
+ */
+export function collateralOf(raw: string | undefined, pair: string): string | null | undefined {
+  const s = (raw ?? "").trim();
+  if (s === "") return ccsCollateralCurrency(pair);
+  if (/^(none|null|nein|no|keine?|unbesichert|ohne|-|–)$/i.test(s)) return null;
+  const ccy = s.toUpperCase();
+  if (!/^[A-Z]{3}$/.test(ccy))
+    throw new Error(`Collateral-Währung „${s}“ nicht lesbar (Spalte „collateral“: Währung wie USD, leer = Standard, „none“ = unbesichert)`);
+  return ccy;
 }
 
 const STATUS_MAP: Record<string, Trade["status"]> = {
@@ -476,15 +537,17 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
   if (rec.book) common.book = rec.book;
   const status = STATUS_MAP[(rec.status ?? "").toLowerCase()];
   if (status) common.status = status;
-  const start = dateOf(rec.start, valuationDate) ?? addTenor(valuationDate, "2D");
+  // FRAs read `start` themselves (period "3x6" or explicit dates) – every other product starts at T+2 unless the row says otherwise.
+  const start = type === "FRA" ? valuationDate : (dateOf(rec.start, valuationDate, "start") ?? addTenor(valuationDate, "2D"));
+  /** Maturity cell: a tenor ("10Y") is passed to the builder, anything else must be a valid date (R5-F1). */
+  const maturityOf = (raw: string): string | number => (/^\d+[dwmy]$/i.test(raw.trim()) ? raw.trim().toUpperCase() : dateOf(raw, start, "maturity")!);
   if (type === "IRS" || type === "SWAP" || type === "ZINSSWAP") {
     const notional = num(rec.notional);
     const rate = rateOf(rec.rate);
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
     if (rate === undefined) throw new Error("Festsatz fehlt");
     if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
-    const maturity = /^\d+[dwmy]$/i.test(rec.maturity.trim()) ? rec.maturity.trim().toUpperCase() : dateOf(rec.maturity, start);
-    if (maturity === undefined) throw new Error(`Laufzeit „${rec.maturity}“ nicht lesbar`);
+    const maturity = maturityOf(rec.maturity);
     const dir = (rec.direction ?? "Pay").toLowerCase();
     const t = makeVanillaSwap({
       id,
@@ -506,7 +569,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     const sellCcy = (rec.sellCurrency ?? "").toUpperCase();
     const buyAmount = num(rec.buyAmount);
     const sellAmount = num(rec.sellAmount);
-    const delivery = dateOf(rec.deliveryDate ?? rec.maturity, valuationDate);
+    const delivery = dateOf(rec.deliveryDate ?? rec.maturity, valuationDate, "deliveryDate");
     if (!/^[A-Z]{3}$/.test(buyCcy) || !/^[A-Z]{3}$/.test(sellCcy)) throw new Error("Kauf-/Verkaufswährung fehlt");
     if (buyCcy === sellCcy) throw new Error("Kauf- und Verkaufswährung müssen sich unterscheiden");
     if (buyAmount === undefined || sellAmount === undefined) throw new Error("Kauf-/Verkaufsbetrag fehlt");
@@ -524,8 +587,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
     if (strike === undefined) throw new Error("Strike fehlt");
     if (!rec.maturity) throw new Error("Laufzeit/Enddatum fehlt");
-    const maturity = /^\d+[dwmy]$/i.test(rec.maturity.trim()) ? rec.maturity.trim().toUpperCase() : dateOf(rec.maturity, start);
-    if (maturity === undefined) throw new Error(`Laufzeit „${rec.maturity}“ nicht lesbar`);
+    const maturity = maturityOf(rec.maturity);
     const t = makeCapFloor({
       id,
       counterparty: common.counterparty,
@@ -547,8 +609,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     if (strike === undefined) throw new Error("Strike fehlt");
     const expiryRaw = (rec.expiry ?? "").trim();
     if (!expiryRaw) throw new Error("Verfall fehlt (Tenor „1Y“ oder Datum)");
-    const expiry = /^\d+[dwmy]$/i.test(expiryRaw) ? expiryRaw.toUpperCase() : dateOf(expiryRaw, valuationDate);
-    if (expiry === undefined) throw new Error(`Verfall „${expiryRaw}“ nicht lesbar`);
+    const expiry = /^\d+[dwmy]$/i.test(expiryRaw) ? expiryRaw.toUpperCase() : dateOf(expiryRaw, valuationDate, "expiry")!;
     const tenor = (rec.tenor ?? rec.maturity ?? "").trim().toUpperCase();
     if (!/^\d+[DWMY]$/.test(tenor)) throw new Error("Swap-Laufzeit fehlt (z. B. 5Y)");
     const dir = (rec.direction ?? "Payer").toLowerCase();
@@ -572,7 +633,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     const strike = num(rec.strike);
     if (notional === undefined || notional <= 0) throw new Error("Nominal fehlt oder ≤ 0");
     if (strike === undefined || strike <= 0) throw new Error("Strike fehlt");
-    const expiry = dateOf(rec.expiry ?? rec.maturity, valuationDate);
+    const expiry = dateOf(rec.expiry ?? rec.maturity, valuationDate, "expiry");
     if (expiry === undefined) throw new Error("Verfall fehlt");
     const optionType = /^(put|p|verkauf)/i.test((rec.optionType ?? rec.direction ?? "Call").trim()) ? "Put" : "Call";
     const t = makeFxOption({ id, counterparty: common.counterparty, pair, optionType, notional, strike, expiryDate: expiry });
@@ -603,7 +664,7 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
       effectiveDate: start,
       tenor,
       domesticPayReceive: /^(pay|payer|p|zahl)/.test(dir) ? "Pay" : "Receive",
-      collateralCurrency: ccsCollateralCurrency(pair),
+      collateralCurrency: collateralOf(rec.collateral, pair),
     });
     return { ...t, ...common, name: common.name ?? t.name } as Trade;
   }
@@ -627,8 +688,8 @@ function tradeFromRecord(rec: Partial<Record<CsvColumn, string>>, valuationDate:
     let t: Trade;
     if (/^\d{1,2}\s*[xX×]\s*\d{1,2}$/.test(period)) t = makeFra({ ...base, start: period.replace(/\s+/g, "").toLowerCase(), valuationDate });
     else {
-      const startDate = dateOf(rec.start, valuationDate);
-      const endDate = dateOf(rec.maturity, startDate ?? valuationDate);
+      const startDate = dateOf(rec.start, valuationDate, "start");
+      const endDate = dateOf(rec.maturity, startDate ?? valuationDate, "maturity");
       if (startDate === undefined || endDate === undefined) throw new Error("FRA-Periode fehlt (z. B. „3x6“ oder Start- und Enddatum)");
       if (endDate <= startDate) throw new Error("FRA: Ende muss nach dem Start liegen");
       t = makeFra({ ...base, start: startDate, end: endDate, valuationDate });

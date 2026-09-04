@@ -76,10 +76,12 @@ describe("N4-01 compute budget covers hedge routes, store-pricing GETs and the s
     const r = await tiny.inject({ method: "POST", url: "/api/hedge/effectiveness", payload: { relationship: relationship("IRS-0001") } });
     expect(r.statusCode).toBe(413);
     expect(r.json()).toMatchObject({ code: "PERIOD_BUDGET_EXCEEDED", details: { weight: 40, source: "store", trades: 1 } });
-    // Unknown stored instrument: nothing to bound, the route answers its 404 with a code.
-    const missing = await tiny.inject({ method: "POST", url: "/api/hedge/effectiveness", payload: { relationship: relationship("NOPE") } });
+    // Unknown stored instrument: the route answers its 404 with a code (on the default budget – since R5 the hedged item's
+    // own schedule counts too, so the tiny budget above would trip 413 before the lookup, N5-04).
+    const missing = await app.inject({ method: "POST", url: "/api/hedge/effectiveness", payload: { relationship: relationship("NOPE") } });
     expect(missing.statusCode).toBe(404);
     expect(missing.json().code).toBe("NOT_FOUND");
+    expect((await tiny.inject({ method: "POST", url: "/api/hedge/effectiveness", payload: { relationship: relationship("NOPE") } })).statusCode).toBe(413);
     await tiny.close();
     // The sample relationship on the default budget still works.
     const ok = await app.inject({ method: "POST", url: "/api/hedge/effectiveness", payload: { relationship: relationship("IRS-0001") } });
@@ -496,6 +498,8 @@ describe("N3-04 the API imports only the documented public surface of the core (
     "serializeMarket",
     "deserializeMarket",
     "validateMarket",
+    "validateVolSurfaces",
+    "VolSurfacesInput",
     "marketSnapshotId",
     // Builders
     "makeVanillaSwap",

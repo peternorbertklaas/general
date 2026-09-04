@@ -1,3 +1,5 @@
+import { PricingError } from "../errors.js";
+
 export interface RootFindOptions {
   tolerance?: number;
   maxIterations?: number;
@@ -16,7 +18,7 @@ export function brent(f: (x: number) => number, lower: number, upper: number, op
   if (fa === 0) return a;
   if (fb === 0) return b;
   if (fa * fb > 0) {
-    throw new Error(`brent: root not bracketed on [${a}, ${b}] (f(a)=${fa}, f(b)=${fb})`);
+    throw new PricingError("NUMERICAL_FAILURE", `brent: root not bracketed on [${a}, ${b}] (f(a)=${fa}, f(b)=${fb})`);
   }
   let c = a;
   let fc = fa;
@@ -74,7 +76,7 @@ export function brent(f: (x: number) => number, lower: number, upper: number, op
     else b += xm > 0 ? tol1 : -tol1;
     fb = f(b);
   }
-  throw new Error("brent: maximum iterations exceeded");
+  throw new PricingError("NUMERICAL_FAILURE", "brent: maximum iterations exceeded");
 }
 
 /**
@@ -105,7 +107,7 @@ export function solveBracketed(
     }
     n++;
   }
-  if (flo * fhi > 0) throw new Error("solveBracketed: unable to bracket root");
+  if (flo * fhi > 0) throw new PricingError("NUMERICAL_FAILURE", "solveBracketed: unable to bracket root");
   return brent(f, lo, hi, opts);
 }
 

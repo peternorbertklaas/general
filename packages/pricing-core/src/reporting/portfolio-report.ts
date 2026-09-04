@@ -244,7 +244,7 @@ export function portfolioReportToMarkdown(report: PortfolioReport): string {
     ...(report.audit.preparedBy ? [`| **Erstellt von** | ${report.audit.preparedBy} |`] : []),
     "",
     "---",
-    "_Sensitivitäten per Bump-and-Reprice (DV01 zentrale Differenz ±1 bp aller Zinskurven, FX-Delta ±1 % Spot, Theta 1-Tages-Constant-Curve-Roll inkl. Cashflows im Intervall). Nicht bewertbare Geschäfte sind in den Summen nicht enthalten._",
+    "_Sensitivitäten per Bump-and-Reprice (DV01 zentrale Differenz ±1 bp aller Zinskurven, FX-Delta ±1 % Spot, Theta 1-Tages-Constant-Curve-Roll inkl. Cashflows im Intervall – FX-Legs mit Lieferung am Roll-Datum zählen einmal als Value Today im gerollten Barwert). Nicht bewertbare Geschäfte sind in den Summen nicht enthalten._",
   );
   return out.join("\n");
 }

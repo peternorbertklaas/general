@@ -6,7 +6,7 @@
  */
 import { chromium } from "playwright";
 import { spawn } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,6 +78,8 @@ try {
   // Blotter renders portfolio, no external font requests, favicon present
   check((await page.locator("table.grid-table tbody tr").count()) >= 10, "blotter rows");
   check((await page.locator('[data-testid="onboarding"]').count()) === 1, "onboarding hint on first launch");
+  const onboardingText = await page.locator('[data-testid="onboarding"]').innerText();
+  check(onboardingText.includes("15.03.2027") && !/\d{4}-\d{2}-\d{2}/.test(onboardingText), "onboarding examples use German dates (R5-09)");
   check((await page.locator("h1").innerText()) === "DERIVA", "h1 title");
   check((await page.locator('link[rel="icon"]').count()) === 1, "favicon link present");
   check(!failedRequests.some((u) => u.includes("fonts.googleapis")), "no external font requests");
@@ -101,6 +103,31 @@ try {
   await page.locator("table.blotter tbody tr.selected").focus();
   await page.keyboard.press("Tab");
   check((await page.evaluate(() => document.activeElement?.tagName)) !== "TR", "Tab leaves the blotter after one stop (R4-03)");
+  // Row checkboxes are no tab stops; the selected row is reached within 30 Tabs from the skip link (R5-02)
+  const cellStops = await page.evaluate(() => document.querySelectorAll('table.blotter tbody input.compare-check:not([tabindex="-1"])').length);
+  check(cellStops === 0, `compare checkboxes are not tab stops (${cellStops}) (R5-02)`);
+  await page.locator("a.skip").focus();
+  let tabsToRow = 0;
+  for (; tabsToRow < 60; tabsToRow++) {
+    await page.keyboard.press("Tab");
+    if (await page.evaluate(() => document.activeElement?.tagName === "TR" && document.activeElement.closest("table.blotter") !== null)) break;
+  }
+  // 49 Tabs in R5 (13 checkbox stops + 8 header stops); now ≤ 35 including the four onboarding chips of the first launch
+  check(tabsToRow + 1 <= 35, `selected blotter row reached after ${tabsToRow + 1} Tabs (R5-02)`);
+  await page.keyboard.press("Space");
+  await wait(150);
+  check((await page.locator(".compare-check:checked").count()) === 1, "Space on the focused row marks it for comparison (R5-02)");
+  await page.keyboard.press("Space");
+  await wait(150);
+  // sortable headers: one tab stop, ←/→ move along the columns, Enter sorts
+  const headerStops = await page.evaluate(() => document.querySelectorAll('table.blotter thead .th-btn:not([tabindex="-1"])').length);
+  check(headerStops === 1, `blotter header row is one tab stop (${headerStops}) (R5-02)`);
+  await page.locator('table.blotter thead .th-btn[tabindex="0"]').focus();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  const hdrFocus = await page.evaluate(() => document.activeElement?.textContent?.trim() ?? "");
+  check(/Kontrahent|Name|Typ/.test(hdrFocus), `arrow keys move between column headers (${hdrFocus}) (R5-02)`);
+  await page.keyboard.press("Home");
   // Chords take precedence on a focused row (R4-02): y i copies the indication, i does not toggle the inspector, y y copies the row
   await page.locator("table.blotter tbody tr.selected").focus();
   const inspBefore = await page.locator(".inspector").count();
@@ -180,6 +207,30 @@ try {
   await page.locator('[data-testid="import-skip"]').click();
   await wait(500);
   check(Number((await page.locator(".statusbar").innerText()).match(/(\d+) Trades/)?.[1]) === tradesAfterCsv, "skip strategy keeps the trade count");
+  // Impossible dates are row errors, never silent defaults (R5-F1)
+  const csvDates = join(tmpdir(), `deriva-e2e-dates-${port}.csv`);
+  writeFileSync(
+    csvDates,
+    "\uFEFFtype;id;name;currency;notional;direction;rate;start;maturity;index\r\nIRS;IRS-D1;Datum 31.02.;EUR;5000000;Pay;3,0 %;31.02.2026;7Y;EURIBOR-6M\r\nIRS;IRS-D2;Datum ISO 30.02.;EUR;5000000;Pay;3,0 %;2026-02-30;7Y;EURIBOR-6M\r\nIRS;IRS-D3;gültig;EUR;5000000;Pay;3,0 %;15.03.2027;7Y;EURIBOR-6M\r\n",
+    "utf8",
+  );
+  await page.locator('[data-testid="export-menu-btn"]').click();
+  await wait(150);
+  await page.locator('[data-testid="import-csv"]').setInputFiles(csvDates);
+  await wait(800);
+  check((await page.locator('[data-testid="csv-errors-table"] tbody tr').count()) === 2, "impossible start dates are listed as row errors (R5-F1)");
+  const dateErrs = await page.locator('[data-testid="csv-errors-table"]').innerText();
+  check(
+    /Ungültiges Datum „31\.02\.2026“ in Spalte „start“/.test(dateErrs) && dateErrs.includes("2026-02-30"),
+    "date row errors name value, column and format (R5-F1)",
+  );
+  check((await page.locator('[data-testid="csv-errors-continue"]').innerText()).includes("1 gültige"), "only the valid row is offered for import (R5-F1)");
+  await page.locator('[data-testid="csv-errors-continue"]').click();
+  await wait(800);
+  check(
+    (await page.locator("td.id-cell", { hasText: "IRS-D3" }).count()) === 1 && (await page.locator("td.id-cell", { hasText: "IRS-D1" }).count()) === 0,
+    "valid row imported, impossible-date rows not (R5-F1)",
+  );
 
   // Compare: Space marks trades, g v opens the compare view
   await page.locator("td.id-cell", { hasText: "IRS-0001" }).click();
@@ -525,6 +576,49 @@ try {
   await page.locator('button[aria-label="Stufe 1 entfernen"]').click();
   await wait(300);
   check((await page.locator('[data-testid="coupon-schedule-0"] table').count()) === 0, "removing the step drops the table");
+  // Shift+P on a cap sets the ATM strike, on a collar the zero-cost floor strike (R5-03); risk table is named and German (R5-04)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("CAP-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(500);
+  const capStrikeBefore = await page.locator('input[aria-label="Strike"]').first().inputValue();
+  await page.keyboard.press("Shift+P");
+  await wait(600);
+  check((await page.locator(".toast", { hasText: "ATM-Strike übernommen" }).count()) === 1, "Shift+P on a cap takes over the ATM strike (R5-03)");
+  check((await page.locator('input[aria-label="Strike"]').first().inputValue()) !== capStrikeBefore, `cap strike changed (${capStrikeBefore} → ATM) (R5-03)`);
+  check((await page.locator(".toast", { hasText: "Kein Par-Wert" }).count()) === 0, "no 'Kein Par-Wert' toast for the cap (R5-03)");
+  await page.keyboard.press("Control+z");
+  await wait(400);
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("collar 7y 3.5/1.5 6m");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(600);
+  const collarPvBefore = await page.locator('[data-testid="pv-value"]').innerText();
+  await page.keyboard.press("Shift+P");
+  await wait(800);
+  check((await page.locator(".toast", { hasText: "Zero-Cost-Collar" }).count()) === 1, "Shift+P on a collar solves the zero-cost floor strike (R5-03)");
+  const collarPvAfter = Number((await page.locator('[data-testid="pv-value"]').innerText()).replace(/[.\s]/g, "").replace("−", "-").replace(",", "."));
+  check(
+    Number.isFinite(collarPvAfter) && Math.abs(collarPvAfter) < 100 && collarPvBefore !== String(collarPvAfter),
+    `collar PV ≈ 0 after Shift+P (${collarPvAfter}) (R5-03)`,
+  );
+  const collarId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
+  const riskTable = page.locator('[data-testid="risk-table"]');
+  check((await riskTable.getAttribute("aria-label")) === "Risiko (Bump)", "risk table carries an aria-label (R5-04)");
+  check(
+    /Vega Caplet|Vega Swaption|Vega FX/.test(await riskTable.innerText()) && !/Vega caplet|Vega swaption/.test(await riskTable.innerText()),
+    "vega bucket labels are German (R5-04)",
+  );
+  check(
+    (await page.locator('[data-testid="analytics-table"]').getAttribute("aria-label")) === "Preis-Analytics",
+    "analytics table carries an aria-label (R5-04)",
+  );
+  // remove the collar again (Shift+D → toast with Rückgängig)
+  await page.keyboard.press("Shift+D");
+  await wait(400);
+  check((await page.locator(".toast", { hasText: `Gelöscht: ${collarId}` }).count()) === 1, "collar deleted again");
 
   // Report: generate, audit line, governance, perspective, what-if badge, documents
   await chord(page, "r");
@@ -539,6 +633,19 @@ try {
     "market table shows interpolation labels (R3-06)",
   );
   check((await page.locator('[data-testid="audit-hashes"]').innerText()).includes("deriva-pricing-core"), "engine version shown");
+  // Customer mode hides the internal formulas of the report (R5-07)
+  const reportInternal = await page.locator('[data-testid="report"]').innerText();
+  check(reportInternal.includes("= risikofrei − CVA + DVA") && /Marge der Bank/.test(reportInternal), "auditor report shows decomposition and margin rule");
+  await page.keyboard.press("Shift+K");
+  await wait(400);
+  const reportCustomer = await page.locator('[data-testid="report"]').innerText();
+  check(
+    !reportCustomer.includes("risikofrei − CVA") && !/Marge der Bank/.test(reportCustomer) && !/\bCVA\b|\bDVA\b/.test(reportCustomer),
+    "customer-mode report hides CVA/DVA decomposition and the bank-margin formula (R5-07)",
+  );
+  check(reportCustomer.includes("inkl. Kontrahentenrisiko"), "customer-mode fair value carries the neutral subtitle (R5-07)");
+  await page.keyboard.press("Shift+K");
+  await wait(400);
   check((await page.locator('[data-testid="report-governance"]').innerText()).includes("indikativ"), "governance line shows snapshot status");
   check((await page.locator('[data-testid="perspective-seg"] button[aria-pressed="true"]').innerText()) === "Kunde", "default perspective is Kunde");
   check(
@@ -767,13 +874,16 @@ try {
     const ratio = document.querySelector('input[aria-label="Hedge Ratio"]');
     const unit = ratio?.parentElement?.querySelector(".unit");
     const gap = ratio && unit ? unit.getBoundingClientRect().left - ratio.getBoundingClientRect().right : 999;
-    return { sels: sels.length, clipped, gap };
+    const ratioW = ratio ? ratio.getBoundingClientRect().width : 999;
+    return { sels: sels.length, clipped, gap, ratioW };
   });
   check(
     hedgePrintFit.sels >= 2 && hedgePrintFit.clipped === 0,
     `hedge print: selects are not clipped (${hedgePrintFit.clipped} of ${hedgePrintFit.sels}) (R4-08)`,
   );
   check(hedgePrintFit.gap >= -1 && hedgePrintFit.gap < 30, `hedge print: unit sits next to the value (gap ${Math.round(hedgePrintFit.gap)} px) (R4-08)`);
+  // The input shrinks to its value, so "50" and "%" are visually adjacent, not 50 px apart (R5-08)
+  check(hedgePrintFit.ratioW < 60, `hedge print: ratio input shrinks to its value (${Math.round(hedgePrintFit.ratioW)} px wide) (R5-08)`);
   await page.screenshot({ path: join(outDir, "08-hedge-print.png"), fullPage: true });
   await page.emulateMedia({ media: "screen" });
   // "Zurücksetzen" asks first (R3-F4)
@@ -1003,6 +1113,144 @@ try {
   await wait(500);
   check((await page.locator('[data-testid="fx-fixings-table"]').count()) === 0, "Ctrl+Z removes the FX fixing again");
 
+  // Snapshot round trip (R5-F2): export → change a quote → import the same file → identical id, no "modifiziert", quote table reset
+  const snapId0 = await page.locator('[data-testid="snapshot-id"]').innerText();
+  check(/^[0-9a-f]{12,}$/.test(snapId0), `market view shows the snapshot id (${snapId0}) (R5-F2)`);
+  const [snapDownload] = await Promise.all([page.waitForEvent("download"), page.locator('[data-testid="snapshot-export"]').click()]);
+  const snapPath = join(tmpdir(), `deriva-e2e-snapshot-${port}.json`);
+  await snapDownload.saveAs(snapPath);
+  await chord(page, "c");
+  await page.locator("button.btn", { hasText: "Quotes +10 bp" }).click();
+  await wait(500);
+  await chord(page, "m");
+  const snapIdMod = await page.locator('[data-testid="snapshot-id"]').innerText();
+  check(snapIdMod !== snapId0, "quote change changes the snapshot id");
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"), "quote change flags the market as modifiziert");
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapPath);
+  await wait(1200);
+  check((await page.locator('[data-testid="snapshot-id"]').innerText()) === snapId0, `re-import of the exported snapshot reproduces the id ${snapId0} (R5-F2)`);
+  check((await page.locator(".toast", { hasText: `importiert · ID ${snapId0}` }).count()) === 1, "import toast names the snapshot id (R5-F2)");
+  check((await page.locator('[data-testid="snapshot-imported"]').count()) === 1, "market view marks the imported source (R5-F2)");
+  check(!(await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"), "imported market is not 'modifiziert' (R5-F2)");
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("importiert"), "market chip says importiert (R5-F2)");
+  await chordO(page, "r");
+  check(
+    (await page.locator('[data-testid="audit-hashes"]').innerText()).includes(`Snapshot ${snapId0}`),
+    "report snapshot id equals the market id after import (R5-F2)",
+  );
+  await chord(page, "c");
+  check(
+    (await page.locator('[data-testid="curves-import-note"]').count()) === 1,
+    "curves view explains that quotes are not editable for an imported market (R5-F2)",
+  );
+  check((await page.locator("button.btn", { hasText: "Quotes +10 bp" }).isDisabled()) === true, "quote bump buttons disabled for an imported market (R5-F2)");
+  // a valuation-date change is refused unless confirmed – the import is never dropped silently
+  let dateDialog = "";
+  page.once("dialog", (d) => {
+    dateDialog = d.message();
+    d.dismiss();
+  });
+  await page.keyboard.press("Shift+T");
+  await wait(200);
+  // the snapshot carries 30.09.2026 (= Monatsende), so "−1 Tag" is the preset that actually changes the date
+  await page.locator('[data-testid="valdate-popover"] .chip', { hasText: "−1 Tag" }).click();
+  await wait(600);
+  check(/importierten Snapshot/.test(dateDialog) && /verwirft den Snapshot/.test(dateDialog), "date change with an imported snapshot asks first (R5-F2)");
+  check((await page.locator(".toast", { hasText: "bleibt geladen" }).count()) >= 1, "declining the date change is explained in a toast (R5-F2)");
+  check((await page.locator('[data-testid="valdate-popover"]').count()) === 1, "declined date change keeps the popover open");
+  await page.keyboard.press("Escape");
+  await wait(200);
+  check((await page.locator(".statusbar").innerText()).includes("Bewertungstag 30.09.2026"), "declined date change keeps the valuation date (R5-F2)");
+  await chord(page, "m");
+  check((await page.locator('[data-testid="snapshot-imported"]').count()) === 1, "declined date change keeps the imported snapshot (R5-F2)");
+  check((await page.locator('[data-testid="snapshot-id"]').innerText()) === snapId0, "declined date change keeps the snapshot id (R5-F2)");
+  // a snapshot with another valuation date sets the app's date – statusbar, chip and report agree with the market
+  const snapJson = JSON.parse(readFileSync(snapPath, "utf8"));
+  const snapOther = { ...snapJson, valuationDate: "2026-10-30" };
+  const snapOtherPath = join(tmpdir(), `deriva-e2e-snapshot-other-${port}.json`);
+  writeFileSync(snapOtherPath, JSON.stringify(snapOther), "utf8");
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapOtherPath);
+  await wait(1200);
+  check(
+    (await page.locator(".statusbar").innerText()).includes("Bewertungstag 30.10.2026"),
+    "snapshot with another valuation date sets the app's date (R5-F2)",
+  );
+  check((await page.locator('[data-testid="market-chip"]').innerText()).includes("30.10.2026"), "market chip shows the snapshot's date (R5-F2)");
+  await chordO(page, "r");
+  check(
+    (await page.locator('[data-testid="report-header"]').innerText()).includes("Bewertungstag 30.10.2026"),
+    "report header shows the snapshot's valuation date (R5-F2)",
+  );
+  await chord(page, "m");
+  // German causes for invalid snapshots (R5-06)
+  const badSnaps = [
+    [`deriva-e2e-bad1-${port}.json`, JSON.stringify({ curves: [] }), /Schema „fehlt“ unbekannt, erwartet deriva.market\/1/],
+    [`deriva-e2e-bad2-${port}.json`, JSON.stringify({ ...snapJson, valuationDate: "2026-13-45" }), /Ungültiges Datum: 2026-13-45/],
+    [`deriva-e2e-bad3-${port}.json`, JSON.stringify({ schema: "deriva.market/1", valuationDate: "2026-09-03" }), /Snapshot unvollständig – Feld/],
+    [`deriva-e2e-bad4-${port}.json`, "{bad json", /kein gültiges JSON/],
+  ];
+  const dismissToasts = async () => {
+    for (let i = 0; i < 6 && (await page.locator(".toast .close").count()) > 0; i++) {
+      await page.locator(".toast .close").first().click();
+      await wait(60);
+    }
+  };
+  for (const [name, content, re] of badSnaps) {
+    await dismissToasts();
+    const p = join(tmpdir(), name);
+    writeFileSync(p, content, "utf8");
+    await page.locator('[data-testid="snapshot-import"]').setInputFiles(p);
+    await wait(500);
+    const toastTexts = await page.locator(".toast").allInnerTexts();
+    const t = toastTexts.filter((x) => x.startsWith("Import fehlgeschlagen")).pop();
+    check(
+      !!t && re.test(t) && !/Unsupported|Cannot convert|undefined|Datum: Ungültiges/.test(t),
+      `invalid snapshot ${name} → German cause (${t?.slice(0, 90)}) (R5-06)`,
+    );
+  }
+  check((await page.locator(".statusbar").innerText()).includes("Bewertungstag 30.10.2026"), "invalid snapshots leave the imported market untouched (R5-06)");
+  // a snapshot without FX vol surfaces: optional collections default to empty, and the palette warns for every FX option (Markt R5-2)
+  const snapNoFxVols = { ...snapJson, fxVols: undefined };
+  const snapNoFxVolsPath = join(tmpdir(), `deriva-e2e-snapshot-nofxvols-${port}.json`);
+  writeFileSync(snapNoFxVolsPath, JSON.stringify(snapNoFxVols), "utf8");
+  await dismissToasts();
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapNoFxVolsPath);
+  await wait(1200);
+  check(
+    (await page.locator(".toast", { hasText: "importiert · ID" }).count()) === 1,
+    "snapshot without fxVols imports (optional collections default to empty) (R5-06)",
+  );
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("fxo usdchf call 0.80 1m 6m");
+  await wait(250);
+  const fxoPreview = await page.locator(".palette .item").first().innerText();
+  check(
+    /keine FX-Vol-Fläche für USD\/CHF \(Fallback 8 %, Level 3\)/.test(fxoPreview),
+    `fxo preview flags a pair without vol surface (${fxoPreview.slice(0, 90)}) (Markt R5-2)`,
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
+  // back to the sample market at the previous date
+  await page.locator('[data-testid="snapshot-leave"]').click();
+  await wait(800);
+  check((await page.locator('[data-testid="snapshot-imported"]').count()) === 0, "Zum Sample-Markt leaves the import (R5-F2)");
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("stichtag 30.09.2026");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(900);
+  check((await page.locator(".statusbar").innerText()).includes("Bewertungstag 30.09.2026"), "valuation date restored after the snapshot flow");
+  // with the sample market (FX surfaces for every pair) the same preview carries no warning (Markt R5-2)
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("fxo usdchf call 0.80 1m 6m");
+  await wait(250);
+  check(
+    !/keine FX-Vol-Fläche/.test(await page.locator(".palette .item").first().innerText()),
+    "fxo preview has no warning when the pair has a surface (Markt R5-2)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(200);
+
   // Toast stack is capped at four (N-09)
   await chord(page, "b");
   for (let i = 0; i < 6; i++) {
@@ -1076,6 +1324,10 @@ try {
       () => Array.from(document.querySelectorAll('[role="dialog"][aria-label="Tastenkürzel"] kbd')).filter((k) => k.textContent.trim() === "").length,
     )) === 0,
     "help sheet: no empty kbd boxes (N-04)",
+  );
+  check(
+    (await page.locator('[role="dialog"][aria-label="Tastenkürzel"]').innerText()).includes("FX-Fixings (MtM-Reset)"),
+    "help sheet names the FX-fixings card (Markt R5)",
   );
   await page.keyboard.press("t");
   await wait(150);
@@ -1151,6 +1403,53 @@ try {
   const reportFit = await noOverflow(page);
   check(reportFit.main, "1280px report market table does not overflow (R3-09)");
 
+  // 1024 × 768: inspector table fits its sidebar (R5-01), FX-vol pair tabs stay inside the card, cost card does not overflow (R5-05)
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await wait(300);
+  await chord(page, "b");
+  const insp1024 = await page.evaluate(() => {
+    const insp = document.querySelector(".inspector");
+    if (!insp) return null;
+    const ir = insp.getBoundingClientRect();
+    const cells = Array.from(insp.querySelectorAll("table td"));
+    const clipped = cells.filter((td) => td.getBoundingClientRect().right > ir.right + 0.5).length;
+    const truncated = cells.filter((td) => td.classList.contains("num") && td.scrollWidth > td.clientWidth + 1).length;
+    return { w: Math.round(ir.width), cells: cells.length, clipped, truncated, scrollX: insp.scrollWidth - insp.clientWidth };
+  });
+  check(
+    !!insp1024 && insp1024.cells >= 6 && insp1024.clipped === 0 && insp1024.truncated === 0 && insp1024.scrollX <= 1,
+    `1024px inspector table fits the sidebar (${insp1024?.w} px, ${insp1024?.clipped} clipped, ${insp1024?.truncated} truncated) (R5-01)`,
+  );
+  await chord(page, "m");
+  const fxTabs1024 = await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="fx-vol-card"]');
+    const btns = Array.from(document.querySelectorAll('[data-testid="fx-vol-pairs"] button'));
+    if (!card) return null;
+    const cr = card.getBoundingClientRect();
+    return {
+      n: btns.length,
+      outside: btns.filter((b) => b.getBoundingClientRect().right > cr.right + 0.5 || b.getBoundingClientRect().left < cr.left - 0.5).length,
+    };
+  });
+  check(!!fxTabs1024 && fxTabs1024.n >= 5 && fxTabs1024.outside === 0, `1024px FX-vol pair tabs stay inside the card (${fxTabs1024?.outside} outside) (R5-05)`);
+  const lastPair = page.locator('[data-testid="fx-vol-pairs"] button').last();
+  await lastPair.click();
+  await wait(200);
+  check((await lastPair.getAttribute("aria-pressed")) === "true", "1024px last FX-vol pair tab is clickable (R5-05)");
+  await page.locator('[data-testid="fx-vol-pairs"] button').first().click();
+  await chord(page, "r");
+  await chordO(page, "r");
+  const costCard1024 = await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="cost-table"]')?.closest(".card");
+    return card ? { overflow: card.scrollWidth - card.clientWidth } : null;
+  });
+  check(!!costCard1024 && costCard1024.overflow <= 1, `1024px cost-transparency card does not overflow (${costCard1024?.overflow} px) (R5-05)`);
+  const o1024 = await noOverflow(page);
+  check(o1024.page && o1024.main, "1024px no horizontal overflow (Report)");
+  await page.screenshot({ path: join(outDir, "1024-report.png") });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await wait(200);
+
   // Offline reload via the app-shell service worker (US-8.13 / R4-F3)
   const swReady = await page.evaluate(() =>
     "serviceWorker" in navigator ? Promise.race([navigator.serviceWorker.ready.then(() => true), new Promise((r) => setTimeout(() => r(false), 8000))]) : false,
@@ -1175,6 +1474,47 @@ try {
   }
   await context.setOffline(false);
   await wait(300);
+
+  // Offline after the FIRST online visit (R5-F4): a fresh browser context, one visit, install precaches the assets → offline reload works
+  const freshContext = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "de-DE" });
+  const fresh = await freshContext.newPage();
+  await fresh.goto(`http://localhost:${port}/`, { waitUntil: "networkidle" });
+  const firstVisitReady = await fresh.evaluate(() =>
+    "serviceWorker" in navigator ? Promise.race([navigator.serviceWorker.ready.then(() => true), new Promise((r) => setTimeout(() => r(false), 8000))]) : false,
+  );
+  check(firstVisitReady === true, "fresh context: service worker ready after the first visit (R5-F4)");
+  const precached = await fresh.evaluate(async () => {
+    const until = Date.now() + 8000;
+    while (Date.now() < until) {
+      for (const k of await caches.keys()) {
+        const reqs = await (await caches.open(k)).keys();
+        const assets = reqs.filter((r) => new URL(r.url).pathname.startsWith("/assets/")).length;
+        const shell = reqs.some((r) => new URL(r.url).pathname === "/index.html");
+        if (shell && assets >= 4) return { key: k, assets };
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return null;
+  });
+  check(!!precached && precached.assets >= 4, `fresh context: install precached the built assets (${precached?.assets ?? 0} in ${precached?.key}) (R5-F4)`);
+  await freshContext.setOffline(true);
+  let firstVisitOfflineOk = false;
+  try {
+    await fresh.reload({ waitUntil: "load" });
+    await wait(800);
+    firstVisitOfflineOk = (await fresh.locator("h1").count()) === 1 && (await fresh.locator("h1").innerText()) === "DERIVA";
+  } catch {
+    firstVisitOfflineOk = false;
+  }
+  check(firstVisitOfflineOk, "fresh context: offline reload after the first online visit renders the app (R5-F4)");
+  if (firstVisitOfflineOk) {
+    check((await fresh.locator('[data-testid="offline-chip"]').count()) === 1, "fresh context: offline chip shown (R5-F4)");
+    await chord(fresh, "s");
+    check((await crumb(fresh)).includes("Szenarien"), "fresh context: lazy chart view opens offline from the precache (R5-F4 / ADR-026)");
+    await fresh.screenshot({ path: join(outDir, "offline-first-visit.png") });
+  }
+  await freshContext.setOffline(false);
+  await freshContext.close();
 
   check(errors.length === 0, `page errors: ${errors.join(" | ")}`);
   const relevantConsole = consoleErrors.filter((m) => !/favicon|ResizeObserver loop/.test(m));

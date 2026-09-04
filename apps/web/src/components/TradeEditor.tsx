@@ -28,6 +28,7 @@ import {
   translateCoreMessage,
 } from "../lib/i18n.js";
 import { parseNumberInput } from "../lib/num-parse.js";
+import { hasFxVolSurface } from "../lib/quick-parser.js";
 import { annuityAmortisation, frequencyMonths, parseSchedulePaste, scheduleValueAt } from "../lib/trade-ops.js";
 import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
 import { LS_KEYS, STATUS_LABELS, TRADE_STATUSES, readLocal, useStore, writeLocal } from "../state/store.js";
@@ -613,6 +614,7 @@ export function TradeEditor({ trade, onChange }: Props) {
   const valuationDate = useStore((s) => s.valuationDate);
   /** Currencies with a swaption vol cube in the market (currency choice of the swaption editor, Markt R4-2). */
   const swaptionVolCurrencies = useStore(useShallow((s) => Object.keys(s.baseMarket.swaptionVols ?? {})));
+  const fxVolPairs = useStore(useShallow((s) => Object.keys(s.baseMarket.fxVols ?? {})));
   /** Core warnings of the current valuation – e.g. `COLLATERAL_CURVE_MISSING:` for a CSA without a collateral curve (Markt R4-1). */
   const pricingWarnings = useStore(useShallow((s) => s.results[trade.id]?.result?.warnings ?? []));
   const collateralCurveMissing = pricingWarnings.find((w) => w.startsWith("COLLATERAL_CURVE_MISSING"));
@@ -1289,7 +1291,14 @@ export function TradeEditor({ trade, onChange }: Props) {
       return (
         <div className="form">
           {common}
-          <Field label="Paar">
+          <Field
+            label="Paar"
+            hint={
+              hasFxVolSurface(trade.pair, fxVolPairs)
+                ? undefined
+                : `Keine FX-Vol-Fläche für ${trade.pair.slice(0, 3)}/${trade.pair.slice(3)} im Markt – Bewertung mit Fallback-Vol 8 % (IFRS-13 Level 3)`
+            }
+          >
             <Select value={trade.pair} options={PAIRS} onChange={(v) => upd({ pair: v })} />
           </Field>
           <Field label="Typ (auf Basis-Ccy)">

@@ -13,6 +13,7 @@ import {
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import { sendError } from "../lib/errors.js";
+import { volSurfaceProblems } from "../lib/vol-surfaces.js";
 import { arrayResponse, bootstrapBodySchema, marketPutSchema, objectResponse, responses } from "../schemas.js";
 
 function curveSummary(c: Curve, valuationDate: number) {
@@ -298,7 +299,9 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         operationId: "updateMarket",
         tags: ["market"],
         summary:
-          "Spots/Fixings/FX-Fixings/Spot-Daten/Fixing-Policy/Vol-Flächen setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut; Vol-Flächen je Key ersetzt, ohne kompletten Snapshot)",
+          "Spots/Fixings/FX-Fixings/Spot-Daten/Fixing-Policy/Vol-Flächen setzen oder Bewertungstag wechseln (Sample-Markt wird neu aufgebaut; Vol-Flächen je Key ersetzt, ohne kompletten Snapshot; strukturell geprüft → 400 VOL_SURFACE_INVALID)",
+        description:
+          "Vol surfaces are validated structurally before the market is touched (Markt R5-1): grid rows = expiries, row length = tenors / strikes, FX vectors = expiries, axes strictly increasing, finite non-negative quotes, key = `currency` / `currency-index` / `pair`. A malformed surface answers 400 `VOL_SURFACE_INVALID` with `problems[]` and leaves the market unchanged – it can no longer be stored and fail every later swaption valuation.",
         body: marketPutSchema,
         response: responses(
           {
@@ -324,7 +327,14 @@ export async function registerMarketRoutes(app: FastifyInstance, ctx: AppContext
         ),
       },
     },
-    async (req) => {
+    async (req, reply) => {
+      // Structural check of the incoming surfaces first – nothing (not even a valuation-date rebuild) is applied on a bad surface.
+      const problems = volSurfaceProblems(req.body);
+      if (problems.length) {
+        return sendError(reply, req, 400, "VOL_SURFACE_INVALID", `Vol surface(s) structurally invalid (${problems.length} problem(s)) – market unchanged`, {
+          problems,
+        });
+      }
       let m = ctx.market.get();
       if (req.body.valuationDate) m = ctx.market.rebuild(parseISO(req.body.valuationDate));
       if (req.body.fxSpots) m = { ...m, fxSpots: { ...m.fxSpots, ...req.body.fxSpots } };

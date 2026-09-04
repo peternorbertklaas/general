@@ -173,5 +173,5 @@ export function nextImmDate(d: SerialDate): SerialDate {
       year++;
     }
   }
-  throw new Error("nextImmDate: not found");
+  throw new PricingError("INVALID_DATE", "nextImmDate: not found");
 }

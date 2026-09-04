@@ -1,4 +1,4 @@
-import { type PricingResult, type Trade } from "@deriva/pricing-core";
+import { type MarketContext, type PricingResult, type Trade, priceTrade } from "@deriva/pricing-core";
 import { fmtBp, fmtNum, fmtPct } from "./format.js";
 
 /** Whether a swap has no fixed leg (tenor basis swap). */
@@ -112,8 +112,88 @@ function shiftSchedule<T extends { date: number }>(schedule: T[] | undefined, ke
   return schedule?.map((e) => ({ ...e, [key]: (e as unknown as Record<string, number>)[key]! + shift }));
 }
 
-/** Set the fixed rate / strike / contract rate / spread to the fair (par) level from the latest pricing. */
-export function applyParSolve(t: Trade, r: PricingResult | undefined): Trade | undefined {
+/** Market access for par solves that need the pricer itself (cap / floor / collar strikes, R5-03). */
+export interface ParSolveContext {
+  market: MarketContext;
+  reportingCurrency: string;
+  /** Pricer override (tests); defaults to the core `priceTrade`. */
+  price?: (market: MarketContext, trade: Trade, ccy: string) => PricingResult;
+}
+
+type CapFloorTrade = Extract<Trade, { type: "CapFloor" }>;
+
+/** Bisection on `[lo, hi]`; undefined when the function has no sign change or is not finite on the bracket. */
+function bisect(f: (x: number) => number, lo: number, hi: number, iterations = 80): number | undefined {
+  let flo = f(lo);
+  const fhi = f(hi);
+  if (!Number.isFinite(flo) || !Number.isFinite(fhi) || flo * fhi > 0) return undefined;
+  if (flo === 0) return lo;
+  if (fhi === 0) return hi;
+  for (let i = 0; i < iterations; i++) {
+    const mid = (lo + hi) / 2;
+    const fm = f(mid);
+    if (!Number.isFinite(fm)) return undefined;
+    if (fm === 0 || hi - lo < 1e-10) return mid;
+    if (fm * flo < 0) hi = mid;
+    else {
+      lo = mid;
+      flo = fm;
+    }
+  }
+  return (lo + hi) / 2;
+}
+
+/**
+ * Fair strike of a cap / floor / collar solved on the core pricer (R5-03):
+ *  - Cap / Floor: the ATM strike, i.e. the strike at which cap and floor have the
+ *    same value (PV of a collar with cap strike = floor strike = K is zero – the
+ *    forward swap rate of the cap period);
+ *  - Collar: the floor strike that makes the collar zero-cost for the given cap
+ *    strike (PV = 0).
+ * An upfront premium on the trade is ignored for the solve (it is the price of
+ * the current strike, not part of the fair one). Returns the patch or undefined
+ * when no root exists on the bracket (e.g. collar with a cap strike below every
+ * attainable floor).
+ */
+export function solveCapFloorStrike(t: CapFloorTrade, ctx: ParSolveContext): Partial<CapFloorTrade> | undefined {
+  const price = ctx.price ?? priceTrade;
+  const pv = (tr: Trade): number => {
+    try {
+      const v = price(ctx.market, { ...tr, upfront: undefined }, ctx.reportingCurrency).pv;
+      return Number.isFinite(v) ? v : Number.NaN;
+    } catch {
+      return Number.NaN;
+    }
+  };
+  const round = (k: number) => Math.round(k * 1e6) / 1e6;
+  // Lognormal models cannot be evaluated at negative strikes – fall back to a positive bracket then.
+  const brackets: [number, number][] = [
+    [-0.02, 0.25],
+    [1e-4, 0.25],
+  ];
+  if (t.capFloor === "Collar") {
+    const f = (k: number) => pv({ ...t, floorStrike: k });
+    for (const [lo, hi] of brackets) {
+      const k = bisect(f, lo, Math.min(hi, t.strike));
+      if (k !== undefined) return { floorStrike: round(k) };
+    }
+    return undefined;
+  }
+  const f = (k: number) => pv({ ...t, capFloor: "Collar", strike: k, floorStrike: k });
+  for (const [lo, hi] of brackets) {
+    const k = bisect(f, lo, hi);
+    if (k !== undefined) return { strike: round(k) };
+  }
+  return undefined;
+}
+
+/**
+ * Set the fixed rate / strike / contract rate / spread to the fair (par) level
+ * from the latest pricing. Cap / floor / collar strikes are solved on the core
+ * pricer and therefore need the market context (`ctx`); without it they return
+ * undefined ("kein Par-Wert").
+ */
+export function applyParSolve(t: Trade, r: PricingResult | undefined, ctx?: ParSolveContext): Trade | undefined {
   if (!r) return undefined;
   switch (t.type) {
     case "InterestRateSwap":
@@ -158,10 +238,10 @@ export function applyParSolve(t: Trade, r: PricingResult | undefined): Trade | u
       return { ...t, underlying: { ...t.underlying, legs: t.underlying.legs.map((l) => (l.type === "Fixed" ? { ...l, rate: fwd } : l)) } };
     }
     case "CapFloor": {
-      // "Par" for a cap/floor: strike at the forward rate (ATM).
-      const fwd = (r.analytics.forwardRate ?? r.analytics.atmRate ?? r.analytics.forward) as number | undefined;
-      if (fwd === undefined) return undefined;
-      return { ...t, strike: Math.round(fwd * 1e6) / 1e6 };
+      // ATM strike (cap / floor) or zero-cost floor strike (collar) via bisection on the pricer (R5-03).
+      if (!ctx) return undefined;
+      const patch = solveCapFloorStrike(t, ctx);
+      return patch ? { ...t, ...patch } : undefined;
     }
     case "FxForward": {
       const fair = r.analytics.fairForward as number | undefined;
@@ -186,6 +266,53 @@ export function applyParSolve(t: Trade, r: PricingResult | undefined): Trade | u
       return fwd === undefined ? undefined : { ...t, fixedRate: fwd };
     }
   }
+}
+
+/** Toast text after a successful `Shift+P` – names what was taken over (par rate, ATM strike, zero-cost floor …). */
+export function parSolveLabel(t: Trade): string {
+  switch (t.type) {
+    case "CapFloor":
+      return t.capFloor === "Collar" ? "Zero-Cost-Collar: Floor-Strike übernommen (Prämie 0)" : "ATM-Strike übernommen (Cap-Wert = Floor-Wert)";
+    case "InterestRateSwap":
+    case "CrossCurrencySwap":
+      return isBasisSwap(t) ? "Fairer Spread übernommen" : "Par-Satz übernommen";
+    case "Swaption":
+      return "ATM-Strike (Forward-Swapsatz) übernommen";
+    case "FxForward":
+    case "FxSwap":
+      return "Fairer Forward übernommen";
+    case "FxOption":
+      return "ATM-Forward-Strike übernommen";
+    case "FRA":
+      return "Forward-Satz übernommen";
+  }
+}
+
+/** Button title of the `≈ Par` affordance – says what `Shift+P` does for this product. */
+export function parSolveTitle(t: Trade): string {
+  switch (t.type) {
+    case "CapFloor":
+      return t.capFloor === "Collar" ? "Floor-Strike für einen Zero-Cost-Collar übernehmen" : "ATM-Strike übernehmen (Cap-Wert = Floor-Wert)";
+    case "InterestRateSwap":
+    case "CrossCurrencySwap":
+      return isBasisSwap(t) ? "Fairen Spread übernehmen" : "Par-Satz übernehmen";
+    case "Swaption":
+      return "ATM-Strike (Forward-Swapsatz) übernehmen";
+    case "FxForward":
+    case "FxSwap":
+      return "Fairen Forward übernehmen";
+    case "FxOption":
+      return "ATM-Forward-Strike übernehmen";
+    case "FRA":
+      return "Forward-Satz übernehmen";
+  }
+}
+
+/** Toast text when no fair value could be taken over. */
+export function parSolveUnavailable(t: Trade): string {
+  if (t.type === "CapFloor" && t.capFloor === "Collar")
+    return "Kein Zero-Cost-Floor-Strike für diesen Cap-Strike – Cap-Strike anheben oder Floor-Strike manuell setzen";
+  return "Kein Par-Wert für diesen Trade verfügbar (Bewertung fehlgeschlagen)";
 }
 
 export function tradeTypeBadge(type: Trade["type"]): { label: string; cls: string } {

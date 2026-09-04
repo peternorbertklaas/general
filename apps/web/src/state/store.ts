@@ -7,6 +7,7 @@ import {
   type HedgeRelationship,
   type InterpolationMethod,
   type MarketContext,
+  type MarketSnapshotJson,
   type SwaptionVolSurface,
   type PricingResult,
   type ReportPerspective,
@@ -18,7 +19,9 @@ import {
   bootstrapCurves,
   buildSampleMarket,
   computeRisk,
+  deserializeMarket,
   hashString,
+  marketSnapshotId,
   parseISO,
   priceTrade,
   sampleBootstrapSpecs,
@@ -26,10 +29,13 @@ import {
   shiftFxSpots,
   stableStringify,
   toISO,
+  validateMarket,
 } from "@deriva/pricing-core";
 import { type ViewId } from "../hotkeys/keymap.js";
-import { INTERPOLATION_DE, germanTradeName, translatePricingError } from "../lib/i18n.js";
+import { validateVolSurfaces } from "../lib/core-compat.js";
+import { INTERPOLATION_DE, germanTradeName, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { copyName, idPrefix, nextId } from "../lib/ids.js";
+import { snapshotErrorText } from "../lib/snapshot-import.js";
 import { hasErrors, validateTrade } from "../lib/validate-trade.js";
 import { samplePortfolio } from "./sample-portfolio.js";
 
@@ -147,8 +153,24 @@ export interface CdsQuote {
   spread: number;
 }
 
+/**
+ * Where the base market comes from (R5-F2): `"sample"` = bootstrapped from the
+ * editable quote set at the valuation date; `"import"` = a `deriva.market/1`
+ * snapshot whose curves are taken as they are – quotes, interpolation and
+ * turn-of-year do not apply, the valuation date is the snapshot's.
+ */
+export type MarketSource = "sample" | "import";
+
+export type ImportSnapshotResult = { ok: true; id: string; label: string; valuationDate: number; dateChanged: boolean } | { ok: false; error: string };
+
 interface AppState {
   valuationDate: number;
+  /** Origin of the base market (see `MarketSource`). */
+  marketSource: MarketSource;
+  /** The imported snapshot file (persisted, rebuilt on hydration) – null in sample mode. */
+  importedSnapshot: MarketSnapshotJson | null;
+  /** Deserialized imported snapshot (not persisted; the base every rebuild in import mode starts from). */
+  importedBase: MarketContext | null;
   /** Market quotes the sample market is bootstrapped from (editable in the curves view). */
   quotes: SampleMarketQuotes;
   /** Interpolation overrides per curve id (persisted, survive valuation-date changes – N-23). */
@@ -262,7 +284,23 @@ interface AppState {
   risk(id: string): RiskReport | undefined;
   /** Compute and cache the risk report of a trade (call from effects / handlers, never during render). */
   ensureRisk(id: string): RiskReport | undefined;
-  setValuationDate(iso: string): boolean;
+  /**
+   * Set the valuation date and rebuild the sample market from the quotes. With
+   * an imported snapshot the call is refused (returns false) unless
+   * `discardImport` is set – the import is never dropped silently (R5-F2); use
+   * `changeValuationDate()` from the UI, it asks first.
+   */
+  setValuationDate(iso: string, opts?: { discardImport?: boolean }): boolean;
+  /**
+   * Replace the whole market by a `deriva.market/1` snapshot (R5-F2): curves,
+   * spots, fixings, FX fixings, vol surfaces, credit data and the valuation
+   * date come from the file; quote edits, interpolation / turn-of-year
+   * overrides and vol overrides are reset, so the "modifiziert" flag is off and
+   * the snapshot id equals the core `marketSnapshotId` of the file.
+   */
+  importSnapshot(json: MarketSnapshotJson): ImportSnapshotResult;
+  /** Back to the sample market bootstrapped from the quotes at the current valuation date. */
+  leaveImport(): void;
   setHedgeRelationship(rel: HedgeRelationship): void;
   /** Discard the stored hedge documentation of a trade – undoable (R3-F4). */
   removeHedgeRelationship(tradeId: string): void;
@@ -352,10 +390,21 @@ export function volSurfaceCount(v: VolSurfaces | undefined): number {
   return Object.keys(v.swaptionVols ?? {}).length + Object.keys(v.capletVols ?? {}).length + Object.keys(v.fxVols ?? {}).length;
 }
 
-/** Quotes, spots, interpolation overrides, turn-of-year jumps, vol surfaces or FX fixings differ from the sample market (N-23, R3-4). */
+/**
+ * Quotes, spots, interpolation overrides, turn-of-year jumps, vol surfaces or FX
+ * fixings differ from the sample market (N-23, R3-4). For an imported snapshot
+ * only vol edits made *after* the import count – the snapshot itself is the
+ * reference, not the sample (R5-F2).
+ */
 export function marketModified(
-  s: Pick<AppState, "quotes" | "interpolation"> & { turnOfYear?: Record<string, TurnOfYear>; volSurfaces?: VolSurfaces; fxFixings?: FxFixing[] },
+  s: Pick<AppState, "quotes" | "interpolation"> & {
+    turnOfYear?: Record<string, TurnOfYear>;
+    volSurfaces?: VolSurfaces;
+    fxFixings?: FxFixing[];
+    marketSource?: MarketSource;
+  },
 ): boolean {
+  if (s.marketSource === "import") return volSurfaceCount(s.volSurfaces) > 0;
   return (
     quotesModified(s.quotes) ||
     Object.keys(s.interpolation).length > 0 ||
@@ -547,9 +596,53 @@ export function sampleVolSurfaces(): Required<VolSurfaces> {
   return { swaptionVols: initialMarket.swaptionVols ?? {}, capletVols: initialMarket.capletVols ?? {}, fxVols: initialMarket.fxVols ?? {} };
 }
 
+/**
+ * Structural check of a persisted snapshot before the core rebuilds it (schema,
+ * valuation date, curves, spots); anything else falls back to the sample market.
+ */
+function isPlausibleSnapshot(v: unknown): v is MarketSnapshotJson {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return (
+    o.schema === "deriva.market/1" &&
+    typeof o.valuationDate === "string" &&
+    Array.isArray(o.curves) &&
+    !!o.discountCurveId &&
+    typeof o.discountCurveId === "object" &&
+    !!o.fxSpots &&
+    typeof o.fxSpots === "object"
+  );
+}
+
+/**
+ * Deserialize + validate a snapshot for import (curves, spots, FX fixings, meta
+ * and – R5-1 – the vol surfaces). Returns the market or a German problem text.
+ */
+export function loadSnapshot(json: MarketSnapshotJson): { ok: true; market: MarketContext } | { ok: false; error: string } {
+  let market: MarketContext;
+  try {
+    market = deserializeMarket({ ...json, fixings: json.fixings ?? [] });
+  } catch (e) {
+    return { ok: false, error: snapshotErrorText(e, translatePricingError) };
+  }
+  let problems: string[];
+  try {
+    problems = [...validateMarket(market), ...validateVolSurfaces(market)];
+  } catch (e) {
+    return { ok: false, error: snapshotErrorText(e, translatePricingError) };
+  }
+  if (problems.length) {
+    const first = translateCoreMessage(problems[0]);
+    return { ok: false, error: `Snapshot ungültig: ${first}${problems.length > 1 ? ` (+${problems.length - 1} weitere)` : ""}` };
+  }
+  return { ok: true, market };
+}
+
 /** Slice of the state written to localStorage. */
 export interface PersistedSlice {
   trades: Trade[];
+  marketSource?: MarketSource;
+  importedSnapshot?: MarketSnapshotJson | null;
   quotes: SampleMarketQuotes;
   interpolation: Record<string, InterpolationMethod>;
   turnOfYear?: Record<string, TurnOfYear>;
@@ -623,6 +716,13 @@ export const useStore = create<AppState>()(
         const entry: UndoEntry = { kind: "fxFixings", fxFixings: fxFixings.map((f) => ({ ...f })), label, at: now };
         set({ undoStack: [...undoStack, entry].slice(-UNDO_DEPTH) });
       };
+      /**
+       * Base market for the given inputs. Sample mode bootstraps the quotes at
+       * `date`; import mode starts from the imported snapshot (its own date and
+       * curves – quotes, interpolation and turn-of-year do not apply) and layers
+       * the vol overrides and FX fixings on top (R5-F2). Historical fixings of
+       * the current base market are kept in both modes.
+       */
       const rebuildMarket = (
         date: number,
         quotes: SampleMarketQuotes,
@@ -631,12 +731,20 @@ export const useStore = create<AppState>()(
         volSurfaces: VolSurfaces = get().volSurfaces,
         fxFixings: FxFixing[] = get().fxFixings,
       ): MarketContext => {
-        const built = buildMarket(date, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
+        const imported = get().marketSource === "import" ? get().importedBase : null;
+        const built = imported
+          ? withVolSurfaces({ ...imported, fxFixings: fxFixings.length ? fxFixings : undefined }, volSurfaces)
+          : buildMarket(date, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
         const fixings = get().baseMarket.fixings;
         return fixings && fixings.length > 0 ? { ...built, fixings } : built;
       };
+      /** Drop undo entries that would rebuild the market from the quotes (they would silently replace an imported snapshot). */
+      const undoWithoutMarketEntries = () => get().undoStack.filter((e) => e.kind === "trades" || e.kind === "hedge");
       return {
         valuationDate: initialDate,
+        marketSource: "sample",
+        importedSnapshot: null,
+        importedBase: null,
         quotes: initialQuotes,
         interpolation: {},
         turnOfYear: {},
@@ -954,6 +1062,8 @@ export const useStore = create<AppState>()(
           set({ baseMarket, market, results, lastPricingMs: ms, riskCache: {}, fxFixings: (baseMarket.fxFixings ?? []).filter(isPlausibleFxFixing) });
         },
         setQuotes: (quotes, label) => {
+          // Imported curves are not bootstrapped from quotes – a quote edit would silently replace the snapshot (R5-F2).
+          if (get().marketSource === "import") return false;
           try {
             const base = rebuildMarket(get().valuationDate, quotes);
             pushQuoteUndo(label ?? "Quote-Änderung");
@@ -970,6 +1080,7 @@ export const useStore = create<AppState>()(
         setInterpolation: (curveId, method) => {
           const prev = get().interpolation[curveId];
           if (prev === method) return true;
+          if (get().marketSource === "import") return false;
           const interpolation = { ...get().interpolation };
           if (method === undefined) delete interpolation[curveId];
           else interpolation[curveId] = method;
@@ -987,6 +1098,7 @@ export const useStore = create<AppState>()(
         setTurnOfYear: (curveId, toy) => {
           // A jump on or before the valuation date can never be applied – refuse instead of storing it silently (R3-F2).
           if (toy && toy.date <= get().valuationDate) return false;
+          if (get().marketSource === "import") return false;
           const turnOfYear = { ...get().turnOfYear };
           if (toy === undefined) delete turnOfYear[curveId];
           else turnOfYear[curveId] = toy;
@@ -1068,11 +1180,17 @@ export const useStore = create<AppState>()(
           if (r) set({ riskCache: { ...get().riskCache, [id]: r } });
           return r;
         },
-        setValuationDate: (iso) => {
+        setValuationDate: (iso, opts) => {
           try {
             const d = parseISO(iso);
             if (!Number.isFinite(d)) return false;
             const before = get().valuationDate;
+            if (get().marketSource === "import") {
+              if (d === before) return true;
+              // Never drop an imported snapshot silently (R5-F2): the caller must confirm the switch back to the quotes market.
+              if (!opts?.discardImport) return false;
+              set({ marketSource: "sample", importedSnapshot: null, importedBase: null });
+            }
             const baseMarket = rebuildMarket(d, get().quotes);
             set({ valuationDate: d, reportStamp: null, reportKey: null });
             get().setMarket(baseMarket);
@@ -1086,6 +1204,45 @@ export const useStore = create<AppState>()(
           } catch {
             return false;
           }
+        },
+        importSnapshot: (json) => {
+          const loaded = loadSnapshot(json);
+          if (!loaded.ok) return loaded;
+          const imported = loaded.market;
+          const before = get().valuationDate;
+          const fxFixings = (imported.fxFixings ?? []).filter(isPlausibleFxFixing);
+          // Everything that describes the market now comes from the file: quote edits, overrides and vol edits are reset.
+          set({
+            marketSource: "import",
+            importedSnapshot: json,
+            importedBase: imported,
+            valuationDate: imported.valuationDate,
+            quotes: cloneQuotes(SAMPLE_QUOTES),
+            interpolation: {},
+            turnOfYear: {},
+            volSurfaces: {},
+            fxFixings,
+            reportStamp: null,
+            reportKey: null,
+            undoStack: undoWithoutMarketEntries(),
+          });
+          // Historical fixings come from the snapshot too (not the previous base market).
+          const market = applyWhatIf(imported, get().whatIf);
+          const { results, ms } = priceAll(market, get().trades, get().reportingCurrency);
+          set({ baseMarket: imported, market, results, lastPricingMs: ms, riskCache: {} });
+          return {
+            ok: true,
+            id: marketSnapshotId(imported),
+            label: imported.meta?.label ?? toISO(imported.valuationDate),
+            valuationDate: imported.valuationDate,
+            dateChanged: imported.valuationDate !== before,
+          };
+        },
+        leaveImport: () => {
+          if (get().marketSource !== "import") return;
+          set({ marketSource: "sample", importedSnapshot: null, importedBase: null, volSurfaces: {}, fxFixings: [], reportStamp: null, reportKey: null });
+          const built = buildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, {}, []);
+          get().setMarket(built);
         },
         setHedgeRelationship: (rel) => set({ hedgeRelationships: { ...get().hedgeRelationships, [rel.hedgingInstrumentId]: rel } }),
         removeHedgeRelationship: (tradeId) => {
@@ -1120,6 +1277,9 @@ export const useStore = create<AppState>()(
           const { results, ms } = priceAll(market, trades, get().reportingCurrency);
           set({
             valuationDate,
+            marketSource: "sample",
+            importedSnapshot: null,
+            importedBase: null,
             quotes,
             interpolation: {},
             turnOfYear: {},
@@ -1151,6 +1311,8 @@ export const useStore = create<AppState>()(
       storage: createJSONStorage(() => localStorage),
       partialize: (s): PersistedSlice => ({
         trades: s.trades,
+        marketSource: s.marketSource,
+        importedSnapshot: s.importedSnapshot,
         quotes: s.quotes,
         interpolation: s.interpolation,
         turnOfYear: s.turnOfYear,
@@ -1187,9 +1349,24 @@ export const useStore = create<AppState>()(
           }
           const volSurfaces = plausibleVolSurfaces(p.volSurfaces);
           const fxFixings = Array.isArray(p.fxFixings) ? p.fxFixings.filter(isPlausibleFxFixing) : [];
-          const valuationDate = typeof p.valuationDate === "number" && Number.isFinite(p.valuationDate) ? p.valuationDate : current.valuationDate;
+          let valuationDate = typeof p.valuationDate === "number" && Number.isFinite(p.valuationDate) ? p.valuationDate : current.valuationDate;
           const view = VIEW_IDS.includes(p.view as ViewId) ? (p.view as ViewId) : current.view;
-          const baseMarket = buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
+          // An imported snapshot survives the reload as the base market (R5-F2); an unreadable one falls back to the sample market.
+          let marketSource: MarketSource = "sample";
+          let importedSnapshot: MarketSnapshotJson | null = null;
+          let importedBase: MarketContext | null = null;
+          if (p.marketSource === "import" && isPlausibleSnapshot(p.importedSnapshot)) {
+            const loaded = loadSnapshot(p.importedSnapshot);
+            if (loaded.ok) {
+              marketSource = "import";
+              importedSnapshot = p.importedSnapshot;
+              importedBase = loaded.market;
+              valuationDate = loaded.market.valuationDate;
+            }
+          }
+          const baseMarket = importedBase
+            ? withVolSurfaces({ ...importedBase, fxFixings: fxFixings.length ? fxFixings : undefined }, volSurfaces)
+            : buildMarket(valuationDate, quotes, interpolation, turnOfYear, volSurfaces, fxFixings);
           const reportingCurrency =
             typeof p.reportingCurrency === "string" && reportingCurrencies(baseMarket).includes(p.reportingCurrency)
               ? p.reportingCurrency
@@ -1203,6 +1380,9 @@ export const useStore = create<AppState>()(
           return {
             ...current,
             trades,
+            marketSource,
+            importedSnapshot,
+            importedBase,
             quotes,
             interpolation,
             turnOfYear,
@@ -1221,7 +1401,7 @@ export const useStore = create<AppState>()(
             results,
             lastPricingMs: ms,
             selectedId,
-            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear, volSurfaces, fxFixings }) },
+            restored: { trades: trades.length, quotesModified: marketModified({ quotes, interpolation, turnOfYear, volSurfaces, fxFixings, marketSource }) },
           };
         } catch {
           return current;
@@ -1264,6 +1444,41 @@ export function deleteWithUndo(id: string): void {
       },
     },
   });
+}
+
+/** TT.MM.JJJJ of a serial date (UI helpers below). */
+function dateDe(d: number): string {
+  return isoDe(d);
+}
+
+/**
+ * Change the valuation date from the UI (popover, palette `stichtag`). In sample
+ * mode this is `setValuationDate`; with an imported snapshot the user is asked
+ * first, because the snapshot's curves belong to its own date – confirming
+ * discards the import and rebuilds the sample market from the quotes, with a
+ * toast that says so (R5-F2). Returns whether the date was changed.
+ */
+export function changeValuationDate(iso: string): boolean {
+  const s = useStore.getState();
+  if (s.marketSource === "import") {
+    if (toISO(s.valuationDate) === iso) return true;
+    const label = s.baseMarket.meta?.label ?? "Snapshot";
+    const question =
+      `Der Markt stammt aus dem importierten Snapshot „${label}“ (Bewertungstag ${dateDe(s.valuationDate)}). ` +
+      `Ein anderer Bewertungstag verwirft den Snapshot und baut den Sample-Markt aus den Quotes zum ${iso.split("-").reverse().join(".")} neu auf. Fortfahren?`;
+    const confirmed = typeof window !== "undefined" && typeof window.confirm === "function" ? window.confirm(question) : false;
+    if (!confirmed) {
+      s.showToast(`Bewertungstag unverändert – Snapshot „${label}“ bleibt geladen`);
+      return false;
+    }
+    const ok = s.setValuationDate(iso, { discardImport: true });
+    if (ok) s.showToast(`Snapshot „${label}“ verworfen – Sample-Markt aus den Quotes zum ${iso.split("-").reverse().join(".")} aufgebaut`);
+    else s.showToast("Ungültiges Datum");
+    return ok;
+  }
+  const ok = s.setValuationDate(iso);
+  if (!ok) s.showToast("Ungültiges Datum");
+  return ok;
 }
 
 export function whatIfActive(w: WhatIf): boolean {

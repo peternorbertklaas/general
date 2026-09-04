@@ -1,8 +1,13 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { swPrecachePlugin } from "./scripts/sw-precache-plugin.js";
+
+const here = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig(({ mode }) => ({
-  plugins: [react()],
+  // The service worker is emitted from `src/sw/sw.js` with the built asset list injected (US-8.13 / R5-F4).
+  plugins: [react(), swPrecachePlugin({ templatePath: `${here}src/sw/sw.js` })],
   server: {
     port: 5173,
     proxy: {
@@ -16,10 +21,12 @@ export default defineConfig(({ mode }) => ({
     target: "es2022",
     // Hidden source maps in production: generated for error tooling, not referenced from the bundle (arch N-10).
     sourcemap: mode === "production" ? "hidden" : true,
-    chunkSizeWarningLimit: 600,
+    // ADR-026: the size gate is `scripts/size-limit.mjs` (gzip budgets per chunk); this is only Rollup's advisory warning.
+    chunkSizeWarningLimit: 500,
     rollupOptions: {
       output: {
         // Stable vendor chunks: charts, the pricing engine and the React runtime are cached independently of app code.
+        // ECharts is only imported by lazily loaded views / the lazy chart wrapper, so the start chunk never pulls it in (N4-07).
         manualChunks(id) {
           if (id.includes("node_modules/echarts") || id.includes("node_modules/zrender")) return "echarts";
           if (id.includes("packages/pricing-core") || id.includes("@deriva/pricing-core")) return "core";
@@ -38,8 +45,9 @@ export default defineConfig(({ mode }) => ({
       provider: "v8",
       reporter: ["text-summary", "lcov"],
       include: ["src/**/*.{ts,tsx}"],
-      exclude: ["src/**/*.test.{ts,tsx}", "src/main.tsx", "src/test/**"],
-      thresholds: { lines: 45, functions: 40, branches: 35, statements: 45 },
+      exclude: ["src/**/*.test.{ts,tsx}", "src/main.tsx", "src/test/**", "src/sw/**"],
+      // ADR-026 (N4-07): thresholds 10–15 points below the measured values (R5: lines 86 / functions 54 / branches 77).
+      thresholds: { lines: 80, functions: 50, branches: 70, statements: 80 },
     },
   },
 }));

@@ -714,8 +714,16 @@ function instrumentLines(ctx: MarketContext, trade: Trade, pricing: PricingResul
         : trade.digital
           ? " (Digital analytisch, Cash- bzw. Asset-or-Nothing)"
           : "";
+      const lifecycle = String(a.lifecycle ?? "alive");
+      const lifecycleLine =
+        lifecycle === "delivered"
+          ? `Lebenszyklus: Option bereits abgewickelt (Lieferung ${formatDateDe(trade.deliveryDate)} vor dem Bewertungstag) – Barwert 0, keine Sensitivitäten, im EMIR-Bewertungsexport mit Wert 0 und Delta 0.`
+          : lifecycle === "alive"
+            ? undefined
+            : `Lebenszyklus: ${lifecycle === "expires-today" ? "Ausübungstag = Bewertungstag" : `Option am ${formatDateDe(trade.expiryDate)} verfallen, Abwicklung am ${formatDateDe(trade.deliveryDate)} noch offen`} – Ausübungs- bzw. Barrier-Entscheid am FX-Fixing des Verfalltags (${pricing.warnings.some((w) => w.startsWith("MISSING_FX_FIXING")) ? "kein Fixing geladen: heutiger Spot als Näherung, Warnung MISSING_FX_FIXING" : "geladenes Fixing bzw. heutiger Kurs"}); ausgeübte Option = Terminposition zum Strike mit Lieferung am Abwicklungstag (physische Lieferung), Digital = fester Auszahlungsbetrag, ausgeknockte Barrier = Rebate; keine Vega-, Gamma- oder Theta-Sensitivität mehr, Delta der Terminposition${lifecycle === "settles-today" ? "; Abwicklung am Bewertungstag als Value-Today-Austausch undiskontiert (SETTLES_TODAY)" : ""}.`;
       return [
         `${kind}: Garman-Kohlhagen${barrierNote}; Forward am Spot-Datum verankert (${base}${quote}: T+${lag} auf dem Paar-Kalender${base !== "USD" && quote !== "USD" ? " inkl. USD" : ""}${pricing.details?.spotDate ? `, Spot-Datum ${spotDateDe(pricing.details.spotDate)}` : ""}), Diskontierung bis Lieferdatum ${formatDateDe(trade.deliveryDate)}, Vol-Zeit bis Ausübung ${formatDateDe(trade.expiryDate)}; ${smile}${vol}; ${greeks}.`,
+        ...(lifecycleLine ? [lifecycleLine] : []),
         `FX-Delta-Betrag: Barwertänderung in der Reporting-Währung bei +1 % Spot der Basiswährung ${base} gegen ${quote} (Geldbetrag); Delta-Quote = vorzeichenbehaftetes Spot-Delta als Anteil des Nominals (= Delta-Betrag / (1 % des Nominals in Reporting-Währung), Long Call ≈ +0,5 am Geld, Long Put ≈ −0,5; für Vanillas in [−1, 1]). Vega-Buckets je Laufzeitzeile der FX-Fläche (ATM +1 Vol-Punkt, optional RR/BF als Smile-Buckets; Summe ≈ paralleles Vega bis auf die Varianz-Interpolation zwischen den Laufzeiten).`,
       ];
     }
@@ -726,7 +734,7 @@ function riskLines(risk: RiskReport | undefined, xva: XvaResult | undefined): st
   const lines: string[] = [];
   if (risk) {
     lines.push(
-      "Sensitivitäten per Bump-and-Reprice: DV01 und Zero-Buckets als zentrale Differenz ±1 bp der Zero-Sätze (parallel bzw. je Pillar; unter lokaler Interpolation summieren sich die Buckets zum DV01, unter monoton-konvexer oder Spline-Interpolation nur näherungsweise – für Hedge-Zwecke Par-Risiko je Marktquote), Vega +1 bp Normal-Vol (bzw. +1 Vol-Punkt lognormal/FX), FX-Delta ±1 % Spot (Barwertänderung in Reporting-Währung je +1 % Aufwertung der Fremdwährung – Geldbetrag, nicht die Delta-Quote); Theta = 1-Tages-Constant-Curve-Roll (Zero-Sätze je Laufzeit konstant, Turn-of-Year-Sprünge bleiben auf ihrem Kalenderdatum, Vol-Flächen mit fester Restlaufzeit) plus in (t, t+1] gezahlte Cashflows, zerlegt in Carry (Forward-Roll) und Roll-Down.",
+      "Sensitivitäten per Bump-and-Reprice: DV01 und Zero-Buckets als zentrale Differenz ±1 bp der Zero-Sätze (parallel bzw. je Pillar; unter lokaler Interpolation summieren sich die Buckets zum DV01, unter monoton-konvexer oder Spline-Interpolation nur näherungsweise – für Hedge-Zwecke Par-Risiko je Marktquote), Vega +1 bp Normal-Vol (bzw. +1 Vol-Punkt lognormal/FX), FX-Delta ±1 % Spot (Barwertänderung in Reporting-Währung je +1 % Aufwertung der Fremdwährung – Geldbetrag, nicht die Delta-Quote); Theta = 1-Tages-Constant-Curve-Roll (Zero-Sätze je Laufzeit konstant, Turn-of-Year-Sprünge bleiben auf ihrem Kalenderdatum, Vol-Flächen mit fester Restlaufzeit) plus in (t, t+1] gezahlte Cashflows, zerlegt in Carry (Forward-Roll) und Roll-Down; jeder Cashflow zählt genau einmal – FX-Legs mit Lieferung am Roll-Datum gelten im gerollten Barwert als heute geliefert (Value Today) und werden nicht zusätzlich als Cashflow gezählt.",
     );
   }
   if (xva)
@@ -816,7 +824,7 @@ function staticMethodology(trade: Trade): string[] {
     case "FxOption":
       return [
         ...common,
-        "Garman-Kohlhagen für europäische FX-Optionen; Smile aus ATM/RR/BF-Quotes im Delta-Raum; Barrieren nach Reiner-Rubinstein, Digitals analytisch; Greeks der Exoten per finiten Differenzen.",
+        "Garman-Kohlhagen für europäische FX-Optionen; Smile aus ATM/RR/BF-Quotes im Delta-Raum; Barrieren nach Reiner-Rubinstein, Digitals analytisch; Greeks der Exoten per finiten Differenzen. Lebenszyklus: verfallene, noch nicht abgewickelte Optionen als abgewickelter Payoff (Ausübungsentscheid am Verfall-Fixing, ausgeübt = Terminposition zum Strike; Warnung EXPIRED), Lieferung am Bewertungstag als Value-Today-Austausch (SETTLES_TODAY), bereits gelieferte Optionen mit Barwert 0 ausgeschlossen.",
       ];
   }
 }

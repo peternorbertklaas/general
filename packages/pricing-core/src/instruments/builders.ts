@@ -4,6 +4,7 @@ import { type SerialDate, addTenor, immDate, nextImmDate, today, toYMD } from ".
 import { buildSchedule, frequencyPerYear } from "../dates/schedule.js";
 import { formatDe, formatPctDe } from "../format.js";
 import { fxSpotDateFrom, pipFactor } from "../market/fx-spot.js";
+import { PricingError } from "../errors.js";
 import {
   type CapFloor,
   type CrossCurrencySwap,
@@ -479,13 +480,13 @@ export function defaultCcsCollateralCurrency(domestic: string, foreign: string):
  */
 export function makeCrossCurrencySwap(p: CrossCurrencySwapParams): CrossCurrencySwap {
   const pair = p.pair.replace("/", "").toUpperCase();
-  if (pair.length !== 6) throw new Error(`Invalid FX pair: ${p.pair}`);
+  if (pair.length !== 6) throw new PricingError("INVALID_TRADE", `Invalid FX pair: ${p.pair}`);
   const dom = (p.domesticCurrency ?? pair.slice(0, 3)).toUpperCase();
   const frn = (p.foreignCurrency ?? pair.slice(3, 6)).toUpperCase();
-  if (!pair.includes(dom) || !pair.includes(frn) || dom === frn) throw new Error(`Currencies ${dom}/${frn} do not match pair ${pair}`);
+  if (!pair.includes(dom) || !pair.includes(frn) || dom === frn) throw new PricingError("INVALID_TRADE", `Currencies ${dom}/${frn} do not match pair ${pair}`);
   let foreignNotional = p.foreignNotional;
   if (foreignNotional === undefined) {
-    if (p.fxSpot === undefined) throw new Error("makeCrossCurrencySwap: either fxSpot or foreignNotional is required");
+    if (p.fxSpot === undefined) throw new PricingError("INVALID_TRADE", "makeCrossCurrencySwap: either fxSpot or foreignNotional is required");
     // fxSpot is quoted for the pair: 1 base = fxSpot quote.
     foreignNotional = pair.startsWith(dom) ? p.domesticNotional * p.fxSpot : p.domesticNotional / p.fxSpot;
   }
@@ -635,7 +636,7 @@ export function makeFra(p: {
   const conv = getSwapConventions(p.currency);
   // Period form "3x6": months from spot; the index tenor follows the period length unless given explicitly (R3-2).
   const period = typeof p.start === "string" ? /^\s*(\d+)\s*[xX×]\s*(\d+)\s*$/.exec(p.start) : null;
-  if (typeof p.start === "string" && !period) throw new Error(`Invalid FRA period "${p.start}" – expected e.g. "3x6"`);
+  if (typeof p.start === "string" && !period) throw new PricingError("INVALID_TRADE", `Invalid FRA period "${p.start}" – expected e.g. "3x6"`);
   let periodMonths: number | undefined;
   if (period) periodMonths = Number(period[2]) - Number(period[1]);
   else if (typeof p.start === "number" && p.end !== undefined) periodMonths = Math.round((p.end - p.start) / 30.4375);
@@ -656,7 +657,7 @@ export function makeFra(p: {
     endDate = p.end ?? advance(start, idx.tenor, cal, "ModifiedFollowing", idx.endOfMonth);
     label = "";
   }
-  if (endDate <= startDate) throw new Error("makeFra: end must be after start");
+  if (endDate <= startDate) throw new PricingError("INVALID_TRADE", "makeFra: end must be after start");
   return {
     id: p.id ?? nextTradeId("FRA"),
     name: p.name ?? `FRA ${p.currency} ${label} ${p.payReceive === "Pay" ? "Zahler" : "Empfänger"} @ ${rateDe(p.rate)}`.replace(/\s+/g, " "),

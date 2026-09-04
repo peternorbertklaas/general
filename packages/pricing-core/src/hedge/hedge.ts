@@ -25,6 +25,7 @@ import { fxToReporting } from "../pricing/leg-pricer.js";
 import { priceTrade, tradeCurrencies } from "../pricing/price.js";
 import { STANDARD_SCENARIOS, type ScenarioDefinition, applyScenario } from "../risk/scenarios.js";
 import { capletSurfaceKeysFor } from "../risk/sensitivities.js";
+import { PricingError } from "../errors.js";
 
 /**
  * Hedge accounting (Bilanzierung von Sicherungsbeziehungen) for IFRS 9 and
@@ -443,7 +444,7 @@ function instrumentTerms(trade: Trade, hedgedCcy: string): InstrumentTerms {
     }
     default: {
       const never: never = trade;
-      throw new Error(`Unsupported trade type: ${(never as Trade).type}`);
+      throw new PricingError("UNSUPPORTED_TRADE_TYPE", `Unsupported trade type: ${(never as Trade).type}`);
     }
   }
 }
@@ -455,10 +456,10 @@ function counterCurrency(rel: HedgeRelationship, instrument: Trade): string {
     const { base, quote } = splitPair(rel.hedgedItem.fxPair);
     if (base === hedged) return quote;
     if (quote === hedged) return base;
-    throw new Error(`fxPair ${rel.hedgedItem.fxPair} does not contain hedged currency ${hedged}`);
+    throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `fxPair ${rel.hedgedItem.fxPair} does not contain hedged currency ${hedged}`);
   }
   const other = tradeCurrencies(instrument).find((c) => c.toUpperCase() !== hedged);
-  if (!other) throw new Error(`Cannot determine counter currency for FX hedge ${rel.id}`);
+  if (!other) throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `Cannot determine counter currency for FX hedge ${rel.id}`);
   return other;
 }
 
@@ -477,7 +478,7 @@ function hedgedPortionNotional(rel: HedgeRelationship): number {
 
 function hedgeRatioOf(rel: HedgeRelationship): number {
   const r = rel.hedgeRatio ?? 1;
-  if (!(r > 0) || !Number.isFinite(r)) throw new Error(`Invalid hedge ratio for ${rel.id}: ${r}`);
+  if (!(r > 0) || !Number.isFinite(r)) throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `Invalid hedge ratio for ${rel.id}: ${r}`);
   return r;
 }
 
@@ -613,13 +614,14 @@ export function hedgedItemNotionalSchedule(rel: HedgeRelationship): { date: Seri
   const notional = Math.abs(item.amount ?? item.notional);
   switch (am.type) {
     case "Custom":
-      if (!am.schedule?.length) throw new Error(`Hedged item of ${rel.id}: amortisation "Custom" needs a schedule`);
+      if (!am.schedule?.length) throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `Hedged item of ${rel.id}: amortisation "Custom" needs a schedule`);
       return scale(am.schedule);
     case "Linear":
       return scale(linearAmortisation(itemScheduleLeg(item, am.frequency), notional, am.finalNotional ?? 0));
     case "Annuity": {
       const loanRate = am.loanRate ?? item.fixedRate;
-      if (loanRate === undefined) throw new Error(`Hedged item of ${rel.id}: amortisation "Annuity" needs loanRate (or fixedRate)`);
+      if (loanRate === undefined)
+        throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `Hedged item of ${rel.id}: amortisation "Annuity" needs loanRate (or fixedRate)`);
       return scale(annuityAmortisationSchedule(itemScheduleLeg(item, am.frequency), notional, loanRate, am.finalNotional ?? 0));
     }
   }
@@ -707,14 +709,16 @@ export function hypotheticalDerivative(ctx: MarketContext, rel: HedgeRelationshi
   const name = `Hypothetisches Derivat ${rel.name}`;
 
   if (isFxKind(item.kind)) {
-    if (item.maturityDate <= ctx.valuationDate) throw new Error(`Hedged FX cash flow of ${rel.id} is not in the future of the market date`);
+    if (item.maturityDate <= ctx.valuationDate)
+      throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `Hedged FX cash flow of ${rel.id} is not in the future of the market date`);
     const other = counterCurrency(rel, hedgingInstrument);
     const amount = hedgedPortionNotional(rel);
     if (hedgingInstrument.type === "FxOption" && !hedgingInstrument.barrier && !hedgingInstrument.digital) {
       // Hypothetical option: same strike / expiry / delivery / type on the hedged amount.
       const { base, quote } = splitPair(hedgingInstrument.pair);
       const notional = base === hedgedCcy ? amount : quote === hedgedCcy ? amount / hedgingInstrument.strike : undefined;
-      if (notional === undefined) throw new Error(`FX option ${hedgingInstrument.id} does not reference hedged currency ${hedgedCcy}`);
+      if (notional === undefined)
+        throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `FX option ${hedgingInstrument.id} does not reference hedged currency ${hedgedCcy}`);
       const hypo: FxOption = {
         id,
         name,
@@ -794,7 +798,8 @@ export function hypotheticalDerivative(ctx: MarketContext, rel: HedgeRelationshi
   if (fixedRate === undefined) {
     const probe = withSchedule(makeVanillaSwap({ ...common, id: `${id}-PROBE`, fixedRate: 0 }));
     const par = priceTrade(ctx, probe, hedgedCcy).analytics.parRate;
-    if (typeof par !== "number" || !Number.isFinite(par)) throw new Error(`Par rate for hypothetical derivative of ${rel.id} not available`);
+    if (typeof par !== "number" || !Number.isFinite(par))
+      throw new PricingError("INVALID_HEDGE_RELATIONSHIP", `Par rate for hypothetical derivative of ${rel.id} not available`);
     fixedRate = par;
   }
   return withSchedule(makeVanillaSwap({ ...common, id, name, fixedRate }));

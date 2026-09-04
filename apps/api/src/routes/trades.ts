@@ -14,8 +14,9 @@ import { type AppContext } from "../app.js";
 import { CSV_TRADE_TYPES, type CsvImportResult, type CsvTradeType, csvTemplatesMarkdown, csvToTrades } from "../lib/csv-import.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import { describeError, sendError } from "../lib/errors.js";
+import { ifMatchSatisfied, ifNoneMatchSatisfied } from "../lib/etag.js";
 import { assertTradeWithinLimits } from "../lib/limits.js";
-import { arrayResponse, errorRef, fromTemplateBodySchema, pricingResultSchema, responses, storedTradeSchema, tradeId, tradeRef } from "../schemas.js";
+import { arrayResponse, fromTemplateBodySchema, pricingResultSchema, responses, storedTradeSchema, tradeId, tradeRef } from "../schemas.js";
 
 const currencyQuery = { type: "string", pattern: "^[A-Z]{3}$", description: "Reporting currency for the probe valuation (default EUR)" } as const;
 const idParams = { type: "object", required: ["id"], properties: { id: tradeId } } as const;
@@ -25,7 +26,16 @@ const ifMatchHeaders = {
     "if-match": {
       type: "string",
       description:
-        'ETag of the version being modified, or "*". Optional unless the server runs with REQUIRE_IF_MATCH=1 (then 428 without it); a mismatch is always 412.',
+        'Strong ETag of the version being modified (`"version-hash"` as returned by GET/POST/PUT), or "*". Compared with the strong comparison of RFC 9110 §13.1.1 – a weak tag (`W/"…"`) never matches. Optional unless the server runs with REQUIRE_IF_MATCH=1 (then 428 without it); a mismatch is always 412 with `currentEtag`.',
+    },
+  },
+} as const;
+const ifNoneMatchHeaders = {
+  type: "object",
+  properties: {
+    "if-none-match": {
+      type: "string",
+      description: 'ETag(s) the client holds, or "*"; weak comparison (RFC 9110 §13.1.2 – `W/` is ignored). Match → 304 without body.',
     },
   },
 } as const;
@@ -75,19 +85,25 @@ function buildFromTemplate(body: TemplateBody, m: MarketContext): Trade {
   });
 }
 
-/** Match a conditional header (`If-Match` / `If-None-Match`) against an ETag; `*` matches any. */
-function etagMatches(header: string | undefined, etag: string): boolean {
-  if (!header) return false;
-  return header.split(",").some((v) => {
-    const t = v.trim();
-    return t === "*" || t === etag;
-  });
-}
-
-/** 412 on an `If-Match` that does not match; 428 when the header is missing and the server requires it; `null` = proceed. */
+/**
+ * 412 on an `If-Match` that does not match (strong comparison – a `W/` tag or a stale version); 428 when the
+ * header is missing and the server requires it; `null` = proceed.
+ */
 function precondition(ctx: AppContext, ifMatch: string | undefined, currentEtag: string, requestId: string) {
-  if (ifMatch && !etagMatches(ifMatch, currentEtag)) {
-    return { status: 412, body: { error: "ETag mismatch – trade was modified", statusCode: 412, code: "PRECONDITION_FAILED", currentEtag, requestId } };
+  if (ifMatch && !ifMatchSatisfied(ifMatch, currentEtag)) {
+    const weak = ifMatch.trim().startsWith("W/");
+    return {
+      status: 412,
+      body: {
+        error: weak
+          ? "If-Match requires the strong ETag – a weak validator (W/) never matches (RFC 9110 §13.1.1); send the ETag as returned by the server"
+          : "ETag mismatch – trade was modified",
+        statusCode: 412,
+        code: "PRECONDITION_FAILED",
+        currentEtag,
+        requestId,
+      },
+    };
   }
   if (!ifMatch && ctx.requireIfMatch) {
     return {
@@ -153,17 +169,21 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       schema: {
         operationId: "getTrade",
         tags: ["trades"],
-        summary: "Trade lesen (liefert ETag; If-None-Match → 304)",
+        summary: "Trade lesen (liefert starken ETag; If-None-Match → 304)",
         params: idParams,
-        headers: { type: "object", properties: { "if-none-match": { type: "string" } } },
-        response: responses({ 200: storedTradeSchema, 304: { type: "null", description: "Not modified (ETag matches If-None-Match)" } }, 400, 404),
+        headers: ifNoneMatchHeaders,
+        response: responses(
+          { 200: storedTradeSchema, 304: { type: "null", description: "Not modified (ETag matches If-None-Match, weak comparison)" } },
+          400,
+          404,
+        ),
       },
     },
     async (req, reply) => {
       const t = ctx.trades.get(req.params.id);
       if (!t) return sendError(reply, req, 404, "NOT_FOUND", "Trade not found");
       reply.header("etag", t.etag);
-      if (etagMatches(req.headers["if-none-match"], t.etag)) return reply.status(304).send();
+      if (ifNoneMatchSatisfied(req.headers["if-none-match"], t.etag)) return reply.status(304).send();
       return datesToIso(t);
     },
   );
@@ -183,7 +203,7 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
         },
         response: responses(
           {
-            201: { ...storedTradeSchema, description: "Created (headers: ETag, Location)" },
+            201: { ...storedTradeSchema, description: 'Created (headers: strong ETag `"version-hash"`, Location)' },
             200: { ...storedTradeSchema, description: "Replaced via ?upsert=1" },
           },
           400,
@@ -219,7 +239,8 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       schema: {
         operationId: "updateTrade",
         tags: ["trades"],
-        summary: "Trade aktualisieren (optimistic locking über If-Match: Abweichung → 412; ohne Header → 428 bei REQUIRE_IF_MATCH=1)",
+        summary:
+          "Trade aktualisieren (optimistic locking über If-Match mit starkem ETag: Abweichung oder W/-Tag → 412; ohne Header → 428 bei REQUIRE_IF_MATCH=1)",
         params: idParams,
         headers: ifMatchHeaders,
         querystring: { type: "object", properties: { reportingCurrency: currencyQuery } },
@@ -406,10 +427,10 @@ export async function registerTradeRoutes(app: FastifyInstance, ctx: AppContext)
       schema: {
         operationId: "deleteTrade",
         tags: ["trades"],
-        summary: "Trade löschen (If-Match: Abweichung → 412; ohne Header → 428 bei REQUIRE_IF_MATCH=1)",
+        summary: "Trade löschen (If-Match mit starkem ETag: Abweichung oder W/-Tag → 412; ohne Header → 428 bei REQUIRE_IF_MATCH=1)",
         params: idParams,
         headers: ifMatchHeaders,
-        response: { 204: { type: "null", description: "Deleted" }, 400: errorRef, ...responses({}, 404, 412, 428) },
+        response: responses({ 204: { type: "null", description: "Deleted" } }, 400, 404, 412, 428),
       },
     },
     async (req, reply) => {

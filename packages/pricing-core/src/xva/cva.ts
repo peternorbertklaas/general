@@ -126,20 +126,41 @@ export function flatHazardCurve(hazard: number, recovery: number): HazardCurve {
 }
 
 /**
+ * Premium-leg accrual factor per year of hazard time: standard CDS accrue the
+ * running spread ACT/360 (ISDA 2003/2014 definitions, ISDA standard model)
+ * while the hazard curve is parameterised in ACT/365F years, so a coupon
+ * period of Δ years (ACT/365F) accrues s·Δ·365/360 (N5-5).
+ */
+export const CDS_PREMIUM_ACCRUAL_PER_YEAR = 365 / 360;
+
+/**
  * Bootstrap a piecewise-constant hazard curve from par CDS spreads (standard
  * premium-leg approximation): for each pillar T_i the hazard λ_i on
  * (T_{i-1}, T_i] solves
  *
- *   s · Σ_j Δ_j DF(t_j) [Q(t_j) + ½ (Q(t_{j-1}) − Q(t_j))]  =  (1 − R) · Σ_j DF(t_j) (Q(t_{j-1}) − Q(t_j))
+ *   s · Σ_j Δ_j·(365/360) · [DF(t_j)·Q(t_j) + DF(t_j^m)·½·(Q(t_{j-1}) − Q(t_j))]
+ *     =  (1 − R) · Σ_j DF(t_j^m) · (Q(t_{j-1}) − Q(t_j))
  *
- * with quarterly premium dates t_j up to T_i (accrual on default at mid
- * period, protection paid at the period end). Earlier pillars are kept fixed
- * (sequential bootstrap). `discount` defaults to DF ≡ 1 – a flat term
- * structure then reproduces λ = s / (1 − R) up to the quarterly discretisation
- * (relative error ≈ (λΔ)²/12). Quotes: `tenor` like "1Y", "5Y"; `spread` in
- * decimal (0.01 = 100bp). Negative hazards (inverted quotes) are rejected
- * with `PricingError("INVALID_CREDIT_CURVE")` unless `opts.floorHazard` is set
+ * with quarterly premium dates t_j up to T_i (Δ_j in ACT/365F years, t_j^m the
+ * period midpoint): the premium accrues **ACT/360** (ISDA standard CDS
+ * convention, N5-5: the factor 365/360 on the ACT/365F hazard time), the
+ * accrual on default and the protection payment are discounted to the period
+ * midpoint (ISDA standard model approximation of the continuous integral).
+ * Earlier pillars are kept fixed (sequential bootstrap). `discount` defaults
+ * to DF ≡ 1 – a flat term structure then reproduces λ = s·(365/360) / (1 − R)
+ * up to the quarterly discretisation (relative error ≈ (λΔ)²/12). Quotes:
+ * `tenor` like "1Y", "5Y"; `spread` in decimal (0.01 = 100bp). Negative
+ * hazards (inverted quotes) are rejected with
+ * `PricingError("INVALID_CREDIT_CURVE")` unless `opts.floorHazard` is set
  * (R3-3, see `HazardBootstrapOptions`).
+ *
+ * Cross-check (QuantLib 1.43 `PiecewiseFlatHazardRate` / `SpreadCdsHelper`,
+ * ISDA engine, quarterly ACT/360 premium, flat 2 % discount, R 40 %): flat
+ * 100 bp → λ(1Y) 168.10 bp in QuantLib; the engine reproduces the QuantLib
+ * hazards to ≈ 2e-3 relative and the survival probabilities to ≈ 1e-4
+ * (remaining difference: QuantLib integrates the default leg daily on the
+ * exact IMM-free coupon schedule, the engine uses the quarterly midpoint) –
+ * see `test-data/golden/cds-hazard-bootstrap.json`.
  */
 export function bootstrapHazardCurve(
   quotes: { tenor: string; spread: number }[],
@@ -179,22 +200,20 @@ export function bootstrapHazardCurve(
       let protection = 0;
       let prev = 0;
       let qPrev = 1;
-      for (let t = dt; t < p.t + 1e-9; t += dt) {
-        const tj = Math.min(t, p.t);
+      // One coupon period (prev, tj]: ACT/360 premium accrual on survival at the period end, accrual on
+      // default and protection at the period midpoint (N5-5).
+      const period = (tj: number): void => {
         const q = survivalProbability(partial, tj);
-        const d = df(tj);
-        premium += (tj - prev) * d * (q + 0.5 * (qPrev - q));
-        protection += d * (qPrev - q);
+        const dEnd = df(tj);
+        const dMid = df(0.5 * (prev + tj));
+        const accrual = (tj - prev) * CDS_PREMIUM_ACCRUAL_PER_YEAR;
+        premium += accrual * (dEnd * q + dMid * 0.5 * (qPrev - q));
+        protection += dMid * (qPrev - q);
         prev = tj;
         qPrev = q;
-      }
-      if (prev < p.t - 1e-9) {
-        // stub to the pillar
-        const q = survivalProbability(partial, p.t);
-        const d = df(p.t);
-        premium += (p.t - prev) * d * (q + 0.5 * (qPrev - q));
-        protection += d * (qPrev - q);
-      }
+      };
+      for (let t = dt; t < p.t + 1e-9; t += dt) period(Math.min(t, p.t));
+      if (prev < p.t - 1e-9) period(p.t); // stub to the pillar
       return p.s * premium - lgd * protection;
     };
     const guess = p.s / lgd;
@@ -248,7 +267,7 @@ function hazardLabel(credit: CreditInputs): string {
 export function cvaSwap(ctx: MarketContext, swap: InterestRateSwap, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
   const fixed = swap.legs.find((l): l is FixedLeg => l.type === "Fixed");
-  if (!fixed) throw new Error("CVA (swaption approach) needs a fixed/float swap");
+  if (!fixed) throw new PricingError("UNSUPPORTED_TRADE_TYPE", "CVA (swaption approach) needs a fixed/float swap");
   const ccy = fixed.currency;
   const fx = fxToReporting(ctx, ccy, reporting, swap.collateralCurrency);
   const dates = scheduleDates(fixed).filter((d) => d > ctx.valuationDate);
@@ -323,7 +342,7 @@ function appendMaturityPoint(profile: ExposurePoint[], ctx: MarketContext, matur
 export function cvaBasisSwap(ctx: MarketContext, swap: InterestRateSwap, credit: CreditInputs, reporting: string): XvaResult {
   const warnings: string[] = [];
   const floats = swap.legs.filter((l): l is FloatLeg => l.type === "Float");
-  if (floats.length !== 2 || swap.legs.length !== 2) throw new Error("cvaBasisSwap needs exactly two floating legs");
+  if (floats.length !== 2 || swap.legs.length !== 2) throw new PricingError("UNSUPPORTED_TRADE_TYPE", "cvaBasisSwap needs exactly two floating legs");
   const leg0 = swap.legs[0] as FloatLeg;
   const ccy = leg0.currency;
   const fx = fxToReporting(ctx, ccy, reporting, swap.collateralCurrency);
@@ -546,12 +565,80 @@ function isOption(t: Trade): t is Extract<Trade, { payReceive: "Pay" | "Receive"
   return t.type === "CapFloor" || t.type === "Swaption" || t.type === "FxOption";
 }
 
+const isFiniteNum = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+
+/** Structural problems of a hazard curve (times strictly increasing and positive, hazards finite ≥ 0, recovery in [0, 1)). */
+function hazardCurveProblems(curve: unknown, path: string): string[] {
+  const out: string[] = [];
+  const c = curve as Partial<HazardCurve> | null;
+  if (!c || typeof c !== "object" || !Array.isArray(c.times) || !Array.isArray(c.hazards))
+    return [`${path} must be a HazardCurve { times, hazards, recovery }`];
+  if (c.times.length !== c.hazards.length || c.times.length === 0)
+    out.push(`${path}: times (${c.times.length}) and hazards (${c.hazards.length}) must be non-empty arrays of equal length`);
+  let prev = 0;
+  c.times.forEach((t, i) => {
+    if (!isFiniteNum(t) || t <= prev) out.push(`${path}.times[${i}] must be a finite year fraction, strictly increasing and > 0 (got ${String(t)})`);
+    else prev = t;
+  });
+  c.hazards.forEach((h, i) => {
+    if (!isFiniteNum(h) || h < 0) out.push(`${path}.hazards[${i}] must be a finite, non-negative hazard rate (got ${String(h)})`);
+  });
+  if (!isFiniteNum(c.recovery) || c.recovery < 0 || c.recovery >= 1) out.push(`${path}.recovery must be in [0, 1) (got ${String(c.recovery)})`);
+  return out;
+}
+
+/**
+ * Structural validation of `CreditInputs` (N5-4e): recoveries in [0, 1),
+ * hazard rates finite and ≥ 0, hazard curves well-formed, basis-spread vol
+ * finite ≥ 0. Returns the list of problems (empty = valid); `computeXva`
+ * throws `PricingError("INVALID_CREDIT_CURVE")` with it – a missing
+ * `cptyRecovery` used to yield `cva: NaN`, `cptyRecovery: 1.5` or a negative
+ * hazard a negative CVA, silently.
+ */
+export function validateCreditInputs(credit: CreditInputs, path = "credit"): string[] {
+  const out: string[] = [];
+  if (!credit || typeof credit !== "object") return [`${path} must be an object (CreditInputs)`];
+  const c = credit as Partial<CreditInputs>;
+  if (!isFiniteNum(c.cptyRecovery) || c.cptyRecovery < 0 || c.cptyRecovery >= 1) {
+    out.push(`${path}.cptyRecovery must be a finite recovery rate in [0, 1) (got ${String(c.cptyRecovery)})`);
+  }
+  if (c.cptyHazardCurve === undefined) {
+    if (!isFiniteNum(c.cptyHazard) || c.cptyHazard < 0) out.push(`${path}.cptyHazard must be a finite, non-negative hazard rate (got ${String(c.cptyHazard)})`);
+  } else {
+    out.push(...hazardCurveProblems(c.cptyHazardCurve, `${path}.cptyHazardCurve`));
+    if (c.cptyHazard !== undefined && (!isFiniteNum(c.cptyHazard) || c.cptyHazard < 0)) {
+      out.push(`${path}.cptyHazard must be a finite, non-negative hazard rate when given (got ${String(c.cptyHazard)})`);
+    }
+  }
+  if (c.ownRecovery !== undefined && (!isFiniteNum(c.ownRecovery) || c.ownRecovery < 0 || c.ownRecovery >= 1)) {
+    out.push(`${path}.ownRecovery must be a finite recovery rate in [0, 1) (got ${String(c.ownRecovery)})`);
+  }
+  if (c.ownHazard !== undefined && (!isFiniteNum(c.ownHazard) || c.ownHazard < 0)) {
+    out.push(`${path}.ownHazard must be a finite, non-negative hazard rate (got ${String(c.ownHazard)})`);
+  }
+  if (c.ownHazardCurve !== undefined) out.push(...hazardCurveProblems(c.ownHazardCurve, `${path}.ownHazardCurve`));
+  if (c.basisSpreadVol !== undefined && (!isFiniteNum(c.basisSpreadVol) || c.basisSpreadVol < 0)) {
+    out.push(`${path}.basisSpreadVol must be a finite, non-negative normal vol (got ${String(c.basisSpreadVol)})`);
+  }
+  return out;
+}
+
+/** Throw `PricingError("INVALID_CREDIT_CURVE")` listing the problems of `credit` (see `validateCreditInputs`). */
+export function assertValidCreditInputs(credit: CreditInputs): void {
+  const problems = validateCreditInputs(credit);
+  if (problems.length) throw new PricingError("INVALID_CREDIT_CURVE", `Invalid credit inputs: ${problems.join("; ")}`, { problems });
+}
+
 /**
  * Dispatch: fixed/float swaps → swaption replication; single-currency tenor
  * basis swaps → basis-swaption replication; FX forwards → GK forward
- * exposure; everything else → generic delta-normal exposure.
+ * exposure; everything else → generic delta-normal exposure. Invalid
+ * `CreditInputs` raise `PricingError("INVALID_CREDIT_CURVE")` (N5-4e) – the
+ * CVA is never NaN or negative because of a missing / out-of-range recovery or
+ * a negative hazard.
  */
 export function computeXva(ctx: MarketContext, trade: Trade, credit: CreditInputs, reporting: string): XvaResult {
+  assertValidCreditInputs(credit);
   switch (trade.type) {
     case "InterestRateSwap": {
       const hasFixed = trade.legs.some((l) => l.type === "Fixed");

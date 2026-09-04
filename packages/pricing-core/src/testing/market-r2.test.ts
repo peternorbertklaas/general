@@ -26,7 +26,15 @@ import { HISTORICAL_SCENARIOS, applyScenario, runScenarios } from "../risk/scena
 import { buildValuationReport, marketSnapshotId } from "../reporting/valuation-report.js";
 import { EMIR_CSV_HEADER, emirCsv, emirDelta, emirValuationRecord } from "../reporting/emir.js";
 import { generateConfirmation, generateKid, summaryRiskIndicator } from "../reporting/documents.js";
-import { bootstrapHazardCurve, computeXva, flatHazardCurve, hazardFromSpread, marginalPd, survivalProbability } from "../xva/cva.js";
+import {
+  CDS_PREMIUM_ACCRUAL_PER_YEAR,
+  bootstrapHazardCurve,
+  computeXva,
+  flatHazardCurve,
+  hazardFromSpread,
+  marginalPd,
+  survivalProbability,
+} from "../xva/cva.js";
 import { type HedgeRelationship, criticalTermsMatch, hedgeEffectivenessReport, hypotheticalDerivative, intrinsicValue } from "../hedge/hedge.js";
 
 const VAL = parseISO("2026-09-03");
@@ -574,7 +582,7 @@ describe("N10 – HISTORICAL_SCENARIOS", () => {
 // N11 – hazard term structure
 // ---------------------------------------------------------------------------
 describe("N11 – bootstrapHazardCurve / survival / CVA with a term structure", () => {
-  it("a flat CDS term structure reproduces λ = s / (1 − R)", () => {
+  it("a flat CDS term structure reproduces λ = s·(365/360) / (1 − R) (ACT/360 premium accrual on ACT/365F hazard time, N5-5)", () => {
     const curve = bootstrapHazardCurve(
       [
         { tenor: "1Y", spread: 0.01 },
@@ -586,7 +594,7 @@ describe("N11 – bootstrapHazardCurve / survival / CVA with a term structure", 
       VAL,
     );
     expect(curve.times).toHaveLength(4);
-    const lambda = hazardFromSpread(0.01, 0.4);
+    const lambda = hazardFromSpread(0.01, 0.4) * CDS_PREMIUM_ACCRUAL_PER_YEAR;
     for (const h of curve.hazards) expect(Math.abs(h / lambda - 1)).toBeLessThan(2e-3);
     expect(survivalProbability(curve, 0)).toBe(1);
     expect(survivalProbability(curve, 5)).toBeCloseTo(Math.exp(-lambda * 5), 4);

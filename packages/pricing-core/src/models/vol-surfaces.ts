@@ -1,3 +1,4 @@
+import { assertCapletSurface, assertSwaptionSurface } from "../market/vol-validation.js";
 import { linearInterp, locate } from "../math/interpolation.js";
 import { type SabrParams, sabrAlphaFromAtm, sabrLognormalVol, sabrNormalVol } from "./sabr.js";
 
@@ -66,7 +67,9 @@ export function bilinear(xs: number[], ys: number[], grid: number[][], x: number
   return (1 - tx) * ((1 - ty) * g00 + ty * g01) + tx * ((1 - ty) * g10 + ty * g11);
 }
 
+/** ATM vol by bilinear interpolation; a malformed cube raises `PricingError("INVALID_VOL_SURFACE")` (Markt R5-1). */
 export function swaptionAtmVol(s: SwaptionVolSurface, expiry: number, tenor: number): number {
+  assertSwaptionSurface(s);
   return bilinear(s.expiries, s.tenors, s.atm, expiry, tenor);
 }
 
@@ -138,7 +141,9 @@ export function swaptionVol(s: SwaptionVolSurface, expiry: number, tenor: number
   }
 }
 
+/** Caplet vol by bilinear interpolation; a malformed surface raises `PricingError("INVALID_VOL_SURFACE")` (Markt R5-1). */
 export function capletVol(s: CapletVolSurface, expiry: number, strike: number): number {
+  assertCapletSurface(s);
   return bilinear(s.expiries, s.strikes, s.vols, expiry, strike);
 }
 

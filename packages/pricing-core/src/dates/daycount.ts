@@ -205,7 +205,7 @@ export function yearFraction(start: SerialDate, end: SerialDate, dc: DayCountCon
     case "ACT/ACT ICMA":
       return actActIcma(start, end, ctx);
     case "BUS/252": {
-      if (!ctx.businessDays) throw new Error("BUS/252 requires a business-day counter");
+      if (!ctx.businessDays) throw new PricingError("UNKNOWN_DAYCOUNT", "BUS/252 requires a business-day counter");
       return ctx.businessDays(start, end) / 252;
     }
     default:

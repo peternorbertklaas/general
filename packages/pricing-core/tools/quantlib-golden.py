@@ -648,6 +648,149 @@ def ql_sample_bootstrap_check():  # pragma: no cover
     }
 
 
+# --------------------------------------------------------------------------
+# I. CDS hazard bootstrap (N5-5): quarterly ACT/360 premium leg on ACT/365F
+#    hazard time, accrual on default and protection at the period midpoint,
+#    flat 2 % discount curve, R 40 % – independent re-implementation + QuantLib
+# --------------------------------------------------------------------------
+CDS_QUOTES = [("1Y", 0.01), ("3Y", 0.015), ("5Y", 0.02), ("10Y", 0.025)]
+CDS_RECOVERY = 0.4
+CDS_DISC_RATE = 0.02
+
+
+def golden_cds() -> None:
+    """Sequential bootstrap of a piecewise-constant hazard curve from par CDS
+    spreads. Pillar times T_i are ACT/365F year fractions of the tenor dates
+    (calendar months from the valuation date, no business-day adjustment). For
+    each pillar the hazard λ_i on (T_{i−1}, T_i] solves premium = protection on a
+    quarterly grid t_j = 0.25·j (ACT/365F years, last stub to T_i):
+      premium    = s · Σ_j (t_j − t_{j−1})·(365/360) · [DF(t_j)·Q(t_j) + DF(t_j^m)·½·(Q(t_{j−1}) − Q(t_j))]
+      protection = (1 − R) · Σ_j DF(t_j^m) · (Q(t_{j−1}) − Q(t_j)),   t_j^m = ½(t_{j−1} + t_j)
+    with Q(t) = exp(−∫λ) (piecewise constant, earlier pillars fixed) and the
+    discount factor read off a flat 2 % continuously compounded curve at the
+    integer day nearest to the grid time (half up), DF(t) = exp(−r·⌊365·t + ½⌋/365)
+    (the engine's curves live on integer serial dates). Solved by bisection to 1e-14.
+    Without discounting (DF ≡ 1) a flat spread reproduces λ = s·(365/360)/(1 − R)
+    up to the quarterly discretisation."""
+    val = VAL
+    # JS Math.round (half up), not Python's banker's rounding: the 6M grid point 182.5 days → 183.
+    disc = lambda t: df_flat(CDS_DISC_RATE, math.floor(365 * t + 0.5) / 365.0)  # noqa: E731
+
+    def pillar_time(tenor: str) -> float:
+        return days(val, add_tenor(val, tenor)) / 365.0
+
+    def survival(times, hazards, t):
+        integral = 0.0
+        prev = 0.0
+        for T, h in zip(times, hazards):
+            if t <= T:
+                return math.exp(-(integral + h * (t - prev)))
+            integral += h * (T - prev)
+            prev = T
+        return math.exp(-(integral + hazards[-1] * (t - prev)))
+
+    def legs(times, hazards, T, s, dfn):
+        premium = 0.0
+        protection = 0.0
+        prev = 0.0
+        q_prev = 1.0
+        grid = []
+        t = 0.25
+        while t < T + 1e-9:
+            grid.append(min(t, T))
+            t += 0.25
+        if not grid or grid[-1] < T - 1e-9:
+            grid.append(T)
+        for tj in grid:
+            q = survival(times, hazards, tj)
+            d_end = dfn(tj)
+            d_mid = dfn(0.5 * (prev + tj))
+            premium += (tj - prev) * (365.0 / 360.0) * (d_end * q + d_mid * 0.5 * (q_prev - q))
+            protection += d_mid * (q_prev - q)
+            prev, q_prev = tj, q
+        return s * premium - (1.0 - CDS_RECOVERY) * protection
+
+    def bootstrap(quotes, dfn):
+        times, hazards = [], []
+        for tenor, s in quotes:
+            T = pillar_time(tenor)
+            lo, hi = 0.0, 5.0
+            for _ in range(200):
+                mid = 0.5 * (lo + hi)
+                f = legs(times + [T], hazards + [mid], T, s, dfn)
+                # premium − protection decreases in λ (more default → more protection)
+                if f > 0:
+                    lo = mid
+                else:
+                    hi = mid
+            times.append(T)
+            hazards.append(0.5 * (lo + hi))
+        return times, hazards
+
+    times, hazards = bootstrap(CDS_QUOTES, disc)
+    flat_times, flat_hazards = bootstrap([("5Y", 0.01)], lambda t: 1.0)
+    payload = {
+        "case": "cds-hazard-bootstrap",
+        "description": "Piecewise-constant hazard curve from par CDS spreads 100/150/200/250 bp at 1Y/3Y/5Y/10Y, recovery 40 %, flat 2 % continuously compounded discount curve, valuation 2026-09-03: quarterly ACT/360 premium accrual (ISDA standard CDS convention) on ACT/365F hazard time, accrual on default and protection at the period midpoint (N5-5).",
+        "derivation": golden_cds.__doc__.strip(),
+        "inputs": {
+            "valuationDate": val.isoformat(),
+            "recovery": CDS_RECOVERY,
+            "discountRate": CDS_DISC_RATE,
+            "discountDayCount": "ACT/365F",
+            "premiumDayCount": "ACT/360",
+            "premiumFrequency": "3M",
+            "quotes": [{"tenor": tn, "spread": s} for tn, s in CDS_QUOTES],
+        },
+        "expected": {
+            "pillars": [
+                {"tenor": tn, "spread": s, "time": T, "hazard": h, "survival": survival(times, hazards, T)}
+                for (tn, s), T, h in zip(CDS_QUOTES, times, hazards)
+            ],
+            "flatUndiscounted": {
+                "tenor": "5Y",
+                "spread": 0.01,
+                "hazard": flat_hazards[0],
+                "closedForm": 0.01 * 365.0 / 360.0 / (1.0 - CDS_RECOVERY),
+                "note": "DF ≡ 1: bootstrap vs λ = s·(365/360)/(1 − R); the difference is the quarterly discretisation (≈ (λΔ)²/12).",
+            },
+        },
+        "quantlib": ql_cds_check() if HAVE_QL else {"status": "pending", "note": "QuantLib not installed when the file was generated; run tools/quantlib-golden.py with the QuantLib Python bindings to fill in the cross-check."},
+    }
+    write("cds-hazard-bootstrap.json", payload)
+
+
+def ql_cds_check():  # pragma: no cover
+    """QuantLib cross-check: PiecewiseFlatHazardRate from SpreadCdsHelpers (ISDA engine, quarterly ACT/360, flat 2 % discount)."""
+    today = ql.Date(VAL.day, VAL.month, VAL.year)
+    ql.Settings.instance().evaluationDate = today
+    disc = ql.YieldTermStructureHandle(ql.FlatForward(today, CDS_DISC_RATE, ql.Actual365Fixed()))
+    helpers = []
+    for tenor, s in CDS_QUOTES:
+        helpers.append(
+            ql.SpreadCdsHelper(
+                ql.QuoteHandle(ql.SimpleQuote(s)), ql.Period(tenor), 0, ql.WeekendsOnly(), ql.Quarterly, ql.Following, ql.DateGeneration.Forward,
+                ql.Actual360(), CDS_RECOVERY, disc, True, True, ql.Date(), ql.Actual360(), True, ql.CreditDefaultSwap.ISDA,
+            )
+        )
+    hz = ql.PiecewiseFlatHazardRate(today, helpers, ql.Actual365Fixed())
+    hz.enableExtrapolation()
+    pillars = []
+    for tenor, s in CDS_QUOTES:
+        d_ = today + ql.Period(tenor)
+        pillars.append({"tenor": tenor, "date": ql.Date.to_date(d_).isoformat(), "time": ql.Actual365Fixed().yearFraction(today, d_), "hazard": hz.hazardRate(d_ - 1), "survival": hz.survivalProbability(d_)})
+    return {
+        "status": "done",
+        "version": ql.__version__,
+        "engine": "PiecewiseFlatHazardRate / SpreadCdsHelper (ISDA engine, Quarterly, Actual360 premium, Following on WeekendsOnly, DateGeneration.Forward, settlesAccrual, paysAtDefaultTime)",
+        # QuantLib integrates the default leg daily on the exact (business-day adjusted) coupon schedule; the engine's
+        # quarterly grid with midpoint accrual / protection agrees to ≈ 3e-4 in survival and ≈ 3e-3 relative in the
+        # hazards (the 1Y pillar carries the largest difference: QuantLib 168.10 bp vs engine 168.56 bp, QuantLib's own
+        # later pillars of a flat 100 bp curve are 168.57 bp) – see test-data/golden/README.md.
+        "pillars": pillars,
+    }
+
+
 if __name__ == "__main__":
     print("QuantLib available:", HAVE_QL)
     golden_swap()
@@ -658,4 +801,5 @@ if __name__ == "__main__":
     golden_swaption()
     golden_cap()
     golden_sample_bootstrap()
+    golden_cds()
     sys.exit(0)

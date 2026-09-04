@@ -1,0 +1,105 @@
+{
+  "case": "cds-hazard-bootstrap",
+  "description": "Piecewise-constant hazard curve from par CDS spreads 100/150/200/250 bp at 1Y/3Y/5Y/10Y, recovery 40 %, flat 2 % continuously compounded discount curve, valuation 2026-09-03: quarterly ACT/360 premium accrual (ISDA standard CDS convention) on ACT/365F hazard time, accrual on default and protection at the period midpoint (N5-5).",
+  "derivation": "Sequential bootstrap of a piecewise-constant hazard curve from par CDS\n    spreads. Pillar times T_i are ACT/365F year fractions of the tenor dates\n    (calendar months from the valuation date, no business-day adjustment). For\n    each pillar the hazard λ_i on (T_{i−1}, T_i] solves premium = protection on a\n    quarterly grid t_j = 0.25·j (ACT/365F years, last stub to T_i):\n      premium    = s · Σ_j (t_j − t_{j−1})·(365/360) · [DF(t_j)·Q(t_j) + DF(t_j^m)·½·(Q(t_{j−1}) − Q(t_j))]\n      protection = (1 − R) · Σ_j DF(t_j^m) · (Q(t_{j−1}) − Q(t_j)),   t_j^m = ½(t_{j−1} + t_j)\n    with Q(t) = exp(−∫λ) (piecewise constant, earlier pillars fixed) and the\n    discount factor read off a flat 2 % continuously compounded curve at the\n    integer day nearest to the grid time (half up), DF(t) = exp(−r·⌊365·t + ½⌋/365)\n    (the engine's curves live on integer serial dates). Solved by bisection to 1e-14.\n    Without discounting (DF ≡ 1) a flat spread reproduces λ = s·(365/360)/(1 − R)\n    up to the quarterly discretisation.",
+  "inputs": {
+    "valuationDate": "2026-09-03",
+    "recovery": 0.4,
+    "discountRate": 0.02,
+    "discountDayCount": "ACT/365F",
+    "premiumDayCount": "ACT/360",
+    "premiumFrequency": "3M",
+    "quotes": [
+      {
+        "tenor": "1Y",
+        "spread": 0.01
+      },
+      {
+        "tenor": "3Y",
+        "spread": 0.015
+      },
+      {
+        "tenor": "5Y",
+        "spread": 0.02
+      },
+      {
+        "tenor": "10Y",
+        "spread": 0.025
+      }
+    ]
+  },
+  "expected": {
+    "pillars": [
+      {
+        "tenor": "1Y",
+        "spread": 0.01,
+        "time": 1.0,
+        "hazard": 0.016855957369726823,
+        "survival": 0.9832853094369405
+      },
+      {
+        "tenor": "3Y",
+        "spread": 0.015,
+        "time": 3.0027397260273974,
+        "hazard": 0.029788216061030763,
+        "survival": 0.9263399444729646
+      },
+      {
+        "tenor": "5Y",
+        "spread": 0.02,
+        "time": 5.002739726027397,
+        "hazard": 0.048280839946696866,
+        "survival": 0.841073959171389
+      },
+      {
+        "tenor": "10Y",
+        "spread": 0.025,
+        "time": 10.008219178082191,
+        "hazard": 0.05392004598242184,
+        "survival": 0.6421255952757131
+      }
+    ],
+    "flatUndiscounted": {
+      "tenor": "5Y",
+      "spread": 0.01,
+      "hazard": 0.01689817326639404,
+      "closedForm": 0.016898148148148148,
+      "note": "DF ≡ 1: bootstrap vs λ = s·(365/360)/(1 − R); the difference is the quarterly discretisation (≈ (λΔ)²/12)."
+    }
+  },
+  "quantlib": {
+    "status": "done",
+    "version": "1.43",
+    "engine": "PiecewiseFlatHazardRate / SpreadCdsHelper (ISDA engine, Quarterly, Actual360 premium, Following on WeekendsOnly, DateGeneration.Forward, settlesAccrual, paysAtDefaultTime)",
+    "pillars": [
+      {
+        "tenor": "1Y",
+        "date": "2027-09-03",
+        "time": 1.0,
+        "hazard": 0.016809991308126524,
+        "survival": 0.983330508228842
+      },
+      {
+        "tenor": "3Y",
+        "date": "2029-09-03",
+        "time": 3.0027397260273974,
+        "hazard": 0.029797154389270813,
+        "survival": 0.9263989043529549
+      },
+      {
+        "tenor": "5Y",
+        "date": "2031-09-03",
+        "time": 5.002739726027397,
+        "hazard": 0.04830089539607715,
+        "survival": 0.8411363948017345
+      },
+      {
+        "tenor": "10Y",
+        "date": "2036-09-03",
+        "time": 10.008219178082191,
+        "hazard": 0.05392619069159367,
+        "survival": 0.6421634079673815
+      }
+    ]
+  }
+}

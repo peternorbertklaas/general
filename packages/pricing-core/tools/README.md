@@ -5,6 +5,22 @@
 Generates `src/version.ts` from `package.json` (`prebuild` / `pretest` hook) so the
 engine version embedded in every report has a single source.
 
+## `gen-index.mjs` – curated public surface (ADR-024)
+
+Prints `src/index.ts` with every `export * from "<module>"` expanded into an explicit
+named export list (values first, then `type` exports) using the TypeScript compiler
+API. Since round 5 (N4-03) `index.ts` contains no wildcard re-export any more; run
+the script after adding a module or an export to get the list to paste and curate:
+
+```sh
+cd packages/pricing-core
+node tools/gen-index.mjs > /tmp/index.ts && diff src/index.ts /tmp/index.ts
+```
+
+Lines that are already explicit are kept verbatim, so the script is idempotent on
+a curated file; a name exported by two modules (e.g. `addDays`, re-exported by
+`dates/calendar.ts`) must be listed once only.
+
 ## `quantlib-golden.py` – golden-master reference values
 
 Writes `test-data/golden/*.json`. Every `expected` value is derived **independently
@@ -43,10 +59,18 @@ What the cross-check computes:
 | `swap-flat-curve`         | `VanillaSwap` on `FlatForward(0.03, Actual365Fixed, Continuous)`, `NullCalendar`, `Unadjusted` → `NPV`, `fairRate`, leg NPVs |
 | `black76-bachelier`       | `blackFormula`, `bachelierBlackFormula`                                                                                      |
 | `sample-market-bootstrap` | `PiecewiseLogLinearDiscount` from `OISRateHelper`s on an `OvernightIndex` (TARGET, spot lag 2, payment lag 1, `Annual`)      |
+| `cds-hazard-bootstrap`    | `PiecewiseFlatHazardRate` from `SpreadCdsHelper`s (ISDA engine, `Quarterly`, `Actual360` premium, flat 2 % discount, R 40 %) |
 
 Expected (and asserted) agreement:
 
 - flat-curve swap, Black-76, Bachelier: 1e-13 relative (identical formulas);
+- CDS hazard bootstrap (N5-5): **survival probabilities within 3e-4, hazards within
+  3e-3 relative** at the 1Y/3Y/5Y/10Y pillars. The engine accrues the premium
+  ACT/360 on a quarterly ACT/365F grid with accrual-on-default and protection at
+  the period midpoint; QuantLib's ISDA engine integrates the default leg daily on
+  the business-day-adjusted coupon schedule. Largest difference at 1Y: QuantLib
+  168.10 bp vs engine 168.56 bp for 100 bp / R 40 % (QuantLib's own later pillars of
+  a flat 100 bp curve are 168.57 bp); the round-4 ACT/365F accrual gave 166.67 bp;
 - sample bootstrap: **DF ratios between neighbouring pillars 1e-12** (identical
   schedules, calendar, stub rule, payment lag and interpolation), **absolute pillar
   DFs within 5e-8 – uniformly +1.87·10⁻⁸** on every pillar. The uniform factor is

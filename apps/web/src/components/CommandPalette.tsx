@@ -4,7 +4,7 @@ import { VISIBLE_HOTKEYS, keyList, keyTokens, type HotkeyDef } from "../hotkeys/
 import { fmtDate, fmtMoney } from "../lib/format.js";
 import { QUICK_ENTRY_EXAMPLES, parseQuickEntry, parseValuationDateCommand } from "../lib/quick-parser.js";
 import { tradeTypeBadge } from "../lib/trade-ops.js";
-import { useStore } from "../state/store.js";
+import { changeValuationDate, useStore } from "../state/store.js";
 import { restoreFocus, useModalRegistration } from "./Modal.js";
 
 interface Item {
@@ -58,6 +58,7 @@ export function CommandPalette({ onHotkey }: Props) {
       results: st.results,
       fxSpots: st.market.fxSpots,
       swaptionVols: st.market.swaptionVols,
+      fxVols: st.market.fxVols,
     })),
   );
   const act = useStore.getState;
@@ -77,8 +78,13 @@ export function CommandPalette({ onHotkey }: Props) {
   }, []);
 
   const parsed = useMemo(
-    () => parseQuickEntry(q, s.valuationDate, { fxSpots: s.fxSpots, swaptionVolCurrencies: Object.keys(s.swaptionVols ?? {}) }),
-    [q, s.valuationDate, s.fxSpots, s.swaptionVols],
+    () =>
+      parseQuickEntry(q, s.valuationDate, {
+        fxSpots: s.fxSpots,
+        swaptionVolCurrencies: Object.keys(s.swaptionVols ?? {}),
+        fxVolPairs: Object.keys(s.fxVols ?? {}),
+      }),
+    [q, s.valuationDate, s.fxSpots, s.swaptionVols, s.fxVols],
   );
   const valDateCmd = useMemo(() => parseValuationDateCommand(q), [q]);
 
@@ -193,9 +199,9 @@ export function CommandPalette({ onHotkey }: Props) {
             label: `Bewertungstag setzen: ${valDateCmd.split("-").reverse().join(".")}`,
             icon: "📅",
             run: () => {
-              if (act().setValuationDate(valDateCmd)) act().showToast(`Bewertungstag ${valDateCmd.split("-").reverse().join(".")}`);
-              else act().showToast("Ungültiges Datum");
               act().setPalette(false);
+              // An imported snapshot is not discarded silently – the helper asks first (R5-F2).
+              if (changeValuationDate(valDateCmd)) act().showToast(`Bewertungstag ${valDateCmd.split("-").reverse().join(".")}`);
             },
           }
         : null;

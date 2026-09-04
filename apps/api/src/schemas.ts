@@ -26,6 +26,24 @@ const currency = { type: "string", pattern: "^[A-Z]{3}$", description: "ISO-4217
 const currencyPair = { type: "string", pattern: "^[A-Z]{6}$", description: 'Currency pair "EURUSD" (1 EUR = x USD)' } as const;
 const payReceive = { type: "string", enum: ["Pay", "Receive"] } as const;
 const positiveNumber = { type: "number", exclusiveMinimum: 0 } as const;
+/**
+ * Upper bound for notionals and cash amounts (10 trillion in units of the currency). Amounts like
+ * `1e300` are not trades but numeric-overflow probes; they are rejected at the schema (400
+ * VALIDATION_ERROR) instead of producing a PV of ±1e298 (review R5, cosmetic).
+ */
+export const MAX_AMOUNT = 1e13;
+const amount = {
+  type: "number",
+  exclusiveMinimum: 0,
+  maximum: MAX_AMOUNT,
+  description: `Amount in currency units (0 < x ≤ ${MAX_AMOUNT.toExponential(0)})`,
+} as const;
+const signedAmount = {
+  type: "number",
+  minimum: -MAX_AMOUNT,
+  maximum: MAX_AMOUNT,
+  description: `Signed amount in currency units (|x| ≤ ${MAX_AMOUNT.toExponential(0)})`,
+} as const;
 const shortText = { type: "string", maxLength: 200 } as const;
 
 export const TRADE_ID_PATTERN = "^[A-Za-z0-9._-]{1,64}$";
@@ -93,7 +111,7 @@ const tradeBaseProperties = {
   upfront: {
     type: "object",
     required: ["amount", "currency", "date"],
-    properties: { amount: { type: "number" }, currency, date: isoDate },
+    properties: { amount: signedAmount, currency, date: isoDate },
     additionalProperties: false,
   },
   tags: { type: "array", items: { type: "string", maxLength: 64 }, maxItems: 20 },
@@ -120,7 +138,7 @@ const stepSchedule = (valueKey: "rate" | "spread", value: unknown, description: 
 
 const legBaseProperties = {
   payReceive,
-  notional: positiveNumber,
+  notional: amount,
   currency,
   effectiveDate: isoDate,
   terminationDate: isoDate,
@@ -138,7 +156,7 @@ const legBaseProperties = {
     items: {
       type: "object",
       required: ["date", "notional"],
-      properties: { date: isoDate, notional: { type: "number", minimum: 0 } },
+      properties: { date: isoDate, notional: { type: "number", minimum: 0, maximum: MAX_AMOUNT } },
       additionalProperties: false,
     },
   },
@@ -232,7 +250,7 @@ export const fraSchema = {
     type: { type: "string", enum: ["FRA"] },
     ...tradeBaseProperties,
     payReceive: { ...payReceive, description: "Pay = pay fixed" },
-    notional: positiveNumber,
+    notional: amount,
     currency,
     index: rateIndex,
     startDate: isoDate,
@@ -267,7 +285,7 @@ export const capFloorSchema = {
     ...tradeBaseProperties,
     capFloor: { type: "string", enum: ["Cap", "Floor", "Collar"] },
     payReceive: { ...payReceive, description: "Receive = long the option(s)" },
-    notional: positiveNumber,
+    notional: amount,
     currency,
     index: rateIndex,
     effectiveDate: isoDate,
@@ -314,9 +332,9 @@ export const swaptionSchema = {
 
 const fxForwardLegProperties = {
   buyCurrency: currency,
-  buyAmount: positiveNumber,
+  buyAmount: amount,
   sellCurrency: currency,
-  sellAmount: positiveNumber,
+  sellAmount: amount,
   deliveryDate: isoDate,
   ndf: {
     type: "object",
@@ -367,7 +385,7 @@ export const fxOptionSchema = {
     optionType: { type: "string", enum: ["Call", "Put"], description: "Call = right to buy the base currency" },
     pair: currencyPair,
     strike: positiveNumber,
-    notional: { ...positiveNumber, description: "Notional in base currency" },
+    notional: { ...amount, description: `Notional in base currency (0 < x ≤ ${MAX_AMOUNT.toExponential(0)})` },
     expiryDate: isoDate,
     deliveryDate: isoDate,
     exercise: { type: "string", enum: ["European"] },
@@ -381,7 +399,7 @@ export const fxOptionSchema = {
     digital: {
       type: "object",
       required: ["payoutCurrency", "payout"],
-      properties: { payoutCurrency: currency, payout: positiveNumber },
+      properties: { payoutCurrency: currency, payout: amount },
       additionalProperties: false,
     },
     volOverride: { type: "number", minimum: 0, maximum: 5 },
@@ -722,9 +740,16 @@ export const gridBodySchema = {
 
 // Vol surfaces (shared by the snapshot schema and `PUT /api/market`, R4-5): plain data of the core's
 // `SwaptionVolSurface` / `CapletVolSurface` / `FxVolSurface`, keyed like `MarketContext.*Vols`.
+// The schema pins what JSON Schema can express (non-empty axes, positive pillars, non-negative vols);
+// the grid dimensions (rows = expiries, columns = tenors / strikes, FX vectors = expiries) and the
+// ordering of the axes are checked by `lib/vol-surfaces.ts` → 400 `VOL_SURFACE_INVALID` (Markt R5-1).
 const volType = { type: "string", enum: ["Normal", "Lognormal", "ShiftedLognormal"] } as const;
-const numberVector = { type: "array", items: { type: "number" }, maxItems: 200 } as const;
-const numberGrid = { type: "array", items: numberVector, maxItems: 200 } as const;
+const numberVector = { type: "array", items: { type: "number" }, minItems: 1, maxItems: 200 } as const;
+/** Axis pillars in years – strictly positive (ordering is checked structurally). */
+const pillarVector = { type: "array", items: { type: "number", exclusiveMinimum: 0 }, minItems: 1, maxItems: 200 } as const;
+/** Vol quotes (decimal, non-negative; JSON cannot carry NaN/Infinity). */
+const volVector = { type: "array", items: { type: "number", minimum: 0 }, minItems: 1, maxItems: 200 } as const;
+const volGrid = { type: "array", items: volVector, minItems: 1, maxItems: 200 } as const;
 export const swaptionVolsSchema = {
   type: "object",
   maxProperties: 50,
@@ -736,9 +761,9 @@ export const swaptionVolsSchema = {
       currency,
       volType,
       shift: { type: "number", minimum: 0, maximum: 1 },
-      expiries: numberVector,
-      tenors: numberVector,
-      atm: numberGrid,
+      expiries: { ...pillarVector, description: "Option expiries in years, strictly increasing" },
+      tenors: { ...pillarVector, description: "Underlying swap tenors in years, strictly increasing" },
+      atm: { ...volGrid, description: "atm[expiryIdx][tenorIdx] – one row per expiry, one column per tenor" },
       sabr: {
         type: "object",
         additionalProperties: {
@@ -769,9 +794,9 @@ export const capletVolsSchema = {
       index: rateIndex,
       volType,
       shift: { type: "number", minimum: 0, maximum: 1 },
-      expiries: numberVector,
-      strikes: numberVector,
-      vols: numberGrid,
+      expiries: { ...pillarVector, description: "Caplet expiries in years, strictly increasing" },
+      strikes: { ...numberVector, description: "Strikes as decimals, strictly increasing (negative strikes allowed with a shift)" },
+      vols: { ...volGrid, description: "vols[expiryIdx][strikeIdx] – one row per expiry, one column per strike" },
     },
     additionalProperties: false,
   },
@@ -785,12 +810,12 @@ export const fxVolsSchema = {
     properties: {
       id: { type: "string", maxLength: 64 },
       pair: currencyPair,
-      expiries: numberVector,
-      atm: numberVector,
-      rr25: numberVector,
-      bf25: numberVector,
-      rr10: numberVector,
-      bf10: numberVector,
+      expiries: { ...pillarVector, description: "Expiries in years, strictly increasing" },
+      atm: { ...volVector, description: "ATM vols per expiry (same length as `expiries`)" },
+      rr25: { ...numberVector, description: "25Δ risk reversals per expiry" },
+      bf25: { ...volVector, description: "25Δ butterflies per expiry" },
+      rr10: { ...numberVector, description: "10Δ risk reversals per expiry" },
+      bf10: { ...volVector, description: "10Δ butterflies per expiry" },
       atmConvention: { type: "string", enum: ["DeltaNeutral", "Forward"] },
       deltaConvention: { type: "string", enum: ["Spot", "Forward", "PremiumAdjustedSpot", "PremiumAdjustedForward"] },
       smileInterpolation: { type: "string", enum: ["linear", "cubic"] },
@@ -942,9 +967,9 @@ export const crossCurrencySwapParamsSchema = {
     pair: { ...currencyPair, description: 'Pair "EURUSD": first currency domestic, second foreign unless given explicitly' },
     domesticCurrency: currency,
     foreignCurrency: currency,
-    domesticNotional: positiveNumber,
+    domesticNotional: amount,
     fxSpot: { ...positiveNumber, description: "1 domestic = fxSpot foreign; fixes the foreign notional (alternatively `foreignNotional`)" },
-    foreignNotional: positiveNumber,
+    foreignNotional: amount,
     domesticIndex: { ...rateIndex, description: "Default: RFR of the currency" },
     foreignIndex: rateIndex,
     fixedRate: { ...rate, description: "Fixed-vs-float variant: the domestic leg pays/receives this fixed rate" },
@@ -980,7 +1005,7 @@ export const fraParamsSchema = {
   properties: {
     id: tradeId,
     currency,
-    notional: positiveNumber,
+    notional: amount,
     payReceive: { ...payReceive, description: "Pay = pay the fixed rate" },
     index: {
       ...rateIndex,
@@ -1176,9 +1201,18 @@ export const API_ERROR_CODES = {
     "INVALID_TIMESTAMP",
     "INVALID_DATE",
     "INVALID_TENOR",
+    "INVALID_VOL_SURFACE",
+    "INVALID_SNAPSHOT",
+    "INVALID_CURVE_SPEC",
+    "INVALID_HEDGE_RELATIONSHIP",
+    "NUMERICAL_FAILURE",
   ],
   api: [
     "DOMAIN_ERROR",
+    "VALIDATION_ERROR",
+    "INVALID_JSON",
+    "UNSUPPORTED_MEDIA_TYPE",
+    "PAYLOAD_TOO_LARGE",
     "INVALID_REQUEST",
     "ID_MISMATCH",
     "INVALID_QUERY_MAP",
@@ -1188,6 +1222,7 @@ export const API_ERROR_CODES = {
     "CSV_ROW_INVALID",
     "SNAPSHOT_MALFORMED",
     "SNAPSHOT_INVALID",
+    "VOL_SURFACE_INVALID",
     "PERIOD_BUDGET_EXCEEDED",
     "STORE_BUDGET_EXCEEDED",
     "PRECONDITION_FAILED",
@@ -1203,6 +1238,8 @@ export const WARNING_PREFIXES = [
   "COLLATERAL_CURVE_MISSING",
   "VOL_TYPE_CONVERTED",
   "HAZARD_FLOORED",
+  "EXPIRED",
+  "EXPIRES_TODAY",
 ] as const;
 
 export const errorResponseSchema = {
@@ -1222,45 +1259,60 @@ export const errorResponseSchema = {
         "422 domain errors of the pricing core: INVALID_TRADE (semantically invalid trade), NON_FINITE_PV, MISSING_RATE, MISSING_FIXING (policy `throw`), NO_DISCOUNT_CURVE, CURVE_NOT_FOUND, NO_FX_SPOT, UNKNOWN_INDEX, UNKNOWN_CALENDAR, UNSUPPORTED_TRADE_TYPE, " +
         'INVALID_FREQUENCY (frequency that is not a positive tenor, e.g. "7Q"), UNKNOWN_DAYCOUNT (day count outside the supported conventions), ' +
         "VOL_MODEL_INCOMPATIBLE (requested option model cannot be fed from the vol surface – e.g. Black on a non-positive forward or strike without shift), " +
-        "INVALID_CREDIT_CURVE (CDS quotes imply a negative hazard rate; `details.pillar`; avoid with `floorHazard`), INVALID_TIMESTAMP (non-ISO-8601 timestamp: 400 on snapshot import, 422 from the EMIR export), DOMAIN_ERROR (plain core error without code). " +
-        "400: INVALID_TRADE (programming error while pricing, reported as invalid trade), INVALID_DATE (a date that does not exist, e.g. `2027-02-30`), INVALID_TENOR (unparsable tenor string), TOO_MANY_PERIODS (estimated coupon periods of one leg above the bound), " +
-        "INVALID_REQUEST (semantically invalid request outside the schema, e.g. no trades for a portfolio par-risk run), ID_MISMATCH (body `id` differs from the path id), INVALID_QUERY_MAP (`uti`/`transactionPrice` map malformed or above 4 kB – use the POST body), CSV_INVALID (CSV import: unparsable file / header / missing `?type=`), SNAPSHOT_MALFORMED; " +
-        "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request) and STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED; 500 INTERNAL_ERROR. " +
+        "INVALID_CREDIT_CURVE (CDS quotes imply a negative hazard rate; `details.pillar`; avoid with `floorHazard`), INVALID_TIMESTAMP (non-ISO-8601 timestamp: 400 on snapshot import, 422 from the EMIR export), " +
+        "INVALID_VOL_SURFACE (a stored vol surface is structurally unusable at pricing time – `details.problems`; 400 when `deserializeMarket` rejects a snapshot / `designationSnapshot`; the API's own pre-check answers VOL_SURFACE_INVALID first), INVALID_SNAPSHOT (400: unsupported snapshot `schema` or malformed `fxFixings` entry), INVALID_CURVE_SPEC (bootstrap specification unusable: malformed FX pair, missing reference curve, circular dependency), INVALID_HEDGE_RELATIONSHIP (hedge relationship structurally inconsistent: FX pair without the hedged currency, non-positive hedge ratio, amortisation without schedule / loan rate), NUMERICAL_FAILURE (root search or implied-vol solve did not converge), DOMAIN_ERROR (plain core error without code). " +
+        "400: VALIDATION_ERROR (request body, query, params or headers violate the JSON schema – `validation[]` carries the Ajv errors), INVALID_JSON (body is not valid JSON or is empty with `content-type: application/json`), INVALID_TRADE (programming error while pricing, reported as invalid trade), INVALID_DATE (a date that does not exist, e.g. `2027-02-30`; `details.input`), INVALID_TENOR (unparsable tenor string; `details.input`), TOO_MANY_PERIODS (estimated coupon periods of one leg – or of a hedged item's schedule – above the bound), " +
+        "INVALID_REQUEST (semantically invalid request outside the schema, e.g. no trades for a portfolio par-risk run), ID_MISMATCH (body `id` differs from the path id), INVALID_QUERY_MAP (`uti`/`transactionPrice` map malformed or above 4 kB – use the POST body), CSV_INVALID (CSV import: unparsable file / header / missing `?type=`), SNAPSHOT_MALFORMED, VOL_SURFACE_INVALID (a swaption / caplet / FX vol surface in `PUT /api/market`, a snapshot or a `designationSnapshot` is structurally inconsistent – grid rows ≠ expiries, row length ≠ tenors / strikes, FX vectors ≠ expiries, axes not strictly increasing, key ≠ currency / pair; `problems[]` names each path); " +
+        "404 NOT_FOUND (trade, curve or route); 409 CONFLICT (trade id exists); 412 PRECONDITION_FAILED; 413 PERIOD_BUDGET_EXCEEDED (compute budget of one request), STORE_BUDGET_EXCEEDED (the trade store would exceed `MAX_STORE_PERIODS` estimated coupon periods) and PAYLOAD_TOO_LARGE (body above the 5 MB limit); 415 UNSUPPORTED_MEDIA_TYPE (request body with a content-type other than `application/json` – or `text/csv` on the import route); 422 SNAPSHOT_INVALID (`problems[]`); 428 PRECONDITION_REQUIRED; 429 RATE_LIMITED (also on unknown routes); 500 INTERNAL_ERROR. " +
         "Per-item codes of batch results (`POST /api/trades/import`, `GET /api/trades?price=1`): the same plus CSV_ROW_INVALID and INTERNAL_ERROR (pricing failed for reasons that are not the trade's). " +
-        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0).",
+        "Not errors – prefixes of `warnings[]` entries on 200 responses: `MISSING_FIXING:` (fixing estimated from the curve), `MISSING_FX_FIXING:` (FX fixing of a past MtM reset – or of an expired FX option's exercise date – approximated by today's rate), `SETTLES_TODAY:` (FX leg delivering on the valuation date valued as a value-today exchange), `EXPIRED:` (FX option past its expiry with the delivery still pending – settled payoff, Greeks 0), `EXPIRES_TODAY:` (FX option expiring on the valuation date – intrinsic value on today's fixing / spot), `COLLATERAL_CURVE_MISSING:` (collateral currency without a collateral discount curve – standard curve used), `VOL_TYPE_CONVERTED:` (surface vol converted into the requested model's quotation, e.g. a Black cap on a normal caplet surface), `HAZARD_FLOORED:` (hazard pillar floored at 0).",
     },
-    details: { type: "object", additionalProperties: true, description: "Structured context of a PricingError (trade id, curve id, …)" },
+    details: {
+      type: "object",
+      additionalProperties: true,
+      description:
+        "Structured context of a PricingError (trade id, curve id, `input` of INVALID_DATE / INVALID_TENOR, …) or of a budget error (periods, limits)",
+    },
     requestId: { type: "string" },
-    validation: { type: "array", items: { type: "object", additionalProperties: true }, description: "Ajv validation errors (400)" },
-    currentEtag: { type: "string", description: "Current ETag on 412" },
-    problems: { type: "array", items: { type: "string" }, description: "Snapshot validation problems (422)" },
+    validation: { type: "array", items: { type: "object", additionalProperties: true }, description: "Ajv validation errors (400 VALIDATION_ERROR)" },
+    currentEtag: { type: "string", description: 'Current (strong) ETag `"version-hash"` on 412 / 428' },
+    problems: {
+      type: "array",
+      items: { type: "string" },
+      description: "Snapshot validation problems (422 SNAPSHOT_INVALID) or vol-surface problems (400 VOL_SURFACE_INVALID)",
+    },
   },
   additionalProperties: true,
 } as const;
 
 export const errorRef = { $ref: "ErrorResponse#" } as const;
 
-/** Common error responses shared by every route (rate limit, internal error). */
+/** Common error responses shared by every route (unsupported body media type, rate limit, internal error). */
 const commonErrors = {
+  415: {
+    ...errorRef,
+    description:
+      "Unsupported media type – a request body arrived with a content-type other than `application/json` (`text/csv` only on `POST /api/trades/import`); `code: UNSUPPORTED_MEDIA_TYPE`",
+  },
   429: {
     ...errorRef,
     description:
-      "Rate limit exceeded (default 600/min per client IP; the key is `request.ip`, which is the `X-Forwarded-For` client only when the server runs with `TRUST_PROXY` – see SECURITY.md)",
+      "Rate limit exceeded (default 600/min per client IP, unknown routes included; the key is `request.ip`, which is the `X-Forwarded-For` client only when the server runs with `TRUST_PROXY` – see SECURITY.md)",
   },
   500: { ...errorRef, description: "Internal server error (generic message, `code: INTERNAL_ERROR`, details logged server-side)" },
 } as const;
-/** Response map for routes exempt from the rate limit (health probes): success + generic 500, no 429. */
+/** Response map for routes exempt from the rate limit (health probes): success + generic 500, no 415/429. */
 export function responsesUnlimited(success: Record<number, unknown>): Record<number, unknown> {
   return { ...success, 500: commonErrors[500] };
 }
 
 type ErrorStatus = 400 | 404 | 409 | 412 | 413 | 422 | 428;
 const ERROR_DESCRIPTIONS: Record<ErrorStatus, string> = {
-  400: "Schema validation failed (`validation[]`), malformed JSON, invalid trade shape, or a leg with more than the allowed coupon periods (`code: TOO_MANY_PERIODS`)",
+  400: "Schema validation failed (`code: VALIDATION_ERROR`, `validation[]`), malformed JSON (`code: INVALID_JSON`), invalid trade shape, or a leg with more than the allowed coupon periods (`code: TOO_MANY_PERIODS`) – every 400 carries a catalogued `code`",
   404: "Resource not found",
   409: "Conflict (resource already exists)",
-  412: "Precondition failed (ETag mismatch)",
-  413: "Payload too large (body limit 5 MB) or compute budget exceeded (`code: PERIOD_BUDGET_EXCEEDED` – estimated coupon periods × valuations per request)",
+  412: "Precondition failed (`If-Match` does not match the current strong ETag – RFC 9110 strong comparison, a `W/` tag never matches)",
+  413: "Payload too large (body limit 5 MB, `code: PAYLOAD_TOO_LARGE`) or compute budget exceeded (`code: PERIOD_BUDGET_EXCEEDED` – estimated coupon periods × valuations per request)",
   422: "Domain error – trade cannot be priced (`code`)",
   428: "Precondition required – `If-Match` missing while the server runs with REQUIRE_IF_MATCH=1 (`code: PRECONDITION_REQUIRED`, `currentEtag`)",
 };
@@ -1290,7 +1342,8 @@ export const pricingResultSchema = {
     legs: anyArray("LegResult[] (pv, pvReporting, annuity, cashflows[] with paymentDate/discountFactor/presentValue)"),
     analytics: anyObject(
       "Instrument analytics – numbers plus short enumerated strings (parRate, forward, impliedVol, Greeks). FX forwards and FX swaps: `deltaAmount` = PV change in reporting currency for +1 % of the (near-leg) buy currency; FX options: `deltaAmount` (base currency +1 %) plus `deltaPct` = signed spot delta as a fraction of the notional (−1 … 1). " +
-        "Caps/floors and swaptions: `model` (Bachelier | Black | ShiftedBlack), `volatility` in the model's own quotation, `volConverted` (\"yes\" when the surface vols were converted into that quotation because the requested model differs from the surface's vol type – then `warnings[]` carries `VOL_TYPE_CONVERTED:` and swaptions additionally report the unconverted `surfaceVolatility`). Dates live in `details`.",
+        "Caps/floors and swaptions: `model` (Bachelier | Black | ShiftedBlack), `volatility` in the model's own quotation, `volConverted` (\"yes\" when the surface vols were converted into that quotation because the requested model differs from the surface's vol type – then `warnings[]` carries `VOL_TYPE_CONVERTED:` and swaptions additionally report the unconverted `surfaceVolatility`). " +
+        'FX options additionally: `lifecycle` (state on the valuation date: live | expires-today | expired-pending-delivery | delivered – expired / delivered options are a settled payoff with Greeks 0 and `warnings[]` `EXPIRED:` / `EXPIRES_TODAY:`) and `greeksMethod` ("analytic" for vanillas, "finite-difference" for barrier / digital, "settled-payoff" after expiry). Dates live in `details`.',
     ),
     details: anyObject(
       "Non-numeric details complementing `analytics`: ISO dates such as `spotDate` (FX; FX options additionally `standardDelivery` = spot date of the expiry, the market-standard delivery the trade's `deliveryDate` may deviate from), `fixingDate`/`settlementDate` (FRA), `maturity` (swaps)",
@@ -1316,7 +1369,10 @@ export const riskReportSchema = {
     bucketed: anyArray("Key-rate deltas per curve pillar"),
     fxDelta: anyObject("FX delta per currency (+1 % appreciation)"),
     vega: num("Vega (+1bp normal / +1 vol point)"),
-    theta: num("1-day theta"),
+    theta: num("1-day theta = PV(t+1) + cashflows paid in (t, t+1] − PV(t), every cashflow counted once"),
+    thetaDetail: anyObject(
+      "Theta decomposition { total, carry, rollDown, cashflows, valueTodayOnRollDate }: `cashflows` = coupons that leave the PV by t+1, `valueTodayOnRollDate` = undiscounted amount of FX legs delivering on t+1 that stay in PV(t+1) as a value-today exchange (`SETTLES_TODAY:`) and are therefore not in `cashflows`",
+    ),
     gamma: num("Gamma"),
   },
   additionalProperties: true,

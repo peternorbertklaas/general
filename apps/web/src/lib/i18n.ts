@@ -31,6 +31,118 @@ const CORE_MESSAGES: Rule[] = [
     to: (m) => `${m[1]}-Modell: verschobener Forward/Strike nicht positiv${m[2]} – innerer Wert ohne Zeitwert`,
   },
   { re: /^FRA already settled$/, to: () => "FRA bereits abgerechnet" },
+  // Core R5: FX option past expiry (settlement pending) – valued as the settled payoff, no Greeks
+  {
+    re: /^EXPIRED: FX option expired (\d{4}-\d{2}-\d{2}) – settlement pending until (\d{4}-\d{2}-\d{2}): settled payoff on (.+?) \((exercised.*?|not exercised.*?)\), no vega, gamma or theta$/,
+    to: (m) =>
+      `FX-Option am ${isoToDe(m[1]!)} verfallen – Lieferung am ${isoToDe(m[2]!)} steht aus: abgerechnete Auszahlung auf ${germanizeText(m[3]!)} (${
+        /^exercised/.test(m[4]!) ? "ausgeübt, als Terminposition zum Strike bewertet" : "nicht ausgeübt / ausgeknockt"
+      }), kein Vega, Gamma oder Theta`,
+  },
+  { re: /^EXPIRED: FX option expired (\d{4}-\d{2}-\d{2}) – (.+)$/, to: (m) => `FX-Option am ${isoToDe(m[1]!)} verfallen – ${germanizeText(m[2]!)}` },
+  { re: /^EXPIRED: (.+)$/, to: (m) => `Verfallen: ${germanizeText(m[1]!)}` },
+  // Market snapshot import (R5-06): schema / structure problems raised by `deserializeMarket`
+  {
+    re: /^Unsupported market snapshot schema: (.*)$/,
+    to: (m) => `Datei ist kein DERIVA-Markt-Snapshot (Schema „${m[1] === "undefined" || m[1] === "" ? "fehlt" : m[1]}“ unbekannt, erwartet deriva.market/1)`,
+  },
+  {
+    re: /^Market snapshot: fxFixings\[(\d+)\]\.pair must be a 6-letter currency pair \(got (.+)\)$/,
+    to: (m) => `Snapshot: FX-Fixing ${Number(m[1]) + 1} – Währungspaar ${m[2]} ungültig (erwartet 6 Buchstaben wie EURUSD)`,
+  },
+  {
+    re: /^Market snapshot: fxFixings\[(\d+)\]\.date must be an ISO date \(got (.+)\)$/,
+    to: (m) => `Snapshot: FX-Fixing ${Number(m[1]) + 1} – Datum ${m[2]} ungültig (erwartet JJJJ-MM-TT)`,
+  },
+  {
+    re: /^Market snapshot: fxFixings\[(\d+)\]\.rate must be a positive finite number \(got (.+)\)$/,
+    to: (m) => `Snapshot: FX-Fixing ${Number(m[1]) + 1} – Kurs ${m[2]} ungültig (erwartet eine positive Zahl)`,
+  },
+  {
+    re: /^Market snapshot: fxFixings must be an array of \{ pair, date, rate \}$/,
+    to: () => "Snapshot: „fxFixings“ muss eine Liste aus Paar, Datum und Kurs sein",
+  },
+  // Structurally unusable vol surface on import (core R5-1, `INVALID_VOL_SURFACE`) – one line per problem, all German
+  {
+    re: /^(?:Market snapshot|Snapshot): malformed vol surface (\S+): (.+)$/,
+    to: (m) => `Vol-Fläche strukturell ungültig – ${m[2]!.split(/;\s*/).map(translateVolProblem).join("; ")}`,
+  },
+  { re: /^Market snapshot: (.+)$/, to: (m) => `Snapshot: ${m[1]}` },
+  {
+    re: /^meta\.snapshotTime must be an ISO-8601 date-time \(got (.+)\)$/,
+    to: (m) => `Snapshot-Zeitstempel (meta.snapshotTime) ${m[1]} ist kein ISO-8601-Zeitstempel (erwartet JJJJ-MM-TTThh:mm:ssZ)`,
+  },
+  { re: /^Discount curve (\S+) for (\S+) missing$/, to: (m) => `Diskontkurve ${m[1]} für ${m[2]} fehlt im Snapshot` },
+  {
+    re: /^Curve (\S+): discount factor (\S+) at (\d{4}-\d{2}-\d{2}) out of range$/,
+    to: (m) => `Kurve ${m[1]}: Diskontfaktor ${m[2]!.replace(".", ",")} am ${isoToDe(m[3]!)} außerhalb (0, 1]`,
+  },
+  {
+    re: /^Curve (\S+): discount factors not decreasing at (\d{4}-\d{2}-\d{2}) \(negative forward rate\)$/,
+    to: (m) => `Kurve ${m[1]}: Diskontfaktoren steigen am ${isoToDe(m[2]!)} (negativer Forward)`,
+  },
+  { re: /^FX pair (\S+) malformed$/, to: (m) => `Währungspaar ${m[1]} ungültig (erwartet 6 Buchstaben wie EURUSD)` },
+  { re: /^FX spot (\S+) must be positive$/, to: (m) => `FX-Spot ${m[1]} muss positiv sein` },
+  { re: /^FX fixing (\S+) on (\d{4}-\d{2}-\d{2}) given twice$/, to: (m) => `FX-Fixing ${pairDe(m[1]!)} vom ${isoToDe(m[2]!)} ist doppelt hinterlegt` },
+  {
+    re: /^FX fixing (\S+) on (\S+) must be positive$/,
+    to: (m) => `FX-Fixing ${pairDe(m[1]!)} vom ${m[2]!.includes("-") ? isoToDe(m[2]!) : m[2]} muss positiv sein`,
+  },
+  { re: /^FX fixing \[(\d+)\]: pair (\S+) malformed$/, to: (m) => `FX-Fixing ${Number(m[1]) + 1}: Währungspaar ${m[2]} ungültig` },
+  {
+    re: /^FX fixing \[(\d+)\] \((\S*)\): date must be a serial date$/,
+    to: (m) => `FX-Fixing ${Number(m[1]) + 1}${m[2] ? ` (${pairDe(m[2]!)})` : ""}: Datum fehlt oder ungültig`,
+  },
+  { re: /^meta\.snapshotTime (.+) is not an ISO-8601 date-time$/, to: (m) => `Snapshot-Zeitstempel (meta.snapshotTime) ${m[1]} ist kein ISO-8601-Zeitstempel` },
+  // Vol-surface structure problems (core `validateVolSurfaces` / `deserializeMarket`, Markt R5-1) – paths like "swaptionVols.USD.atm[3]"
+  { re: /^(\S+): has (\d+) rows but there are (\d+) expiries$/, to: (m) => `${volPathDe(m[1]!)}: ${m[2]} Zeilen, aber ${m[3]} Verfälle` },
+  {
+    re: /^(\S+): has (\d+) columns but there are (\d+) (tenors|strikes)$/,
+    to: (m) => `${volPathDe(m[1]!)}: ${m[2]} Spalten, aber ${m[3]} ${m[4] === "tenors" ? "Tenore" : "Strikes"}`,
+  },
+  { re: /^(\S+): has (\d+) entries but there are (\d+) expiries$/, to: (m) => `${volPathDe(m[1]!)}: ${m[2]} Einträge, aber ${m[3]} Verfälle` },
+  { re: /^(\S+): must be a non-empty array of numbers$/, to: (m) => `${volPathDe(m[1]!)}: muss eine nicht leere Zahlenliste sein` },
+  { re: /^(\S+): must be an array of numbers$/, to: (m) => `${volPathDe(m[1]!)}: muss eine Zahlenliste sein` },
+  { re: /^(\S+): must be a matrix of numbers$/, to: (m) => `${volPathDe(m[1]!)}: muss eine Zahlenmatrix sein` },
+  { re: /^(\S+): must be finite$/, to: (m) => `${volPathDe(m[1]!)}: muss eine endliche Zahl sein` },
+  { re: /^(\S+): must be ≥ 0$/, to: (m) => `${volPathDe(m[1]!)}: darf nicht negativ sein` },
+  { re: /^(\S+): must be > 0 \(years\)$/, to: (m) => `${volPathDe(m[1]!)}: muss > 0 sein (Jahre)` },
+  {
+    re: /^(\S+): not strictly increasing at index (\d+) \((.+)\)$/,
+    to: (m) => `${volPathDe(m[1]!)}: nicht streng steigend an Position ${Number(m[2]) + 1} (${m[3]})`,
+  },
+  {
+    re: /^(\S+)\.volType: unknown vol type (.+)$/,
+    to: (m) => `${volPathDe(m[1]!)}: unbekannter Vol-Typ ${m[2]} (erwartet Normal, Lognormal oder ShiftedLognormal)`,
+  },
+  { re: /^(\S+)\.shift: must be a finite number ≥ 0$/, to: (m) => `${volPathDe(m[1]!)}: Shift muss eine endliche Zahl ≥ 0 sein` },
+  { re: /^(\S+)\.shift: ShiftedLognormal needs a shift > 0$/, to: (m) => `${volPathDe(m[1]!)}: ShiftedLognormal benötigt einen Shift > 0` },
+  { re: /^(\S+): must be an object$/, to: (m) => `${volPathDe(m[1]!)}: muss ein Objekt sein` },
+  {
+    re: /^(\S+): key must equal the surface's currency \((.+?)\).*$/,
+    to: (m) => `${volPathDe(m[1]!)}: Schlüssel muss der Währung der Fläche entsprechen (${m[2]})`,
+  },
+  {
+    re: /^(\S+): key must equal the surface's pair \((.+?)\).*$/,
+    to: (m) => `${volPathDe(m[1]!)}: Schlüssel muss dem Währungspaar der Fläche entsprechen (${m[2]})`,
+  },
+  {
+    re: /^(\S+): key must be "(.+?)" \(currency-index\) or "(.+?)".*$/,
+    to: (m) => `${volPathDe(m[1]!)}: Schlüssel muss „${m[2]}“ (Währung-Index) oder „${m[3]}“ lauten`,
+  },
+  { re: /^(\S+): currency and index must be strings$/, to: (m) => `${volPathDe(m[1]!)}: Währung und Index müssen Texte sein` },
+  { re: /^(\S+): rr10 and bf10 must be given together$/, to: (m) => `${volPathDe(m[1]!)}: 10Δ Risk Reversal und Butterfly nur gemeinsam` },
+  {
+    re: /^(\S+)\.sabr: must be an object keyed "<expiry>x<tenor>"$/,
+    to: (m) => `${volPathDe(m[1]!)}: SABR-Parameter müssen je „<Verfall>x<Tenor>“ hinterlegt sein`,
+  },
+  {
+    re: /^(\S+)\.sabr\.(\S+): key must be "<expiry>x<tenor>" in years$/,
+    to: (m) => `${volPathDe(m[1]!)}: SABR-Schlüssel „${m[2]}“ muss „<Verfall>x<Tenor>“ in Jahren sein`,
+  },
+  { re: /^(\S+)\.sabr\.(\S+)\.(\w+): must be a finite number$/, to: (m) => `${volPathDe(m[1]!)}: SABR ${m[2]} – ${m[3]} muss eine endliche Zahl sein` },
+  // any other core vol-surface problem line ("swaptionVols.USD.atm has 1 rows, expected 11 (one per expiry)")
+  { re: /^(swaptionVols|capletVols|fxVols)\b.*$/, to: (m) => translateVolProblem(m[0]) },
   // Core R4-1: historical FX fixing for an MtM reset missing
   {
     re: /^MISSING_FX_FIXING: Missing FX fixing for ([A-Z]{6}) on (\d{4}-\d{2}-\d{2}); MtM reset of leg (\d+) valued with today's rate as proxy.*$/,
@@ -238,6 +350,77 @@ function isoToDe(iso: string): string {
   return `${d}.${m}.${y}`;
 }
 
+/** "swaptionVols.USD.atm[3]" → "Swaption-Cube USD, atm[3]" (paths of the vol-surface validator). */
+function volPathDe(path: string): string {
+  const m = /^(swaptionVols|capletVols|fxVols)\.([^.[]+)(?:[.[](.*))?$/.exec(path);
+  if (!m) return path;
+  const kind = m[1] === "swaptionVols" ? "Swaption-Cube" : m[1] === "capletVols" ? "Caplet-Fläche" : "FX-Vol-Fläche";
+  const rest = m[3] ? `, ${/^\d/.test(m[3]) ? "[" : ""}${m[3]}` : "";
+  return `${kind} ${m[2]}${rest}`;
+}
+
+const AXIS_DE: Record<string, string> = { expiry: "Verfall", tenor: "Tenor", strike: "Strike", expiries: "Verfälle", tenors: "Tenore", strikes: "Strikes" };
+const axisDe = (a: string) => AXIS_DE[a] ?? a;
+
+/**
+ * One problem line of the core's `validateVolSurfaces` ("swaptionVols.USD.atm has
+ * 1 rows, expected 11 (one per expiry)") → German. Unknown phrasings keep their
+ * text behind the translated path.
+ */
+function translateVolProblem(p: string): string {
+  const s = p.trim();
+  let m = /^(\S+) has (\d+) rows, expected (\d+) \(one per (\w+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: ${m[2]} Zeilen, erwartet ${m[3]} (eine je ${axisDe(m[4]!)})`;
+  m = /^(\S+) has (\d+) entries, expected (\d+) \(one per (\w+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: ${m[2]} Einträge, erwartet ${m[3]} (einer je ${axisDe(m[4]!)})`;
+  m = /^(\S+) must be a (\d+)×(\d+) array \((\w+) × (\w+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: muss eine ${m[2]}×${m[3]}-Matrix sein (${axisDe(m[4]!)} × ${axisDe(m[5]!)})`;
+  m = /^(\S+) must be an array of (\d+) vols$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: muss eine Liste aus ${m[2]} Vols sein`;
+  m = /^(\S+) must be an array of vols \(one per expiry\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: muss eine Liste aus Vols sein (eine je Verfall)`;
+  m = /^(\S+) must be a non-empty array of numbers$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: muss eine nicht leere Zahlenliste sein`;
+  m = /^(\S+) must be an expiries × (tenors|strikes) array$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: muss eine Matrix Verfälle × ${axisDe(m[2]!)} sein`;
+  m = /^(\S+) must be (?:a|an) (swaption|caplet|FX) vol surface object$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: muss ein ${m[2] === "swaption" ? "Swaption-Cube" : m[2] === "caplet" ? "Caplet-Flächen" : "FX-Vol-Flächen"}-Objekt sein`;
+  m = /^(\S+)\.(currency|pair) "(.+?)" does not match the key "(.+?)"$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: ${m[2] === "pair" ? "Währungspaar" : "Währung"} „${m[3]}“ passt nicht zum Schlüssel „${m[4]}“`;
+  m = /^(\S+)\.pair "(.+?)" must be a 6-letter currency pair$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: Währungspaar „${m[2]}“ muss aus 6 Buchstaben bestehen`;
+  m = /^(\S+)\.(id|currency|index|pair) missing$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: Feld „${m[2]}“ fehlt`;
+  m = /^(\S+)\.volType must be one of (.+?) \(got (.+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: Vol-Typ ${m[3]} unbekannt (erlaubt ${m[2]})`;
+  m = /^(\S+)\.shift must be a finite, non-negative number \(got (.+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: Shift ${m[2]} muss eine endliche Zahl ≥ 0 sein`;
+  m = /^(\S+)\.(atmConvention|deltaConvention|smileInterpolation|strangleType) must be (.+?) \(got (.+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: ${m[2]} ${m[4]} ungültig (erwartet ${m[3]})`;
+  m = /^(\S+)\[(\d+)\] \((.+?)\) must be greater than \S+\[(\d+)\] \((.+?)\) – axis strictly increasing, no duplicates$/.exec(s);
+  if (m)
+    return `${volPathDe(m[1]!)}: Achse nicht streng steigend – Position ${Number(m[2]) + 1} (${m[3]}) muss größer als Position ${Number(m[4]) + 1} (${m[5]}) sein`;
+  m = /^(\S+)\[(\d+)\] must be a finite(, positive)? number \(got (.+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}[${m[2]}]: muss eine endliche${m[3] ? ", positive" : ""} Zahl sein (${m[4]})`;
+  m = /^(\S+)\[(\d+)\] must be non-negative \(got (.+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}[${m[2]}]: darf nicht negativ sein (${m[3]})`;
+  m = /^(\S+)\[(\d+)\]\[(\d+)\] must be a finite, non-negative vol \(got (.+)\)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}[${m[2]}][${m[3]}]: Vol muss endlich und ≥ 0 sein (${m[4]})`;
+  m = /^(\S+)\[(\d+)\] must be an array of (\d+) vols$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}[${m[2]}]: muss eine Liste aus ${m[3]} Vols sein`;
+  m = /^(\S+)\.sabr (.+)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: SABR – ${m[2]}`;
+  m = /^(\S+)\.sabr\["(.+?)"\](.*)$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: SABR ${m[2]}${m[3]}`;
+  m = /^(\S+): rr10 and bf10 must be given together$/.exec(s);
+  if (m) return `${volPathDe(m[1]!)}: 10Δ Risk Reversal und Butterfly nur gemeinsam`;
+  m = /^(swaptionVols|capletVols|fxVols) must be an object keyed by (.+)$/.exec(s);
+  if (m)
+    return `${volPathDe(`${m[1]}.*`).replace(" *", "")}: muss ein Objekt je ${m[2] === "currency pair" ? "Währungspaar" : m[2] === "currency" ? "Währung" : "Währung[-Index]"} sein`;
+  m = /^(\S+)[:.]?\s(.*)$/.exec(s);
+  return m && /^(swaptionVols|capletVols|fxVols)\./.test(m[1]!) ? `${volPathDe(m[1]!.replace(/:$/, ""))}: ${m[2]}` : s;
+}
+
 /** Leg labels of the FX pricer ("FX forward", "near leg", "far leg") → German. */
 function legLabelDe(label: string): string {
   const l = label.trim();
@@ -320,18 +503,26 @@ export const PRICING_ERROR_CODES_DE: Record<string, string> = {
   INVALID_TENOR: "Ungültiger Tenor",
   MISSING_FX_FIXING: "FX-Fixing fehlt",
   COLLATERAL_CURVE_MISSING: "Collateral-Kurve fehlt",
+  // core round 5
+  INVALID_VOL_SURFACE: "Vol-Fläche strukturell ungültig",
+  INVALID_CURVE_SPEC: "Kurvenspezifikation ungültig",
+  NUMERICAL_FAILURE: "Numerische Lösung nicht konvergiert",
+  EXPIRED: "Verfallen",
 };
 
 /**
  * German text for any error thrown by the core: `PricingError`s get their
  * code headline plus the translated detail, plain errors are translated by
- * message.
+ * message. A detail that already starts with the headline ("Ungültiges Datum:
+ * 2026-13-45" for `INVALID_DATE`) is not prefixed a second time (R5-06).
  */
 export function translatePricingError(e: unknown): string {
   if (isPricingError(e)) {
     const head = PRICING_ERROR_CODES_DE[e.code] ?? e.code;
     const detail = translateCoreMessage(e.message);
-    return detail && detail !== head ? `${head}: ${detail}` : head;
+    if (!detail || detail === head) return head;
+    if (detail.toLowerCase().startsWith(head.toLowerCase())) return detail;
+    return `${head}: ${detail}`;
   }
   if (e instanceof Error) return translateCoreMessage(e.message);
   return translateCoreMessage(String(e));

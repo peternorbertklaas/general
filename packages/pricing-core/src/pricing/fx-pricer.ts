@@ -1,14 +1,15 @@
 import { toISO } from "../dates/date.js";
 import { yearFraction } from "../dates/daycount.js";
 import { type Cashflow, type FxForward, type FxOption, type FxSwap, type LegResult, type PricingResult } from "../instruments/types.js";
-import { type MarketContext, getDiscountCurve, getFxSpot } from "../market/market-context.js";
+import { type MarketContext, getDiscountCurve, getFxFixing, getFxSpot } from "../market/market-context.js";
 import { fxRateAtValuationDate, fxSpotDate, fxSpotDateFrom, pipFactor } from "../market/fx-spot.js";
 import { type FxOptionInputs, fxBarrier, fxDigital, fxExoticGreeks, garmanKohlhagen } from "../models/garman-kohlhagen.js";
 import { fxVolAtStrike } from "../models/fx-vol-surface.js";
+import { PricingError } from "../errors.js";
 
 export function splitPair(pair: string): { base: string; quote: string } {
   const p = pair.replace("/", "").toUpperCase();
-  if (p.length !== 6) throw new Error(`Invalid FX pair: ${pair}`);
+  if (p.length !== 6) throw new PricingError("INVALID_TRADE", `Invalid FX pair: ${pair}`);
   return { base: p.slice(0, 3), quote: p.slice(3) };
 }
 
@@ -214,6 +215,69 @@ export function priceFxSwap(ctx: MarketContext, trade: FxSwap, reportingCurrency
   };
 }
 
+/** Warning prefix for an FX option past its expiry whose delivery is still pending (N5-2). */
+export const EXPIRED_PREFIX = "EXPIRED:";
+/** Warning prefix for an FX option expiring on the valuation date (intrinsic value on today's rate, N5-2). */
+export const EXPIRES_TODAY_PREFIX = "EXPIRES_TODAY:";
+/** Warning prefix for a required historical FX fixing that is not loaded (shared with the MtM-reset CCS, R4-1). */
+export const MISSING_FX_FIXING_PREFIX = "MISSING_FX_FIXING:";
+
+/**
+ * Lifecycle state of an FX option on the valuation date (N5-2):
+ * - "alive": expiry after the valuation date – Garman–Kohlhagen / Reiner–Rubinstein value;
+ * - "expires-today": expiry on the valuation date – intrinsic value on today's fixing (or spot);
+ * - "expired": expired before the valuation date, delivery still pending – settled payoff;
+ * - "settles-today": delivery on the valuation date – settled payoff as a value-today exchange (DF 1);
+ * - "delivered": delivered before the valuation date – excluded (PV 0).
+ */
+export type FxOptionLifecycle = "alive" | "expires-today" | "expired" | "settles-today" | "delivered";
+
+export function fxOptionLifecycle(trade: Pick<FxOption, "expiryDate" | "deliveryDate">, valuationDate: number): FxOptionLifecycle {
+  if (trade.deliveryDate < valuationDate) return "delivered";
+  if (trade.deliveryDate === valuationDate) return "settles-today";
+  if (trade.expiryDate < valuationDate) return "expired";
+  if (trade.expiryDate === valuationDate) return "expires-today";
+  return "alive";
+}
+
+/** Payoff-currency value per unit base notional and spot delta of an option whose exercise is already decided. */
+interface SettledPayoff {
+  premiumPerUnit: number;
+  spotDelta: number;
+}
+
+/**
+ * Value of an FX option after its expiry (N5-2): the exercise / knock state is
+ * decided on the expiry fixing `sFix`; an exercised vanilla is the forward
+ * position at the strike delivered on the delivery date (physical delivery),
+ * i.e. sign·(F_del − K)·DF_q per unit base with the linear delta sign·DF_f of
+ * that forward. Digitals pay their fixed amount (cash-or-nothing: no spot
+ * delta; asset-or-nothing: one unit of base per payout, delta DF_f). Barriers
+ * use the fixing as the knock observation (no path monitoring between the
+ * trade date and the fixing is available): a knocked-out option is worth its
+ * rebate, a knocked-in option that was never triggered is worth 0. No vega,
+ * gamma, theta or rho remain.
+ */
+function settledPayoff(trade: FxOption, sFix: number, forward: number, spot: number, dfQ: number, scalePayout: number): SettledPayoff {
+  const sign = trade.optionType === "Call" ? 1 : -1;
+  const dfF = spot > 0 ? (dfQ * forward) / spot : dfQ;
+  const itm = sign * (sFix - trade.strike) > 0;
+  const exercised: SettledPayoff = itm ? { premiumPerUnit: sign * (forward - trade.strike) * dfQ, spotDelta: sign * dfF } : { premiumPerUnit: 0, spotDelta: 0 };
+  if (trade.digital) {
+    const payoutInBase = trade.digital.payoutCurrency.toUpperCase() === splitPair(trade.pair).base;
+    if (!itm) return { premiumPerUnit: 0, spotDelta: 0 };
+    return payoutInBase ? { premiumPerUnit: scalePayout * dfF * spot, spotDelta: scalePayout * dfF } : { premiumPerUnit: scalePayout * dfQ, spotDelta: 0 };
+  }
+  if (trade.barrier) {
+    const b = trade.barrier;
+    const breached = b.type.startsWith("Up") ? sFix >= b.level : sFix <= b.level;
+    const alive = b.type.endsWith("Out") ? !breached : breached;
+    if (alive) return exercised;
+    return b.type.endsWith("Out") ? { premiumPerUnit: (b.rebate ?? 0) * dfQ, spotDelta: 0 } : { premiumPerUnit: 0, spotDelta: 0 };
+  }
+  return exercised;
+}
+
 /**
  * FX vanilla / barrier / digital option (Garman–Kohlhagen, Reiner–Rubinstein).
  *
@@ -229,6 +293,18 @@ export function priceFxSwap(ctx: MarketContext, trade: FxSwap, reportingCurrency
  * hit are taken from the curves on the expiry horizon (`rdExpiry`/`rfExpiry`
  * = rates to the standard delivery of the expiry), so the extra carry of the
  * longer lag only enters the payoff discount and the delivery forward.
+ *
+ * Lifecycle (N5-2, `analytics.lifecycle`, `fxOptionLifecycle`): an option
+ * that expired before the valuation date is valued as its settled payoff
+ * (`settledPayoff`) – exercise decided on the FX fixing of the expiry date
+ * (`ctx.fxFixings`, either quotation), today's spot as proxy with a
+ * `MISSING_FX_FIXING:` warning when no fixing is loaded – with an `EXPIRED:`
+ * warning, zero vega / gamma and the delta of the resulting forward; an
+ * option expiring today uses today's fixing or spot (`EXPIRES_TODAY:`); a
+ * delivery on the valuation date is a value-today exchange at DF 1
+ * (`SETTLES_TODAY:`, like FX forwards); an option delivered before the
+ * valuation date is excluded (PV 0, all Greeks 0, "already settled" warning)
+ * – consistent with FX forwards / FRAs and the EMIR delta (0).
  */
 export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurrency?: string): PricingResult {
   const { base, quote } = splitPair(trade.pair);
@@ -236,19 +312,24 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
   const val = ctx.valuationDate;
   const spot = getFxSpot(ctx, base, quote);
   const spotDate = fxSpotDate(ctx, base, quote);
+  const lifecycle = fxOptionLifecycle(trade, val);
+  const alive = lifecycle === "alive";
+  const delivered = lifecycle === "delivered";
   const tExp = Math.max(0, yearFraction(val, trade.expiryDate, "ACT/365F"));
   const tDel = Math.max(tExp, yearFraction(val, trade.deliveryDate, "ACT/365F"));
-  const dfQ = trade.deliveryDate > val ? getDiscountCurve(ctx, quote, trade.collateralCurrency).df(trade.deliveryDate) : 1;
+  const dfQ = delivered ? 0 : trade.deliveryDate > val ? getDiscountCurve(ctx, quote, trade.collateralCurrency).df(trade.deliveryDate) : 1;
   const forward = fxForwardRate(ctx, base, quote, Math.max(trade.deliveryDate, val), trade.collateralCurrency);
   // Effective foreign discount factor consistent with the spot-anchored forward.
   const dfF = (dfQ * forward) / spot;
-  const rd = tDel > 0 ? -Math.log(dfQ) / tDel : 0;
-  const rf = tDel > 0 ? -Math.log(dfF) / tDel : 0;
+  const rd = tDel > 0 && dfQ > 0 ? -Math.log(dfQ) / tDel : 0;
+  const rf = tDel > 0 && dfF > 0 ? -Math.log(dfF) / tDel : 0;
   const warnings: string[] = [];
   const surface = ctx.fxVols?.[`${base}${quote}`] ?? ctx.fxVols?.[`${quote}${base}`];
   let vol = trade.volOverride;
   if (vol === undefined) {
-    if (surface) {
+    if (!alive) {
+      vol = 0; // no optionality left – the smile is not read (N5-2)
+    } else if (surface) {
       const inverted = !ctx.fxVols?.[`${base}${quote}`];
       vol = inverted
         ? fxVolAtStrike(surface, tExp, 1 / forward, 1 / trade.strike, { dfForeign: dfQ })
@@ -269,45 +350,96 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
     inputs.rfExpiry = inputs.rdExpiry - Math.log(fwdStd / spot) / tExp;
     deliveryConvention = "non-standard";
   }
-  const gk = garmanKohlhagen(inputs);
-  let premiumPerUnit = gk.premiumDomestic;
-  let kind = "Vanilla";
-  let greeks = {
-    spotDelta: gk.spotDelta,
-    gamma: gk.gamma,
-    vega: gk.vega,
-    theta: gk.theta,
-    rhoDomestic: gk.rhoDomestic,
-    rhoForeign: gk.rhoForeign,
-  };
-  let greeksMethod = "analytic";
-  if (trade.barrier) {
-    const b = trade.barrier;
-    const priceFn = (i: FxOptionInputs) => fxBarrier({ ...i, barrier: b.level, barrierType: b.type, rebate: b.rebate });
-    premiumPerUnit = priceFn(inputs);
-    greeks = fxExoticGreeks(priceFn, inputs, { barrier: b.level });
-    greeksMethod = "finite-difference";
-    kind = `Barrier ${b.type}`;
-  } else if (trade.digital) {
-    const payoutCcy = trade.digital.payoutCurrency.toUpperCase();
-    const payoutInBase = payoutCcy === base;
-    // Payout in a third currency: converted to quote at the forward for the delivery date.
-    const payoutFx = payoutInBase || payoutCcy === quote ? 1 : fxForwardRate(ctx, payoutCcy, quote, trade.deliveryDate, trade.collateralCurrency);
-    const scalePayout = (trade.digital.payout * payoutFx) / (trade.notional || 1);
-    const priceFn = (i: FxOptionInputs) => fxDigital(i, payoutInBase) * scalePayout;
-    premiumPerUnit = priceFn(inputs);
-    greeks = fxExoticGreeks(priceFn, inputs);
-    greeksMethod = "finite-difference";
-    kind = payoutInBase ? "Digital (asset-or-nothing, base payout)" : "Digital (cash-or-nothing)";
+  // Digital payout scale (per unit base notional, in quote currency); a payout in a third currency is converted at the delivery forward.
+  const payoutCcy = trade.digital?.payoutCurrency.toUpperCase();
+  const payoutInBase = payoutCcy === base;
+  const payoutFx =
+    trade.digital && !payoutInBase && payoutCcy !== quote
+      ? fxForwardRate(ctx, payoutCcy!, quote, Math.max(trade.deliveryDate, val), trade.collateralCurrency)
+      : 1;
+  const scalePayout = trade.digital ? (trade.digital.payout * payoutFx) / (trade.notional || 1) : 0;
+  let kind = trade.barrier
+    ? `Barrier ${trade.barrier.type}`
+    : trade.digital
+      ? payoutInBase
+        ? "Digital (asset-or-nothing, base payout)"
+        : "Digital (cash-or-nothing)"
+      : "Vanilla";
+
+  let premiumPerUnit: number;
+  let greeks: { spotDelta: number; gamma: number; vega: number; theta: number; rhoDomestic: number; rhoForeign: number };
+  let greeksMethod: string;
+  let d1 = 0;
+  let d2 = 0;
+  if (!alive) {
+    // N5-2: exercise decided on the expiry fixing; the remaining position is a settled payoff (or nothing).
+    const noGreeks = { gamma: 0, vega: 0, theta: 0, rhoDomestic: 0, rhoForeign: 0 };
+    greeksMethod = "settled-payoff";
+    if (delivered) {
+      premiumPerUnit = 0;
+      greeks = { spotDelta: 0, ...noGreeks };
+      kind = `${kind} (delivered)`;
+      warnings.push(`FX option already settled (delivered ${toISO(trade.deliveryDate)}) – excluded from the PV`);
+    } else {
+      const fixing = getFxFixing(ctx, `${base}${quote}`, trade.expiryDate);
+      const sFix = fixing ?? spot;
+      const settled = settledPayoff(trade, sFix, forward, spot, dfQ, scalePayout);
+      premiumPerUnit = settled.premiumPerUnit;
+      greeks = { spotDelta: settled.spotDelta, ...noGreeks };
+      const fixingNote = fixing !== undefined ? `expiry fixing ${sFix}` : "today's spot as proxy for the expiry fixing";
+      if (lifecycle === "expires-today") {
+        warnings.push(`${EXPIRES_TODAY_PREFIX} FX option expires on the valuation date ${toISO(val)} – intrinsic value on ${fixingNote}, no time value`);
+      } else {
+        warnings.push(
+          `${EXPIRED_PREFIX} FX option expired ${toISO(trade.expiryDate)} – settlement pending until ${toISO(trade.deliveryDate)}: settled payoff on ${fixingNote} (${settled.premiumPerUnit !== 0 ? "exercised, valued as the forward position at the strike" : "not exercised / knocked out"}), no vega, gamma or theta`,
+        );
+        if (fixing === undefined) {
+          warnings.push(
+            `${MISSING_FX_FIXING_PREFIX} Missing FX fixing for ${base}${quote} on ${toISO(trade.expiryDate)}; exercise of the expired option decided on today's spot ${spot} (load ctx.fxFixings)`,
+          );
+        }
+      }
+      if (lifecycle === "settles-today") {
+        warnings.push(
+          `${SETTLES_TODAY_PREFIX} FX option settles on the valuation date ${toISO(val)} – payoff valued as a value-today exchange (not discounted)`,
+        );
+      }
+    }
+  } else {
+    const gk = garmanKohlhagen(inputs);
+    d1 = gk.d1;
+    d2 = gk.d2;
+    premiumPerUnit = gk.premiumDomestic;
+    greeks = {
+      spotDelta: gk.spotDelta,
+      gamma: gk.gamma,
+      vega: gk.vega,
+      theta: gk.theta,
+      rhoDomestic: gk.rhoDomestic,
+      rhoForeign: gk.rhoForeign,
+    };
+    greeksMethod = "analytic";
+    if (trade.barrier) {
+      const b = trade.barrier;
+      const priceFn = (i: FxOptionInputs) => fxBarrier({ ...i, barrier: b.level, barrierType: b.type, rebate: b.rebate });
+      premiumPerUnit = priceFn(inputs);
+      greeks = fxExoticGreeks(priceFn, inputs, { barrier: b.level });
+      greeksMethod = "finite-difference";
+    } else if (trade.digital) {
+      const priceFn = (i: FxOptionInputs) => fxDigital(i, payoutInBase) * scalePayout;
+      premiumPerUnit = priceFn(inputs);
+      greeks = fxExoticGreeks(priceFn, inputs);
+      greeksMethod = "finite-difference";
+    }
   }
   const longShort = trade.payReceive === "Receive" ? 1 : -1;
   const fxQ = fxRateAtValuationDate(ctx, quote, reporting, trade.collateralCurrency);
   const pvQuote = longShort * trade.notional * premiumPerUnit;
   let pv = pvQuote * fxQ;
   if (trade.upfront && trade.upfront.date > val) {
-    const d2 = getDiscountCurve(ctx, trade.upfront.currency, trade.collateralCurrency);
+    const d = getDiscountCurve(ctx, trade.upfront.currency, trade.collateralCurrency);
     const fxu = fxRateAtValuationDate(ctx, trade.upfront.currency, reporting, trade.collateralCurrency);
-    pv -= trade.upfront.amount * d2.df(trade.upfront.date) * fxu;
+    pv -= trade.upfront.amount * d.df(trade.upfront.date) * fxu;
   }
   const scale = longShort * trade.notional * fxQ;
   // PV change (reporting ccy) for a +1 % spot move of the base currency vs the quote currency.
@@ -333,7 +465,7 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
             paymentDate: trade.deliveryDate,
             notional: trade.notional,
             rate: trade.strike,
-            amount: pvQuote / dfQ,
+            amount: dfQ > 0 ? pvQuote / dfQ : 0,
             discountFactor: dfQ,
             presentValue: pvQuote,
             kind: "OptionPayoff",
@@ -343,6 +475,8 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
     ],
     analytics: {
       kind,
+      /** Lifecycle state on the valuation date (N5-2), see `fxOptionLifecycle`. */
+      lifecycle,
       spot,
       spotAtValuationDate: fxRateAtValuationDate(ctx, base, quote, trade.collateralCurrency),
       forward,
@@ -371,9 +505,10 @@ export function priceFxOption(ctx: MarketContext, trade: FxOption, reportingCurr
       thetaPerDay: (scale * greeks.theta) / 365,
       rhoDomestic: scale * greeks.rhoDomestic * 0.0001,
       rhoForeign: scale * greeks.rhoForeign * 0.0001,
+      /** "analytic" (vanilla), "finite-difference" (barrier / digital) or "settled-payoff" (expired / delivered, N5-2). */
       greeksMethod,
-      d1: gk.d1,
-      d2: gk.d2,
+      d1,
+      d2,
       /** "standard" when delivery = spot date of the expiry; barriers with a "non-standard" lag use expiry-horizon drift/rebate rates (R3-9). */
       deliveryConvention,
     },

@@ -3,7 +3,7 @@ import { type Curve } from "../curves/curve.js";
 import { getIndex } from "../curves/index-definitions.js";
 import { toISO } from "../dates/date.js";
 import { embeddedOptionLegs, tradeIndexNames } from "../instruments/trade-dates.js";
-import { type PricingResult, type Trade } from "../instruments/types.js";
+import { type Cashflow, type PricingResult, type Trade } from "../instruments/types.js";
 import { type MarketContext, getDiscountCurve, withCurves } from "../market/market-context.js";
 import { type FxSmileComponent, shiftFxSurface, shiftFxSurfaceRow } from "../models/fx-vol-surface.js";
 import { type CapletVolSurface, type SwaptionVolSurface, shiftCapletSurface, shiftSwaptionSurface } from "../models/vol-surfaces.js";
@@ -25,8 +25,23 @@ export interface ThetaDetail {
   carry: number;
   /** Roll-down: total − carry (effect of the curve not realising its forwards). */
   rollDown: number;
-  /** Cashflows paid in (t, t+1] (added back so a coupon dropping out of the PV is not counted as a loss). */
+  /**
+   * Cashflows that are part of PV(t) and leave the valuation by t+1 (coupons
+   * paid in (t, t+1], value-today exchanges settled on t), added back so a
+   * cashflow dropping out of the PV is not counted as a loss. Cashflows
+   * settling exactly on the rolled valuation date that the pricer still values
+   * as a value-today exchange (FX legs, `SETTLES_TODAY`) are **not** in this
+   * figure – they are counted once, inside the rolled PV (N5-1); their
+   * reporting-currency amount is `valueTodayOnRollDate`.
+   */
   cashflows: number;
+  /**
+   * Undiscounted amount (reporting currency) of the cashflows settling on the
+   * rolled valuation date t+1 that remain part of PV(t+1) as a value-today
+   * exchange and are therefore excluded from `cashflows` (N5-1). 0 for trades
+   * whose pricer drops cashflows on the valuation date (swaps, caps, FRAs).
+   */
+  valueTodayOnRollDate: number;
 }
 
 export interface RiskReport {
@@ -131,33 +146,100 @@ export function capletSurfaceKeysFor(ctx: MarketContext, trade: Trade): string[]
 }
 
 /**
+ * True when the rolled valuation still contains cashflow `c` of the base
+ * valuation as a valued (DF > 0) cashflow – i.e. the pricer treats a cashflow
+ * settling on its valuation date as a value-today exchange (FX forward / FX
+ * swap legs and option deliveries, R4-2 `SETTLES_TODAY`) instead of dropping it.
+ */
+function stillValuedInRolled(rolled: PricingResult, c: Cashflow): boolean {
+  for (const leg of rolled.legs) {
+    if (leg.legIndex !== c.legIndex) continue;
+    for (const r of leg.cashflows) {
+      if (r.paymentDate === c.paymentDate && r.kind === c.kind && r.currency === c.currency && r.discountFactor > 0) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Cashflows of a priced trade that are paid in (valuationDate, valuationDate + days],
  * converted to the reporting currency (undiscounted amounts). Option payoff
  * placeholders of swaptions / FX options are excluded (their value change is
  * captured by repricing).
+ *
+ * Single-count rule (N5-1): with the rolled valuation `rolled` a cashflow is
+ * counted **iff** it is part of PV(t) (valued at DF > 0 and due no later than
+ * t + days) and no longer part of PV(t + days). Swap, cap and FRA pricers drop
+ * cashflows with `paymentDate ≤ valuationDate`, so their coupons due tomorrow
+ * are counted as cash; FX forward / FX swap legs (and settled FX option
+ * payoffs) delivering on the rolled valuation date stay in PV(t + days) as a
+ * value-today exchange at DF 1 (R4-2) and are therefore *not* added again –
+ * before this rule the theta of an FX forward the day before delivery was ≈
+ * its full PV (+122 k on a PV of 123 k instead of −485); an FX exchange
+ * settling on t itself (carried in PV(t) as value-today, gone from PV(t + days))
+ * is counted as cash received, so its theta is 0 rather than −PV. Without
+ * `rolled` (legacy call) every cashflow in (t, t + days] except option payoff
+ * placeholders is counted.
  */
-export function cashflowsPaidWithin(ctx: MarketContext, trade: Trade, base: PricingResult, days: number, reportingCurrency: string): number {
+export function cashflowsPaidWithin(
+  ctx: MarketContext,
+  trade: Trade,
+  base: PricingResult,
+  days: number,
+  reportingCurrency: string,
+  rolled?: PricingResult,
+): number {
+  return splitCashflowsWithin(ctx, trade, base, days, reportingCurrency, rolled).paid;
+}
+
+/** `cashflowsPaidWithin` plus the value-today amount left inside the rolled PV (see `ThetaDetail`). */
+function splitCashflowsWithin(
+  ctx: MarketContext,
+  trade: Trade,
+  base: PricingResult,
+  days: number,
+  reportingCurrency: string,
+  rolled?: PricingResult,
+): { paid: number; valueToday: number } {
   const val = ctx.valuationDate;
   let paid = 0;
+  let valueToday = 0;
   for (const leg of base.legs) {
     for (const c of leg.cashflows) {
+      if (rolled) {
+        // Single-count rule: a cashflow is added back iff it is part of PV(t) (valued, DF > 0, due no later
+        // than t + days) and no longer part of PV(t + days). Cashflows the rolled pricer still values as a
+        // value-today exchange on t + days stay inside PV(t + days); an exchange settled on t itself that
+        // PV(t) carries as value-today (R4-2) and PV(t + days) has dropped is cash received – theta 0, not −PV.
+        if (!(c.paymentDate <= val + days && c.discountFactor > 0)) continue;
+        const amount = c.amount * fxToReporting(ctx, c.currency, reportingCurrency, trade.collateralCurrency);
+        if (stillValuedInRolled(rolled, c)) valueToday += amount;
+        else paid += amount;
+        continue;
+      }
       if (!(c.paymentDate > val && c.paymentDate <= val + days)) continue;
       if (c.kind === "OptionPayoff" && (trade.type === "Swaption" || trade.type === "FxOption")) continue;
       paid += c.amount * fxToReporting(ctx, c.currency, reportingCurrency, trade.collateralCurrency);
     }
   }
-  return paid;
+  return { paid, valueToday };
 }
 
-/** Carry-consistent 1-day theta with carry / roll-down decomposition. */
+/**
+ * Carry-consistent 1-day theta with carry / roll-down decomposition:
+ * theta = PV(t+1) + cashflows paid in (t, t+1] − PV(t), every cashflow counted
+ * exactly once (cashflows settling on t+1 that the pricer keeps as value-today
+ * exchanges are in PV(t+1), not in `cashflows` – N5-1).
+ */
 export function computeTheta(ctx: MarketContext, trade: Trade, reportingCurrency: string, base?: PricingResult, days = 1): ThetaDetail {
   const b = base ?? priceTrade(ctx, trade, reportingCurrency);
-  const paid = cashflowsPaidWithin(ctx, trade, b, days, reportingCurrency);
-  const pvRolled = priceTrade(rollMarket(ctx, days), trade, reportingCurrency).pv;
+  const rolledResult = priceTrade(rollMarket(ctx, days), trade, reportingCurrency);
+  const { paid, valueToday } = splitCashflowsWithin(ctx, trade, b, days, reportingCurrency, rolledResult);
+  const pvRolled = rolledResult.pv;
   const pvForward = priceTrade(rollMarketForward(ctx, days), trade, reportingCurrency).pv;
   const total = pvRolled + paid - b.pv;
   const carry = pvForward + paid - b.pv;
-  return { total, carry, rollDown: total - carry, cashflows: paid };
+  return { total, carry, rollDown: total - carry, cashflows: paid, valueTodayOnRollDate: valueToday };
 }
 
 export function computeRisk(

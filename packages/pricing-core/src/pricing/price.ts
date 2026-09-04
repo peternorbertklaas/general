@@ -95,6 +95,41 @@ function checkNotionalSchedule(schedule: unknown, path: string, out: string[]): 
   });
 }
 
+/** Optional numeric field: finite number when given (N5-4c: `spread: null` / `"0.001"` used to surface as `NON_FINITE_PV`). */
+function checkOptionalNumber(v: unknown, what: string, out: string[]): void {
+  if (v === undefined) return;
+  if (!isNum(v)) out.push(`${what} must be a finite number (got ${JSON.stringify(v) ?? String(v)})`);
+}
+
+/** Optional boolean flag (N5-4f: `observationShift: "yes"` was read as true). */
+function checkOptionalBoolean(v: unknown, what: string, out: string[]): void {
+  if (v === undefined) return;
+  if (typeof v !== "boolean") out.push(`${what} must be a boolean (got ${JSON.stringify(v) ?? String(v)})`);
+}
+
+/** Optional step schedule (`rateSchedule` / `spreadSchedule`): serial dates strictly increasing, finite values (N5-4c). */
+function checkStepSchedule(schedule: unknown, valueKey: "rate" | "spread", path: string, out: string[]): void {
+  if (schedule === undefined) return;
+  if (!Array.isArray(schedule)) {
+    out.push(`${path} must be an array of { date, ${valueKey} }`);
+    return;
+  }
+  let prev: number | undefined;
+  schedule.forEach((e: unknown, i) => {
+    const entry = e as Record<string, unknown> | null;
+    if (!entry || typeof entry !== "object") {
+      out.push(`${path}[${i}] must be an object { date, ${valueKey} }`);
+      return;
+    }
+    if (!isNum(entry.date)) out.push(`${path}[${i}].date must be a serial date`);
+    else {
+      if (prev !== undefined && entry.date <= prev) out.push(`${path}[${i}].date must be after the previous entry (dates strictly increasing)`);
+      prev = entry.date;
+    }
+    if (!isNum(entry[valueKey])) out.push(`${path}[${i}].${valueKey} must be a finite number`);
+  });
+}
+
 function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
   if (!l || typeof l !== "object") {
     out.push(`${path}: leg missing`);
@@ -111,12 +146,23 @@ function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
   if (!isStr(l.calendar)) out.push(`${path}.calendar missing`);
   checkBusinessDayCount(l.paymentLag, `${path}.paymentLag`, out);
   checkNotionalSchedule(l.notionalSchedule, `${path}.notionalSchedule`, out);
-  if (l.type === "Fixed" && !isNum((l as FixedLeg).rate)) out.push(`${path}.rate (fixed rate) missing or not a finite number`);
+  if (l.type === "Fixed") {
+    const fl = l as FixedLeg;
+    if (!isNum(fl.rate)) out.push(`${path}.rate (fixed rate) missing or not a finite number`);
+    checkStepSchedule(fl.rateSchedule, "rate", `${path}.rateSchedule`, out);
+  }
   if (l.type === "Float") {
     const fl = l as FloatLeg;
     if (!isStr(fl.index)) out.push(`${path}.index (floating index) missing`);
     checkBusinessDayCount(fl.fixingLag, `${path}.fixingLag`, out);
     checkBusinessDayCount(fl.lookbackDays, `${path}.lookbackDays`, out);
+    checkOptionalNumber(fl.spread, `${path}.spread`, out);
+    checkOptionalNumber(fl.gearing, `${path}.gearing`, out);
+    checkStepSchedule(fl.spreadSchedule, "spread", `${path}.spreadSchedule`, out);
+    checkOptionalBoolean(fl.observationShift, `${path}.observationShift`, out);
+    if (fl.compounding !== undefined && fl.compounding !== "Compound" && fl.compounding !== "Average") {
+      out.push(`${path}.compounding must be "Compound" or "Average"`);
+    }
     if (fl.capRate !== undefined && !isNum(fl.capRate)) out.push(`${path}.capRate must be a finite number`);
     if (fl.floorRate !== undefined && !isNum(fl.floorRate)) out.push(`${path}.floorRate must be a finite number`);
     if (isNum(fl.capRate) && isNum(fl.floorRate) && fl.capRate < fl.floorRate) {
@@ -124,6 +170,21 @@ function checkLeg(l: SwapLeg | undefined, path: string, out: string[]): void {
     }
   }
 }
+
+/** Optional upfront premium: finite amount, 3-letter currency, serial date. */
+function checkUpfront(u: unknown, path: string, out: string[]): void {
+  if (u === undefined) return;
+  const up = u as { amount?: unknown; currency?: unknown; date?: unknown } | null;
+  if (!up || typeof up !== "object") {
+    out.push(`${path} must be an object { amount, currency, date }`);
+    return;
+  }
+  if (!isNum(up.amount)) out.push(`${path}.amount must be a finite number`);
+  if (!isStr(up.currency)) out.push(`${path}.currency missing`);
+  if (!isNum(up.date)) out.push(`${path}.date must be a serial date`);
+}
+
+const BARRIER_TYPES = ["UpIn", "UpOut", "DownIn", "DownOut"];
 
 function checkFxLeg(l: Omit<FxForward, "type" | "id"> | undefined, path: string, out: string[]): void {
   if (!l || typeof l !== "object") {
@@ -143,7 +204,10 @@ function checkFxLeg(l: Omit<FxForward, "type" | "id"> | undefined, path: string,
  * embedded caps/floors, exactly one fixed leg under a swaption; R4-3: swaption
  * expiry ≤ swap start and < swap end, non-negative barrier rebate, positive
  * strictly dated `notionalSchedule` entries, non-negative integer
- * `fixingLag` / `lookbackDays`). Returns a
+ * `fixingLag` / `lookbackDays`; N5-3: `mtmReset.resettingLegIndex` an integer
+ * in [0, legs.length); N5-4: positive digital payout, barrier type from the
+ * enum, numeric `spread` / `gearing` / step schedules, boolean
+ * `observationShift`, FX swap far leg after near leg). Returns a
  * list of problems (empty = valid); `priceTrade` throws a
  * `PricingError("INVALID_TRADE")` with this list instead of producing a null
  * or NaN PV.
@@ -157,6 +221,15 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
     case "CrossCurrencySwap":
       if (!Array.isArray(trade.legs) || trade.legs.length === 0) out.push(`${path}.legs must be a non-empty array`);
       else trade.legs.forEach((l, i) => checkLeg(l, `${path}.legs[${i}]`, out));
+      // N5-3: the resetting leg of an MtM-reset CCS must exist (used to surface as a TypeError).
+      if (trade.type === "CrossCurrencySwap" && trade.mtmReset !== undefined) {
+        const legCount = Array.isArray(trade.legs) ? trade.legs.length : 0;
+        const idx: unknown = trade.mtmReset?.resettingLegIndex;
+        if (!trade.mtmReset || typeof trade.mtmReset !== "object") out.push(`${path}.mtmReset must be an object { resettingLegIndex }`);
+        else if (!Number.isInteger(idx) || (idx as number) < 0 || (idx as number) >= legCount) {
+          out.push(`${path}.mtmReset.resettingLegIndex must be an integer in [0, ${legCount}) (got ${JSON.stringify(idx) ?? String(idx)})`);
+        } else if (legCount < 2) out.push(`${path}.mtmReset requires two legs (resetting leg and the leg it resets against)`);
+      }
       break;
     case "FRA":
       checkPositive(trade.notional, `${path}.notional`, out);
@@ -222,6 +295,10 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
     case "FxSwap":
       checkFxLeg(trade.nearLeg, `${path}.nearLeg`, out);
       checkFxLeg(trade.farLeg, `${path}.farLeg`, out);
+      // N5-4d: the far leg must deliver after the near leg (far ≤ near was priced silently).
+      if (isNum(trade.nearLeg?.deliveryDate) && isNum(trade.farLeg?.deliveryDate) && trade.farLeg.deliveryDate <= trade.nearLeg.deliveryDate) {
+        out.push(`${path}: farLeg.deliveryDate (${trade.farLeg.deliveryDate}) must be after nearLeg.deliveryDate (${trade.nearLeg.deliveryDate})`);
+      }
       break;
     case "FxOption":
       if (!isStr(trade.pair) || trade.pair.replace("/", "").length !== 6) out.push(`${path}.pair must be a 6-letter currency pair`);
@@ -230,11 +307,35 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
       checkPositive(trade.notional, `${path}.notional`, out);
       if (!isNum(trade.expiryDate) || !isNum(trade.deliveryDate)) out.push(`${path}: expiryDate / deliveryDate must be serial dates`);
       else if (trade.deliveryDate < trade.expiryDate) out.push(`${path}: deliveryDate must not be before expiryDate`);
-      if (trade.barrier && (!isNum(trade.barrier.level) || trade.barrier.level <= 0)) out.push(`${path}.barrier.level must be a positive finite number`);
-      // R4-3b: a negative rebate would give a bought option a negative value.
-      if (trade.barrier?.rebate !== undefined && (!isNum(trade.barrier.rebate) || trade.barrier.rebate < 0)) {
-        out.push(`${path}.barrier.rebate must be a non-negative finite number (got ${String(trade.barrier.rebate)})`);
+      if (trade.barrier !== undefined) {
+        if (!trade.barrier || typeof trade.barrier !== "object") out.push(`${path}.barrier must be an object { type, level, rebate? }`);
+        else {
+          // N5-4b: an unknown barrier type used to surface as NON_FINITE_PV.
+          if (!BARRIER_TYPES.includes(String(trade.barrier.type))) {
+            out.push(
+              `${path}.barrier.type must be one of ${BARRIER_TYPES.join(", ")} (got ${JSON.stringify(trade.barrier.type) ?? String(trade.barrier.type)})`,
+            );
+          }
+          if (!isNum(trade.barrier.level) || trade.barrier.level <= 0) out.push(`${path}.barrier.level must be a positive finite number`);
+          // R4-3b: a negative rebate would give a bought option a negative value.
+          if (trade.barrier.rebate !== undefined && (!isNum(trade.barrier.rebate) || trade.barrier.rebate < 0)) {
+            out.push(`${path}.barrier.rebate must be a non-negative finite number (got ${String(trade.barrier.rebate)})`);
+          }
+        }
       }
+      // N5-4a: digital payout must be a positive finite amount in a 3-letter currency (−100 gave a bought digital a negative PV).
+      if (trade.digital !== undefined) {
+        if (!trade.digital || typeof trade.digital !== "object") out.push(`${path}.digital must be an object { payoutCurrency, payout }`);
+        else {
+          if (!isNum(trade.digital.payout) || trade.digital.payout <= 0) {
+            out.push(`${path}.digital.payout must be a positive finite number (got ${String(trade.digital.payout)})`);
+          }
+          if (!isStr(trade.digital.payoutCurrency) || !/^[A-Za-z]{3}$/.test(trade.digital.payoutCurrency)) {
+            out.push(`${path}.digital.payoutCurrency must be a 3-letter currency code`);
+          }
+        }
+      }
+      if (trade.barrier && trade.digital) out.push(`${path}: barrier and digital features cannot be combined`);
       checkVolOverride(trade.volOverride, `${path}.volOverride`, out);
       break;
     default:
@@ -243,6 +344,7 @@ export function validateTrade(trade: Trade, path = "trade"): string[] {
   if ("payReceive" in trade && trade.payReceive !== "Pay" && trade.payReceive !== "Receive") {
     out.push(`${path}.payReceive must be "Pay" or "Receive"`);
   }
+  checkUpfront(trade.upfront, `${path}.upfront`, out);
   return out;
 }
 

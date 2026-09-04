@@ -22,7 +22,7 @@ import {
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import { safeFilename } from "../lib/store.js";
-import { arrayResponse, creditSchema, jsonOrText, markdownResponse, objectResponse, responses, scenarioSchema, tradeRef } from "../schemas.js";
+import { MAX_AMOUNT, arrayResponse, creditSchema, jsonOrText, markdownResponse, objectResponse, responses, scenarioSchema, tradeRef } from "../schemas.js";
 
 const isoDate = { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$", description: "ISO-8601 date" } as const;
 const currency = { type: "string", pattern: "^[A-Z]{3}$" } as const;
@@ -78,7 +78,7 @@ const kidOptionsSchema = {
     targetMarket: { type: "string", maxLength: 2000 },
     transactionPrice: { type: "number", description: "Price paid by the `perspective` party at inception (cost section)" },
     perspective: { type: "string", enum: ["Bank", "Kunde"], description: 'Perspective of pricing.pv / transactionPrice (default "Bank")' },
-    notional: { type: "number", exclusiveMinimum: 0, description: "Notional for percentage figures (default inferred from the trade)" },
+    notional: { type: "number", exclusiveMinimum: 0, maximum: MAX_AMOUNT, description: "Notional for percentage figures (default inferred from the trade)" },
     contact: { type: "string", maxLength: 500, description: "Website / contact for complaints" },
   },
   additionalProperties: false,

@@ -15,15 +15,10 @@ import { downloadPortfolioReport } from "./lib/portfolio-export.js";
 import { downloadText } from "./lib/portfolio-io.js";
 import { deleteWithUndo, marketModified, selectedTrade, setToastHover, useStore, whatIfActive, whatIfLabel } from "./state/store.js";
 import { Blotter } from "./views/Blotter.js";
-import { CompareView } from "./views/CompareView.js";
-import { CurvesView } from "./views/CurvesView.js";
-import { HedgeView } from "./views/HedgeView.js";
-import { MarketView } from "./views/MarketView.js";
-import { PricingWorkspace } from "./views/PricingWorkspace.js";
-import { ReportView } from "./views/ReportView.js";
-import { ScenariosView } from "./views/ScenariosView.js";
+// Every view except the blotter is a lazily loaded chunk (ADR-026 / N4-07); `g` chords prefetch the target view.
+import { CompareView, CurvesView, HedgeView, MarketView, PricingWorkspace, ReportView, ScenariosView, preloadView, preloadViews } from "./views/lazy-views.js";
 import { isTemplateId, newTradeTemplate } from "./lib/templates.js";
-import { applyParSolve, flipTrade } from "./lib/trade-ops.js";
+import { applyParSolve, flipTrade, parSolveLabel, parSolveUnavailable } from "./lib/trade-ops.js";
 
 export const VIEWS: { id: ViewId; label: string; icon: string; hint: string }[] = [
   { id: "blotter", label: "Blotter", icon: "▤", hint: "1" },
@@ -83,6 +78,7 @@ export function App() {
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
       fxFixings: st.fxFixings,
+      marketSource: st.marketSource,
       valuationDate: st.valuationDate,
       reportingCurrency: st.reportingCurrency,
       tradesCount: st.trades.length,
@@ -112,6 +108,18 @@ export function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = s.theme;
   }, [s.theme]);
+
+  // Idle prefetch of the remaining view chunks once the start route is interactive (ADR-026): a later hotkey
+  // switch then renders synchronously; a chord start (`g`) prefetches eagerly in addition (see `setChord`).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const hasIdle = typeof window.requestIdleCallback === "function";
+    const handle = hasIdle ? window.requestIdleCallback(() => void preloadViews(), { timeout: 4000 }) : window.setTimeout(() => void preloadViews(), 2500);
+    return () => {
+      if (hasIdle && typeof window.cancelIdleCallback === "function") window.cancelIdleCallback(handle);
+      else window.clearTimeout(handle);
+    };
+  }, []);
 
   // "Eingabemodus" indicator (F-05): track whether a text field owns the focus.
   useEffect(() => {
@@ -293,11 +301,11 @@ export function App() {
         case "solve.par":
           if (needTrade()) {
             const r = st.results[t!.id]?.result;
-            const t2 = applyParSolve(t!, r);
+            const t2 = applyParSolve(t!, r, { market: st.market, reportingCurrency: st.reportingCurrency });
             if (t2) {
               st.updateTrade(t2);
-              st.showToast("Par-Satz / fairer Preis übernommen", { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
-            } else st.showToast("Kein Par-Wert für diesen Trade verfügbar");
+              st.showToast(parSolveLabel(t!), { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+            } else st.showToast(parSolveUnavailable(t!));
           }
           break;
         case "bump.up":
@@ -380,7 +388,15 @@ export function App() {
     return false;
   }, []);
   const setChord = useStore((st) => st.setChord);
-  useHotkeys(onHotkey, { onChord: setChord, filter: hotkeyFilter });
+  const onChord = useCallback(
+    (prefix: string | null) => {
+      setChord(prefix);
+      // `g …` announces a view switch: fetch the view chunks now so the second key renders without a skeleton (ADR-026).
+      if (prefix === "g") void preloadViews();
+    },
+    [setChord],
+  );
+  useHotkeys(onHotkey, { onChord, filter: hotkeyFilter });
 
   const wiActive = whatIfActive(s.whatIf);
   const modified = marketModified(s);
@@ -455,6 +471,8 @@ export function App() {
               aria-label={v.label}
               title={`${v.label} (Alt+${v.hint} oder ${chordOf(v.id)})`}
               onClick={() => act().setView(v.id)}
+              onMouseEnter={() => void preloadView(v.id)}
+              onFocus={() => void preloadView(v.id)}
             >
               <span style={{ fontSize: 18 }} aria-hidden="true">
                 {v.icon}
@@ -512,9 +530,12 @@ export function App() {
               aria-expanded={s.valDateOpen}
               aria-haspopup="dialog"
               data-testid="market-chip"
-              title={`Bewertungstag setzen (${keysText(hk("valdate"))})${modified ? " · Quotes/Interpolation weichen vom Sample ab" : ""}`}
+              title={`Bewertungstag setzen (${keysText(hk("valdate"))})${modified ? " · Quotes/Interpolation weichen vom Sample ab" : ""}${
+                s.marketSource === "import" ? " · Markt aus importiertem Snapshot" : ""
+              }`}
             >
               <span className="dot" /> {s.marketLabel ?? "Markt"}
+              {s.marketSource === "import" && " · importiert"}
               {modified && " · modifiziert"} · {fmtDate(s.valuationDate)}
               {wiActive && ` · What-if ${whatIfLabel(s.whatIf)}`}
             </button>

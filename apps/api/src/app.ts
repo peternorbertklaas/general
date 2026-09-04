@@ -348,7 +348,9 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
   await registerDocumentRoutes(app, ctx);
   await registerExtendedRiskRoutes(app, ctx);
 
-  app.setNotFoundHandler((req, reply) => {
+  // Unknown routes share the client's rate-limit bucket (N5-02): `@fastify/rate-limit` only guards registered
+  // routes, so the not-found handler gets the plugin's preHandler – route scanning answers 429 like any route.
+  app.setNotFoundHandler({ preHandler: app.rateLimit() }, (req, reply) => {
     sendError(reply, req, 404, "NOT_FOUND", `Route ${req.method} ${stripQuery(req.url)} not found`);
   });
 
@@ -365,7 +367,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<FastifyInstance> 
     reply.status(c.status).send({
       error: c.message,
       statusCode: c.status,
-      ...(c.code ? { code: c.code } : {}),
+      code: c.code,
       ...(c.details ? { details: c.details } : {}),
       ...(c.validation ? { validation: c.validation } : {}),
       requestId: req.id,

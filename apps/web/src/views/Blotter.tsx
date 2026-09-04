@@ -36,6 +36,7 @@ import {
   tradesFromJson,
   tradesToJson,
 } from "../lib/portfolio-io.js";
+import { QUICK_ENTRY_EXAMPLES } from "../lib/quick-parser.js";
 import { quoteExpired, tradeTypeBadge } from "../lib/trade-ops.js";
 import { utiValid } from "../lib/validate-trade.js";
 import { type DuplicateStrategy, LS_KEYS, STATUS_LABELS, deleteWithUndo, readLocal, useStore, writeLocal, type TradeStatus } from "../state/store.js";
@@ -43,7 +44,12 @@ import { type DuplicateStrategy, LS_KEYS, STATUS_LABELS, deleteWithUndo, readLoc
 type SortKey = "id" | "type" | "notional" | "maturity" | "pv" | "dv01" | "cpty" | "book" | "status";
 const SORT_KEYS: SortKey[] = ["id", "type", "notional", "maturity", "pv", "dv01", "cpty", "book", "status"];
 
-export const ONBOARDING_EXAMPLES = ["irs 10y pay 3.1% 10m", "cap 5y 3% 8m", "fxf eurusd -2m 1.1725 2027-03-15"];
+/** Welcome-card chips – taken from the palette examples so both show the same grammar and date format (R5-09). */
+export const ONBOARDING_EXAMPLES = [
+  QUICK_ENTRY_EXAMPLES.find((e) => e.startsWith("irs 10y")),
+  QUICK_ENTRY_EXAMPLES.find((e) => e.startsWith("cap ")),
+  QUICK_ENTRY_EXAMPLES.find((e) => e.startsWith("fxf ")),
+].filter((e): e is string => e !== undefined);
 
 /** Below this width the blotter toolbar collapses its filters into a popover and shows icon buttons (R3-09 / N-12). */
 export const COMPACT_TOOLBAR_QUERY = "(max-width: 1400px)";
@@ -61,6 +67,41 @@ export function StatusBadge({ status, expired }: { status: Trade["status"]; expi
       )}
     </>
   );
+}
+
+/**
+ * Roving focus between the sortable column headers (R5-02): ←/→ and Home/End
+ * move the focus (and the tab stop) along the `.th-btn`s of the header row,
+ * Enter/Space keep their native button behaviour (sort).
+ */
+export function headerKeyNav(e: React.KeyboardEvent<HTMLTableSectionElement>): void {
+  const target = e.target as HTMLElement;
+  if (!target.matches?.(".th-btn")) return;
+  const btns = Array.from(e.currentTarget.querySelectorAll<HTMLElement>(".th-btn"));
+  const i = btns.indexOf(target);
+  if (i < 0) return;
+  let next = i;
+  switch (e.key) {
+    case "ArrowRight":
+      next = Math.min(btns.length - 1, i + 1);
+      break;
+    case "ArrowLeft":
+      next = Math.max(0, i - 1);
+      break;
+    case "Home":
+      next = 0;
+      break;
+    case "End":
+      next = btns.length - 1;
+      break;
+    default:
+      return;
+  }
+  e.preventDefault();
+  if (next === i) return;
+  target.tabIndex = -1;
+  btns[next]!.tabIndex = 0;
+  btns[next]!.focus();
 }
 
 /** First-launch hint card (dismissible, remembered in localStorage). */
@@ -428,6 +469,8 @@ export function Blotter() {
   const ariaSort = (key: SortKey): "ascending" | "descending" | "none" => (sort.key === key ? (sort.dir === 1 ? "ascending" : "descending") : "none");
   const arrow = (key: SortKey) => (sort.key === key ? (sort.dir === 1 ? " ▲" : " ▼") : "");
   const show = (k: BlotterColKey) => cols.includes(k) && !(customer && BLOTTER_COLUMNS.find((c) => c.key === k)?.internal);
+  /** Sortable columns currently shown – the tab stop of the header row is the active sort column (or the first one, R5-02). */
+  const visibleSortable = BLOTTER_COLUMNS.filter((c) => c.sortable && show(c.key)).map((c) => c.key as SortKey);
   const toggleCol = (k: BlotterColKey) => {
     const next = cols.includes(k) ? cols.filter((c) => c !== k) : BLOTTER_COLUMNS.map((c) => c.key).filter((c) => c === k || cols.includes(c));
     if (!next.includes("id")) next.unshift("id");
@@ -586,9 +629,11 @@ export function Blotter() {
         onContextMenu={(e) => contextMenu(e, r.t)}
       >
         <td onClick={(e) => e.stopPropagation()}>
+          {/* Not a tab stop: the row is the roving tab stop and Space toggles the mark; the mouse still hits the box (R5-02 / R4-03). */}
           <input
             type="checkbox"
             className="compare-check"
+            tabIndex={-1}
             aria-label={`${r.t.id} vergleichen`}
             checked={inCompare}
             onChange={() => act().toggleCompare(r.t.id)}
@@ -979,9 +1024,14 @@ export function Blotter() {
         </div>
         <div className="table-scroll">
           <table className="grid-table blotter" ref={tableRef} role="grid" aria-label="Blotter" aria-rowcount={orderedRows.length}>
-            <thead>
+            {/* Sortable headers form one tab stop (the active sort column); ←/→ move between them (R5-02, roving tabindex like the rows). */}
+            <thead onKeyDown={headerKeyNav}>
               <tr>
-                <th title="Für Vergleich markieren (Space)" style={{ width: 28 }} aria-label="Vergleich">
+                <th
+                  title="Für Vergleich markieren: Space auf der fokussierten Zeile (die Kästchen sind keine Tabstopps)"
+                  style={{ width: 28 }}
+                  aria-label="Vergleich"
+                >
                   ⇆
                 </th>
                 {BLOTTER_COLUMNS.filter((c) => show(c.key)).map((c) => {
@@ -989,7 +1039,12 @@ export function Blotter() {
                   const label = c.key === "pv" ? `PV ${s.reportingCurrency}` : c.label;
                   return c.sortable ? (
                     <th key={c.key} className={c.num ? "num" : ""} aria-sort={ariaSort(sk)}>
-                      <button className="th-btn" onClick={() => toggleSort(sk)} title={`Nach ${label} sortieren`}>
+                      <button
+                        className="th-btn"
+                        tabIndex={sk === sort.key || !visibleSortable.includes(sort.key) ? (visibleSortable[0] === sk || sk === sort.key ? 0 : -1) : -1}
+                        onClick={() => toggleSort(sk)}
+                        title={`Nach ${label} sortieren (←/→ wechseln die Spalte, ↵ sortiert)`}
+                      >
                         {label}
                         {arrow(sk)}
                       </button>

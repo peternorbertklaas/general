@@ -5,21 +5,36 @@ import {
   type Fixing,
   type FxFixing,
   type FxVolSurface,
-  type MarketSnapshotJson,
   type SwaptionVolSurface,
-  deserializeMarket,
+  marketSnapshotId,
   serializeMarket,
   survivalProbability,
   toISO,
-  validateMarket,
 } from "@deriva/pricing-core";
 import { DateInput } from "../components/DateInput.js";
 import { NumInput } from "../components/NumInput.js";
+import { validateVolSurfaces } from "../lib/core-compat.js";
 import { CDS_TENORS, hazardCurveResult, normaliseCdsQuotes, tenorYears } from "../lib/credit.js";
 import { fmtBp, fmtDate, fmtNum, fmtPct } from "../lib/format.js";
-import { translateCoreMessage, translatePricingError } from "../lib/i18n.js";
+import { translateCoreMessage } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
-import { type CdsQuote, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, useStore } from "../state/store.js";
+import { readSnapshotJson, snapshotErrorText } from "../lib/snapshot-import.js";
+import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, useStore } from "../state/store.js";
+
+/**
+ * Apply an edited vol surface: structural problems (dimensions, finite vols,
+ * sorted expiries – core `validateVolSurfaces`, R5-1) are reported in German
+ * before the market is touched; a failed valuation is reported as well.
+ */
+function applyVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface, label: string): void {
+  const act = useStore.getState;
+  const problems = validateVolSurfaces({ [kind]: { [id]: surface } } as Parameters<typeof validateVolSurfaces>[0]);
+  if (problems.length) {
+    act().showToast(`Vol nicht übernommen – ${translateCoreMessage(problems[0])}`);
+    return;
+  }
+  if (!act().setVolSurface(kind, id, surface, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+}
 
 /** Expiry in years → "1M" / "3M" / "2Y" (also weeks for FX). */
 export function expiryLabel(e: number): string {
@@ -40,7 +55,7 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
   const setCell = (i: number, j: number, v: number) => {
     const next: SwaptionVolSurface = { ...surface, atm: surface.atm.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
     const label = `Swaption-Vol ${id} ${expiryLabel(surface.expiries[i]!)}×${surface.tenors[j]}Y ${fmtNum(surface.atm[i]![j]! * 1e4, 1)} → ${fmtNum(v * 1e4, 1)} bp`;
-    if (!act().setVolSurface("swaptionVols", id, next, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+    applyVolSurface("swaptionVols", id, next, label);
   };
   return (
     <div className="card" data-testid="swaption-vol-card">
@@ -130,12 +145,12 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
     if (!arr) return;
     const next: FxVolSurface = { ...surface, [k]: arr.map((x, idx) => (idx === i ? v : x)) };
     const label = `FX-Vol ${id} ${expiryLabel(surface.expiries[i]!)} ${ROWS.find((r) => r.k === k)!.label} ${fmtNum(arr[i]! * 100, 2)} → ${fmtNum(v * 100, 2)} %`;
-    if (!act().setVolSurface("fxVols", id, next, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+    applyVolSurface("fxVols", id, next, label);
   };
   return (
     <div className="card" data-testid="fx-vol-card">
       <h3>
-        FX-Vol-Fläche (%, editierbar)
+        FX-Vol-Fläche {id.slice(0, 3)}/{id.slice(3)} (%, editierbar)
         <span className="right row wrap" style={{ gap: 6 }}>
           {edited && (
             <>
@@ -152,15 +167,16 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
               </button>
             </>
           )}
-          <div className="seg" role="group" aria-label="Währungspaar">
-            {keys.map((k) => (
-              <button key={k} className={k === id ? "active" : ""} aria-pressed={k === id} onClick={() => onSelect(k)}>
-                {k.slice(0, 3)}/{k.slice(3)}
-              </button>
-            ))}
-          </div>
         </span>
       </h3>
+      {/* Pair tabs in their own wrapping row below the title: at 1024 px six pairs no longer run out of the card (R5-05). */}
+      <div className="seg wrap" role="group" aria-label="Währungspaar" data-testid="fx-vol-pairs" style={{ marginBottom: 8 }}>
+        {keys.map((k) => (
+          <button key={k} className={k === id ? "active" : ""} aria-pressed={k === id} onClick={() => onSelect(k)}>
+            {k.slice(0, 3)}/{k.slice(3)}
+          </button>
+        ))}
+      </div>
       <div className="table-scroll">
         <table className="grid-table compact">
           <thead>
@@ -215,7 +231,7 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
   const setCell = (i: number, j: number, v: number) => {
     const next: CapletVolSurface = { ...surface, vols: surface.vols.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
     const label = `Caplet-Vol ${id} ${expiryLabel(surface.expiries[i]!)} @ ${fmtNum(surface.strikes[j]! * 100, 2)} % ${fmtNum(surface.vols[i]![j]! * 1e4, 0)} → ${fmtNum(v * 1e4, 0)} bp`;
-    if (!act().setVolSurface("capletVols", id, next, label)) act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
+    applyVolSurface("capletVols", id, next, label);
   };
   return (
     <div className="card" data-testid="caplet-vol-card">
@@ -815,10 +831,14 @@ export function MarketView() {
       turnOfYear: st.turnOfYear,
       volSurfaces: st.volSurfaces,
       fxFixings: st.fxFixings,
+      marketSource: st.marketSource,
     })),
   );
   const act = useStore.getState;
   const m = s.baseMarket;
+  const imported = s.marketSource === "import";
+  // Deterministic id of exactly this base market – the same value the report shows as "Snapshot" (R5-F2).
+  const snapshotId = useMemo(() => marketSnapshotId(m), [m]);
   const swptKeys = Object.keys(m.swaptionVols ?? {});
   const [swptSel, setSwptSel] = useState(swptKeys[0] ?? "EUR");
   const swptId = swptKeys.includes(swptSel) ? swptSel : swptKeys[0];
@@ -835,7 +855,8 @@ export function MarketView() {
 
   const setSpot = (pair: string, v: number) => {
     if (!Number.isFinite(v) || v <= 0) return;
-    // Spots live in the quote set so they survive valuation-date changes and are flagged as "modifiziert".
+    // Spots live in the quote set so they survive valuation-date changes and are flagged as "modifiziert";
+    // with an imported snapshot the spot is edited on the imported market directly (no quotes there).
     if (!act().setQuotes({ ...s.quotes, fxSpots: { ...s.quotes.fxSpots, [pair]: v } }, `Spot ${pair} ${fmtNum(v, 4)}`))
       act().setMarket({ ...m, fxSpots: { ...m.fxSpots, [pair]: v } });
   };
@@ -855,6 +876,16 @@ export function MarketView() {
           </div>
           <div className="muted small" style={{ marginTop: 10 }}>
             Quelle: {m.meta?.source}
+            {imported && (
+              <span
+                className="badge ok"
+                style={{ marginLeft: 6 }}
+                data-testid="snapshot-imported"
+                title="Kurven, Spots, Fixings und Vol-Flächen stammen aus der importierten Datei"
+              >
+                importiert
+              </span>
+            )}
             <br />
             Label: {m.meta?.label}
             {modified && (
@@ -863,6 +894,11 @@ export function MarketView() {
               </span>
             )}
             <br />
+            Snapshot-ID:{" "}
+            <span className="mono" data-testid="snapshot-id" title="Deterministische ID aller Marktdaten (FNV-1a) – identisch mit der Snapshot-ID im Report">
+              {snapshotId}
+            </span>
+            <br />
             Kurven: {Object.keys(m.curves).length} · Fixings: {m.fixings?.length ?? 0} · FX-Fixings: {m.fxFixings?.length ?? 0} · Vol-Flächen:{" "}
             {Object.keys(m.swaptionVols ?? {}).length + Object.keys(m.capletVols ?? {}).length + Object.keys(m.fxVols ?? {}).length}
             {Object.keys(s.interpolation).length > 0 && ` · Interpolations-Overrides: ${Object.keys(s.interpolation).join(", ")}`}
@@ -870,9 +906,10 @@ export function MarketView() {
           <div className="row wrap" style={{ marginTop: 10 }}>
             <button
               className="btn"
+              data-testid="snapshot-export"
               onClick={() => {
                 downloadText(`deriva-market-${toISO(m.valuationDate)}.json`, JSON.stringify(serializeMarket(m), null, 2), "application/json");
-                act().showToast("Markt-Snapshot exportiert");
+                act().showToast(`Markt-Snapshot exportiert · ID ${snapshotId}`);
               }}
             >
               ⤓ Snapshot exportieren
@@ -883,27 +920,43 @@ export function MarketView() {
                 type="file"
                 accept="application/json"
                 style={{ display: "none" }}
+                data-testid="snapshot-import"
                 onChange={async (e) => {
                   const file = e.target.files?.[0];
                   if (!file) return;
                   try {
-                    const parsed = JSON.parse(await file.text()) as MarketSnapshotJson;
-                    const imported = deserializeMarket(parsed);
-                    const problems = validateMarket(imported);
-                    if (problems.length) {
-                      act().showToast(`Snapshot ungültig: ${translateCoreMessage(problems[0])}`);
+                    // German causes for every failure: JSON, schema, missing fields, core validation (R5-06)
+                    const json = readSnapshotJson(await file.text());
+                    const r = act().importSnapshot(json);
+                    if (!r.ok) {
+                      act().showToast(`Import fehlgeschlagen: ${r.error}`, { ms: 8000 });
                       return;
                     }
-                    act().setMarket(imported);
-                    act().showToast(`Snapshot ${parsed.valuationDate} importiert`);
+                    act().showToast(
+                      `Snapshot „${r.label}“ importiert · ID ${r.id}${r.dateChanged ? ` · Bewertungstag auf ${fmtDate(r.valuationDate)} gesetzt` : ""}`,
+                      { ms: 6000 },
+                    );
                   } catch (err) {
-                    act().showToast(`Import fehlgeschlagen: ${translatePricingError(err)}`);
+                    act().showToast(`Import fehlgeschlagen: ${snapshotErrorText(err, (x) => (x instanceof Error ? x.message : String(x)))}`, { ms: 8000 });
                   } finally {
                     e.target.value = "";
                   }
                 }}
               />
             </label>
+            {imported && (
+              <button
+                className="btn ghost"
+                onClick={() => {
+                  act().leaveImport();
+                  act().showToast(`Sample-Markt aus den Quotes zum ${fmtDate(useStore.getState().valuationDate)} aufgebaut`);
+                }}
+                data-testid="snapshot-leave"
+                title="Importierten Snapshot verwerfen und den Sample-Markt aus den Quotes am aktuellen Bewertungstag aufbauen"
+              >
+                Zum Sample-Markt
+              </button>
+            )}
             {modified && (
               <button
                 className="btn ghost"
@@ -920,9 +973,17 @@ export function MarketView() {
               </button>
             )}
           </div>
-          <div className="warning" style={{ marginTop: 10 }}>
-            Indikative Beispieldaten. Für den Produktivbetrieb Marktdaten-Adapter (Refinitiv/Bloomberg/ICE/EZB) gemäß ADR-005 anbinden.
-          </div>
+          {imported ? (
+            <div className="warning" style={{ marginTop: 10 }} data-testid="snapshot-import-note">
+              Markt aus importiertem Snapshot: Kurven, Spots, Fixings und Vol-Flächen kommen aus der Datei, der Bewertungstag ist der des Snapshots (
+              {fmtDate(m.valuationDate)}). Quotes, Interpolation und Turn-of-Year sind nicht verfügbar; ein anderer Bewertungstag verwirft den Snapshot nach
+              Rückfrage.
+            </div>
+          ) : (
+            <div className="warning" style={{ marginTop: 10 }}>
+              Indikative Beispieldaten. Für den Produktivbetrieb Marktdaten-Adapter (Refinitiv/Bloomberg/ICE/EZB) gemäß ADR-005 anbinden.
+            </div>
+          )}
         </div>
         <div className="card">
           <h3>FX-Spots (editierbar)</h3>

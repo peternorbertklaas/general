@@ -22,9 +22,20 @@ import { keysText, HOTKEYS } from "../hotkeys/keymap.js";
 import { fmtDate, fmtMoney, fmtMs, fmtNum, fmtPct, signClass } from "../lib/format.js";
 import { CASHFLOW_KIND_DE, legTypeLabel, t, translateCoreMessage, translatePricingError } from "../lib/i18n.js";
 import { copyText, indicationText } from "../lib/indication.js";
-import { analyticsRows, detailRows } from "../lib/metrics.js";
+import { analyticsRows, bucketLabel, detailRows } from "../lib/metrics.js";
 import { downloadText } from "../lib/portfolio-io.js";
-import { applyParSolve, flipTrade, isBasisSwap, isOption, keyMetric, keyMetricLabel, tradeTypeBadge } from "../lib/trade-ops.js";
+import {
+  applyParSolve,
+  flipTrade,
+  isBasisSwap,
+  isOption,
+  keyMetric,
+  keyMetricLabel,
+  parSolveLabel,
+  parSolveTitle,
+  parSolveUnavailable,
+  tradeTypeBadge,
+} from "../lib/trade-ops.js";
 import { LS_KEYS, deleteWithUndo, readLocal, selectedTrade, useStore, writeLocal } from "../state/store.js";
 import { StatusBadge } from "./Blotter.js";
 
@@ -212,13 +223,14 @@ export function PricingWorkspace() {
                 </button>
                 <button
                   className="btn ghost"
-                  title={`${isBasisSwap(trade) ? "Fairen Spread" : "Par-Satz / fairen Preis"} übernehmen (${hk("solve.par")})`}
+                  title={`${parSolveTitle(trade)} (${hk("solve.par")})`}
+                  disabled={!res}
                   onClick={() => {
-                    const t2 = applyParSolve(trade, res);
+                    const t2 = applyParSolve(trade, res, { market: s.market, reportingCurrency: s.reportingCurrency });
                     if (t2) {
                       act().updateTrade(t2);
-                      act().showToast("Par-Wert übernommen", { action: { label: "Rückgängig", run: () => act().undo() } });
-                    } else act().showToast("Kein Par-Wert für diesen Trade verfügbar");
+                      act().showToast(parSolveLabel(trade), { action: { label: "Rückgängig", run: () => act().undo() } });
+                    } else act().showToast(parSolveUnavailable(trade));
                   }}
                 >
                   ≈ Par
@@ -322,11 +334,11 @@ export function PricingWorkspace() {
           <div className="grid cols-2 analytics-grid">
             <div className="card">
               <h3>Preis-Analytics</h3>
-              <AnalyticsTable rows={priceRows} testId="analytics-table" />
+              <AnalyticsTable rows={priceRows} testId="analytics-table" label="Preis-Analytics" />
               {risk && !customer && (
                 <>
                   <h3 style={{ marginTop: 12 }}>Risiko (Bump)</h3>
-                  <table className="grid-table" data-testid="risk-table">
+                  <table className="grid-table kv" data-testid="risk-table" aria-label="Risiko (Bump)">
                     <tbody>
                       <tr style={{ cursor: "default" }}>
                         <td className="muted">
@@ -344,7 +356,7 @@ export function PricingWorkspace() {
                       {Object.entries(risk.fxDelta).map(([k, v]) => (
                         <tr key={`fx-${k}`} style={{ cursor: "default" }}>
                           <td className="muted">
-                            <Term id="fxDelta">FX-Delta 1 % {k.replace(/:/g, " ")}</Term>
+                            <Term id="fxDelta">FX-Delta 1 % {bucketLabel(k)}</Term>
                           </td>
                           <td className={`num ${signClass(v)}`}>{fmtMoney(v)}</td>
                         </tr>
@@ -352,7 +364,8 @@ export function PricingWorkspace() {
                       {Object.entries(risk.vega).map(([k, v]) => (
                         <tr key={`v-${k}`} style={{ cursor: "default" }}>
                           <td className="muted">
-                            <Term id="vega">Vega {k.replace(/:/g, " ")}</Term> <span className="xs">(+1 bp / +1 Pkt)</span>
+                            {/* German bucket label ("Vega Swaption EUR"), same source as the inspector (R5-04) */}
+                            <Term id="vega">Vega {bucketLabel(k)}</Term> <span className="xs">(+1 bp / +1 Pkt)</span>
                           </td>
                           <td className={`num ${signClass(v)}`}>{fmtMoney(v)}</td>
                         </tr>

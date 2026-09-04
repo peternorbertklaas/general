@@ -26,6 +26,7 @@ QuantLib `version` and the objects used.
 | `swaption-flat-curve.json`     | 1Y × 5Y ATM payer swaption, N 10m, flat 3 % single curve, flat normal vol 80 bp; physical, cash "Collateralised Cash Price", cash IRR                                                                         | F = (DF₁ − DF₆)/Σ_{2..6} DF_i; A = Σ_{2..6} DF_i; physical = CCP cash = N·A·σ√T/√(2π); IRR cash = N·DF(settlement)·Σ_{i=1..5}(1+F)^{−i}·Bachelier.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `cap-flat-curve.json`          | Forward-starting 3Y cap 2027-09-03 → 2030-09-03 on EURIBOR-12M, N 10m, K 3 %, flat 3 % single curve, flat normal vol 70 bp                                                                                    | Caplet_i = N·τ_i·DF(pay_i)·Bachelier(F_i, K, σ_N, T_i) with F_i = (DF_{i−1}/DF_i − 1)/τ_i and T_i = time to fixing (accrual start − 2 business days).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `sample-market-bootstrap.json` | Sample-market €STR OIS curve `EUR-ESTR` (18 quotes 1W … 30Y, valuation 2026-09-03): TARGET calendar, spot T+2, ModifiedFollowing, €STR payment lag 1 business day, log-linear discount factors                | Independent Python re-derivation with its own TARGET calendar / date arithmetic: spot node DF = 1/(1 + r_1W·τ_spot); quotes ≤ 1Y are single-period OIS whose par condition is **closed form**, DF(accEnd) = DF(spot)/(1 + r·τ) (the pillar sits on the payment date one business day later, on the same log-linear segment); quotes > 1Y (18M … 30Y) pay annually with a short front stub and are solved by bisection on the pillar DF, Σ DF(pay_i)[DF(acc_{i−1})/DF(acc_i) − 1 − r·τ_i] = 0 (€STR compounding telescopes to DF ratios). The engine must reproduce every pillar DF (1e-12 closed form, 1e-9 bisection) and reprice every quote (residual < 1e-9). **QuantLib 1.43** `PiecewiseLogLinearDiscount` / `OISRateHelper`: all 18 pillar DFs within 5e-8 (uniform factor 1 + 1.87·10⁻⁸ from the 0→spot stub convention, see below), DF ratios between pillars within 1e-12. |
+| `cds-hazard-bootstrap.json`    | Piecewise-constant hazard curve from par CDS spreads 100/150/200/250 bp at 1Y/3Y/5Y/10Y, recovery 40 %, flat 2 % discount, valuation 2026-09-03 (N5-5)                                                        | Independent Python bootstrap (bisection to 1e-14 per pillar): quarterly premium grid in ACT/365F years, premium accrual **ACT/360** (factor 365/360, ISDA standard CDS convention), accrual on default and protection discounted to the period midpoint, DF read at the nearest integer day of the flat curve. Engine hazards within 1e-9, survival within 1e-10; DF ≡ 1 reproduces λ = s·(365/360)/(1 − R) to 1e-4. **QuantLib 1.43** `PiecewiseFlatHazardRate` / `SpreadCdsHelper` (ISDA engine): survival within 3e-4, hazards within 3e-3 relative (1Y: QuantLib 168.10 bp vs engine 168.56 bp; the round-4 ACT/365F accrual gave 166.67 bp).                                                                                                                                                                                                                                    |
 
 Design notes
 
@@ -47,10 +48,22 @@ Design notes
 - The cases exercise the engine end to end (schedules, day counts, leg pricer,
   curve lookup, spot-date logic, settlement conventions, model formulas), not
   the models in isolation.
+- `cds-hazard-bootstrap.json` (review R5, N5-5) pins the CDS convention change
+  of round 5: the premium leg accrues ACT/360 (the ISDA standard CDS convention)
+  on the ACT/365F hazard time, accrual-on-default and protection are discounted
+  to the period midpoint. Hazards from a flat spread curve are therefore
+  365/360 − 1 ≈ 1.39 % higher than in round 4 (100 bp / R 40 %: 168.56 bp instead
+  of 166.67 bp), CVA from CDS-bootstrapped curves ≈ 1 % higher. The QuantLib block
+  (`PiecewiseFlatHazardRate` / `SpreadCdsHelper`, ISDA engine) agrees to 3e-4 in
+  survival and 3e-3 relative in the hazards; the remaining difference is
+  QuantLib's daily integration on the business-day-adjusted coupon schedule
+  versus the engine's quarterly midpoint rule (largest at the 1Y pillar:
+  QuantLib 168.10 bp, whose own later pillars of a flat 100 bp curve are 168.57 bp).
 - **QuantLib cross-check: done (QuantLib 1.43, review R4-4).** The `quantlib`
-  blocks of `swap-flat-curve.json`, `black76-bachelier.json` and
-  `sample-market-bootstrap.json` were generated with the QuantLib 1.43 Python
-  bindings (`tools/README.md`) and are asserted by `golden.test.ts`:
+  blocks of `swap-flat-curve.json`, `black76-bachelier.json`,
+  `sample-market-bootstrap.json` and `cds-hazard-bootstrap.json` were generated
+  with the QuantLib 1.43 Python bindings (`tools/README.md`) and are asserted by
+  `golden.test.ts`:
   - flat-curve swap and the Black-76 / Bachelier formulas agree with the closed
     forms to 1e-13 (identical formulas);
   - the sample bootstrap agrees **exactly in its forward structure** – every DF

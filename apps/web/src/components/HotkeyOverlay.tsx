@@ -41,6 +41,8 @@ const MARKET_KEYS: [string, string][] = [
   ["Vol-Zelle bearbeiten (Swaption-Cube, FX-Smile, Caplet)", "Tab / Klick · ↑ / ↓ · ↵"],
   ["Vol-Änderung rückgängig", "Ctrl+Z"],
   ["Fläche auf Sample zurücksetzen", "Zurücksetzen"],
+  ["FX-Fixings (MtM-Reset) – Karte „FX-Fixings“", "+ heute aus Spot / + Zeile"],
+  ["Snapshot exportieren / importieren (ersetzt Markt und Bewertungstag)", "Karte „Snapshot“"],
 ];
 const NUM_KEYS: [string, string][] = [
   ["Schritt ±", "↑ / ↓"],

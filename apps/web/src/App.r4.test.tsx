@@ -1,14 +1,16 @@
 /** App-level regression tests for the round-4 UI review (docs/quality/review-ui-r4.md) and the market-review web items. */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App.js";
 import { newTradeTemplate } from "./lib/templates.js";
 import { useStore } from "./state/store.js";
+import { preloadViews } from "./views/lazy-views.js";
 
 const tabStops = (sel: string) => document.querySelectorAll(`${sel} tbody tr[tabindex="0"]`).length;
 
 describe("App – round 4", () => {
   let writeText: ReturnType<typeof vi.fn>;
+  beforeAll(() => preloadViews());
   beforeEach(() => {
     localStorage.clear();
     useStore.getState().resetPortfolio();

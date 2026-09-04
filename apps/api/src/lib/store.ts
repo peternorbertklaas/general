@@ -107,7 +107,7 @@ export interface StoredTrade {
   createdAt: string;
   updatedAt: string;
   version: number;
-  /** Weak ETag derived from version + content hash. */
+  /** Strong ETag `"version-hash"` derived from version + content hash (see `tradeEtag`). */
   etag: string;
 }
 
@@ -121,9 +121,15 @@ export interface TradeRepository {
   clear(): void;
 }
 
+/**
+ * Strong ETag of a stored trade: `"version-hash"` over the canonical JSON (`stableStringify`)
+ * of the trade. The representation `GET /api/trades/:id` returns is a deterministic function of
+ * version and content, so a strong validator is correct – and only a strong ETag may satisfy
+ * `If-Match` under RFC 9110 §13.1.1 (N5-03; the earlier `W/"…"` form could never legally match).
+ */
 export function tradeEtag(version: number, trade: Trade): string {
   const h = createHash("sha256").update(stableStringify(trade)).digest("hex").slice(0, 16);
-  return `W/"${version}-${h}"`;
+  return `"${version}-${h}"`;
 }
 
 export class TradeStore implements TradeRepository {

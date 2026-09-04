@@ -1,3 +1,5 @@
+import { PricingError } from "../errors.js";
+
 /**
  * SABR (Hagan et al. 2002) implied-volatility approximations.
  *
@@ -18,7 +20,7 @@ export function sabrLognormalVol(forward: number, strike: number, t: number, p: 
   const f = forward + s;
   const k = strike + s;
   const { alpha, beta, rho, nu } = p;
-  if (f <= 0 || k <= 0) throw new Error("SABR lognormal vol requires positive shifted forward/strike");
+  if (f <= 0 || k <= 0) throw new PricingError("VOL_MODEL_INCOMPATIBLE", "SABR lognormal vol requires positive shifted forward/strike");
   const oneMinusBeta = 1 - beta;
   const fk = f * k;
   const fkPow = Math.pow(fk, oneMinusBeta / 2);
@@ -49,7 +51,7 @@ export function sabrNormalVol(forward: number, strike: number, t: number, p: Sab
   const f = forward + s;
   const k = strike + s;
   const { alpha, beta, rho, nu } = p;
-  if (f <= 0 || k <= 0) throw new Error("SABR normal vol requires positive shifted forward/strike");
+  if (f <= 0 || k <= 0) throw new PricingError("VOL_MODEL_INCOMPATIBLE", "SABR normal vol requires positive shifted forward/strike");
   const oneMinusBeta = 1 - beta;
   const fk = f * k;
   const fMid = (f + k) / 2;

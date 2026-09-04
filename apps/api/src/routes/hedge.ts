@@ -1,16 +1,19 @@
 import { type FastifyInstance } from "fastify";
 import {
   type HedgeRelationship,
+  type MarketContext,
   type Trade,
   deserializeMarket,
   hedgeEffectivenessReport,
   hypotheticalDerivative,
+  isPricingError,
   type MarketSnapshotJson,
 } from "@deriva/pricing-core";
 import { type AppContext } from "../app.js";
 import { datesToIso, datesToSerial } from "../lib/dates.js";
 import { sendError } from "../lib/errors.js";
-import { arrayResponse, marketSnapshotRef, objectResponse, responses, tradeRef } from "../schemas.js";
+import { volSurfaceProblems } from "../lib/vol-surfaces.js";
+import { FREQUENCY_PATTERN, MAX_AMOUNT, arrayResponse, marketSnapshotRef, objectResponse, responses, tradeRef } from "../schemas.js";
 
 /**
  * Valuations per trade of an effectiveness test (compute budget, N4-01): instrument and hypothetical
@@ -31,7 +34,7 @@ const notionalSchedule = {
   items: {
     type: "object",
     required: ["date", "notional"],
-    properties: { date: isoDate, notional: { type: "number", minimum: 0 } },
+    properties: { date: isoDate, notional: { type: "number", minimum: 0, maximum: MAX_AMOUNT } },
     additionalProperties: false,
   },
 } as const;
@@ -46,10 +49,15 @@ const amortisationSchema = {
       enum: ["Linear", "Annuity", "Custom"],
       description: "Linear: equal principal instalments; Annuity: constant instalment at `loanRate`; Custom: `schedule`",
     },
-    finalNotional: { type: "number", minimum: 0, description: "Balloon after the last instalment (default 0)" },
+    finalNotional: { type: "number", minimum: 0, maximum: MAX_AMOUNT, description: "Balloon after the last instalment (default 0)" },
     loanRate: { type: "number", minimum: -1, maximum: 1, description: "Annuity plan rate (default `hedgedItem.fixedRate`)" },
     schedule: { ...notionalSchedule, description: 'Explicit outstanding notional per period start (type "Custom")' },
-    frequency: { type: "string", pattern: "^\\d{1,3}[DWMYdwmy]$", description: "Instalment frequency (default: fixed-leg frequency of the currency)" },
+    frequency: {
+      type: "string",
+      pattern: FREQUENCY_PATTERN,
+      description:
+        'Instalment frequency as upper-case tenor with count ≥ 1 ("1M", "3M", "6M", "1Y"; same pattern as trade legs, N5-04) – default: fixed-leg frequency of the currency. The implied schedule counts against the compute budget (400 TOO_MANY_PERIODS above 1200 periods).',
+    },
   },
   additionalProperties: false,
 } as const;
@@ -68,14 +76,14 @@ const hedgeRelationshipSchema = {
       properties: {
         description: { type: "string", maxLength: 500 },
         currency: { type: "string", pattern: "^[A-Z]{3}$" },
-        notional: { type: "number", exclusiveMinimum: 0 },
+        notional: { type: "number", exclusiveMinimum: 0, maximum: MAX_AMOUNT },
         kind: { type: "string", enum: ["FloatingRateLoan", "FixedRateLoan", "ForecastFxCashflow", "FxReceivable"] },
         index: { type: "string", maxLength: 32 },
         fixedRate: { type: "number", minimum: -1, maximum: 1 },
         effectiveDate: isoDate,
         maturityDate: isoDate,
         fxPair: { type: "string", pattern: "^[A-Z]{6}$" },
-        amount: { type: "number" },
+        amount: { type: "number", minimum: -MAX_AMOUNT, maximum: MAX_AMOUNT },
         notionalSchedule: { ...notionalSchedule, description: "Tilgungsplan: outstanding notional per period start; takes precedence over `amortisation`" },
         amortisation: amortisationSchema,
       },
@@ -191,7 +199,28 @@ export async function registerHedgeRoutes(app: FastifyInstance, ctx: AppContext)
       const rel = datesToSerial(req.body.relationship);
       const instrument = req.body.hedgingInstrument ? datesToSerial(req.body.hedgingInstrument) : ctx.trades.get(rel.hedgingInstrumentId)?.trade;
       if (!instrument) return sendError(reply, req, 404, "NOT_FOUND", `Hedging instrument ${rel.hedgingInstrumentId} not found`);
-      const designationCtx = req.body.designationSnapshot ? deserializeMarket(req.body.designationSnapshot) : undefined;
+      // The designation snapshot is a client-supplied market: its vol surfaces get the same structural check as an import (R5-1).
+      const surfaceProblems = req.body.designationSnapshot ? volSurfaceProblems(req.body.designationSnapshot) : [];
+      if (surfaceProblems.length) {
+        return sendError(
+          reply,
+          req,
+          400,
+          "VOL_SURFACE_INVALID",
+          `designationSnapshot: vol surface(s) structurally invalid (${surfaceProblems.length} problem(s))`,
+          {
+            problems: surfaceProblems,
+          },
+        );
+      }
+      let designationCtx: MarketContext | undefined;
+      try {
+        designationCtx = req.body.designationSnapshot ? deserializeMarket(req.body.designationSnapshot) : undefined;
+      } catch (e) {
+        // Structural problems of the client-supplied snapshot are input errors (400 with the core's code), as on `PUT /api/market/snapshot`.
+        const code = isPricingError(e) ? e.code : "SNAPSHOT_MALFORMED";
+        return reply.status(400).send({ error: `designationSnapshot: ${(e as Error).message}`, statusCode: 400, code, requestId: req.id });
+      }
       const report = hedgeEffectivenessReport(ctx.market.get(), rel, instrument, {
         designationCtx,
         reportingCurrency: req.body.reportingCurrency,

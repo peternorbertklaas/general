@@ -480,6 +480,45 @@ table.grid-table.compact td,
 table.grid-table.compact th {
   padding: 3px 6px;
 }
+/* Key-value tables (Inspector, Preis-Analytics, Risiko): the label column may wrap, the value column never – so a narrow
+   sidebar shortens the label, not the number (R5-01). */
+table.grid-table.kv {
+  table-layout: fixed;
+}
+table.grid-table.kv td:first-child {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+table.grid-table.kv td.num {
+  width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inspector table.grid-table {
+  table-layout: fixed;
+}
+.inspector table.grid-table td {
+  padding: 4px 6px;
+}
+.inspector table.grid-table td:first-child {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.inspector table.grid-table td.num {
+  width: 48%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The KPI pair (DV01 / Theta) must never widen the sidebar: two equal columns, values may wrap (R5-01). */
+.inspector .grid.cols-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.inspector .kpi {
+  min-width: 0;
+}
+.inspector .kpi .value {
+  overflow-wrap: anywhere;
+}
 table.grid-table tbody tr {
   cursor: pointer;
 }
@@ -675,6 +714,11 @@ select[aria-invalid="true"] {
   border: 1px solid var(--border);
   border-radius: var(--radius-m);
   overflow: hidden;
+}
+/* Wrapping segment (FX-vol pair tabs): six pairs stay inside a 287-px card at 1024 px instead of running out of it (R5-05). */
+.seg.wrap {
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 .seg button {
   border: none;
@@ -1377,14 +1421,40 @@ select.inline {
   display: none;
 }
 
+/* Lazy view / chart placeholders (ADR-026): same footprint as the content, subtle pulse */
+.card.skeleton,
+.chart-loading {
+  background: linear-gradient(90deg, var(--bg-1), var(--bg-2), var(--bg-1));
+  background-size: 200% 100%;
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-pulse {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card.skeleton,
+  .chart-loading {
+    animation: none;
+  }
+}
+
 /* ---------- Responsive (F-24) ---------- */
 @media (max-width: 1360px) {
-  /* narrower inspector column – content stays reachable, nothing overlays the workspace */
+  /* narrower inspector column – content stays reachable, nothing overlays the workspace; 300 px so the
+     key-value tables ("Fälligkeit 17.06.2034", "Par-Satz 2,7630 %") fit without clipping (R5-01) */
   :root {
-    --inspector-w: 280px;
+    --inspector-w: 300px;
   }
   .inspector {
     padding: 10px;
+  }
+  .inspector table.grid-table {
+    font-size: var(--fs-xs);
   }
   .pricing-grid,
   .curves-grid {
@@ -1469,12 +1539,15 @@ select.inline {
     color: #333;
     flex: 0 0 auto;
   }
+  /* The input shrinks to its value (`field-sizing: content`), so "50" and "%" print side by side (R5-08 / R4-08);
+     the 10ch cap is only a fallback for engines without field-sizing. */
   .input-unit input {
     padding-right: 0 !important;
-    width: 10ch !important;
+    width: auto !important;
+    max-width: 10ch;
+    min-width: 2ch;
     field-sizing: content;
     flex: 0 0 auto;
-    min-width: 0;
   }
   /* Wider form cells on paper and no flex stretch: a select is as wide as its option text ("Variabel verzinster Kredit"). */
   .form {

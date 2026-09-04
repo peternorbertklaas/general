@@ -526,6 +526,63 @@ export const SAMPLE_EURJPY_VOLS: FxVolSurface = {
 };
 
 /**
+ * Cross-pair FX surfaces (Markt R5-2): every pair of the sample market's five
+ * currencies whose spot is quoted or triangulable has a surface, so no sample
+ * pair falls back to the 8 % flat vol (Level 3). The cross vols are
+ * **indicative**: ATM levels derived from the EUR / USD legs with a
+ * correlation-consistent cross-vol relation σ²ₓ ≈ σ₁² + σ₂² − 2ρσ₁σ₂ (ρ ≈ 0.4
+ * for USDCHF from EURUSD/EURCHF, ≈ 0.3 for the JPY crosses) and smile quotes
+ * in the direction the market shows (CHF calls / JPY calls bid), spot delta
+ * throughout like the other sample surfaces.
+ */
+export const SAMPLE_USDCHF_VOLS: FxVolSurface = {
+  id: "USDCHF-VOL",
+  pair: "USDCHF",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 5],
+  atm: [0.072, 0.074, 0.076, 0.078, 0.08, 0.083],
+  rr25: [-0.006, -0.0065, -0.007, -0.0075, -0.008, -0.008],
+  bf25: [0.0018, 0.002, 0.0022, 0.0025, 0.0028, 0.003],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
+};
+
+/** GBPJPY: high-beta cross, JPY calls bid (negative RR). Indicative, see `SAMPLE_USDCHF_VOLS`. */
+export const SAMPLE_GBPJPY_VOLS: FxVolSurface = {
+  id: "GBPJPY-VOL",
+  pair: "GBPJPY",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 5],
+  atm: [0.105, 0.107, 0.109, 0.111, 0.113, 0.116],
+  rr25: [-0.014, -0.015, -0.016, -0.017, -0.017, -0.017],
+  bf25: [0.0028, 0.003, 0.0032, 0.0035, 0.0037, 0.0037],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
+};
+
+/** CHFJPY: two safe-haven currencies, JPY calls bid. Indicative, see `SAMPLE_USDCHF_VOLS`. */
+export const SAMPLE_CHFJPY_VOLS: FxVolSurface = {
+  id: "CHFJPY-VOL",
+  pair: "CHFJPY",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 5],
+  atm: [0.09, 0.092, 0.094, 0.096, 0.098, 0.101],
+  rr25: [-0.009, -0.01, -0.011, -0.012, -0.012, -0.012],
+  bf25: [0.0024, 0.0027, 0.0029, 0.0032, 0.0034, 0.0034],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
+};
+
+/** GBPCHF: CHF calls bid (negative RR). Indicative, see `SAMPLE_USDCHF_VOLS`. */
+export const SAMPLE_GBPCHF_VOLS: FxVolSurface = {
+  id: "GBPCHF-VOL",
+  pair: "GBPCHF",
+  expiries: [1 / 12, 0.25, 0.5, 1, 2, 5],
+  atm: [0.068, 0.07, 0.072, 0.074, 0.076, 0.079],
+  rr25: [-0.005, -0.0055, -0.006, -0.0065, -0.007, -0.007],
+  bf25: [0.0016, 0.0018, 0.002, 0.0022, 0.0025, 0.0027],
+  deltaConvention: "Spot",
+  atmConvention: "DeltaNeutral",
+};
+
+/**
  * Curve build specifications used by `buildSampleMarket`, keyed by curve id
  * and in build order. Exposed so the UI / API can run par-rate risk
  * (`parRisk`) or rebuild single curves without duplicating the quote lists.
@@ -593,6 +650,7 @@ export function buildSampleMarket(valuationDate: SerialDate = parseISO("2026-09-
       "CHF-SARON": SAMPLE_CHF_CAPLET_VOLS,
       ...(hasJpy ? { "JPY-TONA": SAMPLE_JPY_CAPLET_VOLS } : {}),
     },
+    // Every pair of the five sample currencies (all ten) has a surface – the four crosses are indicative (Markt R5-2).
     fxVols: {
       EURUSD: SAMPLE_EURUSD_VOLS,
       EURGBP: SAMPLE_EURGBP_VOLS,
@@ -600,6 +658,10 @@ export function buildSampleMarket(valuationDate: SerialDate = parseISO("2026-09-
       GBPUSD: SAMPLE_GBPUSD_VOLS,
       USDJPY: SAMPLE_USDJPY_VOLS,
       EURJPY: SAMPLE_EURJPY_VOLS,
+      USDCHF: SAMPLE_USDCHF_VOLS,
+      GBPJPY: SAMPLE_GBPJPY_VOLS,
+      CHFJPY: SAMPLE_CHFJPY_VOLS,
+      GBPCHF: SAMPLE_GBPCHF_VOLS,
     },
     credit: {
       "CPTY-A": { hazardRate: 0.01, recovery: 0.4 },

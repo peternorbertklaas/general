@@ -164,9 +164,11 @@ describe("N3-01 compute bounds", () => {
       code: "PERIOD_BUDGET_EXCEEDED",
       details: { periods: 1 },
     });
+    // Library codes never leave the process; since R5 (N5-01) the envelope carries the catalogued code of the status instead.
     const fst = classifyError(Object.assign(new Error("too large"), { statusCode: 413, code: "FST_ERR_CTP_BODY_TOO_LARGE" }));
     expect(fst.status).toBe(413);
-    expect(fst.code).toBeUndefined();
+    expect(fst.code).toBe("PAYLOAD_TOO_LARGE");
+    expect(fst.details).toBeUndefined();
     // A 5xx never leaks its internal code; since R4 (N4-05) the envelope carries the catalogued INTERNAL_ERROR instead.
     expect(classifyError(Object.assign(new Error("boom"), { statusCode: 500, code: "SOMETHING" })).code).toBe("INTERNAL_ERROR");
   });

@@ -27,7 +27,10 @@
  * the request); routes that write trades declare `storeWrite`. The trades a
  * request prices are read from `body.trade`, `body.trades`, a trade body,
  * `body.hedgingInstrument` (or the stored instrument named by
- * `body.relationship.hedgingInstrumentId`) or the store. A hard wall-clock
+ * `body.relationship.hedgingInstrumentId`) plus the hedged item's own schedule
+ * (`hedgedItem.effectiveDate` → `maturityDate` at the amortisation frequency –
+ * the hypothetical derivative and the notional path are built from it, N5-04)
+ * or the store. A hard wall-clock
  * timeout is deliberately not implemented: the pricing core is synchronous and
  * cannot be aborted mid-way, so the budget is enforced on the input size
  * instead (ADR-026).
@@ -119,7 +122,35 @@ export function estimateLegPeriods(leg: { effectiveDate?: DateLike; terminationD
   return Math.max(1, Math.round(((end - start) / 365.25) * perYear));
 }
 
-type AnyTrade = Partial<Trade> & { type?: string; legs?: unknown[]; underlying?: unknown };
+type AnyTrade = { type?: Trade["type"] | "HedgedItem"; legs?: unknown[]; underlying?: unknown };
+
+/**
+ * Pseudo-trade for the hedged item of a hedge relationship: its schedule (loan start → maturity at the
+ * amortisation frequency) drives the hypothetical derivative and the notional path the core builds, so
+ * it is bounded like a leg. Without an explicit `amortisation.frequency` the core steps at the fixed-leg
+ * frequency of the currency; `6M` is a conservative stand-in for the estimate.
+ */
+export interface HedgedItemEstimate {
+  type: "HedgedItem";
+  id: string;
+  effectiveDate?: DateLike;
+  terminationDate?: DateLike;
+  frequency: string;
+}
+export function hedgedItemEstimate(relationship: unknown): HedgedItemEstimate | undefined {
+  const rel = relationship as
+    { id?: unknown; hedgedItem?: { effectiveDate?: DateLike; maturityDate?: DateLike; amortisation?: { frequency?: unknown } } } | undefined;
+  const item = rel?.hedgedItem;
+  if (!item || typeof item !== "object") return undefined;
+  const frequency = typeof item.amortisation?.frequency === "string" ? item.amortisation.frequency : "6M";
+  return {
+    type: "HedgedItem",
+    id: typeof rel?.id === "string" ? rel.id : "",
+    effectiveDate: item.effectiveDate,
+    terminationDate: item.maturityDate,
+    frequency,
+  };
+}
 
 /** Periods per leg of a trade (single-entry array for one-period instruments). */
 export function tradeLegPeriods(trade: unknown): number[] {
@@ -130,6 +161,7 @@ export function tradeLegPeriods(trade: unknown): number[] {
     case "CrossCurrencySwap":
       return Array.isArray(t.legs) ? t.legs.map((l) => estimateLegPeriods(l as never)) : [];
     case "CapFloor":
+    case "HedgedItem":
       return [estimateLegPeriods(t as never)];
     case "Swaption":
       return tradeLegPeriods(t.underlying);
@@ -151,14 +183,23 @@ function httpError(status: number, code: string, message: string, details: Recor
 /** Throw 400 `TOO_MANY_PERIODS` when any leg of the trade exceeds the per-leg bound; returns the trade's total periods. */
 export function assertTradeWithinLimits(trade: unknown, limits: ComputeLimits): number {
   const legs = tradeLegPeriods(trade);
-  const id = (trade as { id?: unknown })?.id;
+  const { id, type } = (trade as { id?: unknown; type?: unknown }) ?? {};
   legs.forEach((periods, legIndex) => {
     if (periods > limits.maxPeriodsPerLeg) {
+      const subject =
+        type === "HedgedItem"
+          ? `Hedged item of relationship ${String(id ?? "")} (schedule at ${(trade as HedgedItemEstimate).frequency})`
+          : `Trade ${String(id ?? "")} leg ${legIndex}`;
       throw httpError(
         400,
         "TOO_MANY_PERIODS",
-        `Trade ${String(id ?? "")} leg ${legIndex}: ~${periods} coupon periods exceed the limit of ${limits.maxPeriodsPerLeg} (use a coarser frequency or a shorter tenor)`,
-        { tradeId: id, legIndex, periods, maxPeriodsPerLeg: limits.maxPeriodsPerLeg },
+        `${subject}: ~${periods} coupon periods exceed the limit of ${limits.maxPeriodsPerLeg} (use a coarser frequency or a shorter tenor)`,
+        {
+          ...(type === "HedgedItem" ? { relationshipId: id, hedgedItem: true } : { tradeId: id }),
+          legIndex,
+          periods,
+          maxPeriodsPerLeg: limits.maxPeriodsPerLeg,
+        },
       );
     }
   });
@@ -231,27 +272,33 @@ const TRADE_TYPES = new Set(["InterestRateSwap", "FRA", "CapFloor", "Swaption", 
 
 /**
  * Trades a request is about to price: `body.trade`, `body.trades`, the body itself (trade routes),
- * `body.hedgingInstrument` / the stored instrument of `body.relationship` (hedge routes) or the store
- * (fallback routes).
+ * `body.hedgingInstrument` / the stored instrument of `body.relationship` plus the hedged item's schedule
+ * (hedge routes) or the store (fallback routes).
  */
-function tradesOf(req: FastifyRequest, ctx: AppContext): { fromBody: unknown[]; fromStore: unknown[] } {
+function tradesOf(req: FastifyRequest, ctx: AppContext): { fromBody: unknown[]; fromStore: unknown[]; hedgedItems: HedgedItemEstimate[] } {
   const body = req.body as
     | { trade?: unknown; trades?: unknown; type?: unknown; id?: unknown; hedgingInstrument?: unknown; relationship?: { hedgingInstrumentId?: unknown } }
     | undefined;
+  const none: HedgedItemEstimate[] = [];
   if (body && typeof body === "object") {
-    if (body.trade) return { fromBody: [body.trade], fromStore: [] };
-    if (Array.isArray(body.trades)) return { fromBody: body.trades, fromStore: [] };
-    if (typeof body.type === "string" && TRADE_TYPES.has(body.type) && body.id !== undefined) return { fromBody: [body], fromStore: [] };
-    if (body.hedgingInstrument) return { fromBody: [body.hedgingInstrument], fromStore: [] };
-    if (body.relationship && typeof body.relationship === "object") {
-      const id = body.relationship.hedgingInstrumentId;
-      const stored = typeof id === "string" ? ctx.trades.get(id)?.trade : undefined;
-      return { fromBody: [], fromStore: stored ? [stored] : [] };
+    if (body.trade) return { fromBody: [body.trade], fromStore: [], hedgedItems: none };
+    if (Array.isArray(body.trades)) return { fromBody: body.trades, fromStore: [], hedgedItems: none };
+    if (typeof body.type === "string" && TRADE_TYPES.has(body.type) && body.id !== undefined) return { fromBody: [body], fromStore: [], hedgedItems: none };
+    if (body.hedgingInstrument || (body.relationship && typeof body.relationship === "object")) {
+      const hedgedItem = hedgedItemEstimate(body.relationship);
+      const id = body.relationship?.hedgingInstrumentId;
+      const stored = !body.hedgingInstrument && typeof id === "string" ? ctx.trades.get(id)?.trade : undefined;
+      return {
+        fromBody: body.hedgingInstrument ? [body.hedgingInstrument] : [],
+        fromStore: stored ? [stored] : [],
+        hedgedItems: hedgedItem ? [hedgedItem] : [],
+      };
     }
   }
   const fallback = req.routeOptions.config.storeFallback;
-  if (fallback === true || (typeof fallback === "function" && fallback(req))) return { fromBody: [], fromStore: ctx.trades.list().map((s) => s.trade) };
-  return { fromBody: [], fromStore: [] };
+  if (fallback === true || (typeof fallback === "function" && fallback(req)))
+    return { fromBody: [], fromStore: ctx.trades.list().map((s) => s.trade), hedgedItems: none };
+  return { fromBody: [], fromStore: [], hedgedItems: none };
 }
 
 /**
@@ -262,10 +309,13 @@ function tradesOf(req: FastifyRequest, ctx: AppContext): { fromBody: unknown[]; 
  */
 export function registerComputeLimits(app: FastifyInstance, ctx: AppContext, limits: ComputeLimits): void {
   app.addHook("preHandler", async (req) => {
-    const { fromBody, fromStore } = tradesOf(req, ctx);
-    if (fromBody.length === 0 && fromStore.length === 0) return;
+    const { fromBody, fromStore, hedgedItems } = tradesOf(req, ctx);
+    if (fromBody.length === 0 && fromStore.length === 0 && hedgedItems.length === 0) return;
     let periods = 0;
     for (const t of fromBody) periods += assertTradeWithinLimits(t, limits);
+    // The hedged item's schedule is bounded like a leg (400 TOO_MANY_PERIODS) and adds to the request's periods,
+    // but is not a trade of the request (`details.trades` and `source` describe the instruments).
+    for (const h of hedgedItems) periods += assertTradeWithinLimits(h, limits);
     for (const t of fromStore) periods += tradePeriods(t);
     const weight = req.routeOptions.config.computeWeight?.(req.body) ?? 1;
     assertBudget(periods, weight, fromBody.length + fromStore.length, limits, fromBody.length === 0 ? "store" : "body");

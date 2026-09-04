@@ -11,7 +11,7 @@ import {
   toCsv,
   toISO,
 } from "@deriva/pricing-core";
-import { DocumentsModal } from "../components/DocumentsModal.js";
+import { DocumentsModal, INTERNAL_ROW, customerCostRule } from "../components/DocumentsModal.js";
 import { EChart, cssVar } from "../components/EChart.js";
 import { Term } from "../components/InfoTip.js";
 import { NumInput } from "../components/NumInput.js";
@@ -46,6 +46,7 @@ export function ReportView() {
       docKind: st.docKind,
       turnOfYear: st.turnOfYear,
       cdsCurves: st.cdsCurves,
+      marketSource: st.marketSource,
     })),
   );
   const act = useStore.getState;
@@ -82,11 +83,10 @@ export function ReportView() {
   }, [s.reportStamp, s.reportKey, act]);
   const stale = !!s.reportStamp && s.reportKey !== null && s.reportKey !== inputsKey;
 
-  /** Market label carries the "modifiziert" flag so header, JSON and hash agree (N-18). */
-  const reportMarket = useMemo(
-    () => (modified && s.market.meta ? { ...s.market, meta: { ...s.market.meta, label: `${s.market.meta.label ?? "Markt"} · Quotes modifiziert` } } : s.market),
-    [s.market, modified],
-  );
+  // The market goes into the report unchanged: the snapshot id is the core `marketSnapshotId` of exactly this market, no UI label is
+  // hashed into it (R5-F2). "modifiziert" is shown next to the label instead; a modified market changes the id anyway (its curves differ).
+  const reportMarket = s.market;
+  const modifiedSuffix = modified ? " · Quotes modifiziert" : "";
 
   const report = useMemo(() => {
     if (!trade || !s.reportStamp) return null;
@@ -192,8 +192,8 @@ export function ReportView() {
         </div>
         <div>
           Bewertungstag {fmtDate(s.valuationDate)} · erstellt {new Date(report.generatedAt).toLocaleString("de-DE")} · Snapshot {report.audit.snapshotId} (
-          {report.market.label}) · Hash {report.audit.reportHash.slice(0, 16)} · {report.audit.engineVersion} · Perspektive{" "}
-          {tr(PERSPECTIVE_DE, inputs.perspective)}
+          {report.market.label}
+          {modifiedSuffix}) · Hash {report.audit.reportHash.slice(0, 16)} · {report.audit.engineVersion} · Perspektive {tr(PERSPECTIVE_DE, inputs.perspective)}
           {report.whatIf && ` · WHAT-IF ${whatIfLabel(s.whatIf)} – NICHT PRÜFUNGSFÄHIG`}
         </div>
       </div>
@@ -271,7 +271,8 @@ export function ReportView() {
         <div className="muted small" data-testid="report-header">
           {trade.name} · Nominal {fmtMoney(n.amount, n.currency)} · Bewertungstag {fmtDate(s.valuationDate)} · Reporting {report.reportingCurrency} · Snapshot{" "}
           {/* The market label of the core already carries the what-if suffix – no second "What-if" segment (R4-07). */}
-          {report.market.label} · erstellt {new Date(report.generatedAt).toLocaleString("de-DE")}
+          {report.market.label}
+          {modifiedSuffix} · erstellt {new Date(report.generatedAt).toLocaleString("de-DE")}
           {detailRows(report.pricing.details).map((d) => ` · ${d.label} ${d.v}`)}
         </div>
         <div className="muted xs mono audit" style={{ marginTop: 6 }} data-testid="audit-hashes">
@@ -325,7 +326,8 @@ export function ReportView() {
             <Term id="ifrs13">Fair Value (bilateral, IFRS 13 Level {report.fairValue.ifrs13Level})</Term>
           </span>
           <span className={`value ${signClass(report.fairValue.adjusted)}`}>{fmtMoney(report.fairValue.adjusted)}</span>
-          <span className="sub">= risikofrei − CVA + DVA</span>
+          {/* Customer mode hides the internal decomposition (R5-07) */}
+          <span className="sub">{customer ? "inkl. Kontrahentenrisiko" : "= risikofrei − CVA + DVA"}</span>
         </div>
       </div>
 
@@ -453,13 +455,15 @@ export function ReportView() {
           )}
           {ct && (
             <div className="muted xs" style={{ marginTop: 8 }} data-testid="sign-rule">
-              {germanizeParagraph(ct.signRule)}
+              {/* Customer mode: the bank-margin formula stays in the auditor report, the client reads the initial-market-value rule (R5-07) */}
+              {customer ? customerCostRule(germanizeParagraph(ct.signRule)) : germanizeParagraph(ct.signRule)}
             </div>
           )}
           <div className="muted xs" style={{ marginTop: 8 }}>
             Nach BGH XI ZR 33/10 und XI ZR 378/13 ist der anfängliche negative Marktwert dem Kunden einschließlich seiner Höhe offenzulegen. Der Ausweis oben
-            ergibt sich aus Fair Value abzüglich Transaktionspreis. Hinweis: Der Report-Hash des Kerns deckt die Kostentransparenz derzeit nicht ab –
-            Transaktionspreis und Perspektive sind im Inputs-Schlüssel dieser Ansicht enthalten.
+            ergibt sich aus Fair Value abzüglich Transaktionspreis.
+            {!customer &&
+              " Hinweis: Der Report-Hash des Kerns deckt die Kostentransparenz derzeit nicht ab – Transaktionspreis und Perspektive sind im Inputs-Schlüssel dieser Ansicht enthalten."}
           </div>
         </div>
 
@@ -484,9 +488,11 @@ export function ReportView() {
           ) : (
             <div className="empty">{report.xva?.warnings.map(translateCoreMessage).join(" ") || "Kein Exposure-Profil"}</div>
           )}
-          <div className="muted xs" data-testid="xva-method">
-            Methode: {translateCoreMessage(report.xva?.method)}
-          </div>
+          {!customer && (
+            <div className="muted xs" data-testid="xva-method">
+              Methode: {translateCoreMessage(report.xva?.method)}
+            </div>
+          )}
           {!customer && report.xva?.warnings.length ? <div className="muted xs">{report.xva.warnings.map(translateCoreMessage).join(" · ")}</div> : null}
         </div>
       </div>
@@ -538,13 +544,19 @@ export function ReportView() {
         <div className="card">
           <h3>Methodik & Marktdaten</h3>
           <ul className="small" style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }} data-testid="methodology">
-            {report.methodology.map((m) => (
-              <li key={m}>{germanizeParagraph(translateCoreMessage(m))}</li>
-            ))}
+            {/* Customer mode: internal methodology lines (margin formula, CVA/DVA, bilateral view) are filtered like in the documents (R5-07) */}
+            {report.methodology
+              .map((m) => germanizeParagraph(translateCoreMessage(m)))
+              .filter((m) => !customer || !INTERNAL_ROW.test(m))
+              .map((m) => (
+                <li key={m}>{m}</li>
+              ))}
           </ul>
-          <div className="muted xs" style={{ marginTop: 10 }}>
-            {germanizeParagraph(report.fairValue.rationale)}
-          </div>
+          {(!customer || !INTERNAL_ROW.test(report.fairValue.rationale)) && (
+            <div className="muted xs" style={{ marginTop: 10 }}>
+              {germanizeParagraph(report.fairValue.rationale)}
+            </div>
+          )}
           <div className="table-scroll" style={{ marginTop: 10 }}>
             <table className="grid-table" data-testid="market-table">
               <thead>
@@ -589,8 +601,8 @@ export function ReportView() {
             {Object.entries(report.market.fxSpots)
               .map(([k, v]) => `${k} ${fmtNum(v, 4)}`)
               .join(" · ")}{" "}
-            · Stückzinsen {fmtMoney(report.pricing.accrued)} · Restlaufzeit bis {fmtDate(report.pricing.analytics.maturity as number | undefined)} · Hazard ≈{" "}
-            {fmtBp(hazardFromSpread(inputs.cptySpreadBp / 1e4, inputs.recovery / 100), 0)}
+            · Stückzinsen {fmtMoney(report.pricing.accrued)} · Restlaufzeit bis {fmtDate(report.pricing.analytics.maturity as number | undefined)}
+            {!customer && ` · Hazard ≈ ${fmtBp(hazardFromSpread(inputs.cptySpreadBp / 1e4, inputs.recovery / 100), 0)}`}
           </div>
         </div>
       </div>

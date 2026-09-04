@@ -52,7 +52,6 @@ jobs:
         run: pnpm -r run test -- --coverage
       - name: Dependency audit (production, high+; one retry for registry timeouts)
         run: pnpm audit --prod --audit-level=high || (sleep 30 && pnpm audit --prod --audit-level=high)
-        continue-on-error: false
       - name: Build API
         run: pnpm --filter @deriva/api run build
       - name: Build Web

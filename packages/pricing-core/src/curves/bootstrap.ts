@@ -9,6 +9,7 @@ import { type InterpolationMethod, isNonLocalInterpolation } from "../math/inter
 import { priceCrossCurrencySwap, priceInterestRateSwap } from "../pricing/swap-pricer.js";
 import { type Curve, type CurveNode, type ForwardJump, InterpolatedCurve } from "./curve.js";
 import { getIndex, getSwapConventions, type RateIndex } from "./index-definitions.js";
+import { PricingError } from "../errors.js";
 
 /**
  * Market quote used as a bootstrap instrument. Each quote adds exactly one
@@ -275,7 +276,7 @@ function quoteMaturity(
 
 function fxPairOf(pair: string): { base: string; quote: string } {
   const p = pair.replace("/", "").toUpperCase();
-  if (p.length !== 6) throw new Error(`Invalid FX pair in FxSwapPoints quote: ${pair}`);
+  if (p.length !== 6) throw new PricingError("INVALID_CURVE_SPEC", `Invalid FX pair in FxSwapPoints quote: ${pair}`);
   return { base: p.slice(0, 3), quote: p.slice(3) };
 }
 
@@ -400,7 +401,7 @@ export function bootstrapCurve(valuationDate: SerialDate, spec: BootstrapSpec): 
   const refs = spec.referenceCurves ?? {};
   const requireRef = (id: string, purpose: string): Curve => {
     const c = refs[id] ?? (spec.discountCurve?.id === id ? spec.discountCurve : undefined);
-    if (!c) throw new Error(`bootstrapCurve(${spec.id}): reference curve "${id}" (${purpose}) missing in spec.referenceCurves`);
+    if (!c) throw new PricingError("INVALID_CURVE_SPEC", `bootstrapCurve(${spec.id}): reference curve "${id}" (${purpose}) missing in spec.referenceCurves`);
     return c;
   };
 
@@ -507,7 +508,8 @@ export function bootstrapCurve(valuationDate: SerialDate, spec: BootstrapSpec): 
         // F/S = [DF_base(T)/DF_base(t_s)] / [DF_quote(T)/DF_quote(t_s)].
         const { base, quote } = fxPairOf(q.pair);
         const ccy = spec.currency.toUpperCase();
-        if (ccy !== base && ccy !== quote) throw new Error(`bootstrapCurve(${spec.id}): FxSwapPoints pair ${q.pair} does not contain ${spec.currency}`);
+        if (ccy !== base && ccy !== quote)
+          throw new PricingError("INVALID_CURVE_SPEC", `bootstrapCurve(${spec.id}): FxSwapPoints pair ${q.pair} does not contain ${spec.currency}`);
         const other = requireRef(q.otherDiscountCurveId, `discount curve of ${ccy === base ? quote : base}`);
         const fwd = q.fxSpot + q.points / (q.pipFactor ?? pairPipFactor(base, quote));
         const ratio = fwd / q.fxSpot; // = [DF_b(T)/DF_b(ts)] / [DF_q(T)/DF_q(ts)]
@@ -797,7 +799,7 @@ export function orderCurveSpecs(specs: CurveBuildSpec[]): CurveBuildSpec[] {
   const visit = (s: CurveBuildSpec, path: string[]) => {
     const st = state.get(s.id);
     if (st === "done") return;
-    if (st === "visiting") throw new Error(`Circular curve dependency: ${[...path, s.id].join(" -> ")}`);
+    if (st === "visiting") throw new PricingError("INVALID_CURVE_SPEC", `Circular curve dependency: ${[...path, s.id].join(" -> ")}`);
     state.set(s.id, "visiting");
     for (const d of curveDependencies(s)) {
       const ds = byId.get(d);
@@ -827,7 +829,8 @@ export function bootstrapCurves(
     const referenceCurves: Record<string, Curve> = {};
     for (const d of curveDependencies(s)) {
       const c = curves[d] ?? existing[d];
-      if (!c) throw new Error(`bootstrapCurves: curve "${d}" required by "${s.id}" is neither in the specs nor in the existing curves`);
+      if (!c)
+        throw new PricingError("INVALID_CURVE_SPEC", `bootstrapCurves: curve "${d}" required by "${s.id}" is neither in the specs nor in the existing curves`);
       referenceCurves[d] = c;
     }
     const res = bootstrapCurve(valuationDate, {

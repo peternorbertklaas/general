@@ -11,6 +11,7 @@ import { SAMPLE_CURVE_IDS, SAMPLE_QUOTES, buildSampleMarket } from "../market/sa
 import { bachelierGreeks, black76 } from "../models/black.js";
 import { garmanKohlhagen } from "../models/garman-kohlhagen.js";
 import { priceTrade } from "../pricing/price.js";
+import { CDS_PREMIUM_ACCRUAL_PER_YEAR, bootstrapHazardCurve, survivalProbability } from "../xva/cva.js";
 
 /**
  * Golden master: reference values derived independently of the engine (closed
@@ -392,6 +393,57 @@ describe("golden master – cap on the flat curve", () => {
       expectRel(cf.presentValue, e.presentValue, `caplet ${i} PV`);
     });
     expectRel(res.pv, g.expected.pv, "cap PV");
+  });
+});
+
+describe("golden master – CDS hazard bootstrap (ACT/360 premium on ACT/365F hazard time, midpoint accrual / protection, N5-5)", () => {
+  interface Pillar {
+    tenor: string;
+    spread: number;
+    time: number;
+    hazard: number;
+    survival: number;
+  }
+  interface G {
+    inputs: { valuationDate: string; recovery: number; discountRate: number; quotes: { tenor: string; spread: number }[] };
+    expected: { pillars: Pillar[]; flatUndiscounted: { tenor: string; spread: number; hazard: number; closedForm: number } };
+    quantlib: { status: string; version?: string; engine: string; pillars: Pillar[] };
+  }
+  const g = golden<G>("cds-hazard-bootstrap");
+  const val = parseISO(g.inputs.valuationDate);
+  const disc = flatCurve("D", "EUR", val, g.inputs.discountRate);
+  const curve = bootstrapHazardCurve(g.inputs.quotes, g.inputs.recovery, val, disc);
+
+  it("reproduces the independently bootstrapped hazards (1e-9) and survival probabilities (1e-10) at every pillar", () => {
+    expect(curve.times).toHaveLength(g.expected.pillars.length);
+    g.expected.pillars.forEach((p, i) => {
+      expectRel(curve.times[i]!, p.time, `${p.tenor} pillar time`, 1e-12);
+      expectRel(curve.hazards[i]!, p.hazard, `${p.tenor} hazard`, 1e-9);
+      expectRel(survivalProbability(curve, p.time), p.survival, `${p.tenor} survival`, 1e-10);
+    });
+  });
+
+  it("without discounting a flat 100 bp quote gives λ = s·(365/360)/(1 − R) up to the quarterly discretisation", () => {
+    const f = g.expected.flatUndiscounted;
+    const h = bootstrapHazardCurve([{ tenor: f.tenor, spread: f.spread }], g.inputs.recovery, val).hazards[0]!;
+    expectRel(h, f.hazard, "flat undiscounted hazard", 1e-9);
+    expectRel(h, f.closedForm, "flat hazard vs closed form", 1e-4);
+    expectRel(f.closedForm, (f.spread * CDS_PREMIUM_ACCRUAL_PER_YEAR) / (1 - g.inputs.recovery), "closed form", 1e-12);
+  });
+
+  it("QuantLib cross-check (N5-5): PiecewiseFlatHazardRate / SpreadCdsHelper (ISDA) survival within 3e-4 and hazards within 3e-3 relative; 1Y hazard 168.10 bp in QuantLib", () => {
+    expect(g.quantlib.status).toBe("done");
+    expect(g.quantlib.version ?? "1.43").toMatch(/^1\.\d+/);
+    expect(g.quantlib.engine).toContain("PiecewiseFlatHazardRate");
+    expect(g.quantlib.pillars).toHaveLength(g.expected.pillars.length);
+    g.quantlib.pillars.forEach((q, i) => {
+      expect(Math.abs(survivalProbability(curve, q.time) - q.survival)).toBeLessThan(3e-4);
+      expectRel(curve.hazards[i]!, q.hazard, `${q.tenor} hazard vs QuantLib`, 3e-3);
+    });
+    // The reviewer's reference number (100 bp / R 40 % / flat 2 %): QuantLib 168.10 bp; the engine lands within 0.3 %
+    // (the ACT/365F premium accrual of round 4 gave 166.67 bp, −0.85 %).
+    expectRel(g.quantlib.pillars[0]!.hazard, 0.01681, "QuantLib 1Y hazard", 1e-4);
+    expectRel(curve.hazards[0]!, 0.01681, "engine 1Y hazard vs QuantLib 168.10 bp", 3e-3);
   });
 });
 

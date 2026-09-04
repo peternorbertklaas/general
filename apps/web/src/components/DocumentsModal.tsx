@@ -29,8 +29,12 @@ import { NumInput } from "./NumInput.js";
 
 export type { DocKind };
 
-/** Internal rows hidden in customer documents: margins and the bilateral (CVA/DVA) view – the customer sees the risk-free value and the initial market value only (R4-10). */
-const INTERNAL_ROW = /marge|margin|ertrag der bank|bankmarge|deckungsbeitrag|interne|\bCVA\b|\bDVA\b|bilateral/i;
+/**
+ * Internal rows hidden in customer documents *and* in the customer-mode report
+ * view (R5-07): margins and the bilateral (CVA/DVA) view – the customer sees
+ * the risk-free value and the initial market value only (R4-10).
+ */
+export const INTERNAL_ROW = /marge|margin|ertrag der bank|bankmarge|deckungsbeitrag|interne|\bCVA\b|\bDVA\b|bilateral/i;
 const REQUIRED_ROW = /anfänglicher (negativer )?marktwert|initial market value|kosten|einstiegskosten/i;
 
 /** Marker line for documents generated under an active what-if (stress) market (R3-F1). */

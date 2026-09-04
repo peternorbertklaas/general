@@ -218,6 +218,20 @@ export interface QuickEntryOptions {
   fxSpots?: Record<string, number>;
   /** Currencies with a swaption vol cube in the market – a swaption in another currency is flagged in the preview (Markt R4-2). */
   swaptionVolCurrencies?: string[];
+  /** Currency pairs with an FX vol surface in the market – an option on another pair is flagged in the preview (Markt R5-2). */
+  fxVolPairs?: string[];
+}
+
+/** Whether the market has an FX vol surface for `pair` (direct or inverse quotation). */
+export function hasFxVolSurface(pair: string, pairs: string[] | undefined): boolean {
+  if (!pairs) return true;
+  const inv = `${pair.slice(3)}${pair.slice(0, 3)}`;
+  return pairs.includes(pair) || pairs.includes(inv);
+}
+
+/** Preview warning for an FX option on a pair without a vol surface (core fallback 8 %, IFRS-13 Level 3) – Markt R5-2. */
+export function fxVolWarning(pair: string, pairs: string[] | undefined): string {
+  return hasFxVolSurface(pair, pairs) ? "" : ` · ⚠ keine FX-Vol-Fläche für ${pair.slice(0, 3)}/${pair.slice(3)} (Fallback 8 %, Level 3)`;
 }
 
 export function parseQuickEntry(input: string, valuationDate: number, opts: QuickEntryOptions = {}): ParseResult {
@@ -592,7 +606,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       return {
         ok: true,
         trade,
-        description: `FX-Option ${pair} ${isCall ? "Call" : "Put"} @ ${fmtNum(strike, strike >= 20 ? 2 : 4)} · ${amtTok ?? "1m"} · Verfall ${dateLabel(dateTok)}`,
+        description: `FX-Option ${pair} ${isCall ? "Call" : "Put"} @ ${fmtNum(strike, strike >= 20 ? 2 : 4)} · ${amtTok ?? "1m"} · Verfall ${dateLabel(dateTok)}${fxVolWarning(pair, opts.fxVolPairs)}`,
       };
     }
   } catch (e) {

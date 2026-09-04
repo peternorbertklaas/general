@@ -1,7 +1,9 @@
+import { assertFxSurface } from "../market/vol-validation.js";
 import { linearInterp, monotoneCubicInterp } from "../math/interpolation.js";
 import { normCdf, normInv, normPdf } from "../math/normal.js";
 import { solveBracketed } from "../math/rootfind.js";
 import { black76 } from "./black.js";
+import { PricingError } from "../errors.js";
 
 /**
  * Delta convention of the smile quotes:
@@ -70,6 +72,7 @@ export interface SmilePoint {
 
 /** Raw smile pillars (delta, vol) for one expiry row – used by charting/diagnostics (BF read as quoted). */
 export function smileVols(s: FxVolSurface, expiryIdx: number) {
+  assertFxSurface(s);
   const atm = s.atm[expiryIdx]!;
   const rr25 = s.rr25[expiryIdx]!;
   const bf25 = s.bf25[expiryIdx]!;
@@ -95,7 +98,9 @@ function interpolateExpiry(expiries: number[], values: number[], t: number): num
   return linearInterp(expiries, values, t);
 }
 
+/** ATM vol at expiry `t` (linear in total variance, flat beyond the pillars); a malformed surface raises `PricingError("INVALID_VOL_SURFACE")` (Markt R5-1). */
 export function fxAtmVol(s: FxVolSurface, t: number): number {
+  assertFxSurface(s);
   if (s.expiries.length === 1) return s.atm[0]!;
   const vars = s.atm.map((v, i) => v * v * s.expiries[i]!);
   const tv = linearInterp(s.expiries, vars, t);
@@ -137,7 +142,7 @@ export function fxMoneynessFromDelta(delta: number, vol: number, t: number, conv
   const dfScale = conv === "Spot" || conv === "PremiumAdjustedSpot" ? dfForeign : 1;
   if (!isPremiumAdjusted(conv)) {
     const p = (sign * delta) / dfScale;
-    if (p <= 0 || p >= 1) throw new Error(`FX delta ${delta} out of range for ${conv} delta with dfForeign ${dfForeign}`);
+    if (p <= 0 || p >= 1) throw new PricingError("VOL_MODEL_INCOMPATIBLE", `FX delta ${delta} out of range for ${conv} delta with dfForeign ${dfForeign}`);
     const d1 = sign * normInv(p);
     return Math.exp(0.5 * sd * sd - d1 * sd);
   }
@@ -166,7 +171,7 @@ export function fxMoneynessFromDelta(delta: number, vol: number, t: number, conv
   }
   const d2Max = 0.5 * (dLo + dHi);
   const mMax = Math.exp(-d2Max * sd - 0.5 * sd * sd);
-  if (g(mMax) < target) throw new Error(`Premium-adjusted call delta ${delta} not attainable (max ${g(mMax) * dfScale})`);
+  if (g(mMax) < target) throw new PricingError("VOL_MODEL_INCOMPATIBLE", `Premium-adjusted call delta ${delta} not attainable (max ${g(mMax) * dfScale})`);
   let lo = mMax;
   let hi = mMax * Math.exp(10 * sd + 1);
   for (let i = 0; i < 200; i++) {
@@ -207,6 +212,7 @@ interface RowQuotes {
 }
 
 function rawRowQuotes(s: FxVolSurface, t: number): RowQuotes {
+  assertFxSurface(s);
   const row: RowQuotes = {
     atm: fxAtmVol(s, t),
     rr25: interpolateExpiry(s.expiries, s.rr25, t),

@@ -9,14 +9,19 @@ import { Term } from "./InfoTip.js";
 
 export { analyticsRows };
 
-/** Two-column analytics table; whitelisted rows first, unknown keys behind a collapsible "Weitere (technisch)" (N-01). */
-export function AnalyticsTable({ rows, testId }: { rows: AnalyticsRow[]; testId?: string }) {
+/**
+ * Two-column analytics table; whitelisted rows first, unknown keys behind a
+ * collapsible "Weitere (technisch)" (N-01). Key-value tables have no header
+ * row, so they carry an `aria-label` (R5-04); value cells repeat their text as
+ * `title` so a truncated cell in a narrow sidebar is still readable (R5-01).
+ */
+export function AnalyticsTable({ rows, testId, label = "Kennzahlen" }: { rows: AnalyticsRow[]; testId?: string; label?: string }) {
   const [techOpen, setTechOpen] = useState(false);
   const main = rows.filter((r) => !r.technical);
   const tech = rows.filter((r) => r.technical);
   return (
     <>
-      <table className="grid-table" data-testid={testId}>
+      <table className="grid-table kv" data-testid={testId} aria-label={label}>
         <tbody>
           {main.map((row) => (
             <tr key={row.k} style={{ cursor: "default" }}>
@@ -24,7 +29,9 @@ export function AnalyticsTable({ rows, testId }: { rows: AnalyticsRow[]; testId?
                 {row.label}
                 {row.unit && <span className="xs"> ({row.unit})</span>}
               </td>
-              <td className="num">{row.v}</td>
+              <td className="num" title={row.v}>
+                {row.v}
+              </td>
             </tr>
           ))}
           {main.length === 0 && (
@@ -42,7 +49,7 @@ export function AnalyticsTable({ rows, testId }: { rows: AnalyticsRow[]; testId?
             <span>{techOpen ? "▾" : "▸"}</span> Weitere (technisch) · {tech.length}
           </button>
           {techOpen && (
-            <table className="grid-table compact" style={{ marginTop: 4 }}>
+            <table className="grid-table compact kv" style={{ marginTop: 4 }} aria-label={`${label} – technische Kennzahlen`}>
               <tbody>
                 {tech.map((row) => (
                   <tr key={row.k} style={{ cursor: "default" }}>
@@ -147,7 +154,7 @@ export function Inspector() {
         </div>
       )}
       {rk && (vegaEntries.length > 0 || fxEntries.length > 0) && (
-        <table className="grid-table">
+        <table className="grid-table kv" aria-label="Sensitivitäten (Vega, FX-Delta)">
           <tbody>
             {vegaEntries.map(([k, v]) => (
               <tr key={`v-${k}`} style={{ cursor: "default" }}>
@@ -168,7 +175,7 @@ export function Inspector() {
           </tbody>
         </table>
       )}
-      {price.length > 0 && <AnalyticsTable rows={price} testId="inspector-analytics" />}
+      {price.length > 0 && <AnalyticsTable rows={price} testId="inspector-analytics" label="Kennzahlen" />}
       <label className="check muted xs">
         <input type="checkbox" checked={inCompare} onChange={() => useStore.getState().toggleCompare(trade.id)} /> im Vergleich (<kbd>Space</kbd>)
       </label>

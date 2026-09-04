@@ -1,5 +1,6 @@
 import { type SerialDate, parseISO, toISO } from "../dates/date.js";
 import { type DayCountConvention, yearFraction } from "../dates/daycount.js";
+import { PricingError } from "../errors.js";
 import {
   type InterpolationMethod,
   type MonotoneConvexCoefficients,
@@ -147,7 +148,7 @@ export class InterpolatedCurve implements Curve {
   private readonly jumpWindows: { t0: number; t1: number; shift: number }[];
 
   constructor(opts: InterpolatedCurveOptions) {
-    if (opts.nodes.length === 0) throw new Error("Curve needs at least one node");
+    if (opts.nodes.length === 0) throw new PricingError("INVALID_CURVE_SPEC", "Curve needs at least one node");
     const nodes = [...opts.nodes].sort((a, b) => a.date - b.date);
     this.id = opts.id;
     this.currency = opts.currency;

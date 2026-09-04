@@ -131,6 +131,17 @@ const TEXT_METRICS: Record<string, { label: string; values?: Record<string, stri
   mtmReset: { label: "MtM-Reset", values: { yes: "ja", no: "nein" } },
   volConverted: { label: "Vol-Quotierung umgerechnet (Normal ↔ Lognormal)", values: { yes: "ja", no: "nein" } },
   deliveryConvention: { label: "Lieferkonvention", values: { standard: "Standard (Spot-Lag)", "non-standard": "abweichend" } },
+  // core R5 (N5-2): FX option lifecycle – alive, expired (settlement pending), delivered
+  lifecycle: {
+    label: "Lebenszyklus",
+    values: {
+      alive: "laufend",
+      expired: "verfallen (Lieferung ausstehend)",
+      delivered: "geliefert",
+      "expires-today": "verfällt heute",
+      "settles-today": "wird heute geliefert",
+    },
+  },
 };
 
 /** Keys never shown as rows: duplicated elsewhere or purely internal model terms. */

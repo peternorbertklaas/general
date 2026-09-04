@@ -159,8 +159,10 @@ export function CurvesView() {
       fxFixings: st.fxFixings,
       baseMarket: st.baseMarket,
       valuationDate: st.valuationDate,
+      marketSource: st.marketSource,
     })),
   );
+  const imported = s.marketSource === "import";
   const [sel, setSel] = useState(0);
   const [compare, setCompare] = useState<string | null>("EUR-EURIBOR-6M");
   const set = QUOTE_SETS[sel]!;
@@ -232,8 +234,12 @@ export function CurvesView() {
     }
   }, [specs, s.valuationDate, set.curveId, s.baseMarket.curves, override, storedToy]);
 
+  const IMPORT_LOCK =
+    "Kurven stammen aus dem importierten Snapshot – Quotes, Interpolation und Turn-of-Year sind nicht verfügbar („Zum Sample-Markt“ in der Marktansicht)";
   const applyQuotes = (next: SampleMarketQuotes, label: string) => {
-    if (!useStore.getState().setQuotes(next, label)) useStore.getState().showToast("Bootstrap fehlgeschlagen – Quote nicht übernommen");
+    const st = useStore.getState();
+    if (st.marketSource === "import") st.showToast(IMPORT_LOCK);
+    else if (!st.setQuotes(next, label)) st.showToast("Bootstrap fehlgeschlagen – Quote nicht übernommen");
   };
   const updateQuote = (i: number, v: number) => {
     const next = JSON.parse(JSON.stringify(quotes)) as SampleMarketQuotes;
@@ -273,7 +279,8 @@ export function CurvesView() {
     const spec = specs?.[set.curveId];
     const isDefault = spec?.interpolation ? spec.interpolation === m : m === "logLinear";
     try {
-      if (!st.setInterpolation(set.curveId, isDefault ? undefined : m)) st.showToast("Bootstrap mit dieser Interpolation fehlgeschlagen");
+      if (!st.setInterpolation(set.curveId, isDefault ? undefined : m))
+        st.showToast(st.marketSource === "import" ? IMPORT_LOCK : "Bootstrap mit dieser Interpolation fehlgeschlagen");
     } catch (e) {
       st.showToast(`Bootstrap fehlgeschlagen: ${translatePricingError(e)}`);
     }
@@ -307,6 +314,23 @@ export function CurvesView() {
 
   return (
     <div className="stack">
+      {imported && (
+        <div className="warning row wrap" style={{ gap: 10 }} data-testid="curves-import-note">
+          <span>
+            Kurven aus importiertem Snapshot „{s.baseMarket.meta?.label ?? "Snapshot"}“ (Bewertungstag {fmtDate(s.valuationDate)}) – die Quote-Tabelle zeigt die
+            Sample-Quotes nur zur Information; Quotes, Interpolation und Turn-of-Year sind nicht editierbar.
+          </span>
+          <button
+            className="btn xs"
+            onClick={() => {
+              useStore.getState().leaveImport();
+              useStore.getState().showToast(`Sample-Markt aus den Quotes zum ${fmtDate(useStore.getState().valuationDate)} aufgebaut`);
+            }}
+          >
+            Zum Sample-Markt
+          </button>
+        </div>
+      )}
       <div className="row wrap toolbar">
         <div className="seg" role="group" aria-label="Kurve">
           {QUOTE_SETS.map((q, i) => (
@@ -426,10 +450,10 @@ export function CurvesView() {
               : ""}
           </span>
         )}
-        <button className="btn" onClick={() => bumpAll(10)}>
+        <button className="btn" onClick={() => bumpAll(10)} disabled={imported} title={imported ? IMPORT_LOCK : undefined}>
           Quotes +10 bp
         </button>
-        <button className="btn" onClick={() => bumpAll(-10)}>
+        <button className="btn" onClick={() => bumpAll(-10)} disabled={imported} title={imported ? IMPORT_LOCK : undefined}>
           Quotes −10 bp
         </button>
         <button

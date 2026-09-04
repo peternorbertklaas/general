@@ -126,7 +126,8 @@ describe("trade lifecycle semantics", () => {
     const t = (await app2.inject({ method: "GET", url: "/api/trades/IRS-0002" })).json().trade;
     const created = await app2.inject({ method: "POST", url: "/api/trades", payload: { ...t, id: "NEW-1" } });
     expect(created.statusCode).toBe(201);
-    expect(created.headers.etag).toMatch(/^W\//);
+    // Strong ETag `"version-hash"` (N5-03) – a weak `W/` validator could never satisfy If-Match under RFC 9110.
+    expect(created.headers.etag).toMatch(/^"1-[0-9a-f]{16}"$/);
     const dup = await app2.inject({ method: "POST", url: "/api/trades", payload: { ...t, id: "NEW-1" } });
     expect(dup.statusCode).toBe(409);
     const stale = await app2.inject({ method: "PUT", url: "/api/trades/NEW-1", headers: { "if-match": 'W/"999-deadbeef"' }, payload: { ...t, id: "NEW-1" } });

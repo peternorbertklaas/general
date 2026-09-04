@@ -2,9 +2,13 @@
  * Domain error codes of the pricing core. The API maps a `PricingError` to its
  * error envelope `{ error, code, statusCode, requestId, details? }` – 422 for
  * domain errors raised while pricing, 400 for client-input codes
- * (`INVALID_DATE`, `INVALID_TENOR`, `INVALID_TIMESTAMP` on import, `TOO_MANY_PERIODS`).
+ * (`INVALID_DATE`, `INVALID_TENOR`, `INVALID_TIMESTAMP` and `INVALID_VOL_SURFACE` on
+ * import, `TOO_MANY_PERIODS`).
  * Programming errors (TypeError, RangeError) are deliberately not wrapped so
- * they are reported as an invalid request without leaking internals.
+ * they are reported as an invalid request without leaking internals. Every
+ * error the core raises on purpose is a `PricingError` (no plain `Error`
+ * outside tests since round 5, N5-07), so the API's generic domain-error
+ * fallback is unreachable from the core.
  */
 export type PricingErrorCode =
   | "INVALID_TRADE"
@@ -32,7 +36,38 @@ export type PricingErrorCode =
   /** A date string is not `YYYY-MM-DD` or names a day that does not exist (`2027-02-30`); raised by `parseISO` (N4-03). */
   | "INVALID_DATE"
   /** A tenor string is not `<n><D|W|M|Y>` (or ON/TN/SN); raised by `parseTenor` (N4-03). */
-  | "INVALID_TENOR";
+  | "INVALID_TENOR"
+  /**
+   * A volatility surface is structurally unusable (grid dimensions do not match
+   * the axes, non-finite / negative vols, unsorted or duplicate expiries,
+   * unknown `volType`) – raised by `deserializeMarket` on import (with
+   * `details.key` and `details.problems` from `validateVolSurfaces`) and by the
+   * surface lookups at pricing time instead of a `TypeError` (Markt R5-1).
+   */
+  | "INVALID_VOL_SURFACE"
+  /**
+   * A curve build specification is unusable (malformed FX pair in an
+   * `FxSwapPoints` quote, missing reference curve, circular dependency, curve
+   * without nodes); raised by the bootstrapper / `InterpolatedCurve` (N5-07).
+   */
+  | "INVALID_CURVE_SPEC"
+  /**
+   * A numerical routine did not converge or could not bracket its root
+   * (`brent`, `solveBracketed`, implied vol below intrinsic); raised instead of
+   * a plain `Error` so the API can classify it (N5-07).
+   */
+  | "NUMERICAL_FAILURE"
+  /**
+   * A hedge relationship is structurally inconsistent (FX pair without the
+   * hedged currency, non-positive hedge ratio, amortisation without schedule /
+   * loan rate, hedged cash flow in the past); raised by the hedge module (N5-07).
+   */
+  | "INVALID_HEDGE_RELATIONSHIP"
+  /**
+   * A market snapshot is structurally unusable (unsupported `schema`, malformed
+   * `fxFixings` entry); raised by `deserializeMarket` (N5-07).
+   */
+  | "INVALID_SNAPSHOT";
 
 /** Domain error of the pricing core with a stable machine-readable `code`. */
 export class PricingError extends Error {

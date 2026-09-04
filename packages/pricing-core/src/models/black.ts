@@ -1,5 +1,6 @@
 import { normCdf, normPdf } from "../math/normal.js";
 import { solveBracketed } from "../math/rootfind.js";
+import { PricingError } from "../errors.js";
 
 export type OptionType = "Call" | "Put";
 
@@ -80,7 +81,7 @@ export function bachelierGreeks(type: OptionType, forward: number, strike: numbe
 export function impliedBlackVol(type: OptionType, forward: number, strike: number, timeToExpiry: number, premium: number, guess = 0.2): number {
   const sign = type === "Call" ? 1 : -1;
   const intrinsic = Math.max(sign * (forward - strike), 0);
-  if (premium < intrinsic - 1e-14) throw new Error("impliedBlackVol: premium below intrinsic value");
+  if (premium < intrinsic - 1e-14) throw new PricingError("NUMERICAL_FAILURE", "impliedBlackVol: premium below intrinsic value");
   return solveBracketed((v) => black76(type, forward, strike, v, timeToExpiry) - premium, guess, 0.1, {
     minX: 1e-8,
     maxX: 20,
@@ -92,7 +93,7 @@ export function impliedBlackVol(type: OptionType, forward: number, strike: numbe
 export function impliedNormalVol(type: OptionType, forward: number, strike: number, timeToExpiry: number, premium: number, guess = 0.006): number {
   const sign = type === "Call" ? 1 : -1;
   const intrinsic = Math.max(sign * (forward - strike), 0);
-  if (premium < intrinsic - 1e-14) throw new Error("impliedNormalVol: premium below intrinsic value");
+  if (premium < intrinsic - 1e-14) throw new PricingError("NUMERICAL_FAILURE", "impliedNormalVol: premium below intrinsic value");
   return solveBracketed((v) => bachelier(type, forward, strike, v, timeToExpiry) - premium, guess, 0.005, { minX: 1e-10, maxX: 5, tolerance: 1e-14 });
 }
 
@@ -116,7 +117,7 @@ export function lognormalToNormalVol(forward: number, strike: number, timeToExpi
 export function normalToLognormalVol(forward: number, strike: number, timeToExpiry: number, normalVol: number, shift = 0): number {
   const f = forward + shift;
   const k = strike + shift;
-  if (!(f > 0) || !(k > 0)) throw new Error(`normalToLognormalVol: shifted forward/strike must be positive (F ${f}, K ${k})`);
+  if (!(f > 0) || !(k > 0)) throw new PricingError("VOL_MODEL_INCOMPATIBLE", `normalToLognormalVol: shifted forward/strike must be positive (F ${f}, K ${k})`);
   const p = bachelier("Call", forward, strike, normalVol, timeToExpiry);
   const guess = normalVol / f;
   return impliedBlackVol("Call", f, k, timeToExpiry, p, Math.min(Math.max(guess, 1e-4), 5));
@@ -137,7 +138,10 @@ export type IrVolQuotation = { kind: "normal" } | { kind: "lognormal"; shift: nu
 export function convertIrVol(vol: number, from: IrVolQuotation, to: IrVolQuotation, forward: number, strike: number, timeToExpiry: number): number {
   if (from.kind === to.kind && (from.kind === "normal" || (to.kind === "lognormal" && from.shift === to.shift))) return vol;
   if (to.kind === "lognormal" && (!(forward + to.shift > 0) || !(strike + to.shift > 0))) {
-    throw new Error(`convertIrVol: lognormal quotation needs positive shifted forward/strike (F ${forward + to.shift}, K ${strike + to.shift})`);
+    throw new PricingError(
+      "VOL_MODEL_INCOMPATIBLE",
+      `convertIrVol: lognormal quotation needs positive shifted forward/strike (F ${forward + to.shift}, K ${strike + to.shift})`,
+    );
   }
   if (!(timeToExpiry > 0) || !(vol > 0)) {
     // No time value → any vol reproduces the intrinsic value; return the first-order equivalent.
