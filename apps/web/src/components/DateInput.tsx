@@ -16,6 +16,8 @@ export interface DateInputProps {
   base?: number;
   testId?: string;
   disabled?: boolean;
+  /** `-1` for inputs inside a roving-tabindex table row (the row is the tab stop, Enter/F2 focus the input – R7-01). */
+  tabIndex?: number;
 }
 
 /**
@@ -28,7 +30,7 @@ export interface DateInputProps {
  * R3-02) that keeps the edit session open: opening it never commits the typed
  * draft, `Esc` closes it and a second `Esc` discards the draft (R4-04).
  */
-export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, testId, disabled }: DateInputProps) {
+export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, testId, disabled, tabIndex }: DateInputProps) {
   const valuationDate = useStore((s) => s.valuationDate);
   const label = useFieldLabel(ariaLabel);
   const ref = useRef<HTMLInputElement>(null);
@@ -121,6 +123,7 @@ export function DateInput({ value, onChange, invalid, ariaLabel, inline, base, t
         aria-controls={open ? listId : undefined}
         data-testid={testId}
         disabled={disabled}
+        tabIndex={tabIndex}
         placeholder="tt.mm.jjjj · 10y · +6m"
         title="Datum (tt.mm.jjjj, ISO), Tenor ab Bewertungstag (10y, 6m) oder relativ (+6m, -1y); ↑/↓ Tag, ⇧ Monat, ⌥ Jahr; Alt+↓ Vorlagen (Esc schließt, zweites Esc verwirft)"
         onFocus={() => {

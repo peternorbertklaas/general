@@ -6,6 +6,7 @@ import {
   type FxFixing,
   type FxVolSurface,
   type SwaptionVolSurface,
+  knownIndices,
   marketSnapshotId,
   serializeMarket,
   survivalProbability,
@@ -15,10 +16,14 @@ import {
 } from "@deriva/pricing-core";
 import { DateInput } from "../components/DateInput.js";
 import { NumInput } from "../components/NumInput.js";
+import { useGridNav } from "../hooks/useGridNav.js";
+import { useTableNav } from "../hooks/useTableNav.js";
 import { CDS_TENORS, hazardCurveResult, normaliseCdsQuotes, tenorYears } from "../lib/credit.js";
+import { focusWhenPresent } from "../lib/focus.js";
 import { fmtBp, fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { translateCoreMessage } from "../lib/i18n.js";
 import { downloadText } from "../lib/portfolio-io.js";
+import { defaultIndexFor } from "../lib/register.js";
 import { readSnapshotJson, snapshotErrorText } from "../lib/snapshot-import.js";
 import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sampleVolSurfaces, useStore } from "../state/store.js";
 
@@ -26,21 +31,65 @@ import { type CdsQuote, type VolKind, DEFAULT_REPORT_INPUTS, marketModified, sam
  * Apply an edited vol surface: structural problems (dimensions, finite vols,
  * sorted expiries – core `validateVolSurfaces`, R5-1) are reported in German
  * before the market is touched; a failed valuation is reported as well.
+ * Returns whether the surface was applied.
  */
-function applyVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface, label: string): void {
+function applyVolSurface(kind: VolKind, id: string, surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface, label: string): boolean {
   const act = useStore.getState;
   const problems = validateVolSurfaces({ [kind]: { [id]: surface } });
   if (problems.length) {
     act().showToast(`Vol nicht übernommen – ${translateCoreMessage(problems[0])}`);
-    return;
+    return false;
   }
   if (!act().setVolSurface(kind, id, surface, label)) {
     act().showToast("Vol nicht übernommen (Bewertung fehlgeschlagen)");
-    return;
+    return false;
   }
   // Plausibility (Markt R6-4): the edit is applied, but a surface that no longer fits its quotation type is flagged.
   const hints = volSurfaceWarnings({ [kind]: { [id]: surface } });
   if (hints.length) act().showToast(`Hinweis: ${translateCoreMessage(hints[0])}`, { ms: 8000 });
+  return true;
+}
+
+/**
+ * Roving-tabindex helpers shared by the editable row tables of this view
+ * (fixings, FX fixings, CDS quotes – R7-01): the row is the tab stop, `↵`/`F2`
+ * focus the first control of the row, `Esc` inside a control returns to the row.
+ */
+function useRowNav() {
+  const nav = useTableNav({ onEnter: (_i, tr) => tr.querySelector<HTMLElement>("input, select, button")?.focus() });
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
+    const target = e.target as HTMLElement;
+    if (e.key === "F2" && target.tagName === "TR") {
+      e.preventDefault();
+      target.querySelector<HTMLElement>("input, select, button")?.focus();
+      return;
+    }
+    nav.onKeyDown(e);
+  };
+  /** Capture phase: the control's own Esc handler (NumInput / DateInput restore the value) runs afterwards. */
+  const onKeyDownCapture = (e: React.KeyboardEvent<HTMLTableSectionElement>) => {
+    const target = e.target as HTMLElement;
+    if (e.key !== "Escape" || target.tagName === "TR") return;
+    const tr = target.closest("tr");
+    window.setTimeout(() => tr?.focus(), 0);
+  };
+  return { tbodyProps: { onKeyDown, onKeyDownCapture, onFocus: nav.onFocus }, rowProps: nav.rowProps };
+}
+
+/** Removal / reset button of a vol-surface card: a surface the sample market does not carry is *removed* (R7-2), a sample surface reset. */
+function VolCardReset({ kind, id, isNew, testId }: { kind: VolKind; id: string; isNew: boolean; testId: string }) {
+  const act = useStore.getState;
+  const what = kind === "swaptionVols" ? "Swaption-Vols" : kind === "capletVols" ? "Caplet-Vols" : "FX-Vols";
+  return (
+    <button
+      className="btn ghost xs"
+      onClick={() => act().setVolSurface(kind, id, undefined, isNew ? `${what} ${id} entfernt` : `${what} ${id} zurückgesetzt`)}
+      data-testid={testId}
+      title={isNew ? "Angelegte Fläche entfernen (rückgängig über Ctrl+Z)" : "Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"}
+    >
+      {isNew ? "Entfernen" : "Zurücksetzen"}
+    </button>
+  );
 }
 
 /** Expiry in years → "1M" / "3M" / "2Y" (also weeks for FX). */
@@ -52,13 +101,23 @@ export function expiryLabel(e: number): string {
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
-/** Editable swaption ATM cube (Normal vol in bp) – cell edits are undoable and mark the market as modified (R3-4). */
+/** Hint line under every vol grid: one tab stop, arrow keys between cells, Enter / F2 edit (R7-01). */
+function GridKeysHint() {
+  return (
+    <div className="muted xs" style={{ marginTop: 4 }}>
+      <kbd>←</kbd>/<kbd>→</kbd>/<kbd>↑</kbd>/<kbd>↓</kbd> Zelle · <kbd>↵</kbd> oder <kbd>F2</kbd> Wert bearbeiten · <kbd>Esc</kbd> zurück zur Zelle ·{" "}
+      <kbd>Tab</kbd> verlässt das Gitter.
+    </div>
+  );
+}
+
+/** Editable swaption ATM cube (Normal vol in bp) – cell edits are undoable and mark the market as modified (R3-4); one tab stop (R7-01). */
 function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurface }) {
-  const act = useStore.getState;
   const sample = sampleVolSurfaces().swaptionVols[id];
   const edited = !same(surface, sample);
   const volMin = Math.min(...surface.atm.flat());
   const volMax = Math.max(...surface.atm.flat());
+  const grid = useGridNav();
   const setCell = (i: number, j: number, v: number) => {
     const next: SwaptionVolSurface = { ...surface, atm: surface.atm.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
     const label = `Swaption-Vol ${id} ${expiryLabel(surface.expiries[i]!)}×${surface.tenors[j]}Y ${fmtNum(surface.atm[i]![j]! * 1e4, 1)} → ${fmtNum(v * 1e4, 1)} bp`;
@@ -73,16 +132,9 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
           {edited && (
             <>
               <span className="badge warn" data-testid="swaption-vol-edited">
-                geändert
+                {sample ? "geändert" : "angelegt"}
               </span>
-              <button
-                className="btn ghost xs"
-                onClick={() => act().setVolSurface("swaptionVols", id, undefined, `Swaption-Vols ${id} zurückgesetzt`)}
-                data-testid="swaption-vol-reset"
-                title="Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"
-              >
-                Zurücksetzen
-              </button>
+              <VolCardReset kind="swaptionVols" id={id} isNew={!sample} testId="swaption-vol-reset" />
             </>
           )}
         </span>
@@ -90,10 +142,11 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
       <div
         className="heat editable"
         style={{ gridTemplateColumns: `70px repeat(${surface.tenors.length}, 1fr)` }}
-        role="table"
+        {...grid.gridProps}
         aria-label={`Swaption-ATM-Vols ${id}`}
         aria-rowcount={surface.expiries.length + 1}
         aria-colcount={surface.tenors.length + 1}
+        data-testid="swaption-vol-grid"
       >
         <div role="row" style={{ display: "contents" }}>
           <div className="head" role="columnheader" aria-label="Expiry ↓ / Tenor →" />
@@ -112,7 +165,13 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
               const a = (v - volMin) / (volMax - volMin || 1);
               const cellEdited = sample ? sample.atm[i]?.[j] !== v : true;
               return (
-                <div key={j} className={`cell ${cellEdited ? "edited" : ""}`} role="cell" style={{ background: heatBg("--accent", a) }}>
+                <div
+                  key={j}
+                  className={`cell ${cellEdited ? "edited" : ""}`}
+                  {...grid.cellProps(i, j)}
+                  aria-label={`${expiryLabel(e)} × ${surface.tenors[j]}Y`}
+                  style={{ background: heatBg("--accent", a) }}
+                >
                   <NumInput
                     inline
                     value={v}
@@ -120,6 +179,7 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
                     step={1}
                     digits={1}
                     min={0.0001}
+                    tabIndex={-1}
                     ariaLabel={`Swaption-Vol ${expiryLabel(e)} × ${surface.tenors[j]}Y`}
                     testId={i === 0 && j === 0 ? "swaption-vol-cell" : undefined}
                     onChange={(x) => setCell(i, j, x)}
@@ -130,15 +190,16 @@ function SwaptionVolCard({ id, surface }: { id: string; surface: SwaptionVolSurf
           </div>
         ))}
       </div>
+      <GridKeysHint />
     </div>
   );
 }
 
 /** Editable FX smile (ATM / RR / BF per expiry, in %). */
 function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVolSurface; keys: string[]; onSelect: (k: string) => void }) {
-  const act = useStore.getState;
   const sample = sampleVolSurfaces().fxVols[id];
   const edited = !same(surface, sample);
+  const grid = useGridNav();
   type Row = "atm" | "rr25" | "bf25" | "rr10" | "bf10";
   const ROWS: { k: Row; label: string }[] = [
     { k: "atm", label: "ATM" },
@@ -162,16 +223,9 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
           {edited && (
             <>
               <span className="badge warn" data-testid="fx-vol-edited">
-                geändert
+                {sample ? "geändert" : "angelegt"}
               </span>
-              <button
-                className="btn ghost xs"
-                onClick={() => act().setVolSurface("fxVols", id, undefined, `FX-Vols ${id} zurückgesetzt`)}
-                data-testid="fx-vol-reset"
-                title="Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"
-              >
-                Zurücksetzen
-              </button>
+              <VolCardReset kind="fxVols" id={id} isNew={!sample} testId="fx-vol-reset" />
             </>
           )}
         </span>
@@ -185,9 +239,9 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
         ))}
       </div>
       <div className="table-scroll">
-        <table className="grid-table compact">
+        <table className="grid-table compact" {...grid.gridProps} aria-label={`FX-Vol-Fläche ${id.slice(0, 3)}/${id.slice(3)}`} data-testid="fx-vol-grid">
           <thead>
-            <tr>
+            <tr role="row">
               <th>Expiry</th>
               {ROWS.filter((r) => surface[r.k]).map((r) => (
                 <th key={r.k} className="num">
@@ -198,13 +252,18 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
           </thead>
           <tbody>
             {surface.expiries.map((e, i) => (
-              <tr key={e} style={{ cursor: "default" }}>
+              <tr key={e} role="row" style={{ cursor: "default" }}>
                 <td className="mono">{expiryLabel(e)}</td>
-                {ROWS.filter((r) => surface[r.k]).map((r) => {
+                {ROWS.filter((r) => surface[r.k]).map((r, c) => {
                   const v = surface[r.k]![i]!;
                   const cellEdited = sample ? sample[r.k]?.[i] !== v : true;
                   return (
-                    <td key={r.k} className={`num vol-cell ${cellEdited ? "edited" : ""}`}>
+                    <td
+                      key={r.k}
+                      className={`num vol-cell ${cellEdited ? "edited" : ""}`}
+                      {...grid.cellProps(i, c)}
+                      aria-label={`${expiryLabel(e)} ${r.label}`}
+                    >
                       <span style={{ display: "inline-block", width: 84 }}>
                         <NumInput
                           inline
@@ -213,6 +272,7 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
                           step={0.1}
                           digits={2}
                           unit="%"
+                          tabIndex={-1}
                           ariaLabel={`FX-Vol ${expiryLabel(e)} ${r.label}`}
                           testId={i === 0 && r.k === "atm" ? "fx-vol-cell" : undefined}
                           onChange={(x) => setCell(r.k, i, x)}
@@ -226,15 +286,16 @@ function FxVolCard({ id, surface, keys, onSelect }: { id: string; surface: FxVol
           </tbody>
         </table>
       </div>
+      <GridKeysHint />
     </div>
   );
 }
 
 /** Editable caplet surface (Normal vol in bp, expiry × strike). */
 function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface }) {
-  const act = useStore.getState;
   const sample = sampleVolSurfaces().capletVols[id];
   const edited = !same(surface, sample);
+  const grid = useGridNav();
   const setCell = (i: number, j: number, v: number) => {
     const next: CapletVolSurface = { ...surface, vols: surface.vols.map((row, r) => (r === i ? row.map((x, c) => (c === j ? v : x)) : row)) };
     const label = `Caplet-Vol ${id} ${expiryLabel(surface.expiries[i]!)} @ ${fmtNum(surface.strikes[j]! * 100, 2)} % ${fmtNum(surface.vols[i]![j]! * 1e4, 0)} → ${fmtNum(v * 1e4, 0)} bp`;
@@ -249,23 +310,22 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
           {edited && (
             <>
               <span className="badge warn" data-testid="caplet-vol-edited">
-                geändert
+                {sample ? "geändert" : "angelegt"}
               </span>
-              <button
-                className="btn ghost xs"
-                onClick={() => act().setVolSurface("capletVols", id, undefined, `Caplet-Vols ${id} zurückgesetzt`)}
-                data-testid="caplet-vol-reset"
-                title="Fläche auf den Sample-Markt zurücksetzen (rückgängig über Ctrl+Z)"
-              >
-                Zurücksetzen
-              </button>
+              <VolCardReset kind="capletVols" id={id} isNew={!sample} testId="caplet-vol-reset" />
             </>
           )}
         </span>
       </h3>
       <div className="table-scroll" style={{ maxHeight: 320 }}>
         {/* Fixed layout: every strike column gets the same width and the input is bound to its cell (R4-01). */}
-        <table className="grid-table compact vol-grid" data-testid="caplet-vol-table" style={{ minWidth: 70 + surface.strikes.length * 62 }}>
+        <table
+          className="grid-table compact vol-grid"
+          data-testid="caplet-vol-table"
+          style={{ minWidth: 70 + surface.strikes.length * 62 }}
+          {...grid.gridProps}
+          aria-label={`Caplet-Vols ${surface.index}`}
+        >
           <colgroup>
             <col style={{ width: 70 }} />
             {surface.strikes.map((k) => (
@@ -273,7 +333,7 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
             ))}
           </colgroup>
           <thead>
-            <tr>
+            <tr role="row">
               <th>Expiry</th>
               {surface.strikes.map((k) => (
                 <th key={k} className="num">
@@ -284,12 +344,17 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
           </thead>
           <tbody>
             {surface.expiries.map((e, i) => (
-              <tr key={e} style={{ cursor: "default" }}>
+              <tr key={e} role="row" style={{ cursor: "default" }}>
                 <td className="mono">{expiryLabel(e)}</td>
                 {surface.vols[i]!.map((v, j) => {
                   const cellEdited = sample ? sample.vols[i]?.[j] !== v : true;
                   return (
-                    <td key={j} className={`num vol-cell ${cellEdited ? "edited" : ""}`}>
+                    <td
+                      key={j}
+                      className={`num vol-cell ${cellEdited ? "edited" : ""}`}
+                      {...grid.cellProps(i, j)}
+                      aria-label={`${expiryLabel(e)} Strike ${fmtNum(surface.strikes[j]! * 100, 2)} %`}
+                    >
                       <NumInput
                         inline
                         width="100%"
@@ -298,6 +363,7 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
                         step={1}
                         digits={0}
                         min={0.0001}
+                        tabIndex={-1}
                         ariaLabel={`Caplet-Vol ${expiryLabel(e)} Strike ${fmtNum(surface.strikes[j]! * 100, 2)} %`}
                         testId={i === 0 && j === 0 ? "caplet-vol-cell" : undefined}
                         onChange={(x) => setCell(i, j, x)}
@@ -310,11 +376,419 @@ function CapletVolCard({ id, surface }: { id: string; surface: CapletVolSurface 
           </tbody>
         </table>
       </div>
+      <GridKeysHint />
     </div>
   );
 }
 
-const FIXING_INDICES = ["EURIBOR-1M", "EURIBOR-3M", "EURIBOR-6M", "EURIBOR-12M", "ESTR", "SOFR", "SONIA", "SARON", "TONA"];
+type SurfaceKind = "swaption" | "caplet" | "fx";
+
+/** Flat grid `rows × cols` of `v`. */
+const flatGrid = (rows: number, cols: number, v: number): number[][] => Array.from({ length: rows }, () => Array.from({ length: cols }, () => v));
+
+/**
+ * Build a new vol surface for a currency / pair the market has none for (R7-2 /
+ * Markt R7-2): axes from a template surface of the market, values either flat
+ * (ATM vol, smile 0) or copied from the template. Pure – used by the form and
+ * by tests.
+ */
+export function buildVolSurface(
+  kind: SurfaceKind,
+  target: { currency?: string; index?: string; pair?: string },
+  template: SwaptionVolSurface | CapletVolSurface | FxVolSurface,
+  flatVol: number,
+  copyValues: boolean,
+): { kind: VolKind; id: string; surface: SwaptionVolSurface | CapletVolSurface | FxVolSurface } {
+  if (kind === "swaption") {
+    const tpl = template as SwaptionVolSurface;
+    const ccy = target.currency!;
+    return {
+      kind: "swaptionVols",
+      id: ccy,
+      surface: {
+        id: `${ccy}-SWAPTION-${tpl.volType.toUpperCase()}`,
+        currency: ccy,
+        volType: tpl.volType,
+        ...(tpl.shift !== undefined ? { shift: tpl.shift } : {}),
+        expiries: [...tpl.expiries],
+        tenors: [...tpl.tenors],
+        atm: copyValues ? tpl.atm.map((r) => [...r]) : flatGrid(tpl.expiries.length, tpl.tenors.length, flatVol),
+      },
+    };
+  }
+  if (kind === "caplet") {
+    const tpl = template as CapletVolSurface;
+    const ccy = target.currency!;
+    const index = target.index!;
+    const id = `${ccy}-${index}`;
+    return {
+      kind: "capletVols",
+      id,
+      surface: {
+        id,
+        currency: ccy,
+        index,
+        volType: tpl.volType,
+        ...(tpl.shift !== undefined ? { shift: tpl.shift } : {}),
+        expiries: [...tpl.expiries],
+        strikes: [...tpl.strikes],
+        vols: copyValues ? tpl.vols.map((r) => [...r]) : flatGrid(tpl.expiries.length, tpl.strikes.length, flatVol),
+      },
+    };
+  }
+  const tpl = template as FxVolSurface;
+  const pair = target.pair!;
+  const n = tpl.expiries.length;
+  const zeros = () => Array.from({ length: n }, () => 0);
+  return {
+    kind: "fxVols",
+    id: pair,
+    surface: {
+      id: pair,
+      pair,
+      expiries: [...tpl.expiries],
+      atm: copyValues ? [...tpl.atm] : Array.from({ length: n }, () => flatVol),
+      rr25: copyValues ? [...tpl.rr25] : zeros(),
+      bf25: copyValues ? [...tpl.bf25] : zeros(),
+      ...(tpl.rr10 && tpl.bf10 ? { rr10: copyValues ? [...tpl.rr10] : zeros(), bf10: copyValues ? [...tpl.bf10] : zeros() } : {}),
+      ...(tpl.atmConvention ? { atmConvention: tpl.atmConvention } : {}),
+      ...(tpl.deltaConvention ? { deltaConvention: tpl.deltaConvention } : {}),
+      ...(tpl.smileInterpolation ? { smileInterpolation: tpl.smileInterpolation } : {}),
+      ...(tpl.strangleType ? { strangleType: tpl.strangleType } : {}),
+    },
+  };
+}
+
+/**
+ * "+ Fläche" (R7-2 / Markt R7-2): a vol surface for a currency with a curve but
+ * no swaption cube / caplet surface, or for a spot pair without an FX smile.
+ * Axes come from an existing surface, values flat or copied; the result goes
+ * through `validateVolSurfaces` / `volSurfaceWarnings` like every vol edit and
+ * is an undoable, persisted override – so a NOK cap or an EUR/NOK option no
+ * longer falls back to the core's Level-3 vol.
+ */
+function AddVolSurfaceForm({ onDone }: { onDone: (kind?: VolKind, id?: string) => void }) {
+  const m = useStore((s) => s.baseMarket);
+  const swaptionKeys = Object.keys(m.swaptionVols ?? {});
+  const capletKeys = Object.keys(m.capletVols ?? {});
+  const fxKeys = Object.keys(m.fxVols ?? {});
+  const hasFx = (pair: string) => fxKeys.includes(pair) || fxKeys.includes(`${pair.slice(3)}${pair.slice(0, 3)}`);
+  const curveCcys = Object.keys(m.discountCurveId);
+  const swaptionCcys = curveCcys.filter((c) => !swaptionKeys.includes(c));
+  // Caplet: currencies with an index (with curve) that has no surface yet – those without any caplet surface first (the new-currency case).
+  const capletCcys = curveCcys
+    .filter((c) => knownIndices(c).some((i) => i.curveId in m.curves && !capletKeys.includes(`${c}-${i.name}`)))
+    .sort((a, b) => Number(capletKeys.some((k) => k.startsWith(`${a}-`))) - Number(capletKeys.some((k) => k.startsWith(`${b}-`))));
+  const fxPairs = Object.keys(m.fxSpots).filter((p) => /^[A-Z]{6}$/.test(p) && !hasFx(p));
+  const [kind, setKind] = useState<SurfaceKind>(swaptionCcys.length ? "swaption" : fxPairs.length ? "fx" : "caplet");
+  const [ccyState, setCcy] = useState("");
+  const [indexState, setIndex] = useState("");
+  const [pairState, setPair] = useState("");
+  const [templateState, setTemplate] = useState("");
+  const [copyValues, setCopyValues] = useState(false);
+  const [flatBp, setFlatBp] = useState(0.006); // 60 bp normal vol (the core's fallback for caps / 70 bp for swaptions)
+  const [flatPct, setFlatPct] = useState(0.08); // 8 % (the core's FX fallback)
+  const ccys = kind === "swaption" ? swaptionCcys : capletCcys;
+  const ccy = ccys.includes(ccyState) ? ccyState : (ccys[0] ?? "");
+  const indices = kind === "caplet" && ccy ? knownIndices(ccy).filter((i) => i.curveId in m.curves && !capletKeys.includes(`${ccy}-${i.name}`)) : [];
+  const index = indices.some((i) => i.name === indexState)
+    ? indexState
+    : (indices.find((i) => i.name === defaultIndexFor(ccy, Object.keys(m.curves)))?.name ?? indices[0]?.name ?? "");
+  const pair = fxPairs.includes(pairState) ? pairState : (fxPairs[0] ?? "");
+  const templateKeys = kind === "swaption" ? swaptionKeys : kind === "caplet" ? capletKeys : fxKeys;
+  const templateKey = templateKeys.includes(templateState) ? templateState : (templateKeys.find((k) => k.startsWith("EUR")) ?? templateKeys[0] ?? "");
+  const template = kind === "swaption" ? m.swaptionVols?.[templateKey] : kind === "caplet" ? m.capletVols?.[templateKey] : m.fxVols?.[templateKey];
+  const targetOk = kind === "swaption" ? !!ccy : kind === "caplet" ? !!ccy && !!index : !!pair;
+  const built = useMemo(() => {
+    if (!template || !targetOk) return undefined;
+    try {
+      return buildVolSurface(kind, { currency: ccy, index, pair }, template, kind === "fx" ? flatPct : flatBp, copyValues);
+    } catch {
+      return undefined;
+    }
+  }, [kind, ccy, index, pair, template, flatBp, flatPct, copyValues, targetOk]);
+  const problem = !template
+    ? "Keine Vorlagenfläche im Markt – zuerst einen Snapshot mit Vol-Flächen importieren"
+    : !targetOk
+      ? kind === "fx"
+        ? "Alle Spot-Paare haben eine FX-Vol-Fläche – ein neues Paar zuerst unter FX-Spots mit „+ Paar“ anlegen"
+        : "Alle Währungen mit Kurve haben bereits eine Fläche – eine weitere Währung zuerst mit „+ Kurve“ anlegen"
+      : built
+        ? (() => {
+            const problems = validateVolSurfaces({ [built.kind]: { [built.id]: built.surface } });
+            return problems.length ? translateCoreMessage(problems[0]) : undefined;
+          })()
+        : "Fläche konnte nicht gebaut werden";
+  const hints = useMemo(
+    () => (built && !problem ? volSurfaceWarnings({ [built.kind]: { [built.id]: built.surface } }).map(translateCoreMessage) : []),
+    [built, problem],
+  );
+  const submit = () => {
+    if (!built || problem) return;
+    const what =
+      built.kind === "swaptionVols"
+        ? `Swaption-Cube ${built.id}`
+        : built.kind === "capletVols"
+          ? `Caplet-Fläche ${built.id}`
+          : `FX-Vol-Fläche ${pairLabel(built.id)}`;
+    if (!applyVolSurface(built.kind, built.id, built.surface, `${what} angelegt`)) return;
+    useStore
+      .getState()
+      .showToast(`${what} angelegt (${copyValues ? `Werte aus ${templateKey}` : `flach ${kind === "fx" ? fmtPct(flatPct, 1) : fmtBp(flatBp, 0)}`})`, {
+        action: { label: "Rückgängig", run: () => useStore.getState().undo() },
+      });
+    onDone(built.kind, built.id);
+  };
+  return (
+    <div className="card" data-testid="add-vol-form">
+      <h3>
+        + Vol-Fläche anlegen
+        <span className="right muted xs">Achsen aus einer vorhandenen Fläche · Werte flach oder kopiert · danach in der Karte editierbar</span>
+      </h3>
+      <div className="row wrap" style={{ gap: 12, alignItems: "flex-start" }}>
+        <label className="row" style={{ gap: 6 }}>
+          <span className="muted small">Art</span>
+          <select
+            className="inline"
+            value={kind}
+            aria-label="Art der neuen Vol-Fläche"
+            data-testid="add-vol-kind"
+            onChange={(e) => setKind(e.target.value as SurfaceKind)}
+          >
+            <option value="swaption">Swaption-Cube (Währung)</option>
+            <option value="caplet">Caplet-Fläche (Index)</option>
+            <option value="fx">FX-Fläche (Paar)</option>
+          </select>
+        </label>
+        {kind !== "fx" && (
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted small">Währung</span>
+            <select className="inline" value={ccy} aria-label="Währung der neuen Vol-Fläche" data-testid="add-vol-ccy" onChange={(e) => setCcy(e.target.value)}>
+              {ccys.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+              {ccys.length === 0 && <option value="">– alle Währungen mit Kurve haben eine Fläche –</option>}
+            </select>
+          </label>
+        )}
+        {kind === "caplet" && (
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted small">Index</span>
+            <select
+              className="inline"
+              value={index}
+              aria-label="Index der neuen Caplet-Fläche"
+              data-testid="add-vol-index"
+              onChange={(e) => setIndex(e.target.value)}
+            >
+              {indices.map((i) => (
+                <option key={i.name} value={i.name}>
+                  {i.name}
+                </option>
+              ))}
+              {indices.length === 0 && <option value="">–</option>}
+            </select>
+          </label>
+        )}
+        {kind === "fx" && (
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted small">Paar</span>
+            <select
+              className="inline"
+              value={pair}
+              aria-label="Währungspaar der neuen FX-Vol-Fläche"
+              data-testid="add-vol-pair"
+              onChange={(e) => setPair(e.target.value)}
+            >
+              {fxPairs.map((p) => (
+                <option key={p} value={p}>
+                  {pairLabel(p)}
+                </option>
+              ))}
+              {fxPairs.length === 0 && <option value="">– alle Spot-Paare haben eine Fläche –</option>}
+            </select>
+          </label>
+        )}
+        <label className="row" style={{ gap: 6 }}>
+          <span className="muted small">Vorlage (Achsen)</span>
+          <select
+            className="inline"
+            value={templateKey}
+            aria-label="Vorlagenfläche"
+            data-testid="add-vol-template"
+            onChange={(e) => setTemplate(e.target.value)}
+          >
+            {templateKeys.map((k) => (
+              <option key={k} value={k}>
+                {kind === "fx" ? pairLabel(k) : k}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="check" style={{ gap: 6 }}>
+          <input type="checkbox" checked={copyValues} data-testid="add-vol-copy" onChange={(e) => setCopyValues(e.target.checked)} /> Werte der Vorlage
+          übernehmen
+        </label>
+        {!copyValues && (
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted small">{kind === "fx" ? "ATM-Vol (RR/BF = 0)" : "flache Vol"}</span>
+            <span style={{ display: "inline-block", width: 110 }}>
+              {kind === "fx" ? (
+                <NumInput
+                  inline
+                  value={flatPct}
+                  scale={100}
+                  step={0.5}
+                  digits={2}
+                  min={0.0001}
+                  unit="%"
+                  ariaLabel="ATM-Vol der neuen FX-Fläche"
+                  testId="add-vol-flat"
+                  onChange={setFlatPct}
+                />
+              ) : (
+                <NumInput
+                  inline
+                  value={flatBp}
+                  scale={1e4}
+                  step={5}
+                  digits={0}
+                  min={0.0001}
+                  unit="bp"
+                  ariaLabel="Flache Vol der neuen Fläche"
+                  testId="add-vol-flat"
+                  onChange={setFlatBp}
+                />
+              )}
+            </span>
+          </label>
+        )}
+      </div>
+      <div className="row wrap" style={{ gap: 8, marginTop: 8, alignItems: "center" }}>
+        <button className="btn primary" onClick={submit} disabled={!!problem} data-testid="add-vol-submit">
+          Fläche anlegen
+        </button>
+        <button className="btn ghost" onClick={() => onDone()} data-testid="add-vol-cancel">
+          Abbrechen
+        </button>
+        {built && !problem && (
+          <span className="muted xs" data-testid="add-vol-preview">
+            {built.kind === "swaptionVols"
+              ? `${built.id}: ${(built.surface as SwaptionVolSurface).expiries.length} × ${(built.surface as SwaptionVolSurface).tenors.length} (Expiry × Tenor)`
+              : built.kind === "capletVols"
+                ? `${built.id}: ${(built.surface as CapletVolSurface).expiries.length} × ${(built.surface as CapletVolSurface).strikes.length} (Expiry × Strike)`
+                : `${pairLabel(built.id)}: ${(built.surface as FxVolSurface).expiries.length} Verfälle · ATM / 25Δ RR / 25Δ BF${(built.surface as FxVolSurface).rr10 ? " / 10Δ" : ""}`}
+          </span>
+        )}
+        {problem && (
+          <span className="field-msg error" role="alert" data-testid="add-vol-problem">
+            {problem}
+          </span>
+        )}
+        {hints.map((h) => (
+          <span key={h} className="field-msg warn" data-testid="add-vol-hint">
+            {h}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "+ Paar" in the FX-spot table (R7-F1): add a spot for a pair the market does
+ * not quote – e.g. EUR/DKK after a DKK curve arrived without one. Sample mode
+ * stores it in the quote set, import mode as an override (`setFxSpot`).
+ */
+function AddFxSpotForm({ onDone }: { onDone: (pair?: string) => void }) {
+  const m = useStore((s) => s.baseMarket);
+  const has = (p: string) => m.fxSpots[p] !== undefined || m.fxSpots[`${p.slice(3)}${p.slice(0, 3)}`] !== undefined;
+  // Currencies with a discount curve but no EUR spot come first – that is the gap "+ Kurve" without a spot leaves.
+  const suggestions = Object.keys(m.discountCurveId)
+    .filter((c) => c !== "EUR" && !has(`EUR${c}`))
+    .map((c) => `EUR${c}`);
+  const [pairText, setPairText] = useState(suggestions[0] ?? "");
+  const [rate, setRate] = useState(1);
+  const pair = pairText.toUpperCase().replace(/[^A-Z]/g, "");
+  const problem = !/^[A-Z]{6}$/.test(pair)
+    ? "Paar als sechs Buchstaben angeben (z. B. EURDKK)"
+    : pair.slice(0, 3) === pair.slice(3)
+      ? "Basis- und Quotierungswährung müssen verschieden sein"
+      : has(pair)
+        ? `${pairLabel(pair)} ist bereits im Markt (Zeile in der Tabelle bearbeiten)`
+        : !(rate > 0)
+          ? "Kurs muss positiv sein"
+          : undefined;
+  const submit = () => {
+    if (problem) return;
+    const st = useStore.getState();
+    if (!st.setFxSpot(pair, rate, `Spot ${pairLabel(pair)} ${fmtNum(rate, 4)} angelegt`)) {
+      st.showToast("Spot nicht übernommen (Bewertung fehlgeschlagen)");
+      return;
+    }
+    st.showToast(`Spot ${pairLabel(pair)} ${fmtNum(rate, 4)} angelegt`, { action: { label: "Rückgängig", run: () => useStore.getState().undo() } });
+    onDone(pair);
+  };
+  return (
+    <div className="row wrap" style={{ gap: 8, marginTop: 8, alignItems: "center" }} data-testid="add-spot-form">
+      <input
+        className="mono"
+        style={{ width: 90 }}
+        value={pairText}
+        placeholder="EURDKK"
+        maxLength={7}
+        aria-label="Neues Währungspaar"
+        data-testid="add-spot-pair"
+        list="add-spot-suggestions"
+        onChange={(e) => setPairText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") submit();
+        }}
+      />
+      <datalist id="add-spot-suggestions">
+        {suggestions.map((p) => (
+          <option key={p} value={p} />
+        ))}
+      </datalist>
+      <span style={{ display: "inline-block", width: 110 }}>
+        <NumInput
+          inline
+          value={rate}
+          step={0.01}
+          digits={4}
+          min={0.000001}
+          ariaLabel={`Spot ${pairLabel(pair || "……")}`}
+          testId="add-spot-rate"
+          onChange={setRate}
+        />
+      </span>
+      <button className="btn primary xs" onClick={submit} disabled={!!problem} data-testid="add-spot-submit">
+        Spot anlegen
+      </button>
+      <button className="btn ghost xs" onClick={() => onDone()} data-testid="add-spot-cancel">
+        Abbrechen
+      </button>
+      {problem ? (
+        <span className="field-msg error" role="alert" data-testid="add-spot-problem">
+          {problem}
+        </span>
+      ) : (
+        <span className="muted xs">
+          Kurs = 1 {pair.slice(0, 3)} in {pair.slice(3)}; die Gegenquotierung wird automatisch bedient.
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Indices offered in the fixings editor: every registered index whose curve is in the market (R7-02 – no hard-coded G5 list). */
+function fixingIndices(curveIds: readonly string[]): string[] {
+  return knownIndices()
+    .filter((i) => curveIds.includes(i.curveId))
+    .map((i) => i.name);
+}
 
 const pairLabel = (p: string) => (/^[A-Z]{6}$/.test(p) ? `${p.slice(0, 3)}/${p.slice(3)}` : p);
 
@@ -332,6 +806,7 @@ function FxFixingsEditor() {
   const firstPair = pairs[0] ?? "EURUSD";
   const [pairSel, setPairSel] = useState(firstPair);
   const addPair = pairs.includes(pairSel) ? pairSel : firstPair;
+  const rowNav = useRowNav();
   const apply = (next: FxFixing[], label: string) => {
     if (!act().setFxFixings(next, label)) act().showToast("FX-Fixing nicht übernommen (Bewertung fehlgeschlagen)");
   };
@@ -424,11 +899,17 @@ function FxFixingsEditor() {
                 <th />
               </tr>
             </thead>
-            <tbody>
+            <tbody {...rowNav.tbodyProps}>
               {fxFixings.map((f, i) => (
-                <tr key={i} style={{ cursor: "default" }}>
+                <tr key={i} style={{ cursor: "default" }} {...rowNav.rowProps(i, fxFixings.length)}>
                   <td>
-                    <select className="inline" value={f.pair} aria-label={`Paar FX-Fixing ${i + 1}`} onChange={(e) => setRow(i, { pair: e.target.value })}>
+                    <select
+                      className="inline"
+                      value={f.pair}
+                      tabIndex={-1}
+                      aria-label={`Paar FX-Fixing ${i + 1}`}
+                      onChange={(e) => setRow(i, { pair: e.target.value })}
+                    >
                       {[...new Set([...pairs, f.pair])].map((p) => (
                         <option key={p} value={p}>
                           {pairLabel(p)}
@@ -437,7 +918,7 @@ function FxFixingsEditor() {
                     </select>
                   </td>
                   <td>
-                    <DateInput inline value={f.date} ariaLabel={`Datum FX-Fixing ${i + 1}`} onChange={(v) => setRow(i, { date: v })} />
+                    <DateInput inline value={f.date} tabIndex={-1} ariaLabel={`Datum FX-Fixing ${i + 1}`} onChange={(v) => setRow(i, { date: v })} />
                   </td>
                   <td className="num">
                     <span style={{ display: "inline-block", width: 110 }}>
@@ -447,6 +928,7 @@ function FxFixingsEditor() {
                         step={0.0005}
                         digits={4}
                         min={0.000001}
+                        tabIndex={-1}
                         ariaLabel={`Kurs FX-Fixing ${i + 1}`}
                         testId={i === 0 ? "fx-fixing-rate" : undefined}
                         onChange={(v) => setRow(i, { rate: v })}
@@ -454,7 +936,13 @@ function FxFixingsEditor() {
                     </span>
                   </td>
                   <td className="num">
-                    <button className="btn ghost danger" title="FX-Fixing entfernen" aria-label={`FX-Fixing ${i + 1} entfernen`} onClick={() => remove(i)}>
+                    <button
+                      className="btn ghost danger"
+                      tabIndex={-1}
+                      title="FX-Fixing entfernen"
+                      aria-label={`FX-Fixing ${i + 1} entfernen`}
+                      onClick={() => remove(i)}
+                    >
                       ✕
                     </button>
                   </td>
@@ -467,6 +955,12 @@ function FxFixingsEditor() {
       <div className="muted xs" style={{ marginTop: 6 }}>
         Kurs als Preis der Basiswährung ({pairLabel(addPair)} = 1 {addPair.slice(0, 3)} in {addPair.slice(3)}); die Gegenquotierung wird automatisch bedient.
         Teil des Snapshots (Export/Import), rückgängig mit <kbd>Ctrl</kbd>+<kbd>Z</kbd>.
+        {fxFixings.length > 0 && (
+          <>
+            {" "}
+            <kbd>↑</kbd>/<kbd>↓</kbd> Zeile · <kbd>↵</kbd>/<kbd>F2</kbd> bearbeiten · <kbd>Esc</kbd> zurück zur Zeile.
+          </>
+        )}
       </div>
     </div>
   );
@@ -493,6 +987,7 @@ function CreditCard() {
   const [selCpty, setSelCpty] = useState<string>("");
   const cpty = counterparties.includes(selCpty) ? selCpty : (counterparties[0] ?? "");
   const [recovery, setRecovery] = useState(DEFAULT_REPORT_INPUTS.recovery / 100);
+  const rowNav = useRowNav();
   const quotes = cdsCurves[cpty] ?? [];
   const setQuotes = (next: CdsQuote[]) => act().setCdsCurve(cpty, next);
   const addRow = () => {
@@ -572,16 +1067,17 @@ function CreditCard() {
                     <th />
                   </tr>
                 </thead>
-                <tbody>
+                <tbody {...rowNav.tbodyProps}>
                   {quotes.map((q, i) => {
                     const idx = sorted.findIndex((x) => x === q);
                     const years = tenorYears(q.tenor);
                     return (
-                      <tr key={i} style={{ cursor: "default" }}>
+                      <tr key={i} style={{ cursor: "default" }} {...rowNav.rowProps(i, quotes.length)}>
                         <td>
                           <select
                             className="inline"
                             value={q.tenor}
+                            tabIndex={-1}
                             aria-label={`Tenor CDS ${i + 1}`}
                             onChange={(e) => setQuotes(quotes.map((x, j) => (j === i ? { ...x, tenor: e.target.value } : x)))}
                           >
@@ -602,6 +1098,7 @@ function CreditCard() {
                               min={0}
                               digits={1}
                               unit="bp"
+                              tabIndex={-1}
                               ariaLabel={`Spread CDS ${i + 1}`}
                               onChange={(v) => setQuotes(quotes.map((x, j) => (j === i ? { ...x, spread: v } : x)))}
                             />
@@ -612,6 +1109,7 @@ function CreditCard() {
                         <td className="num">
                           <button
                             className="btn ghost danger"
+                            tabIndex={-1}
                             aria-label={`CDS-Quote ${i + 1} entfernen`}
                             title="Quote entfernen"
                             onClick={() => setQuotes(quotes.filter((_, j) => j !== i))}
@@ -691,6 +1189,9 @@ function FixingsEditor() {
   const [filterIndex, setFilterIndex] = useState("");
   const [filterYear, setFilterYear] = useState("");
   const [limit, setLimit] = useState(FIXINGS_PAGE);
+  // Roving tabindex (R7-01): 60 rows × 4 controls used to be 240 tab stops – now the table is one stop.
+  const rowNav = useRowNav();
+  const indexChoices = useMemo(() => fixingIndices(Object.keys(m.curves)), [m.curves]);
   const visible = useMemo(() => {
     const rows = fixings
       .map((f, i) => ({ f, i }))
@@ -784,12 +1285,18 @@ function FixingsEditor() {
                   <th />
                 </tr>
               </thead>
-              <tbody>
-                {visible.slice(0, limit).map(({ f, i }) => (
-                  <tr key={`${f.index}-${f.date}-${i}`} style={{ cursor: "default" }}>
+              <tbody {...rowNav.tbodyProps}>
+                {visible.slice(0, limit).map(({ f, i }, k, arr) => (
+                  <tr key={`${f.index}-${f.date}-${i}`} style={{ cursor: "default" }} {...rowNav.rowProps(k, arr.length)}>
                     <td>
-                      <select className="inline" value={f.index} aria-label={`Index Fixing ${i + 1}`} onChange={(e) => setRow(i, { index: e.target.value })}>
-                        {[...new Set([...FIXING_INDICES, f.index])].map((ix) => (
+                      <select
+                        className="inline"
+                        value={f.index}
+                        tabIndex={-1}
+                        aria-label={`Index Fixing ${i + 1}`}
+                        onChange={(e) => setRow(i, { index: e.target.value })}
+                      >
+                        {[...new Set([...indexChoices, f.index])].map((ix) => (
                           <option key={ix} value={ix}>
                             {ix}
                           </option>
@@ -797,7 +1304,7 @@ function FixingsEditor() {
                       </select>
                     </td>
                     <td>
-                      <DateInput inline value={f.date} ariaLabel={`Datum Fixing ${i + 1}`} onChange={(v) => setRow(i, { date: v })} />
+                      <DateInput inline value={f.date} tabIndex={-1} ariaLabel={`Datum Fixing ${i + 1}`} onChange={(v) => setRow(i, { date: v })} />
                     </td>
                     <td className="num">
                       <span style={{ display: "inline-block", width: 130 }}>
@@ -808,13 +1315,20 @@ function FixingsEditor() {
                           step={0.001}
                           digits={4}
                           unit="%"
+                          tabIndex={-1}
                           ariaLabel={`Wert Fixing ${i + 1}`}
                           onChange={(v) => setRow(i, { value: v })}
                         />
                       </span>
                     </td>
                     <td className="num">
-                      <button className="btn ghost danger" title="Fixing entfernen" aria-label={`Fixing ${i + 1} entfernen`} onClick={() => remove(i)}>
+                      <button
+                        className="btn ghost danger"
+                        tabIndex={-1}
+                        title="Fixing entfernen"
+                        aria-label={`Fixing ${i + 1} entfernen`}
+                        onClick={() => remove(i)}
+                      >
                         ✕
                       </button>
                     </td>
@@ -828,6 +1342,10 @@ function FixingsEditor() {
               weitere {Math.min(FIXINGS_PAGE, visible.length - limit)} anzeigen ({visible.length - limit} ausgeblendet)
             </button>
           )}
+          <div className="muted xs" style={{ marginTop: 6 }}>
+            Ein Tabstopp: <kbd>↑</kbd>/<kbd>↓</kbd> Zeile · <kbd>PgUp</kbd>/<kbd>PgDn</kbd> 10 Zeilen · <kbd>↵</kbd> oder <kbd>F2</kbd> bearbeiten ·{" "}
+            <kbd>Esc</kbd> zurück zur Zeile · <kbd>Tab</kbd> verlässt die Tabelle.
+          </div>
         </>
       )}
     </div>
@@ -931,6 +1449,10 @@ export function MarketView() {
   const capId = capKeys.includes(capSel) ? capSel : capKeys[0];
   const capv = capId ? m.capletVols?.[capId] : undefined;
   const modified = marketModified(s);
+  // "+ Paar" (R7-F1) and "+ Fläche" (R7-2) forms
+  const [addingSpot, setAddingSpot] = useState(false);
+  const [addingVol, setAddingVol] = useState(false);
+  const volCount = swptKeys.length + capKeys.length + fxKeys.length;
 
   const setSpot = (pair: string, v: number) => {
     if (!Number.isFinite(v) || v <= 0) return;
@@ -1073,17 +1595,39 @@ export function MarketView() {
             </div>
           )}
         </div>
-        <div className="card">
-          <h3>FX-Spots (editierbar)</h3>
+        <div className="card" data-testid="fx-spots-card">
+          <h3>
+            FX-Spots (editierbar)
+            <span className="right row">
+              <button
+                className="btn xs"
+                onClick={() => setAddingSpot((v) => !v)}
+                aria-pressed={addingSpot}
+                data-testid="add-spot"
+                title="Spot für ein weiteres Währungspaar anlegen (z. B. EUR/DKK nach „+ Kurve“ ohne Spot) – Quote-Set bzw. Snapshot-Override, rückgängig mit Ctrl+Z"
+              >
+                + Paar
+              </button>
+            </span>
+          </h3>
+          {addingSpot && (
+            <AddFxSpotForm
+              onDone={() => {
+                setAddingSpot(false);
+                // R7-03-style focus return: the keyboard user lands on the button again
+                void focusWhenPresent('[data-testid="add-spot"]');
+              }}
+            />
+          )}
           <div className="table-scroll">
-            <table className="grid-table" aria-label="FX-Spots">
+            <table className="grid-table" aria-label="FX-Spots" data-testid="fx-spots-table">
               <tbody>
                 {Object.entries(m.fxSpots).map(([pair, v]) => {
                   const orig = imported
                     ? (s.importedBase?.fxSpots[pair] ?? v)
                     : ((Object.entries(s.quotes.fxSpots).find(([p]) => p === pair)?.[1] ?? v) as number);
                   return (
-                    <tr key={pair} style={{ cursor: "default" }}>
+                    <tr key={pair} style={{ cursor: "default" }} data-testid={`fx-spot-row-${pair}`}>
                       <td className="mono">
                         {pair.slice(0, 3)}/{pair.slice(3)}
                       </td>
@@ -1113,12 +1657,37 @@ export function MarketView() {
         <FxFixingsEditor />
       </div>
 
+      <div className="row wrap" style={{ gap: 8 }} data-testid="vol-toolbar">
+        <span className="muted xs">
+          Vol-Flächen ({volCount}): {swptKeys.length} Swaption-Cubes · {capKeys.length} Caplet-Flächen · {fxKeys.length} FX-Paare
+        </span>
+        <button
+          className="btn xs"
+          onClick={() => setAddingVol((v) => !v)}
+          aria-pressed={addingVol}
+          data-testid="add-vol"
+          title="Vol-Fläche für eine Währung / ein Paar ohne Fläche anlegen (Swaption-Cube, Caplet-Fläche, FX-Smile) – sonst bewertet der Kern mit der Fallback-Vol (Level 3)"
+        >
+          + Fläche
+        </button>
+      </div>
+      {addingVol && (
+        <AddVolSurfaceForm
+          onDone={(kind, id) => {
+            setAddingVol(false);
+            if (kind === "swaptionVols" && id) setSwptSel(id);
+            if (kind === "capletVols" && id) setCapSel(id);
+            if (kind === "fxVols" && id) setFxSel(id);
+            void focusWhenPresent('[data-testid="add-vol"]');
+          }}
+        />
+      )}
       {swpt && swptId && (
         <>
           {swptKeys.length > 1 && (
             <div className="row wrap" style={{ gap: 8 }}>
               <span className="muted xs">Swaption-Cube</span>
-              <div className="seg" role="group" aria-label="Swaption-Cube Währung">
+              <div className="seg wrap" role="group" aria-label="Swaption-Cube Währung">
                 {swptKeys.map((k) => (
                   <button key={k} className={k === swptId ? "active" : ""} aria-pressed={k === swptId} onClick={() => setSwptSel(k)}>
                     {k}
@@ -1136,7 +1705,7 @@ export function MarketView() {
         {capv && capId && (
           <div className="stack">
             {capKeys.length > 1 && (
-              <div className="seg" role="group" aria-label="Caplet-Fläche">
+              <div className="seg wrap" role="group" aria-label="Caplet-Fläche">
                 {capKeys.map((k) => (
                   <button key={k} className={k === capId ? "active" : ""} aria-pressed={k === capId} onClick={() => setCapSel(k)}>
                     {k}
@@ -1150,7 +1719,8 @@ export function MarketView() {
       </div>
       <div className="muted xs">
         Vol-Flächen sind Teil des Marktes: Änderungen zählen als „Markt modifiziert“, werden lokal gespeichert, überleben den Stichtagswechsel und sind mit{" "}
-        <kbd>Ctrl</kbd>+<kbd>Z</kbd> rückgängig; „Zurücksetzen“ an der Karte oder „Markt zurücksetzen“ stellt den Sample-Markt wieder her.
+        <kbd>Ctrl</kbd>+<kbd>Z</kbd> rückgängig; „Zurücksetzen“ an der Karte oder „Markt zurücksetzen“ stellt den Sample-Markt wieder her. Mit „+ Fläche“
+        angelegte Flächen (neue Währungen / Paare) tragen den Badge „angelegt“ und lassen sich an der Karte entfernen.
       </div>
     </div>
   );

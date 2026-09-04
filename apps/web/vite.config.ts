@@ -28,7 +28,9 @@ export default defineConfig(({ mode }) => ({
         // Stable vendor chunks: charts, the pricing engine and the React runtime are cached independently of app code.
         // ECharts is only imported by lazily loaded views / the lazy chart wrapper, so the start chunk never pulls it in (N4-07).
         manualChunks(id) {
-          if (id.includes("node_modules/echarts") || id.includes("node_modules/zrender")) return "echarts";
+          // `components/echarts-lib.ts` is the dynamic entry of the chart library (R7-05): the library chunk itself is what the
+          // lazy chart wrapper imports, so a failed load names *this* URL and "Erneut versuchen" can cache-bust it.
+          if (id.includes("node_modules/echarts") || id.includes("node_modules/zrender") || id.includes("components/echarts-lib")) return "echarts";
           if (id.includes("packages/pricing-core") || id.includes("@deriva/pricing-core")) return "core";
           if (id.includes("node_modules/react") || id.includes("node_modules/scheduler") || id.includes("node_modules/zustand")) return "react";
           return undefined;

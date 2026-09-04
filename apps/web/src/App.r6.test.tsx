@@ -65,7 +65,10 @@ describe("App – round 6", () => {
     fireEvent.click(screen.getByTestId("add-curve-submit"));
     expect(st().extraCurves["DKK-DESTR"]).toBeDefined();
     expect(st().baseMarket.discountCurveId.DKK).toBe("DKK-DESTR");
-    expect(st().quotes.fxSpots.EURDKK).toBeCloseTo(7.46, 6);
+    // R7-F1: the spot travels with the curve (not the quote set) and reaches the market
+    expect(st().extraCurves["DKK-DESTR"]!.fxSpot).toEqual({ pair: "EURDKK", rate: 7.46 });
+    expect(st().baseMarket.fxSpots.EURDKK).toBeCloseTo(7.46, 6);
+    expect(st().quotes.fxSpots.EURDKK).toBeUndefined();
     expect(st().toasts.some((t) => /Kurve DKK-DESTR aus 4 Quotes angelegt/.test(t.msg) && t.action?.label === "Rückgängig")).toBe(true);
     expect(screen.queryByTestId("add-curve-form")).toBeNull();
     // the new tab is selected and its quotes are editable (undo entry "curves")

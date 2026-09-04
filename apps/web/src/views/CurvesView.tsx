@@ -23,6 +23,7 @@ import { DateInput } from "../components/DateInput.js";
 import { EChart, cssVar } from "../components/EChart.js";
 import { NumInput } from "../components/NumInput.js";
 import { useTableNav } from "../hooks/useTableNav.js";
+import { focusWhenPresent } from "../lib/focus.js";
 import { fmtDate, fmtNum, fmtPct } from "../lib/format.js";
 import { INTERPOLATION_DE, translatePricingError } from "../lib/i18n.js";
 import { rateOf } from "../lib/portfolio-io.js";
@@ -543,7 +544,9 @@ export function CurvesView() {
               const i = sets.findIndex((q) => q.curveId === id);
               // the new set is appended on the next render – select it by position
               setSel(i >= 0 ? i : sets.length);
-            }
+              // R7-03: the keyboard user lands on the new curve's tab, not on body
+              void focusWhenPresent(`[data-testid="curve-tab-${id}"]`);
+            } else void focusWhenPresent('[data-testid="add-curve"]');
           }}
         />
       )}

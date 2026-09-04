@@ -29,6 +29,7 @@ import {
 } from "../lib/i18n.js";
 import { parseNumberInput } from "../lib/num-parse.js";
 import { hasFxVolSurface } from "../lib/quick-parser.js";
+import { currencyOptions, defaultIndexFor, fxCurrencies, indexOptions, knownPairs } from "../lib/register.js";
 import { annuityAmortisation, frequencyMonths, parseSchedulePaste, scheduleValueAt } from "../lib/trade-ops.js";
 import { useTableNav } from "../hooks/useTableNav.js";
 import { issueFor, validateTrade, type TradeIssue } from "../lib/validate-trade.js";
@@ -143,9 +144,8 @@ function marketRate(
 
 const DAYCOUNTS = ["ACT/360", "ACT/365F", "30E/360", "30/360", "ACT/ACT ISDA"] as const;
 const FREQS = ["1M", "3M", "6M", "1Y", "ZC"] as const;
-const INDICES = ["EURIBOR-3M", "EURIBOR-6M", "ESTR", "SOFR", "SONIA", "SARON", "TONA"] as const;
-const CCYS = ["EUR", "USD", "GBP", "CHF", "JPY"] as const;
-const PAIRS = ["EURUSD", "EURGBP", "EURCHF", "EURJPY", "USDJPY"] as const;
+// Currency, index and pair lists are no longer hard-coded G5 constants (R7-02): they come from the core register and the
+// current market – see `useRegisterOptions` below – so a DKK/DESTR trade created after "+ Kurve" displays and edits correctly.
 const STUBS: { v: StubType; l: string }[] = [
   { v: "ShortFront", l: "Short Front" },
   { v: "LongFront", l: "Long Front" },
@@ -175,6 +175,43 @@ export function isOisIndex(index: string): boolean {
 }
 
 type LegPatch = Partial<Omit<FloatLeg, "type">> & Partial<Pick<FixedLeg, "rate" | "rateSchedule">>;
+
+/**
+ * Select options derived from the core register and the base market (R7-02 /
+ * Markt R7-1): currencies with a discount curve first (others "(ohne Kurve)"),
+ * indices with a projection curve first, FX currencies from the spot pairs,
+ * pairs from spots and vol surfaces. The current value is always selectable.
+ */
+export function useRegisterOptions() {
+  const discountCurveId = useStore(useShallow((s) => s.baseMarket.discountCurveId));
+  const curveIds = useStore(useShallow((s) => Object.keys(s.baseMarket.curves)));
+  const fxSpots = useStore(useShallow((s) => s.baseMarket.fxSpots));
+  const fxVolPairs = useStore(useShallow((s) => Object.keys(s.baseMarket.fxVols ?? {})));
+  const swaptionVolCurrencies = useStore(useShallow((s) => Object.keys(s.baseMarket.swaptionVols ?? {})));
+  return {
+    curveIds,
+    fxVolPairs,
+    swaptionVolCurrencies,
+    /** Currencies with a discount curve in the market. */
+    curveCurrencies: Object.keys(discountCurveId),
+    ccy: (current?: string) => currencyOptions(discountCurveId, current),
+    index: (ccy: string | undefined, current?: string) => indexOptions(ccy, curveIds, current),
+    /** Default float index of `ccy` with a curve in the market (conventions → OIS → any). */
+    defaultIndex: (ccy: string) => defaultIndexFor(ccy, curveIds),
+    fxCcy: (...current: (string | undefined)[]) =>
+      fxCurrencies(
+        fxSpots,
+        discountCurveId,
+        current.filter((c): c is string => !!c),
+      ),
+    pairs: (current?: string) => knownPairs(fxSpots, Object.fromEntries(fxVolPairs.map((p) => [p, true])), current),
+    collateral: (current?: string) => {
+      const list = [{ v: "", l: "unbesichert" }, ...Object.keys(discountCurveId).map((c) => ({ v: c, l: `${c}-CSA` }))];
+      if (current && !list.some((o) => o.v === current)) list.push({ v: current, l: `${current}-CSA (ohne Kurve)` });
+      return list;
+    },
+  };
+}
 
 /** Period starts of a leg schedule (empty when the schedule cannot be built). */
 function legPeriodStarts(leg: SwapLeg): number[] {
@@ -633,9 +670,9 @@ function AmortisationEditor({
 export function TradeEditor({ trade, onChange }: Props) {
   const customerMode = useStore((s) => s.customerMode);
   const valuationDate = useStore((s) => s.valuationDate);
-  /** Currencies with a swaption vol cube in the market (currency choice of the swaption editor, Markt R4-2). */
-  const swaptionVolCurrencies = useStore(useShallow((s) => Object.keys(s.baseMarket.swaptionVols ?? {})));
-  const fxVolPairs = useStore(useShallow((s) => Object.keys(s.baseMarket.fxVols ?? {})));
+  /** Register-/market-derived option lists (R7-02) – incl. the currencies with a swaption vol cube (Markt R4-2). */
+  const reg = useRegisterOptions();
+  const { swaptionVolCurrencies, fxVolPairs } = reg;
   /** Core warnings of the current valuation – e.g. `COLLATERAL_CURVE_MISSING:` for a CSA without a collateral curve (Markt R4-1). */
   const pricingWarnings = useStore(useShallow((s) => s.results[trade.id]?.result?.warnings ?? []));
   const collateralCurveMissing = pricingWarnings.find((w) => w.startsWith("COLLATERAL_CURVE_MISSING"));
@@ -770,7 +807,7 @@ export function TradeEditor({ trade, onChange }: Props) {
       >
         <Select
           value={(trade.collateralCurrency ?? "") as string}
-          options={[{ v: "", l: "unbesichert" }, ...CCYS.map((c) => ({ v: c, l: `${c}-CSA` }))]}
+          options={reg.collateral(trade.collateralCurrency)}
           ariaLabel="Collateral-Währung"
           onChange={(v) => upd({ collateralCurrency: v || undefined })}
         />
@@ -794,7 +831,7 @@ export function TradeEditor({ trade, onChange }: Props) {
           <Field label="Upfront-Währung">
             <Select
               value={trade.upfront!.currency}
-              options={[...new Set([...CCYS, trade.upfront!.currency])]}
+              options={reg.ccy(trade.upfront!.currency)}
               ariaLabel="Upfront-Währung"
               onChange={(v) => upd({ upfront: { ...trade.upfront!, currency: v } })}
             />
@@ -814,6 +851,14 @@ export function TradeEditor({ trade, onChange }: Props) {
       const setLeg = (i: number, patch: LegPatch) =>
         onChange({ ...trade, legs: trade.legs.map((l, j) => (j === i ? ({ ...l, ...patch } as SwapLeg) : l)) } as Trade);
       const setBoth = (patch: LegPatch) => onChange({ ...trade, legs: trade.legs.map((l) => ({ ...l, ...patch }) as SwapLeg) } as Trade);
+      /** Currency change of a swap: the float legs move to the new currency's index with a curve in the market (R7-02). */
+      const setSwapCurrency = (ccy: string) =>
+        onChange({
+          ...trade,
+          legs: trade.legs.map(
+            (l) => (l.type === "Float" ? { ...l, currency: ccy, index: reg.defaultIndex(ccy) ?? l.index } : { ...l, currency: ccy }) as SwapLeg,
+          ),
+        } as Trade);
       const leg0 = trade.legs[0]!;
       return (
         <div className="stack">
@@ -821,8 +866,11 @@ export function TradeEditor({ trade, onChange }: Props) {
             {common}
             {trade.type === "InterestRateSwap" && (
               <>
-                <Field label="Währung">
-                  <Select value={leg0.currency} options={CCYS} onChange={(v) => setBoth({ currency: v })} />
+                <Field
+                  label="Währung"
+                  hint={reg.curveCurrencies.includes(leg0.currency) ? undefined : `Keine Diskontkurve für ${leg0.currency} – „+ Kurve“ in der Kurvenansicht`}
+                >
+                  <Select value={leg0.currency} options={reg.ccy(leg0.currency)} onChange={setSwapCurrency} />
                 </Field>
                 <Field label="Nominal">
                   <NumInput
@@ -922,7 +970,13 @@ export function TradeEditor({ trade, onChange }: Props) {
                 {trade.type === "CrossCurrencySwap" && (
                   <>
                     <Field label="Währung">
-                      <Select value={leg.currency} options={CCYS} onChange={(v) => setLeg(i, { currency: v })} />
+                      <Select
+                        value={leg.currency}
+                        options={reg.ccy(leg.currency)}
+                        onChange={(v) =>
+                          setLeg(i, leg.type === "Float" ? { currency: v, index: reg.defaultIndex(v) ?? (leg as FloatLeg).index } : { currency: v })
+                        }
+                      />
                     </Field>
                     <Field label="Nominal">
                       <NumInput
@@ -953,7 +1007,11 @@ export function TradeEditor({ trade, onChange }: Props) {
                 ) : (
                   <>
                     <Field label="Index">
-                      <Select value={(leg as FloatLeg).index} options={INDICES} onChange={(v) => setLeg(i, { index: v })} />
+                      <Select
+                        value={(leg as FloatLeg).index}
+                        options={reg.index(leg.currency, (leg as FloatLeg).index)}
+                        onChange={(v) => setLeg(i, { index: v })}
+                      />
                     </Field>
                     <Field label="Spread">
                       <NumInput
@@ -1002,10 +1060,14 @@ export function TradeEditor({ trade, onChange }: Props) {
               />
             </Field>
             <Field label="Währung">
-              <Select value={trade.currency} options={CCYS} onChange={(v) => upd({ currency: v })} />
+              <Select
+                value={trade.currency}
+                options={reg.ccy(trade.currency)}
+                onChange={(v) => upd({ currency: v, index: reg.defaultIndex(v) ?? trade.index })}
+              />
             </Field>
             <Field label="Index">
-              <Select value={trade.index} options={INDICES} onChange={(v) => upd({ index: v })} />
+              <Select value={trade.index} options={reg.index(trade.currency, trade.index)} onChange={(v) => upd({ index: v })} />
             </Field>
             <Field label="Nominal">
               <NumInput
@@ -1108,14 +1170,22 @@ export function TradeEditor({ trade, onChange }: Props) {
         });
         onChange({ ...trade, underlying: { ...trade.underlying, legs: rebuilt.legs } });
       };
-      const ccyOptions = [...new Set([...swaptionVolCurrencies, fixed.currency])].map((c) => ({
+      // Every currency with a discount curve is selectable (R7-02); the label says whether a vol cube exists (Markt R4-2 / R7-2).
+      const ccyOptions = [...new Set([...swaptionVolCurrencies, ...reg.curveCurrencies, fixed.currency])].map((c) => ({
         v: c,
-        l: swaptionVolCurrencies.includes(c) ? `${c} (Vol-Cube)` : `${c} (ohne Vol-Cube – Fallback-Vol)`,
+        l: swaptionVolCurrencies.includes(c)
+          ? `${c} (Vol-Cube)`
+          : reg.curveCurrencies.includes(c)
+            ? `${c} (ohne Vol-Cube – Fallback-Vol, „+ Fläche“ in der Marktansicht)`
+            : `${c} (ohne Kurve)`,
       }));
       return (
         <div className="form">
           {common}
-          <Field label="Währung" hint="Währungen mit Swaption-Vol-Cube im Markt; der Underlying-Swap folgt den Marktkonventionen der Währung">
+          <Field
+            label="Währung"
+            hint="Währungen mit Kurve im Markt (Vol-Cube je Währung in der Marktansicht); der Underlying-Swap folgt den Marktkonventionen der Währung"
+          >
             <Select value={fixed.currency} options={ccyOptions} ariaLabel="Währung" onChange={setCurrency} />
           </Field>
           <Field label="Typ">
@@ -1225,7 +1295,12 @@ export function TradeEditor({ trade, onChange }: Props) {
         <div className="form">
           {common}
           <Field label="Kaufen">
-            <Select value={trade.buyCurrency} options={CCYS} ariaLabel="Kaufwährung" onChange={(v) => upd({ buyCurrency: v })} />
+            <Select
+              value={trade.buyCurrency}
+              options={reg.fxCcy(trade.buyCurrency, trade.sellCurrency)}
+              ariaLabel="Kaufwährung"
+              onChange={(v) => upd({ buyCurrency: v })}
+            />
           </Field>
           <Field label="Betrag kaufen">
             <NumInput
@@ -1241,7 +1316,7 @@ export function TradeEditor({ trade, onChange }: Props) {
           <Field label="Verkaufen" issue={iss("sellCurrency")}>
             <Select
               value={trade.sellCurrency}
-              options={CCYS}
+              options={reg.fxCcy(trade.buyCurrency, trade.sellCurrency)}
               invalid={!!iss("sellCurrency")}
               ariaLabel="Verkaufswährung"
               onChange={(v) => upd({ sellCurrency: v })}
@@ -1298,7 +1373,7 @@ export function TradeEditor({ trade, onChange }: Props) {
               <Field label="Settlement-Währung">
                 <Select
                   value={trade.ndf.settlementCurrency}
-                  options={[...new Set([trade.buyCurrency, trade.sellCurrency, ...CCYS])]}
+                  options={reg.fxCcy(trade.buyCurrency, trade.sellCurrency, trade.ndf.settlementCurrency)}
                   ariaLabel="NDF-Settlement-Währung"
                   onChange={(v) => upd({ ndf: { ...trade.ndf!, settlementCurrency: v } })}
                 />
@@ -1317,10 +1392,10 @@ export function TradeEditor({ trade, onChange }: Props) {
             hint={
               hasFxVolSurface(trade.pair, fxVolPairs)
                 ? undefined
-                : `Keine FX-Vol-Fläche für ${trade.pair.slice(0, 3)}/${trade.pair.slice(3)} im Markt – Bewertung mit Fallback-Vol 8 % (IFRS-13 Level 3)`
+                : `Keine FX-Vol-Fläche für ${trade.pair.slice(0, 3)}/${trade.pair.slice(3)} im Markt – Bewertung mit Fallback-Vol 8 % (IFRS-13 Level 3); in der Marktansicht mit „+ Fläche“ anlegen`
             }
           >
-            <Select value={trade.pair} options={PAIRS} onChange={(v) => upd({ pair: v })} />
+            <Select value={trade.pair} options={reg.pairs(trade.pair)} onChange={(v) => upd({ pair: v })} />
           </Field>
           <Field label="Typ (auf Basis-Ccy)">
             <Select value={trade.optionType} options={optionsFrom(["Call", "Put"] as const, OPTION_TYPE_DE)} onChange={(v) => upd({ optionType: v })} />
@@ -1512,10 +1587,15 @@ export function TradeEditor({ trade, onChange }: Props) {
             />
           </Field>
           <Field label="Währung">
-            <Select value={trade.currency} options={CCYS} ariaLabel="Währung" onChange={(v) => upd({ currency: v })} />
+            <Select
+              value={trade.currency}
+              options={reg.ccy(trade.currency)}
+              ariaLabel="Währung"
+              onChange={(v) => upd({ currency: v, index: reg.defaultIndex(v) ?? trade.index })}
+            />
           </Field>
           <Field label="Index" hint="Referenzzins der FRA-Periode">
-            <Select value={trade.index} options={[...new Set([...INDICES, trade.index])]} ariaLabel="Index" onChange={(v) => upd({ index: v })} />
+            <Select value={trade.index} options={reg.index(trade.currency, trade.index)} ariaLabel="Index" onChange={(v) => upd({ index: v })} />
           </Field>
           <Field label="Nominal">
             <NumInput
@@ -1560,7 +1640,12 @@ export function TradeEditor({ trade, onChange }: Props) {
             <h3>{title}</h3>
             <div className="form">
               <Field label="Kaufen">
-                <Select value={leg.buyCurrency} options={CCYS} ariaLabel={`${title} Kaufwährung`} onChange={(v) => setLeg({ buyCurrency: v })} />
+                <Select
+                  value={leg.buyCurrency}
+                  options={reg.fxCcy(leg.buyCurrency, leg.sellCurrency)}
+                  ariaLabel={`${title} Kaufwährung`}
+                  onChange={(v) => setLeg({ buyCurrency: v })}
+                />
               </Field>
               <Field label="Betrag kaufen">
                 <NumInput
@@ -1575,7 +1660,7 @@ export function TradeEditor({ trade, onChange }: Props) {
               <Field label="Verkaufen" issue={iss(`${which}.sellCurrency`)}>
                 <Select
                   value={leg.sellCurrency}
-                  options={CCYS}
+                  options={reg.fxCcy(leg.buyCurrency, leg.sellCurrency)}
                   invalid={!!iss(`${which}.sellCurrency`)}
                   ariaLabel={`${title} Verkaufswährung`}
                   onChange={(v) => setLeg({ sellCurrency: v })}

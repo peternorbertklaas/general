@@ -280,9 +280,16 @@ const CORE_MESSAGES: Rule[] = [
   { re: /^must be a finite number$/, to: () => "muss eine endliche Zahl sein" },
   { re: /^expiryDate must be on or before deliveryDate$/, to: () => "Verfall muss vor oder am Lieferdatum liegen" },
   { re: /^Schedule with stub=None does not divide evenly.*$/, to: () => "Laufzeit ist ohne Stub nicht durch die Frequenz teilbar" },
-  { re: /^Curve not found in market context: (.+)$/, to: (m) => `Kurve ${m[1]} nicht im Markt-Snapshot` },
-  { re: /^No discount curve configured for (\w+)$/, to: (m) => `Keine Diskontkurve für ${m[1]} konfiguriert` },
-  { re: /^FX spot not available for (\w+)$/, to: (m) => `Kein FX-Spot für ${m[1]} verfügbar` },
+  // Missing market data name the in-app repair path (R7-F1 / R7-F2): "+ Kurve" in the curves view, "+ Paar" in the FX-spot table.
+  { re: /^Curve not found in market context: (.+)$/, to: (m) => `Kurve ${m[1]} nicht im Markt-Snapshot – in der Kurvenansicht mit „+ Kurve“ anlegen` },
+  {
+    re: /^No discount curve configured for (\w+)$/,
+    to: (m) => `Keine Diskontkurve für ${m[1]} konfiguriert – in der Kurvenansicht mit „+ Kurve“ eine ${m[1]}-Kurve anlegen`,
+  },
+  {
+    re: /^FX spot not available for (\w+)$/,
+    to: (m) => `Kein FX-Spot für ${m[1]} verfügbar – in der Marktansicht unter FX-Spots mit „+ Paar“ ergänzen`,
+  },
   { re: /^Invalid FX pair: (.+)$/, to: (m) => `Ungültiges Währungspaar: ${m[1]}` },
   { re: /^Invalid tenor: (.+)$/, to: (m) => `Ungültiger Tenor: ${m[1]}` },
   { re: /^Invalid frequency: (.+)$/, to: (m) => `Ungültige Frequenz: ${m[1]}` },

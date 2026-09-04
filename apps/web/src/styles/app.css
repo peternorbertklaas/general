@@ -44,6 +44,12 @@ a {
 table.grid-table tr:focus-visible {
   outline-offset: -2px;
 }
+/* Roving grid cells of the vol grids (R7-01): the focused cell is outlined like a focused row; its input opens with ↵ / F2. */
+[role="gridcell"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
 .field input:focus-visible,
 .field select:focus-visible,
 input.inline:focus-visible,

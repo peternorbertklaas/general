@@ -20,6 +20,7 @@ import {
   toISO,
 } from "@deriva/pricing-core";
 import { fmtDate, fmtNum } from "./format.js";
+import { defaultIndexFor, indexHasCurve, indexNamesOf, normaliseIndexToken } from "./register.js";
 import { ccsCollateralCurrency } from "./templates.js";
 
 /**
@@ -274,6 +275,45 @@ export interface QuickEntryOptions {
    * trade that cannot be priced (Markt R6-1 / R6-5).
    */
   curveCurrencies?: string[];
+  /**
+   * Curve ids present in the market (`Object.keys(market.curves)`, round 7 / R7-F2). The swap / cap branches default to an
+   * index whose curve exists (conventions' benchmark → OIS → any), flag a typed index without a curve in the preview and
+   * refuse a currency none of whose indices has a curve – instead of a trade that prices as "Fehler".
+   */
+  curveIds?: string[];
+}
+
+/** Preview fragment for a typed index whose projection curve is not in the market (R7-F2). */
+function missingCurveNote(ccy: string, index: string, opts: QuickEntryOptions): string {
+  if (!opts.curveIds || indexHasCurve(index, opts.curveIds)) return "";
+  return ` · ⚠ Kurve ${ccy}-${index} fehlt – in der Kurvenansicht mit „+ Kurve“ anlegen`;
+}
+
+/**
+ * Float index of a swap / cap without a typed index: the conventions' benchmark when its curve exists, else the OIS
+ * index, else any index of the currency with a curve (R7-F2). Returns the index and a preview note when the choice
+ * deviates from the conventions, or an error when no index of the currency has a curve.
+ */
+function chooseIndex(ccy: string, opts: QuickEntryOptions): { index?: string; note: string } | ParseResult {
+  const conventional = SWAP_CONVENTIONS[ccy]?.floatIndex;
+  const index = defaultIndexFor(ccy, opts.curveIds);
+  if (!opts.curveIds) return { index, note: "" };
+  if (!index) {
+    const names = indexNamesOf(ccy);
+    return fail(
+      `Für ${ccy} fehlt die Kurve${names.length ? ` zu ${names.join(" / ")}` : ""} – in der Kurvenansicht mit „+ Kurve“ anlegen (Währungen mit Kurve: ${(
+        opts.curveCurrencies ?? []
+      ).join(", ")})`,
+    );
+  }
+  const note = conventional && index !== conventional ? ` · ${index} (Kurve vorhanden; ${conventional} ohne Kurve)` : "";
+  return { index, note };
+}
+
+/** Error for an index token no registered index matches ("nibor9m"), naming the currency's indices (R7-1). */
+function unknownIndexError(tok: string, ccy: string): ParseResult {
+  const names = indexNamesOf(ccy);
+  return fail(`Unbekannter Index „${tok}“${names.length ? ` – für ${ccy} registriert: ${names.join(", ")}` : ""}`);
 }
 
 /** Whether the market has an FX vol surface for `pair` (direct or inverse quotation). */
@@ -285,7 +325,9 @@ export function hasFxVolSurface(pair: string, pairs: string[] | undefined): bool
 
 /** Preview warning for an FX option on a pair without a vol surface (core fallback 8 %, IFRS-13 Level 3) – Markt R5-2. */
 export function fxVolWarning(pair: string, pairs: string[] | undefined): string {
-  return hasFxVolSurface(pair, pairs) ? "" : ` · ⚠ keine FX-Vol-Fläche für ${pair.slice(0, 3)}/${pair.slice(3)} (Fallback 8 %, Level 3)`;
+  return hasFxVolSurface(pair, pairs)
+    ? ""
+    : ` · ⚠ keine FX-Vol-Fläche für ${pair.slice(0, 3)}/${pair.slice(3)} (Fallback 8 %, Level 3 – in der Marktansicht mit „+ Fläche“ anlegen)`;
 }
 
 /* ---------- token-level errors (R6-1) ---------- */
@@ -512,6 +554,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       let rateTok: string | undefined;
       const notional = new AmountSlot(10_000_000);
       let index: string | undefined;
+      let badIndexTok: string | undefined;
       for (const t of rest) {
         const tl = t.toLowerCase();
         if (isCcy(t)) ccy = t.toUpperCase();
@@ -526,13 +569,16 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           if (rateTok !== undefined) return duplicate("Satz", rateTok, t);
           rate = parseRate(t);
           rateTok = t;
-        } else if (INDEX_RE.test(t)) index = t.toUpperCase().replace("EURIBOR", "EURIBOR-").replace("--", "-");
-        else {
+        } else if (INDEX_RE.test(t)) {
+          index = normaliseIndexToken(t);
+          if (!index) badIndexTok = t;
+        } else {
           const taken = notional.take(t);
           if (taken === false) return fail(unknownTokenError(t, GRAMMAR.fra));
           if (taken !== true) return taken;
         }
       }
+      if (badIndexTok !== undefined) return unknownIndexError(badIndexTok, ccy);
       if (!period) return fail("Periode fehlt (z.B. fra 3x6 pay 2.2% 10m)");
       const m = FRA_PERIOD.exec(period)!;
       if (Number(m[2]) <= Number(m[1])) return fail("FRA-Periode: Ende muss nach dem Start liegen (z.B. 3x6)");
@@ -553,7 +599,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       return {
         ok: true,
         trade,
-        description: `FRA ${ccy} ${period} · Fest ${pr === "Pay" ? "zahlen" : "erhalten"} @ ${fmtNum(rate * 100, 3)} % · Nominal ${fmtNum(notional.value, 0)} · ${trade.index}`,
+        description: `FRA ${ccy} ${period} · Fest ${pr === "Pay" ? "zahlen" : "erhalten"} @ ${fmtNum(rate * 100, 3)} % · Nominal ${fmtNum(notional.value, 0)} · ${trade.index}${missingCurveNote(ccy, trade.index, opts)}`,
       };
     }
     if (["irs", "swap", "ois", "imm", "amort", "amortising"].includes(cmd)) {
@@ -564,6 +610,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       let rateTok: string | undefined;
       const notional = new AmountSlot(10_000_000);
       let index: string | undefined;
+      let badIndexTok: string | undefined;
       let steps: number[] | undefined;
       let expectSteps = false;
       for (const t of rest) {
@@ -588,13 +635,16 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
           if (rateTok !== undefined) return duplicate("Satz", rateTok, t);
           rate = parseRate(t);
           rateTok = t;
-        } else if (INDEX_RE.test(t)) index = t.toUpperCase().replace("EURIBOR", "EURIBOR-").replace("--", "-");
-        else {
+        } else if (INDEX_RE.test(t)) {
+          index = normaliseIndexToken(t);
+          if (!index) badIndexTok = t;
+        } else {
           const taken = notional.take(t);
           if (taken === false) return fail(unknownTokenError(t, GRAMMAR.irs));
           if (taken !== true) return taken;
         }
       }
+      if (badIndexTok !== undefined) return unknownIndexError(badIndexTok, ccy);
       if (!tenor) return fail("Laufzeit fehlt (z.B. 10Y)");
       const noCurve = noCurveError(ccy, opts);
       if (noCurve) return noCurve;
@@ -606,6 +656,15 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
         rate = 0.03;
       }
       if (cmd === "ois" && !index) index = SWAP_CONVENTIONS[ccy]?.oisIndex ?? "ESTR";
+      // Without a typed index the swap takes an index whose curve exists in the market (R7-F2): "irs dkk …" after
+      // "+ Kurve" DKK-DESTR is a DESTR swap, not an unpriceable CIBOR-6M swap; a typed index without a curve is flagged.
+      let indexNote = "";
+      if (!index) {
+        const chosen = chooseIndex(ccy, opts);
+        if ("ok" in chosen) return chosen;
+        index = chosen.index;
+        indexNote = chosen.note;
+      } else indexNote = missingCurveNote(ccy, index, opts);
       const isAmort = cmd.startsWith("amort");
       const isImm = cmd === "imm";
       // Step-up coupon: the first list entry is the initial coupon, every further entry starts one year later.
@@ -628,7 +687,9 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       return {
         ok: true,
         trade,
-        description: `${isImm ? "IMM-" : ""}${pr === "Pay" ? "Payer" : "Receiver"}-Swap ${ccy} ${tenor} @ ${fmtNum(rate * 100, 3)} %${stepUp ? ` → ${steps!.map((r) => fmtNum(r * 100, 2)).join(" / ")} % Staffel` : ""} · Nominal ${fmtNum(notional.value, 0)}${index ? ` · ${index}` : ""}${isAmort ? " · linear amortisierend" : ""}${immNote}`,
+        description: `${isImm ? "IMM-" : ""}${pr === "Pay" ? "Payer" : "Receiver"}-Swap ${ccy} ${tenor} @ ${fmtNum(rate * 100, 3)} %${stepUp ? ` → ${steps!.map((r) => fmtNum(r * 100, 2)).join(" / ")} % Staffel` : ""} · Nominal ${fmtNum(notional.value, 0)}${
+          indexNote || (index && (rest.some((t) => INDEX_RE.test(t)) || cmd === "ois") ? ` · ${index}` : "")
+        }${isAmort ? " · linear amortisierend" : ""}${immNote}`,
       };
     }
     if (["cap", "floor", "collar"].includes(cmd)) {
@@ -664,15 +725,18 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
       if (!tenor || strike === undefined) return fail("Laufzeit und Strike erforderlich (z.B. cap 5y 3% 8m)");
       const noCurve = noCurveError(ccy, opts);
       if (noCurve) return noCurve;
+      // The cap's index follows the same curve-backed rule as the swap (R7-F2 / Markt R7-1: "cap nok …" after "+ Kurve" NOK-NOWA).
+      const chosen = chooseIndex(ccy, opts);
+      if ("ok" in chosen) return chosen;
       const capFloor = cmd === "cap" ? "Cap" : cmd === "floor" ? "Floor" : "Collar";
       const trade = {
-        ...makeCapFloor({ currency: ccy, notional: notional.value, capFloor, strike, floorStrike, effectiveDate: spot, maturity: tenor }),
+        ...makeCapFloor({ currency: ccy, notional: notional.value, capFloor, strike, floorStrike, effectiveDate: spot, maturity: tenor, index: chosen.index }),
         name: `${capFloor} ${ccy} ${tenor} ${fmtNum(strike * 100, 2)} %${floorStrike !== undefined ? ` / ${fmtNum(floorStrike * 100, 2)} %` : ""}`,
       };
       return {
         ok: true,
         trade,
-        description: `${capFloor} ${ccy} ${tenor} @ ${fmtNum(strike * 100, 2)} %${floorStrike !== undefined ? ` / ${fmtNum(floorStrike * 100, 2)} %` : ""} · Nominal ${fmtNum(notional.value, 0)}`,
+        description: `${capFloor} ${ccy} ${tenor} @ ${fmtNum(strike * 100, 2)} %${floorStrike !== undefined ? ` / ${fmtNum(floorStrike * 100, 2)} %` : ""} · Nominal ${fmtNum(notional.value, 0)}${chosen.note}`,
       };
     }
     if (["swpt", "swaption"].includes(cmd)) {
@@ -724,7 +788,7 @@ function parseCore(toks: string[], valuationDate: number, opts: QuickEntryOption
         trade,
         description: `${pr}-Swaption ${ccy} ${expiry}x${tenor} @ ${fmtNum((strike ?? 0.03) * 100, 3)} % · Nominal ${fmtNum(notional.value, 0)}${
           settlement === "Cash" ? " · Barausgleich" : settlement === "Physical" ? " · physisch" : ""
-        }${noCube ? ` · ⚠ kein Swaption-Vol-Cube für ${ccy} (Fallback-Vol, Level 3)` : ""}`,
+        }${noCube ? ` · ⚠ kein Swaption-Vol-Cube für ${ccy} (Fallback-Vol, Level 3 – in der Marktansicht mit „+ Fläche“ anlegen)` : ""}`,
       };
     }
     if (["fxf", "fxfwd", "forward"].includes(cmd)) {

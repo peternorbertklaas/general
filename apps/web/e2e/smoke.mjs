@@ -578,6 +578,9 @@ try {
   check((await page.locator("label.check", { hasText: "Interim" }).count()) === 1, "CCS editor offers the interim notional exchange");
   check((await page.locator('select[aria-label="MtM-Reset"]').inputValue()) === "1", "quick entry 'mtm' selects the resetting leg");
   check((await page.locator('input[aria-label="UTI"]').count()) === 1, "Regulatorik section with UTI field in the editor");
+  // the quick entry left the focus on "Bezeichnung" (R7-03) – Esc leaves the field before the next chord
+  await page.keyboard.press("Escape");
+  await wait(100);
   // FRA via chord n r: editor with index select, settlement / fixing dates in the header
   await page.keyboard.press("n");
   await page.keyboard.press("r");
@@ -591,6 +594,11 @@ try {
     "no select without accessible name in the editor (R3-03)",
   );
   check(/Fixing-Datum \d{2}\.\d{2}\.\d{4}/.test(await page.locator('[data-testid="pricing-details"]').innerText()), "FRA header shows the fixing date");
+  // R7-03: after a chord trade creation the focus is on the first editor field, not on body
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))) === "Bezeichnung",
+    `n r leaves the focus on the first editor field (${await page.evaluate(() => document.activeElement?.tagName)}) (R7-03)`,
+  );
   // back to the new IRS
   await page.keyboard.press("Control+k");
   await page.keyboard.type(newId);
@@ -626,6 +634,8 @@ try {
   await wait(200);
   await page.keyboard.press("Enter");
   await wait(600);
+  await page.keyboard.press("Escape"); // leave the "Bezeichnung" field the quick entry focused (R7-03)
+  await wait(100);
   const collarPvBefore = await page.locator('[data-testid="pv-value"]').innerText();
   await page.keyboard.press("Shift+P");
   await wait(800);
@@ -946,6 +956,15 @@ try {
   await page.locator('[data-testid="hedge-reset"]').click();
   await wait(300);
   check((await page.locator('input[aria-label="Hedge Ratio"]').inputValue()) === "50", "hedge reset dismissed → documentation kept (R3-F4)");
+  // R7-06: an accepted reset is one undo step that brings back the documentation AND the persisted test result
+  page.once("dialog", (d) => d.accept());
+  await page.locator('[data-testid="hedge-reset"]').click();
+  await wait(400);
+  check((await page.locator('[data-testid="hedge-verdict-badge"]').count()) === 0, "hedge reset drops the stored test result (R7-06)");
+  await page.keyboard.press("Control+z");
+  await wait(500);
+  check((await page.locator('input[aria-label="Hedge Ratio"]').inputValue()) === "50", "undo restores the hedge documentation (R3-F4)");
+  check((await page.locator('[data-testid="hedge-verdict-badge"]').count()) === 1, "undo restores the persisted test result too (R7-06)");
   check((await page.locator('[data-testid="hedge-amortisation"]').count()) === 1, "hedged item offers the amortisation select");
   check((await page.locator('[data-testid="hedge-designation"]').count()) === 0, "designation select hidden for linear instruments");
   // option instrument: designation select, freeze-vol checkbox, cost of hedging card
@@ -1168,7 +1187,62 @@ try {
   await wait(500);
   check((await page.locator('[data-testid="fx-fixings-table"]').count()) === 0, "Ctrl+Z removes the FX fixing again");
 
+  // R7-01: roving tabindex in the market view – fixings table and every vol grid are one tab stop each
+  const marketStops = await page.evaluate(() => {
+    const stopsIn = (sel) => {
+      const el = document.querySelector(sel);
+      return el ? el.querySelectorAll('[tabindex="0"], input:not([tabindex="-1"]), select:not([tabindex="-1"]), button:not([tabindex="-1"])').length : -1;
+    };
+    return {
+      fixings: stopsIn('[data-testid="fixings-table"]'),
+      swaption: stopsIn('[data-testid="swaption-vol-grid"]'),
+      caplet: stopsIn('[data-testid="caplet-vol-table"]'),
+      fxVol: stopsIn('[data-testid="fx-vol-grid"]'),
+      total: document.querySelectorAll(
+        'main [tabindex="0"], main input:not([tabindex="-1"]), main select:not([tabindex="-1"]), main button:not([tabindex="-1"])',
+      ).length,
+    };
+  });
+  check(
+    marketStops.fixings === 1 && marketStops.swaption === 1 && marketStops.caplet === 1 && marketStops.fxVol === 1,
+    `market tables and vol grids are one tab stop each (${JSON.stringify(marketStops)}) (R7-01)`,
+  );
+  check(marketStops.total < 80, `market view has far fewer tab stops than the 489 of round 6 (${marketStops.total}) (R7-01)`);
+  await page.locator('[data-testid="fixings-table"] tbody tr[tabindex="0"]').focus();
+  await page.keyboard.press("ArrowDown");
+  check((await page.evaluate(() => document.activeElement?.tagName)) === "TR", "arrow keys move between fixings rows (R7-01)");
+  await page.keyboard.press("Enter");
+  check(
+    /^Index Fixing/.test(await page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? "")),
+    "Enter on a fixings row opens its first control (R7-01)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(150);
+  check((await page.evaluate(() => document.activeElement?.tagName)) === "TR", "Esc returns to the fixings row (R7-01)");
+  await page.keyboard.press("Tab");
+  check(
+    (await page.evaluate(() => document.activeElement?.closest('[data-testid="fixings-table"]') === null)) === true,
+    "one Tab leaves the fixings table (241 Tabs in round 6) (R7-01)",
+  );
+  await page.locator('[data-testid="swaption-vol-grid"] [role="gridcell"]').first().focus();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowDown");
+  const cellPos = await page.evaluate(() => `${document.activeElement?.getAttribute("data-r")},${document.activeElement?.getAttribute("data-c")}`);
+  check(cellPos === "1,1", `arrow keys move between swaption grid cells (${cellPos}) (R7-01)`);
+  await page.keyboard.press("Enter");
+  check(
+    /^Swaption-Vol /.test(await page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? "")),
+    "Enter on a grid cell edits its value (R7-01)",
+  );
+  await page.keyboard.press("Escape");
+  await wait(150);
+  check((await page.evaluate(() => document.activeElement?.getAttribute("role"))) === "gridcell", "Esc returns to the grid cell (R7-01)");
+
   // + Kurve (Markt R6-5): a DKK OIS curve from quotes – conventions from the core registry, then a DKK swap via the palette
+  // a snapshot of the market *before* the DKK curve – the auditor's file the treasurer imports later (R7-F1)
+  const [snapPreDownload] = await Promise.all([page.waitForEvent("download"), page.locator('[data-testid="snapshot-export"]').click()]);
+  const snapPrePath = join(tmpdir(), `deriva-e2e-snapshot-pre-dkk-${port}.json`);
+  await snapPreDownload.saveAs(snapPrePath);
   await chord(page, "c");
   await page.locator('[data-testid="add-curve"]').click();
   await wait(300);
@@ -1178,21 +1252,113 @@ try {
   const addIndex = await page.locator('[data-testid="add-curve-index"]').inputValue();
   check(addIndex === "DESTR", `DKK defaults to its OIS index (${addIndex}) (R6-5)`);
   await page.locator('[data-testid="add-curve-spot"]').fill("7,46");
-  await page.locator('[data-testid="add-curve-submit"]').click();
+  await page.locator('[data-testid="add-curve-submit"]').focus();
+  await page.keyboard.press("Enter");
   await wait(900);
   check((await page.locator('[data-testid="curve-tab-DKK-DESTR"]').count()) === 1, "the new DKK-DESTR curve appears as a tab (R6-5)");
   check((await page.locator(".toast", { hasText: "Kurve DKK-DESTR aus 6 Quotes angelegt" }).count()) === 1, "toast confirms the added curve (R6-5)");
   check((await page.locator('[data-testid="market-modified-chip"]').count()) === 1, "an added curve counts as modifiziert (R6-5)");
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))) === "curve-tab-DKK-DESTR",
+    "after Kurve anlegen (keyboard) the focus is on the new curve's tab (R7-03)",
+  );
   await page.keyboard.press("Control+k");
   await page.keyboard.type("irs dkk 5y pay 3% 10m");
   await wait(300);
   const dkkPreview = await page.locator(".palette .item").first().innerText();
   check(/Payer-Swap DKK 5Y/.test(dkkPreview), `quick entry prices a DKK swap once the curve exists (${dkkPreview.slice(0, 60)}) (R6-1 / R6-5)`);
+  check(
+    /DESTR \(Kurve vorhanden; CIBOR-6M ohne Kurve\)/.test(dkkPreview) && !/⚠/.test(dkkPreview),
+    `the default form picks the index with a curve and says so in the preview (${dkkPreview.slice(40, 120)}) (R7-F2)`,
+  );
   await page.keyboard.press("Enter");
   await wait(700);
   check((await page.locator('[data-testid="pv-kpi"], .kpi').first().count()) >= 1, "DKK swap opens in the pricing workspace (R6-5)");
+  check((await page.locator('[data-testid="pricing-error"]').count()) === 0, "the default-form DKK swap is priced, not 'Fehler' (R7-F2)");
+  check(
+    (await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))) === "Bezeichnung",
+    "after the palette quick entry the focus is on the first editor field (R7-03)",
+  );
+  await page.keyboard.press("Escape"); // leave the field so the chords below work
+  await wait(100);
+  check(
+    (await page.locator('select[aria-label="Währung"]').inputValue()) === "DKK" && (await page.locator('select[aria-label="Index"]').inputValue()) === "DESTR",
+    "editor shows DKK / DESTR for the new-currency swap instead of EUR / EURIBOR-3M (R7-02)",
+  );
+  check(
+    (await page.locator('select[aria-label="Collateral-Währung"] option', { hasText: "DKK-CSA" }).count()) === 1,
+    "collateral select offers DKK-CSA (R7-02)",
+  );
+  check(
+    (await page.locator('select[aria-label="Währung"] option', { hasText: "NOK (ohne Kurve)" }).count()) === 1,
+    "currency select lists registered currencies without a curve as such (R7-02)",
+  );
+  const dkkTradeId = await page.locator(".card h3 .mono.ellipsis").first().innerText();
+  // R7-F1: import a snapshot without the DKK curve → the trade cannot be priced (error names + Kurve) → Zum Sample-Markt → reload → priced again, spot present
+  await chord(page, "m");
+  await page.locator('[data-testid="snapshot-import"]').setInputFiles(snapPrePath);
+  await wait(1200);
+  await chord(page, "b");
+  const dkkRow = page.locator(`tr[data-id="${dkkTradeId}"]`);
+  check((await dkkRow.locator('[data-testid="valuation-error"]').count()) === 1, "DKK trade shows Fehler while the imported snapshot lacks the curve (R7-F1)");
+  check(
+    /\+ Kurve/.test((await dkkRow.locator('[data-testid="valuation-error"]').getAttribute("title")) ?? ""),
+    "the blotter error names the in-app repair path „+ Kurve“ (R7-F1)",
+  );
+  await chord(page, "m");
+  await page.locator('[data-testid="snapshot-leave"]').click();
+  await wait(900);
+  check((await page.locator('[data-testid="fx-spot-row-EURDKK"]').count()) === 1, "after Zum Sample-Markt the EUR/DKK spot is back in the spot table (R7-F1)");
+  await page.reload({ waitUntil: "networkidle" });
+  await wait(800);
+  await chord(page, "m");
+  check((await page.locator('[data-testid="fx-spot-row-EURDKK"]').count()) === 1, "the EUR/DKK spot survives the reload with the curve (R7-F1)");
+  await chord(page, "c");
+  check((await page.locator('[data-testid="curve-tab-DKK-DESTR"]').isDisabled()) === false, "DKK curve tab enabled after import → leave → reload (R7-F1)");
+  await chord(page, "b");
+  check(
+    (await page.locator(`tr[data-id="${dkkTradeId}"] [data-testid="valuation-error"]`).count()) === 0,
+    "DKK trade priced again after import → leave → reload (R7-F1)",
+  );
+  // R7-F1 / R7-2: "+ Paar" adds an FX spot for a new pair, "+ Fläche" a swaption cube for the new currency
+  await chord(page, "m");
+  await page.locator('[data-testid="add-spot"]').click();
+  await page.locator('[data-testid="add-spot-pair"]').fill("EURSEK");
+  await page.locator('[data-testid="add-spot-rate"]').fill("11,2");
+  await page.keyboard.press("Enter");
+  await page.locator('[data-testid="add-spot-submit"]').click();
+  await wait(500);
+  check((await page.locator('[data-testid="fx-spot-row-EURSEK"]').count()) === 1, "+ Paar adds the EUR/SEK spot row (R7-F1)");
+  check((await page.locator(".toast", { hasText: "Spot EUR/SEK 11,2000 angelegt" }).count()) === 1, "+ Paar toast with Rückgängig (R7-F1)");
   await page.keyboard.press("Control+z");
+  await wait(500);
+  check((await page.locator('[data-testid="fx-spot-row-EURSEK"]').count()) === 0, "Ctrl+Z removes the added spot again (R7-F1)");
+  await page.locator('[data-testid="add-vol"]').click();
+  await wait(200);
+  check((await page.locator('[data-testid="add-vol-ccy"]').inputValue()) === "DKK", "+ Fläche proposes the currency with a curve but no cube (R7-2)");
+  await page.locator('[data-testid="add-vol-submit"]').click();
+  await wait(700);
+  check(
+    /Swaption-ATM-Vols DKK/i.test(await page.locator('[data-testid="swaption-vol-card"]').innerText()), // innerText carries the CSS uppercase
+    "+ Fläche creates and selects the DKK swaption cube (R7-2)",
+  );
+  check((await page.locator('[data-testid="swaption-vol-edited"]').innerText()) === "angelegt", "the new cube carries the badge angelegt (R7-2)");
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("swpt dkk 1y5y payer 3% 10m");
+  await wait(300);
+  check(!/⚠/.test(await page.locator(".palette .item").first().innerText()), "swaption preview no longer warns about a missing DKK cube (R7-2)");
+  await page.keyboard.press("Escape");
+  await wait(200);
+  await page.locator('[data-testid="swaption-vol-reset"]').click();
+  await wait(500);
+  check((await page.locator('[aria-label="Swaption-Cube Währung"] button', { hasText: "DKK" }).count()) === 0, "Entfernen drops the added cube again (R7-2)");
+  // clean up: delete the DKK trade, remove the curve (spot goes with it) → back to the unmodified sample market
+  await chord(page, "b");
+  await page.locator(`tr[data-id="${dkkTradeId}"]`).click();
+  await wait(200);
+  await page.keyboard.press("Shift+D");
   await wait(400);
+  check((await page.locator(".toast", { hasText: `Gelöscht: ${dkkTradeId}` }).count()) === 1, "DKK trade deleted again");
   await chord(page, "c");
   await page.locator('[data-testid="curve-tab-DKK-DESTR"]').click();
   await wait(200);
@@ -1210,14 +1376,12 @@ try {
   );
   await page.keyboard.press("Escape");
   await wait(200);
-  // the added spot EUR/DKK stays a quote edit until undone – undo it so the snapshot round trip starts from the sample market
-  await page.keyboard.press("Control+z");
-  await wait(600);
   await chord(page, "m");
+  check((await page.locator('[data-testid="fx-spot-row-EURDKK"]').count()) === 0, "removing the curve removes its spot too – no orphaned EUR/DKK row (R7-F1)");
   check(
     (await page.locator('[data-testid="market-modified-chip"]').count()) === 0 ||
       !(await page.locator('[data-testid="market-chip"]').innerText()).includes("modifiziert"),
-    "market back to the sample after undoing the curve (R6-5)",
+    "market back to the sample after removing the curve (R6-5 / R7-F1)",
   );
 
   // Snapshot round trip (R5-F2): export → change a quote → import the same file → identical id, no "modifiziert", quote table reset
@@ -1399,7 +1563,7 @@ try {
   await wait(250);
   const fxoPreview = await page.locator(".palette .item").first().innerText();
   check(
-    /keine FX-Vol-Fläche für USD\/CHF \(Fallback 8 %, Level 3\)/.test(fxoPreview),
+    /keine FX-Vol-Fläche für USD\/CHF \(Fallback 8 %, Level 3 – in der Marktansicht mit „\+ Fläche“ anlegen\)/.test(fxoPreview),
     `fxo preview flags a pair without vol surface (${fxoPreview.slice(0, 90)}) (Markt R5-2)`,
   );
   await page.keyboard.press("Escape");
@@ -1594,6 +1758,42 @@ try {
   const reportFit = await noOverflow(page);
   check(reportFit.main, "1280px report market table does not overflow (R3-09)");
 
+  // R7-04: at 1440 px the Key-Rate curve selector of an FX product (five chips) stays inside its two-column card
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await wait(300);
+  await chord(page, "b");
+  const selectedBeforeKeyRate = await page.locator("table.blotter tbody tr.selected").getAttribute("data-id");
+  await page.keyboard.press("Control+k");
+  await page.keyboard.type("FXO-0001");
+  await wait(200);
+  await page.keyboard.press("Enter");
+  await wait(600);
+  await chord(page, "p");
+  await page
+    .locator('[data-testid="keyrate-curves"]')
+    .waitFor({ timeout: 5000 })
+    .catch(() => undefined);
+  const keyRateFit = await page.evaluate(() => {
+    const seg = document.querySelector('[data-testid="keyrate-curves"]');
+    const card = seg?.closest(".card");
+    if (!seg || !card) return null;
+    const cr = card.getBoundingClientRect();
+    const btns = Array.from(seg.querySelectorAll("button"));
+    return { n: btns.length, outside: btns.filter((b) => b.getBoundingClientRect().right > cr.right + 0.5).length, wrap: getComputedStyle(seg).flexWrap };
+  });
+  check(
+    !!keyRateFit && keyRateFit.n >= 3 && keyRateFit.outside === 0 && keyRateFit.wrap === "wrap",
+    `1440px Key-Rate curve chips stay inside the card (${JSON.stringify(keyRateFit)}) (R7-04)`,
+  );
+  // back to the trade that was selected before (the 1024-px inspector check below measures that trade)
+  if (selectedBeforeKeyRate) {
+    await page.keyboard.press("Control+k");
+    await page.keyboard.type(selectedBeforeKeyRate);
+    await wait(200);
+    await page.keyboard.press("Enter");
+    await wait(400);
+  }
+
   // 1024 × 768: inspector table fits its sidebar (R5-01), FX-vol pair tabs stay inside the card, cost card does not overflow (R5-05)
   await page.setViewportSize({ width: 1024, height: 768 });
   await wait(300);
@@ -1703,6 +1903,39 @@ try {
   }
   check(chunkErrors.length === 0, `chunk failure produces no uncaught page errors (${chunkErrors.join(" | ")}) (R6-01)`);
   await chunkContext.close();
+
+  // R7-05: a failed *library* chunk (echarts) – "Erneut versuchen" re-imports the library chunk itself with cache-busting
+  const libContext = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "de-DE", serviceWorkers: "block" });
+  const libPage = await libContext.newPage();
+  const libErrors = [];
+  libPage.on("pageerror", (e) => libErrors.push(String(e)));
+  const libRoute = /\/assets\/echarts-[^/?]*\.js(\?.*)?$/;
+  await libPage.route(libRoute, (r) => r.abort());
+  await libPage.goto(`http://localhost:${port}/`, { waitUntil: "networkidle" });
+  await libPage.keyboard.press("g");
+  await libPage.keyboard.press("c");
+  await libPage
+    .locator('[data-testid="chunk-error"]')
+    .first()
+    .waitFor({ timeout: 8000 })
+    .catch(() => undefined);
+  const libCards = await libPage.locator('[data-testid="chunk-error"]').count();
+  check(
+    libCards >= 1 && /Diagramm nicht verfügbar/i.test(await libPage.locator('[data-testid="chunk-error"]').first().innerText()),
+    `failed echarts chunk shows the Diagramm error card (${libCards}) (R7-05)`,
+  );
+  check((await libPage.locator('[data-testid="quotes-table"]').count()) === 1, "curves view stays usable without the chart library (R7-05)");
+  await libPage.unroute(libRoute);
+  await libPage.locator('[data-testid="chunk-retry"]').first().click();
+  await libPage
+    .locator(".chart canvas")
+    .first()
+    .waitFor({ timeout: 8000 })
+    .catch(() => undefined);
+  check((await libPage.locator(".chart canvas").count()) >= 1, "Erneut versuchen re-imports the echarts chunk and renders the chart (R7-05)");
+  check((await libPage.locator('[data-testid="chunk-error"]').count()) === 0, "every chart error card is gone after the retry (R7-05)");
+  check(libErrors.length === 0, `library chunk failure produces no uncaught page errors (${libErrors.join(" | ")}) (R7-05)`);
+  await libContext.close();
 
   // Offline after the FIRST online visit (R5-F4): a fresh browser context, one visit, install precaches the assets → offline reload works
   const freshContext = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "de-DE" });

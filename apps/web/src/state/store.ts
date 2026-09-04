@@ -138,7 +138,8 @@ export type UndoEntry =
   | { kind: "marketSource"; before: MarketSourceState; label: string; at: number }
   /** User-added curves (Markt R6-5); `quotes` when the action also set an FX spot for the new currency. */
   | { kind: "curves"; extraCurves: Record<string, ExtraCurve>; quotes?: SampleMarketQuotes; label: string; at: number }
-  | { kind: "hedge"; tradeId: string; relationship: HedgeRelationship | undefined; label: string; at: number };
+  /** Hedge documentation discarded; `result` = the persisted test result that went with it (restored on undo, R7-06). */
+  | { kind: "hedge"; tradeId: string; relationship: HedgeRelationship | undefined; result?: HedgeResult; label: string; at: number };
 
 /**
  * Everything that determines the base market besides the trades – captured by
@@ -176,6 +177,12 @@ export interface ExtraCurve {
   /** Registered rate index ("NOWA", "STIBOR-3M"). */
   index: string;
   quotes: CurveQuote[];
+  /**
+   * EUR spot of a new currency entered with the curve ("EURDKK" 7.46, R7-F1). Stored *with* the curve – not in the
+   * quote set – so it survives a snapshot import / "Zum Sample-Markt" / reload together with the curve; a spot the
+   * user edits later in the FX-spot table (quote set / override) wins.
+   */
+  fxSpot?: { pair: string; rate: number };
 }
 
 /** Persisted effectiveness test result of a hedge relationship (R5-F3): survives the reload, flagged stale when `key` no longer matches. */
@@ -547,7 +554,16 @@ export function marketModified(
   );
 }
 
-/** Persisted extra curves: id, 3-letter currency, index name and a quote list. */
+/** A plausible spot stored with an added curve: 6-letter pair, positive finite rate. */
+function plausibleCurveSpot(v: unknown): ExtraCurve["fxSpot"] {
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  return typeof o.pair === "string" && /^[A-Z]{6}$/.test(o.pair) && typeof o.rate === "number" && Number.isFinite(o.rate) && o.rate > 0
+    ? { pair: o.pair, rate: o.rate }
+    : undefined;
+}
+
+/** Persisted extra curves: id, 3-letter currency, index name, a quote list and – optionally – the spot entered with the curve. */
 function plausibleExtraCurves(v: unknown): Record<string, ExtraCurve> {
   const out: Record<string, ExtraCurve> = {};
   if (!v || typeof v !== "object") return out;
@@ -561,8 +577,26 @@ function plausibleExtraCurves(v: unknown): Record<string, ExtraCurve> {
       typeof o.index === "string" &&
       Array.isArray(o.quotes) &&
       o.quotes.length > 0
-    )
-      out[id] = { id, currency: o.currency, index: o.index, quotes: o.quotes as CurveQuote[] };
+    ) {
+      const fxSpot = plausibleCurveSpot(o.fxSpot);
+      out[id] = { id, currency: o.currency, index: o.index, quotes: o.quotes as CurveQuote[], ...(fxSpot ? { fxSpot } : {}) };
+    }
+  }
+  return out;
+}
+
+/**
+ * FX spots the added curves carry (R7-F1), for pairs the market does not quote
+ * yet in either direction – the sample quote set and spot overrides win.
+ */
+export function extraCurveSpots(extraCurves: Record<string, ExtraCurve>, present: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const c of Object.values(extraCurves)) {
+    const fx = c.fxSpot;
+    if (!fx) continue;
+    const inverse = `${fx.pair.slice(3)}${fx.pair.slice(0, 3)}`;
+    if (present[fx.pair] !== undefined || present[inverse] !== undefined || out[fx.pair] !== undefined || out[inverse] !== undefined) continue;
+    out[fx.pair] = fx.rate;
   }
   return out;
 }
@@ -595,6 +629,7 @@ export function validateExtraCurve(c: ExtraCurve, existingCurveIds: string[]): s
     const v = "rate" in q ? q.rate : "price" in q ? q.price : "spread" in q ? q.spread : "points" in q ? q.points : Number.NaN;
     if (!Number.isFinite(v)) return "Jede Quote braucht einen endlichen Satz";
   }
+  if (c.fxSpot && !plausibleCurveSpot(c.fxSpot)) return `Spot ${c.fxSpot.pair} muss ein positiver Kurs eines Währungspaars sein`;
   return undefined;
 }
 
@@ -708,6 +743,9 @@ export function buildMarket(
     });
     const { curves } = bootstrapCurves(date, specs, built.curves);
     built = { ...built, curves: { ...built.curves, ...curves }, discountCurveId };
+    // The EUR spot entered with a new currency's curve travels with the curve (R7-F1); quote-set spots win.
+    const spots = extraCurveSpots(extraCurves, built.fxSpots);
+    if (Object.keys(spots).length) built = { ...built, fxSpots: { ...built.fxSpots, ...spots } };
   }
   return built;
 }
@@ -1384,7 +1422,10 @@ export const useStore = create<AppState>()(
             const next = { ...get().hedgeRelationships };
             if (entry.relationship) next[entry.tradeId] = entry.relationship;
             else delete next[entry.tradeId];
-            set({ undoStack: undoStack.slice(0, -1), hedgeRelationships: next });
+            // The persisted test result comes back with the documentation (R7-06) – no re-test after an undone reset.
+            const hedgeResults = { ...get().hedgeResults };
+            if (entry.result) hedgeResults[entry.tradeId] = entry.result;
+            set({ undoStack: undoStack.slice(0, -1), hedgeRelationships: next, hedgeResults });
             return entry.label;
           }
           const { results, ms } = priceAll(market, entry.trades, reportingCurrency);
@@ -1633,24 +1674,24 @@ export const useStore = create<AppState>()(
         addExtraCurve: (curve, o) => {
           const s = get();
           if (s.marketSource === "import") return { ok: false, error: "Kurven stammen aus dem importierten Snapshot – zuerst „Zum Sample-Markt“ wechseln" };
-          const c: ExtraCurve = { ...curve, currency: curve.currency.toUpperCase(), index: curve.index.toUpperCase() };
+          // The spot of a new currency is stored with the curve (R7-F1): it survives import / leave / reload with it.
+          const fxIn = o?.fxSpot ?? curve.fxSpot;
+          const fx = fxIn ? plausibleCurveSpot({ pair: fxIn.pair.toUpperCase(), rate: fxIn.rate }) : undefined;
+          if (fxIn && !fx) return { ok: false, error: `Spot ${fxIn.pair.toUpperCase()} muss ein positiver Kurs eines Währungspaars sein` };
+          const c: ExtraCurve = { ...curve, currency: curve.currency.toUpperCase(), index: curve.index.toUpperCase(), ...(fx ? { fxSpot: fx } : {}) };
+          if (!fx) delete c.fxSpot;
           const problem = validateExtraCurve(c, Object.keys(s.baseMarket.curves));
           if (problem) return { ok: false, error: problem };
           const extraCurves = { ...s.extraCurves, [c.id]: c };
-          const fx = o?.fxSpot;
-          const quotes =
-            fx && /^[A-Z]{6}$/.test(fx.pair) && Number.isFinite(fx.rate) && fx.rate > 0
-              ? { ...s.quotes, fxSpots: { ...s.quotes.fxSpots, [fx.pair]: fx.rate } }
-              : s.quotes;
           let base: MarketContext;
           try {
-            base = buildMarket(s.valuationDate, quotes, s.interpolation, s.turnOfYear, s.volSurfaces, s.fxFixings, extraCurves);
+            base = buildMarket(s.valuationDate, s.quotes, s.interpolation, s.turnOfYear, s.volSurfaces, s.fxFixings, extraCurves);
             if (s.fixings) base = { ...base, fixings: s.fixings };
           } catch (e) {
             return { ok: false, error: `Bootstrap fehlgeschlagen: ${translatePricingError(e)}` };
           }
-          pushCurvesUndo(`Kurve ${c.id} angelegt${fx ? ` · Spot ${fx.pair.slice(0, 3)}/${fx.pair.slice(3)}` : ""}`, quotes !== s.quotes);
-          set({ extraCurves, quotes });
+          pushCurvesUndo(`Kurve ${c.id} angelegt${fx ? ` · Spot ${fx.pair.slice(0, 3)}/${fx.pair.slice(3)}` : ""}`, false);
+          set({ extraCurves });
           get().setMarket(base);
           return { ok: true };
         },
@@ -1813,8 +1854,8 @@ export const useStore = create<AppState>()(
             reportStamp: null,
             reportKey: null,
           });
-          const built = buildMarket(get().valuationDate, get().quotes, get().interpolation, get().turnOfYear, {}, []);
-          get().setMarket(built);
+          // Rebuilt WITH the user's added curves and their spots (R7-F1) – a DKK trade stays priceable after leaving the import.
+          get().setMarket(rebuildMarket(get().valuationDate, get().quotes));
         },
         setHedgeRelationship: (rel) => set({ hedgeRelationships: { ...get().hedgeRelationships, [rel.hedgingInstrumentId]: rel } }),
         removeHedgeRelationship: (tradeId) => {
@@ -1823,8 +1864,16 @@ export const useStore = create<AppState>()(
           const next = { ...get().hedgeRelationships };
           delete next[tradeId];
           const results = { ...get().hedgeResults };
+          const prevResult = results[tradeId];
           delete results[tradeId];
-          const entry: UndoEntry = { kind: "hedge", tradeId, relationship: prev, label: `Sicherungsdokumentation ${tradeId} verworfen`, at: Date.now() };
+          const entry: UndoEntry = {
+            kind: "hedge",
+            tradeId,
+            relationship: prev,
+            ...(prevResult ? { result: prevResult } : {}),
+            label: `Sicherungsdokumentation ${tradeId} verworfen`,
+            at: Date.now(),
+          };
           set({ hedgeRelationships: next, hedgeResults: results, undoStack: [...get().undoStack, entry].slice(-UNDO_DEPTH) });
         },
         setHedgeResult: (tradeId, result) => {
@@ -1955,7 +2004,9 @@ export const useStore = create<AppState>()(
           // Overrides on top of the base market survive the reload as well (R6-F1): FX spots (import mode) and fixings.
           const fxSpotOverrides = importedBase ? plausibleSpotOverrides(p.fxSpotOverrides) : {};
           const fixings = Array.isArray(p.fixings) ? p.fixings.filter(isPlausibleFixing) : null;
-          let extraCurves = importedBase ? {} : plausibleExtraCurves(p.extraCurves);
+          // Added curves survive the reload in import mode too (R7-F1): they are not applied while the snapshot is the
+          // base market, but "Zum Sample-Markt" / a valuation-date change rebuilds with them.
+          let extraCurves = plausibleExtraCurves(p.extraCurves);
           if (Object.keys(extraCurves).length) {
             // an added curve that no longer bootstraps (registry change, bad quotes) is dropped rather than breaking the start
             try {

@@ -133,8 +133,17 @@ export function lazyComponent<P extends object>(loader: () => Promise<LazyModule
     failed = undefined;
     Lazy = makeLazy();
   };
+  /** Mounted instances – "Erneut versuchen" on one error card re-renders them all (several charts of one view share the library chunk, R7-05). */
+  const mounted = new Set<() => void>();
   const Comp = ((props: P) => {
     const [, bump] = useState(0);
+    useEffect(() => {
+      const rerender = () => bump((n) => n + 1);
+      mounted.add(rerender);
+      return () => {
+        mounted.delete(rerender);
+      };
+    }, []);
     // The render path is fixed per mount: a mount that started through Suspense keeps rendering through it, otherwise the
     // first re-render after the chunk arrived would swap the tree (Suspense → direct) and remount the view – losing focus
     // and local state (e.g. a field edited right after a reload on a lazy view). A mount that finds the chunk in memory
@@ -152,6 +161,7 @@ export function lazyComponent<P extends object>(loader: () => Promise<LazyModule
     const onRetry = () => {
       reset();
       bump((n) => n + 1);
+      mounted.forEach((fn) => fn());
     };
     return createElement(RetryContext.Provider, { value: onRetry }, createElement(Suspense, { fallback }, createElement(Lazy, props)));
   }) as LazyComponent<P>;

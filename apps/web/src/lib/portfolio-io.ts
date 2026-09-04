@@ -182,6 +182,17 @@ export interface CsvTemplate {
   columns: CsvColumn[];
   /** One example row in the column order. */
   example: string[];
+  /**
+   * Header names written to the template where they differ from the canonical column (Markt R7-5): the CCS template
+   * carries the API's column names (`domesticNotional`, `effectiveDate`, `collateralCurrency`, …) so a file exported
+   * here imports via `POST /api/trades/import?type=CrossCurrencySwap` unchanged; the old names stay accepted as aliases.
+   */
+  headers?: Partial<Record<CsvColumn, string>>;
+}
+
+/** Header name of a template column (API-aligned name where defined, canonical column otherwise). */
+export function csvHeaderName(t: CsvTemplate, c: CsvColumn): string {
+  return t.headers?.[c] ?? c;
 }
 
 /** Column templates per trade type – downloadable from the blotter as a starting point. */
@@ -316,6 +327,8 @@ export const CSV_IMPORT_TEMPLATES: Record<CsvTradeType, CsvTemplate> = {
     type: "CCS",
     label: "Cross-Currency-Swap",
     // `collateral`: CSA currency (empty = market default – quote currency; `none` = unsecured), Markt R5-3.
+    // Header names follow the API CSV (Markt R7-5): domesticNotional, fixedRate, domesticPayReceive, effectiveDate, collateralCurrency.
+    headers: { notional: "domesticNotional", rate: "fixedRate", direction: "domesticPayReceive", start: "effectiveDate", collateral: "collateralCurrency" },
     columns: [
       "type",
       "id",
@@ -473,6 +486,12 @@ const HEADER_ALIASES: Record<string, CsvColumn> = {
   nominal: "notional",
   notional: "notional",
   betrag: "notional",
+  // API CSV names of the cross-currency swap (Markt R7-5)
+  domesticnotional: "notional",
+  "domestic notional": "notional",
+  "fixed rate": "rate",
+  domesticpayreceive: "direction",
+  "domestic pay/receive": "direction",
   richtung: "direction",
   direction: "direction",
   payrec: "direction",
@@ -1097,7 +1116,7 @@ export function barrierOf(
 /** CSV template text (header + example row) for one trade type. */
 export function csvTemplateText(type: CsvTradeType): string {
   const t = CSV_IMPORT_TEMPLATES[type];
-  return `\uFEFF${t.columns.join(";")}\r\n${t.example.join(";")}\r\n`;
+  return `\uFEFF${t.columns.map((c) => csvHeaderName(t, c)).join(";")}\r\n${t.example.join(";")}\r\n`;
 }
 
 /** Trigger a browser download of a text blob. */

@@ -399,7 +399,8 @@ export function PricingWorkspace() {
                 </span>
               </h3>
               {bucketed.length > 1 && (
-                <div className="seg" role="group" aria-label="Kurve für Key-Rate-Delta" style={{ marginBottom: 6 }} data-testid="keyrate-curves">
+                // `wrap`: five curve chips of an FX product stay inside the 358-px card of the two-column grid at 1440 px (R7-04)
+                <div className="seg wrap" role="group" aria-label="Kurve für Key-Rate-Delta" style={{ marginBottom: 6 }} data-testid="keyrate-curves">
                   {bucketed.map((b) => (
                     <button
                       key={b.curveId}

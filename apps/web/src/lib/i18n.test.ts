@@ -48,7 +48,13 @@ describe("i18n core message mapping (F-25)", () => {
   });
   it("translates validation errors and passes unknown text through", () => {
     expect(translateCoreMessage("terminationDate must be after effectiveDate")).toBe("Enddatum muss nach dem Startdatum liegen");
-    expect(translateCoreMessage("Curve not found in market context: EUR-XYZ")).toBe("Kurve EUR-XYZ nicht im Markt-Snapshot");
+    // R7-F1 / R7-F2: missing market data name the in-app repair path
+    expect(translateCoreMessage("Curve not found in market context: EUR-XYZ")).toBe(
+      "Kurve EUR-XYZ nicht im Markt-Snapshot – in der Kurvenansicht mit „+ Kurve“ anlegen",
+    );
+    expect(translateCoreMessage("FX spot not available for DKKEUR")).toBe(
+      "Kein FX-Spot für DKKEUR verfügbar – in der Marktansicht unter FX-Spots mit „+ Paar“ ergänzen",
+    );
     expect(translateCoreMessage("Something unexpected")).toBe("Something unexpected");
     expect(translateCoreMessage(undefined)).toBe("");
   });
@@ -64,7 +70,7 @@ describe("i18n core message mapping (F-25)", () => {
   });
   it("maps PricingError codes to German headlines", () => {
     expect(translatePricingError(new PricingError("NO_DISCOUNT_CURVE", "No discount curve configured for JPY"))).toBe(
-      "Keine Diskontkurve konfiguriert: Keine Diskontkurve für JPY konfiguriert",
+      "Keine Diskontkurve konfiguriert: Keine Diskontkurve für JPY konfiguriert – in der Kurvenansicht mit „+ Kurve“ eine JPY-Kurve anlegen",
     );
     expect(translatePricingError(new PricingError("INVALID_TRADE", "terminationDate must be after effectiveDate"))).toBe(
       "Ungültige Trade-Daten: Enddatum muss nach dem Startdatum liegen",

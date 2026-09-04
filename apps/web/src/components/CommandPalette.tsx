@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { VISIBLE_HOTKEYS, keyList, keyTokens, type HotkeyDef } from "../hotkeys/keymap.js";
+import { focusEditorField } from "../lib/focus.js";
 import { fmtDate, fmtMoney } from "../lib/format.js";
 import { QUICK_ENTRY_EXAMPLES, parseQuickEntry, parseValuationDateCommand } from "../lib/quick-parser.js";
 import { tradeTypeBadge } from "../lib/trade-ops.js";
@@ -60,6 +61,7 @@ export function CommandPalette({ onHotkey }: Props) {
       swaptionVols: st.market.swaptionVols,
       fxVols: st.market.fxVols,
       discountCurveId: st.market.discountCurveId,
+      curves: st.market.curves,
     })),
   );
   const act = useStore.getState;
@@ -86,8 +88,10 @@ export function CommandPalette({ onHotkey }: Props) {
         fxVolPairs: Object.keys(s.fxVols ?? {}),
         // R6-1 / R6-5: a rate product in a currency without a curve is an error with the "+ Kurve" remedy, not an unpriceable trade
         curveCurrencies: Object.keys(s.discountCurveId),
+        // R7-F2: the swap / cap index defaults to an index whose curve exists ("irs dkk …" → DESTR after "+ Kurve" DKK-DESTR)
+        curveIds: Object.keys(s.curves),
       }),
-    [q, s.valuationDate, s.fxSpots, s.swaptionVols, s.fxVols, s.discountCurveId],
+    [q, s.valuationDate, s.fxSpots, s.swaptionVols, s.fxVols, s.discountCurveId, s.curves],
   );
   const valDateCmd = useMemo(() => parseValuationDateCommand(q), [q]);
 
@@ -193,6 +197,8 @@ export function CommandPalette({ onHotkey }: Props) {
             const pv = useStore.getState().results[t.id]?.result?.pv;
             act().showToast(`Angelegt: ${t.id}${pv !== undefined ? ` · PV ${fmtMoney(pv, s.reportingCurrency)}` : ""}`);
             act().setPalette(false);
+            // R7-03: the focus lands on the first editor field of the new trade, not on the shell
+            focusEditorField();
           },
         }
       : valDateCmd

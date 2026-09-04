@@ -122,7 +122,8 @@ describe("R5-F1 – impossible CSV dates are row errors, never silent defaults",
 describe("Markt R5-3 – CCS CSV template with a CSA column", () => {
   it("template, parser and aliases carry `collateral`; `none` = unsecured, empty = market default", () => {
     expect(CSV_IMPORT_TEMPLATES.CCS.columns).toContain("collateral");
-    expect(csvTemplateText("CCS").split("\r\n")[0]).toMatch(/;collateral;status$/);
+    // header written with the API's column name since round 7 (Markt R7-5); `collateral` stays an accepted alias
+    expect(csvTemplateText("CCS").split("\r\n")[0]).toMatch(/;collateralCurrency;status$/);
     const head = "type;id;pair;notional;spread;fxSpot;direction;maturity;csa";
     const r = tradesFromCsv(
       `${head}\nCCS;C1;EURGBP;10000000;-20;0,86;Receive;5Y;USD\nCCS;C2;EURGBP;10000000;-20;0,86;Receive;5Y;none\nCCS;C3;EURGBP;10000000;-20;0,86;Receive;5Y;\nCCS;C4;EURGBP;10000000;-20;0,86;Receive;5Y;Dollar\n`,
@@ -145,7 +146,7 @@ describe("Markt R5-2 – FX option on a pair without a vol surface is flagged", 
     const pairs = ["EURUSD", "EURGBP", "USDJPY"];
     const warned = parseQuickEntry("fxo usdchf call 0.80 1m 6m", VAL, { fxSpots: { USDCHF: 0.79 }, fxVolPairs: pairs });
     expect(warned.ok).toBe(true);
-    expect(warned.description).toMatch(/⚠ keine FX-Vol-Fläche für USD\/CHF \(Fallback 8 %, Level 3\)/);
+    expect(warned.description).toMatch(/⚠ keine FX-Vol-Fläche für USD\/CHF \(Fallback 8 %, Level 3 – in der Marktansicht mit „\+ Fläche“ anlegen\)/);
     const fine = parseQuickEntry("fxo eurusd put 1.15 3m 9m", VAL, { fxSpots: { EURUSD: 1.1625 }, fxVolPairs: pairs });
     expect(fine.description).not.toMatch(/⚠/);
     expect(hasFxVolSurface("JPYUSD", pairs)).toBe(true);

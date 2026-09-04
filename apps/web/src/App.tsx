@@ -9,6 +9,7 @@ import { ValuationDatePopover } from "./components/ValuationDatePopover.js";
 import { HOTKEYS, VIEW_HOTKEYS, keyList, keyTokens, keysText, primaryKeys, type HotkeyDef, type ViewId } from "./hotkeys/keymap.js";
 import { isTextEntry, useHotkeys } from "./hotkeys/useHotkeys.js";
 import { blotterCsv, buildBlotterRows, readBlotterColumns } from "./lib/blotter-export.js";
+import { focusEditorField } from "./lib/focus.js";
 import { fmtDate, fmtMs } from "./lib/format.js";
 import { copyText, indicationText } from "./lib/indication.js";
 import { downloadPortfolioReport } from "./lib/portfolio-export.js";
@@ -272,6 +273,8 @@ export function App() {
           if (!isTemplateId(kind)) break;
           const nt = st.addTrade(newTradeTemplate(kind, st.valuationDate), { goToPricing: true, autoId: true });
           st.showToast(`Neu: ${nt.id} · ${nt.name ?? ""}`);
+          // R7-03: the focus lands on the first editor field ("Bezeichnung"), not on body
+          void focusEditorField();
           break;
         }
         case "export.portfolio":

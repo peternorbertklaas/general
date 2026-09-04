@@ -290,7 +290,9 @@ describe("store – curves added from quotes (Markt R6-5)", () => {
     expect(m.curves["NOK-NOWA"]!.currency).toBe("NOK");
     expect(m.discountCurveId.NOK).toBe("NOK-NOWA");
     expect(m.fxSpots.EURNOK).toBe(11.5);
-    expect(st().quotes.fxSpots.EURNOK).toBe(11.5);
+    // R7-F1: the spot is stored with the curve, not as a quote edit
+    expect(st().extraCurves["NOK-NOWA"]!.fxSpot).toEqual({ pair: "EURNOK", rate: 11.5 });
+    expect(st().quotes.fxSpots.EURNOK).toBeUndefined();
     expect(marketModified(st())).toBe(true);
     expect(st().undoStack.at(-1)).toMatchObject({ kind: "curves", label: /Kurve NOK-NOWA angelegt · Spot EUR\/NOK/ });
     // the curve reprices its own quotes (par OIS ≈ 0 residual) and prices a NOK swap
